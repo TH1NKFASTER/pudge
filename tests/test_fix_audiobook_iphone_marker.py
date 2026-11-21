@@ -121,7 +121,7 @@ def test_phone_candidate_and_choosing_it_keeps_the_live_mac_player_in_sync(servi
     phone = checkpoint(manifest, device, position=40000, reason="pause")
     assert service.record_checkpoint(device, phone)["status"] == "conflict"
     progress = service.progress(manifest["assetId"])
-    choice = service.phone_position_choice(progress)
+    choice = service.phone_position_choices(progress)[0]
     assert choice["checkpoint_id"] == phone["checkpointId"]
     assert choice["position"] == 40.0 and choice["revision"] == progress["revision"]
     assert choice["device_name"] == "Phone"
@@ -131,12 +131,12 @@ def test_phone_candidate_and_choosing_it_keeps_the_live_mac_player_in_sync(servi
     # The Mac keeps playing from there: its next save is accepted, no new conflict.
     assert service.record_mac_position(manifest["assetId"], "live-one", 41000)["status"] == "accepted"
     assert service.progress(manifest["assetId"])["conflicts"] == []
-    assert service.phone_position_choice(service.progress(manifest["assetId"])) is None
+    assert service.phone_position_choices(service.progress(manifest["assetId"])) == []
 
 
 def test_mac_only_conflicts_have_no_phone_candidate(service):  # noqa: F811
     progress = {"revision": 3, "selected": {"deviceId": "mac"}, "conflicts": [{"deviceId": "mac"}]}
-    assert service.phone_position_choice(progress) is None
+    assert service.phone_position_choices(progress) == []
 
 
 def test_api_seeks_a_playing_mac_player_and_returns_the_resolved_book():

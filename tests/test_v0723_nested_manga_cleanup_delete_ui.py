@@ -22,6 +22,7 @@ from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.manga import MangaService, _natural_key
+from pudge.manga_spreads import spread_table
 from test_web_app import make_api
 from tests.i18n_support import en, ru
 
@@ -905,7 +906,8 @@ def test_light_novel_volume_cards_show_no_chapter_count(page) -> None:
 # --- Manga reader pages -----------------------------------------------------------------------
 
 # A volume of window.NAMES pages; names like 018-019 are physical two-page spreads.
-READER = r"""
+READER = (
+    r"""
 window.NAMES = ['016.jpg', '017.jpg', '018-019.jpg', '020.jpg', '021.jpg', '022.jpg'];
 window.BOOK = {id: 3, title: 'Vol 1', series_title: 'Manga', position: 0, read_pages: 0};
 __api.manga_state = async () => ({books: [{...BOOK, page_count: NAMES.length}], ocr_available: false});
@@ -913,7 +915,13 @@ __api.manga_page = async (id, index) => ({book_id: id, page_index: index, page_c
                                          spread: NAMES[index].includes('-'), data_uri: 'data:image/png;base64,AAAA', width: 800, height: 1200});
 __api.manga_mark_read = async (id, index) => ({id, read_pages: index + 1});
 __api.manga_set_position = async () => ({ok: true});
+// The Mac's two-page table for these names (pudge/manga_spreads.py; "018-019" is one picture).
+__api.manga_spreads = async () => ({spreads: window.SPREAD_TABLES[NAMES.length], shift: false, wide: []});
 """
+    + "window.SPREAD_TABLES = "
+    + json.dumps({6: spread_table(6, [2]), 10: spread_table(10, [])})
+    + ";\n"
+)
 PAGES = r"""
 const shown = () => [...document.querySelectorAll('#mangaV2Pages .manga-v2-page-frame')].map(f => Number(f.dataset.pageIndex));
 const marked = () => __apiCalls.filter(c => c.name === 'manga_mark_read').map(c => c.args[1]);
@@ -931,7 +939,7 @@ def test_double_page_mode_shows_physical_spreads_alone(page) -> None:
         + r"""
         await __settle(PudgeMangaReaderV2.openBook(3)); await __tick(200);
         const forward = [shown()];
-        forward.push(await turn('ArrowLeft'));
+        for (let k = 0; k < 2; k++) forward.push(await turn('ArrowLeft'));
         const spread = document.querySelector('#mangaV2Pages .manga-v2-page-frame').classList.contains('spread');
         for (let k = 0; k < 2; k++) forward.push(await turn('ArrowLeft'));
         const back = [await turn('ArrowRight'), await turn('ArrowRight'), await turn('ArrowRight')];
@@ -941,8 +949,9 @@ def test_double_page_mode_shows_physical_spreads_alone(page) -> None:
         localStorage=_reader_mode("double"),
     )
     out = result.value
-    # 016+017 side by side, the 018-019 spread alone, then 020+021, then 022.
-    assert out["forward"] == [[0, 1], [2], [3, 4], [5]]
+    # The table of every reader: the cover 016 alone, 017 alone (its partner is the spread),
+    # the 018-019 spread alone, then 020+021, then 022.
+    assert out["forward"] == [[0], [1], [2], [3, 4], [5]]
     # Back: 017 is not paired with the spread that follows it.
     assert out["back"] == [[3, 4], [2], [1]] and out["spread"] is True
 
@@ -984,7 +993,8 @@ def test_manga_progress_counts_only_pages_turned_past_or_the_last_page(page) -> 
         before=READER + ten,
         localStorage=_reader_mode("double"),
     )
-    assert double.value == {"opened": [], "shown": [4, 5], "forward": [5]}
+    # Two pages: the saved page 4 is shown in its pair 3+4 (cover alone, then pairs).
+    assert double.value == {"opened": [], "shown": [3, 4], "forward": [4]}
 
     vertical = page.run(
         PAGES

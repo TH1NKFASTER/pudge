@@ -1,0 +1,632 @@
+{
+ "_comment": "What the Mac sends the phone for each word state (pudge/iphone_media.py); tests/test_fix_iphone_word_state_colours.py keeps it equal to the Mac's output, WordColorsTests.swift decodes it on the phone.",
+ "cases": [
+  {
+   "name": "new",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    0,
+    139
+   ],
+   "state": 0,
+   "wordState": "new",
+   "jitenState": "new"
+  },
+  {
+   "name": "not_in_deck",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    0,
+    267
+   ],
+   "state": 0,
+   "wordState": "not_in_deck",
+   "jitenState": "new"
+  },
+  {
+   "name": "young",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    1,
+    403
+   ],
+   "state": 1,
+   "wordState": "young",
+   "jitenState": "young"
+  },
+  {
+   "name": "learning",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    1,
+    403
+   ],
+   "state": 1,
+   "wordState": "young",
+   "jitenState": "young"
+  },
+  {
+   "name": "mature",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    543
+   ],
+   "state": 3,
+   "wordState": "mature",
+   "jitenState": "mature"
+  },
+  {
+   "name": "known",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    542
+   ],
+   "state": 3,
+   "wordState": "mature",
+   "jitenState": "mature"
+  },
+  {
+   "name": "mastered",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    694
+   ],
+   "state": 3,
+   "wordState": "mastered",
+   "jitenState": "mastered"
+  },
+  {
+   "name": "never-forget",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    694
+   ],
+   "state": 3,
+   "wordState": "mastered",
+   "jitenState": "mastered"
+  },
+  {
+   "name": "never_forget",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    691
+   ],
+   "state": 3,
+   "wordState": "mastered",
+   "jitenState": "mastered"
+  },
+  {
+   "name": "named neverforget",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    691
+   ],
+   "state": 3,
+   "wordState": "mastered",
+   "jitenState": "mastered"
+  },
+  {
+   "name": "named not-in-deck",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    0,
+    267
+   ],
+   "state": 0,
+   "wordState": "not_in_deck",
+   "jitenState": "new"
+  },
+  {
+   "name": "due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    811
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "failed",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    811
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "blacklisted",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    4,
+    930
+   ],
+   "state": 4,
+   "wordState": "blacklisted",
+   "jitenState": "blacklisted"
+  },
+  {
+   "name": "suspended",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    4,
+    1091
+   ],
+   "state": 4,
+   "wordState": "suspended",
+   "jitenState": "suspended"
+  },
+  {
+   "name": "redundant",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    1211
+   ],
+   "state": 3,
+   "wordState": "redundant",
+   "jitenState": "redundant"
+  },
+  {
+   "name": "mature and due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    815
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "mature and blacklisted",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    4,
+    935
+   ],
+   "state": 4,
+   "wordState": "blacklisted",
+   "jitenState": "blacklisted"
+  },
+  {
+   "name": "mastered and due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    815
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "blacklisted and due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    811
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "redundant and due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    811
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "suspended and due",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    2,
+    811
+   ],
+   "state": 2,
+   "wordState": "due",
+   "jitenState": "due"
+  },
+  {
+   "name": "named mature",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    543
+   ],
+   "state": 3,
+   "wordState": "mature",
+   "jitenState": "mature"
+  },
+  {
+   "name": "named known",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    3,
+    542
+   ],
+   "state": 3,
+   "wordState": "mature",
+   "jitenState": "mature"
+  },
+  {
+   "name": "named blacklisted",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    4,
+    930
+   ],
+   "state": 4,
+   "wordState": "blacklisted",
+   "jitenState": "blacklisted"
+  },
+  {
+   "name": "no card",
+   "token": [
+    0,
+    1,
+    7,
+    0,
+    0,
+    11
+   ],
+   "state": 0,
+   "wordState": null,
+   "jitenState": "new"
+  }
+ ],
+ "readerColors": {
+  "new": "#f43f5e",
+  "not_in_deck": "#f43f5e",
+  "young": "#f59e0b",
+  "mature": "#4ade80",
+  "mastered": "#2dd4bf",
+  "due": "#f97316",
+  "blacklisted": "#9ca3af",
+  "suspended": "#9ca3af",
+  "redundant": "#0ea5e9",
+  "learning": "#f59e0b",
+  "known": "#2dd4bf"
+ },
+ "jitenStates": [
+  "new",
+  "young",
+  "mature",
+  "blacklisted",
+  "due",
+  "mastered",
+  "redundant",
+  "suspended"
+ ],
+ "themes": {
+  "Default": [
+   {
+    "text": "#a566ef",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#969696",
+    "opacity": 150
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#c8c8c8",
+    "opacity": 200
+   },
+   {
+    "text": "#969696",
+    "opacity": 150
+   },
+   {
+    "text": "#969696",
+    "opacity": 150
+   }
+  ],
+  "High Contrast": [
+   {
+    "text": "#00ffff",
+    "opacity": 255
+   },
+   {
+    "text": "#ffff00",
+    "opacity": 255
+   },
+   {
+    "text": "#00ff00",
+    "opacity": 255
+   },
+   {
+    "text": "#808080",
+    "opacity": 120
+   },
+   {
+    "text": "#ff4444",
+    "opacity": 255
+   },
+   {
+    "text": "#88ff88",
+    "opacity": 255
+   },
+   {
+    "text": "#808080",
+    "opacity": 120
+   },
+   {
+    "text": "#808080",
+    "opacity": 120
+   }
+  ],
+  "Monochrome": [
+   {
+    "text": "#cccccc",
+    "opacity": 255
+   },
+   {
+    "text": "#999999",
+    "opacity": 255
+   },
+   {
+    "text": "#666666",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 102
+   },
+   {
+    "text": "#ffffff",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 102
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 102
+   }
+  ],
+  "Subtle": [
+   {
+    "text": "#e0e0e0",
+    "opacity": 255
+   },
+   {
+    "text": "#e0e0e0",
+    "opacity": 255
+   },
+   {
+    "text": "#e0e0e0",
+    "opacity": 255
+   },
+   {
+    "text": "#c0c0c0",
+    "opacity": 180
+   },
+   {
+    "text": "#e0e0e0",
+    "opacity": 255
+   },
+   {
+    "text": "#c8c8c8",
+    "opacity": 255
+   },
+   {
+    "text": "#c0c0c0",
+    "opacity": 180
+   },
+   {
+    "text": "#c0c0c0",
+    "opacity": 180
+   }
+  ],
+  "Underline": [
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   }
+  ],
+  "Toy Box": [
+   {
+    "text": "#4b8dff",
+    "opacity": 255
+   },
+   {
+    "text": "#55b87a",
+    "opacity": 255
+   },
+   {
+    "text": "#eeeeee",
+    "opacity": 255
+   },
+   {
+    "text": "#888888",
+    "opacity": 130
+   },
+   {
+    "text": "#d08700",
+    "opacity": 255
+   },
+   {
+    "text": "#aaaaaa",
+    "opacity": 255
+   },
+   {
+    "text": "#888888",
+    "opacity": 130
+   },
+   {
+    "text": "#888888",
+    "opacity": 130
+   }
+  ]
+ },
+ "defaultLook": [
+  {
+   "text": "#a566ef",
+   "opacity": 255
+  },
+  {
+   "text": "#eeeeee",
+   "opacity": 255
+  },
+  {
+   "text": "#eeeeee",
+   "opacity": 255
+  },
+  {
+   "text": "#969696",
+   "opacity": 150
+  },
+  {
+   "text": "#eeeeee",
+   "opacity": 255
+  },
+  {
+   "text": "#c8c8c8",
+   "opacity": 200
+  },
+  {
+   "text": "#969696",
+   "opacity": 150
+  },
+  {
+   "text": "#969696",
+   "opacity": 150
+  }
+ ]
+}

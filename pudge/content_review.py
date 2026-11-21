@@ -12,6 +12,7 @@ from .review_episode_due import build_text_due_review_cards
 from .review_providers import credential_account_key, ReviewOutcomeUnknown
 from .review_actions import resolve_wire_grade
 from .i18n import err
+from .light_novels import JitenUnavailableError
 
 
 class ContentReviewService:
@@ -44,7 +45,9 @@ class ContentReviewService:
             )
         elif kind == "manga":
             book = dict(self.api.manga._book(book_id))
-            if not Path(book["path"]).is_file():
+            # A volume is a CBZ/ZIP archive or an image folder read in place.
+            source = Path(book["path"])
+            if not (source.is_file() or source.is_dir()):
                 raise FileNotFoundError(err("review.mangaSourceRemoved"))
             part = max(0, part // 20 * 20)
             lines = []
@@ -248,6 +251,17 @@ class ContentReviewService:
                 )
             except ReviewOutcomeUnknown:
                 result = {"outcome": "unknown"}
+            except JitenUnavailableError as exc:
+                # Held back by Pudge's Jiten budget: nothing was sent, the card stays
+                # issued and the page sends the same grade again after ``retry_after``.
+                return {
+                    **before.payload(),
+                    "ok": False,
+                    "outcome": "retry",
+                    "retry_after": round(float(exc.retry_after), 1),
+                    "message": str(exc),
+                    "blocking": not before.granted,
+                }
             # Do not resurrect deleted content when a provider reply arrives late.
             self._session(token)
             if result.get("outcome") == "unknown":

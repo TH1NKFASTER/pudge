@@ -42,7 +42,10 @@ const fetched = () => callsOf('manga_page').map(c => c[1]);
 
 @pytest.mark.parametrize(
     ("mode", "shown", "fetched", "turned"),
-    [("single", [4], [4, 3, 5], [5]), ("double", [4, 5], [4, 5, 2, 6], [6, 7])],
+    # Two pages: the Mac's table (cover alone, then pairs 1-2, 3-4, ...) shows the saved page 4
+    # in its pair 3-4 and preloads the spreads before and after it (pudge/manga_spreads.py) and
+    # the pages right next to the pair (2: "Shift pairs by one page" re-pairs without waiting).
+    [("single", [4], [4, 3, 5], [5]), ("double", [3, 4], [3, 4, 1, 5, 2], [5, 6])],
 )
 def test_page_turns_load_the_shown_pages_and_one_turn_either_way(page, mode, shown, fetched, turned) -> None:
     # Old bug: the preload step was undefined after a change, so a page turn broke half-way.

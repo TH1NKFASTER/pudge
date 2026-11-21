@@ -257,6 +257,11 @@ def test_only_mpv_shortcuts_are_configurable_and_app_shortcuts_are_standard(tmp_
         "s_shortcut_mpv_translate",
         "s_shortcut_mpv_explain",
         "s_shortcut_mpv_skip",
+        "s_shortcut_mpv_replay_line",
+        "s_shortcut_mpv_previous_line",
+        "s_shortcut_mpv_next_line",
+        "s_shortcut_mpv_auto_pause",
+        "s_shortcut_mpv_reset_carried_delay",
         "s_shortcut_screen_text",
     ]
     assert (out["translate"], out["explain"]) == ("⌃⌥T", "⌘⌥⇧E")
@@ -308,25 +313,6 @@ def test_library_uses_relative_episode_number_and_singular_label(tmp_path: Path,
     assert payload["local"]["episode"] == 3
     assert payload["local"]["state"] == "waiting_subtitles"
 
-    assert en("label.libraryRangeSingle", episode=3) == "Episode: 3"
-    assert ru("label.libraryRangeSingle", episode=3) == "Серия: 3"
-    # The library card of this title (the backend's payload) names its one episode in the singular.
-    group = json.loads(json.dumps(library[0], default=str))
-    for lang in ("en", "ru"):
-        card = page.run(
-            """
-            const box = document.createElement('div');
-            box.innerHTML = libraryCard(GROUP);
-            const several = document.createElement('div');
-            several.innerHTML = libraryCard({...GROUP, episodes: [1, 2, 3, 5].map(episode => ({...GROUP.episodes[0], episode}))});
-            return {one: box.innerText, single: t('label.libraryRangeSingle', {episode: 3}),
-                    several: several.innerText, ranges: t('label.libraryRanges', {episodes: formatEpisodeRanges([1, 2, 3, 5])})};
-            """.replace("GROUP", json.dumps(group)),
-            lang=lang,
-        ).value
-        assert card["single"] in card["one"]
-        assert card["ranges"] in card["several"] and card["single"] not in card["several"]
-
 
 def test_highest_resolution_prefers_higher_standard_resolution(page) -> None:
     score_2160, _ = _quality_score("Anime 2160p WEB-DL", "highest")
@@ -334,7 +320,7 @@ def test_highest_resolution_prefers_higher_standard_resolution(page) -> None:
     score_1080, _ = _quality_score("Anime 1080p WEB-DL", "highest")
     score_720, _ = _quality_score("Anime 720p WEB-DL", "highest")
     assert score_2160 > score_1440 > score_1080 > score_720
-    assert SubsPleaseClient.feed_url("highest").endswith("?r=1080")
+    assert SubsPleaseClient(base_url="https://weekly.invalid/rss").feed_url("highest").endswith("?r=1080")
 
     # Settings offers every standard resolution and "highest"; the choice is saved.
     result = page.run(
@@ -403,4 +389,3 @@ def test_energy_diagnostics_is_opt_in_and_collects_related_process_activity(monk
     assert sample["energy_metric"] == "cpu_activity_proxy"
     assert sample["related_cpu_percent"] == 20.0
     assert {row["pid"] for row in sample["processes"]} == {100, 101, 202}
-    assert en("settings.energyDiagnostics") == "Energy diagnostics"

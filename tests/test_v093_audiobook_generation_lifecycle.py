@@ -203,6 +203,13 @@ def test_regenerate_keeps_old_audiobook_until_new_one_is_linked(
     monkeypatch.setattr(
         api.audiobooks, "delete", lambda audiobook_id, **_kwargs: delete_calls.append(int(audiobook_id))
     )
+    # The superseded audiobook is a generated folder (checked again before it is deleted).
+    old_folder = api._audiobook_generation_root() / "Book [Generated 8]"
+    old_folder.mkdir(parents=True)
+    (old_folder / ".pudge-audiobook-profile.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        api.audiobooks, "book", lambda audiobook_id, **_kwargs: {"id": audiobook_id, "path": str(old_folder)}
+    )
 
     job_id = api.job_center.start("audiobook_generation", "regenerate", total=5)
     with api._irodori_tts_lock:

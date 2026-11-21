@@ -100,6 +100,7 @@ def _test_python(project: Path) -> Path:
                 "-m",
                 "pip",
                 "install",
+                "--no-cache-dir",
                 "--editable",
                 str(project) + "[dev,sync]",
             ],

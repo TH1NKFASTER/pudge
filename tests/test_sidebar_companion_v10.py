@@ -48,6 +48,9 @@ class Window:
     def hide(self):
         self.calls.append("hide")
 
+    def destroy(self):
+        self.calls.append("destroy")
+
 
 class Audio:
     """Records every call; transport methods must never be touched by visibility."""
@@ -113,9 +116,15 @@ def env(monkeypatch):
             callback, args = pending.pop(0)
             callback(*args)
 
-    return SimpleNamespace(
+    yield SimpleNamespace(
         controller=controller, windows=windows, pending=pending, drain=drain, audio=audio, api=api
     )
+    # A hidden float window is destroyed by a 10-minute timer: it must not fire inside a
+    # later test of the run.
+    for thread in threading.enumerate():
+        if isinstance(thread, threading.Timer) and getattr(thread.function, "__self__", None) is controller:
+            thread.cancel()
+            thread.join(timeout=1)
 
 
 def ctx(open_, ln, audio, gen):
@@ -243,7 +252,7 @@ def test_web_api_reader_context_validates_and_delegates(env):
     assert result["ok"] and result["opened"] is False and logs
     assert WebAppApi.audiobook_reader_context(api, {"generation": "x"})["ok"] is False
     assert WebAppApi.audiobook_float_display(api, 9)["ok"]
-    assert env.controller.display_book_id == 9
+    assert env.controller._display_book_id == 9
 
 
 FLOAT_BOOK = {
@@ -340,6 +349,9 @@ def test_hovered_chapter_marks_its_range_on_the_card_and_sidebar_timelines(page)
         steps.closed = side();
         details.open = true;
         await over(row(7, 2));
+        // An unchanged answer only patches the cards in place (FE-5): a changed book redraws.
+        const snapshot = PudgeMedia.audioSnapshot();
+        __api.audiobook_state = async () => ({books: snapshot.books.map(book => ({...book, title: `${book.title} `}))});
         await PudgeMedia.loadAudio(); await __tick(10);                        // a redraw removed the hovered row
         steps.redrawn = side();
         await over(row(8, 2)); steps.otherBook = [marker('[data-audiobook-id="8"] .audiobook-chapter-hover'), side()];

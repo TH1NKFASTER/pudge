@@ -41,7 +41,7 @@ def test_downloaded_update_source_is_removed_after_installer_exit(tmp_path, monk
         patch.setattr("pudge.updater.os.getpid", lambda: 0)
         patch.setattr("pudge.updater.subprocess.Popen", lambda *a, **k: None)
         updater._launch_script(project, [])
-    script = project.parent / "run-pudge-update.zsh"
+    script = updater.update_root / "run-pudge-update.zsh"
     script.write_text(
         script.read_text()
         .replace("/bin/kill -0 0", "/bin/kill -0 2147483647")

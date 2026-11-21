@@ -1,4 +1,5 @@
-/* External Finder files: overlay only, import remains in the existing native handler. */
+/* External Finder files: overlay only, import remains in the existing native handler.
+   Audiobook files are welcome here too: the native drop imports them as audiobooks. */
 (() => {
   let depth = 0;
   const surface = () => document.getElementById('lightNovelsContent');
@@ -6,7 +7,7 @@
   const external = event => [...(event.dataTransfer?.types || [])].includes('Files');
   const supported = event => {
     const files = [...(event.dataTransfer?.files || [])];
-    return !files.length || files.every(file => /\.(epub|txt)$/i.test(file.name || ''));
+    return !files.length || files.every(file => /\.(epub|txt|m4b|m4a|mp3|aac|opus|ogg|flac|wav)$/i.test(file.name || ''));
   };
   const clear = () => { depth = 0; surface()?.classList.remove('ln-file-drag'); };
   function enter(event) {

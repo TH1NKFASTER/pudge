@@ -150,7 +150,11 @@ def test_new_subtitle_action_only_runs_never_attempted_jobs_and_changes_no_retry
 
     result = api.search_new_subtitles()
 
-    assert (result["eligible"], result["processed"], result["queued"]) == (1, 1, False)
+    # Prepared by a background worker; the call returns at once (WEBFLOW-12).
+    assert (result["eligible"], result["processed"], result["queued"]) == (1, 0, True)
+    for task in list(api.task_supervisor._tasks.values()):  # it runs off the bridge call (WEBFLOW-12)
+        if "subtitle-new-only" in task.name:
+            task.thread.join(timeout=60)
     assert observed == [videos["new"].resolve()]
     # Old attempts are neither retried nor re-queued nor postponed: the queue is as it was.
     assert _job_rows(api) == before

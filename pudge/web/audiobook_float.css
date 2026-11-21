@@ -9,3 +9,5 @@ button{font:inherit;color:inherit;background:#132237;border:1px solid #334862;bo
 #floatEmpty{position:fixed;left:20px;right:20px;top:40%;text-align:center;color:var(--muted)}
 #floatError{position:fixed;bottom:10px;left:10px;right:10px;padding:8px;border-radius:8px;background:#3b2630;color:#ffd5d5;z-index:15000}
 @media(max-height:430px){.sidebar-audio-cover{width:50px;height:70px;min-height:70px}.sidebar-ln-live{font-size:14px}}
+.sidebar-audio-transcript{height:100%;min-height:0}.abt-list{font-size:15px;line-height:1.65}
+@media(max-height:430px){.abt-list{font-size:14px}}

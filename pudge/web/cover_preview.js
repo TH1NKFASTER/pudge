@@ -108,9 +108,6 @@
     if(previewZoom<=1.001)return false;
     previewPanX+=Number(dx||0);previewPanY+=Number(dy||0);applyPreviewTransform();return true;
   }
-  function resetPreview({animate=true}={}){
-    previewZoom=1;previewPanX=0;previewPanY=0;previewPinch=null;previewPan=null;applyPreviewTransform({animate});
-  }
   function fitPreviewImage(image,width=null,height=null){
     if(!image)return;
     const naturalWidth=Number(width||image.naturalWidth||0);

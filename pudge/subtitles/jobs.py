@@ -37,13 +37,15 @@ class SubtitleJobReporter:
                             {"kind": "worker_stage", **payload},
                             ensure_ascii=False,
                             separators=(",", ":"),
+                            default=str,
                         )
                         + "\n"
                     )
-            except OSError:
+            except (OSError, TypeError, ValueError):
                 pass
         if self.path is None:
             return
+        temporary: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -53,11 +55,17 @@ class SubtitleJobReporter:
                 prefix=self.path.name + ".",
                 delete=False,
             ) as handle:
-                json.dump(payload, handle, ensure_ascii=False)
                 temporary = Path(handle.name)
+                # default=str: a Path or another object in the details is reported, not a crash.
+                json.dump(payload, handle, ensure_ascii=False, default=str)
             temporary.replace(self.path)
-        except OSError:
+            temporary = None
+        except (OSError, TypeError, ValueError):
             return
+        finally:
+            if temporary is not None:
+                # A failed write (a full disk) leaves no stray temporary beside the status file.
+                temporary.unlink(missing_ok=True)
 
 
 def read_job_report(path: Path) -> dict[str, Any] | None:

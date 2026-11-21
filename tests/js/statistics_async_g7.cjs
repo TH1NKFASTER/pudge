@@ -16,7 +16,7 @@ class Element {
   set innerHTML(value){this._html=String(value);if(this.id==='statsBody')bodyWrites++;}
   setAttribute(name,value){this[name]=value;}
   addEventListener(type,callback){handlers[type]=callback;}
-  querySelector(query){return query==='.stats-shell'&&this._html.includes('stats-shell')?{}:null;}
+  querySelector(query){return query==='.stats-shell'&&this._html.includes('stats-shell')?{dataset:{}}:null;}
 }
 for(const id of ['statisticsContent','statsBody','statsStatus','statsKind','statsMedia','statsCustomDates','statsStartDate','statsEndDate','statsModalHost']) elements.set(id,new Element(id));
 const document = {

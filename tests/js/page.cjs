@@ -5,7 +5,7 @@ node for behaviour tests (audit 71Б).
   const {openPage} = require('./page.cjs');
   const page = await openPage({lang: 'ru', state: {...}, api: {get_state: ...}});
   await page.run(() => renderLibrary());          // or a string of code
-  page.text('#library');  page.click('[data-action=play-library]');  await page.tick(500);
+  page.text('#library');  page.click('[data-action=card-menu]');  await page.tick(500);
 
 The page's scripts run in their own vm context with dom_lite (no layout, no CSS);
 pywebview.api calls are recorded in page.calls and answered from `api` (values or

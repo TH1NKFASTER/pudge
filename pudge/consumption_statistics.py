@@ -10,15 +10,17 @@ import uuid
 from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
 from .consumption import ConsumptionConflictError, ConsumptionLedger, ConsumptionLedgerError
-from .database import Database
+from .database import STATE_PREFIX_SQL, Database, state_prefix_bounds
 from .consumption_volume import (
     VOLUME_POLICY_VERSION,
     aggregate_volume,
     dump_prior_volume_state,
+    ln_segment_characters,
     load_prior_volume_state,
     merge_prior_volume_states,
     prior_volume_state,
@@ -99,6 +101,7 @@ def _finite(value: Any, *, default: float | None = None) -> float | None:
     return number if math.isfinite(number) else default
 
 
+@lru_cache(maxsize=256)  # asked several times per event: a handful of distinct values
 def _normalize_kind(value: str) -> str:
     kind = str(value or "").strip().casefold()
     aliases = {
@@ -210,27 +213,6 @@ def _sweep_breakdown(segments: list[dict[str, Any]]) -> tuple[float, dict[str, f
     return total, dict(breakdown)
 
 
-def _split_by_local_day(segment: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    start = float(segment["start"])
-    end = float(segment["end"])
-    result: list[tuple[str, dict[str, Any]]] = []
-    cursor = start
-    guard = 0
-    while cursor < end - 1e-6 and guard < 3700:
-        day = _local_day(cursor)
-        next_midnight = _local_midnight_epoch(day + timedelta(days=1))
-        if next_midnight <= cursor + 1e-6:
-            next_midnight = cursor + 3600.0
-        piece_end = min(end, next_midnight)
-        piece = dict(segment)
-        piece["start"] = cursor
-        piece["end"] = piece_end
-        result.append((day.isoformat(), piece))
-        cursor = piece_end
-        guard += 1
-    return result
-
-
 def _segments_by_local_day(segments: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     if not segments:
         return {}
@@ -307,6 +289,139 @@ def _longest_streak(days: list[dict[str, Any]]) -> int:
     return best
 
 
+# A speed needs at least a minute of reading; shorter buckets show no rate.
+_MIN_RATE_SECONDS = 300.0  # 5 minutes: a shorter stretch gives a noisy rate
+
+
+def _cpm(seconds: float, characters: float) -> float | None:
+    # Light-novel characters come from reader locators and are always exact in the
+    # volume policy, so a bucket without them simply has nothing to measure.
+    if seconds < _MIN_RATE_SECONDS - 1e-6 or characters <= 0:
+        return None
+    return characters / (seconds / 60.0)
+
+
+def _ln_reading_pieces(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Light-novel reading without its audiobook, with each piece's share of characters.
+
+    Time where a light novel and an audiobook of the same activity group overlap is
+    read-along ("light_novel+audiobook" in the breakdown): it is cut out, and so are
+    the characters read in it (in proportion to the time cut from the segment).
+    """
+    audio: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for segment in segments:
+        group = str(segment.get("activity_group_id") or "")
+        if group and _normalize_kind(str(segment.get("kind") or "")) == "audiobook":
+            audio[group].append((float(segment["start"]), float(segment["end"])))
+    merged = {group: _merge_intervals(rows) for group, rows in audio.items()}
+    starts = {group: [row[0] for row in rows] for group, rows in merged.items()}
+    pieces: list[dict[str, Any]] = []
+    for segment in segments:
+        if _normalize_kind(str(segment.get("kind") or "")) != "light_novel":
+            continue
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if end <= start:
+            continue
+        characters = ln_segment_characters(segment)
+        group = str(segment.get("activity_group_id") or "")
+        free = [(start, end)]
+        rows = merged.get(group) if group else None
+        if rows:
+            free = []
+            cursor = start
+            index = max(0, bisect_right(starts[group], start) - 1)
+            while index < len(rows) and rows[index][0] < end:
+                audio_start, audio_end = rows[index]
+                if audio_end > cursor:
+                    if audio_start > cursor:
+                        free.append((cursor, min(end, audio_start)))
+                    cursor = max(cursor, audio_end)
+                if cursor >= end:
+                    break
+                index += 1
+            if cursor < end:
+                free.append((cursor, end))
+        span = end - start
+        for piece_start, piece_end in free:
+            if piece_end > piece_start:
+                pieces.append(
+                    {
+                        "start": piece_start,
+                        "end": piece_end,
+                        "characters": characters * (piece_end - piece_start) / span,
+                        "span": piece_end - piece_start,
+                    }
+                )
+    return pieces
+
+
+def _reading_speed(segments: list[dict[str, Any]], day_keys: Iterable[str]) -> dict[str, Any]:
+    """Light-novel reading speed per local day and per local week (Monday first).
+
+    Only reading without audio counts (see _ln_reading_pieces). Time is the union per
+    day, like the time chart; a week's rate is its characters over its minutes, not an
+    average of daily rates. Cost: one pass over the period's segments plus one split by
+    local day, so "all time" stays cheap.
+    """
+    seconds: dict[str, float] = {}
+    characters: dict[str, float] = {}
+    for day, pieces in _segments_by_local_day(_ln_reading_pieces(segments)).items():
+        seconds[day] = _union_seconds((float(row["start"]), float(row["end"])) for row in pieces)
+        # A piece split at midnight keeps its characters in proportion to its time.
+        characters[day] = sum(
+            float(row["characters"]) * (float(row["end"]) - float(row["start"])) / float(row["span"])
+            for row in pieces
+            if float(row["span"]) > 0
+        )
+    keys = sorted(set(day_keys) | set(seconds))
+    days = [
+        {
+            "day": key,
+            "seconds": seconds.get(key, 0.0),
+            "characters": int(round(characters.get(key, 0.0))),
+            "cpm": _cpm(seconds.get(key, 0.0), characters.get(key, 0.0)),
+        }
+        for key in keys
+    ]
+    weeks: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        day = date.fromisoformat(key)
+        monday = day - timedelta(days=day.weekday())
+        week = weeks.setdefault(
+            monday.isoformat(),
+            {
+                "week_start": monday.isoformat(),
+                "week_end": (monday + timedelta(days=6)).isoformat(),
+                "seconds": 0.0,
+                "characters": 0.0,
+            },
+        )
+        week["seconds"] += seconds.get(key, 0.0)
+        week["characters"] += characters.get(key, 0.0)
+    week_rows = []
+    for key in sorted(weeks):
+        week = weeks[key]
+        week_rows.append(
+            {
+                **week,
+                "characters": int(round(week["characters"])),
+                "cpm": _cpm(week["seconds"], week["characters"]),
+            }
+        )
+    total_seconds = sum(seconds.values())
+    total_characters = sum(characters.values())
+    return {
+        "days": days,
+        "weeks": week_rows,
+        "total": {
+            "seconds": total_seconds,
+            "characters": int(round(total_characters)),
+            "cpm": _cpm(total_seconds, total_characters),
+        },
+    }
+
+
 class ConsumptionStatistics:
     def __init__(
         self,
@@ -328,9 +443,28 @@ class ConsumptionStatistics:
         # ln_words(text_hash) -> [(character offset, wordId, readingIndex)] or None:
         # the words of a light-novel chapter from its cached parse.
         self.ln_words = ln_words
+        # Word positions of the light-novel chapters a Statistics query met, kept for the
+        # next query only: bounded by words (not chapters: one chapter holds ~10k), and
+        # dropped once Statistics is not used for LN_WORD_CACHE_IDLE_SECONDS.
         self._ln_word_cache: dict[str, list[tuple[int, int, int]]] = {}
+        self._ln_word_cache_words = 0
+        self._ln_word_cache_used_at = 0.0
+
+    LN_WORD_CACHE_MAX_WORDS = 300_000
+    LN_WORD_CACHE_IDLE_SECONDS = 600.0
+
+    def release_idle(self, force: bool = False) -> int:
+        """Drop the chapter word cache when Statistics has not used it for a while."""
+        idle = time.monotonic() - self._ln_word_cache_used_at >= self.LN_WORD_CACHE_IDLE_SECONDS
+        if not self._ln_word_cache or not (force or idle):
+            return 0
+        dropped = len(self._ln_word_cache)
+        self._ln_word_cache = {}
+        self._ln_word_cache_words = 0
+        return dropped
 
     def _chapter_words(self, chapter: str) -> list[tuple[int, int, int]] | None:
+        self._ln_word_cache_used_at = time.monotonic()
         cached = self._ln_word_cache.get(chapter)
         if cached is not None:
             return cached
@@ -342,10 +476,16 @@ class ConsumptionStatistics:
             positions = None
         if positions is None:
             return None
-        if len(self._ln_word_cache) > 400:
-            self._ln_word_cache.clear()
-        self._ln_word_cache[chapter] = list(positions)
-        return self._ln_word_cache[chapter]
+        words = list(positions)
+        if (
+            len(self._ln_word_cache) > 400
+            or self._ln_word_cache_words + len(words) > self.LN_WORD_CACHE_MAX_WORDS
+        ):
+            self._ln_word_cache = {}
+            self._ln_word_cache_words = 0
+        self._ln_word_cache[chapter] = words
+        self._ln_word_cache_words += len(words)
+        return words
 
     def _words(
         self,
@@ -440,6 +580,7 @@ class ConsumptionStatistics:
         breakdown: dict[str, float],
         volume: dict[str, Any],
         words: dict[str, Any] | None,
+        reading_speed: dict[str, Any],
     ) -> dict[str, Any]:
         sessions = [row for row in journal if not row.get("excluded") and float(row.get("seconds") or 0) > 0]
         longest = max(sessions, key=lambda row: float(row["seconds"]), default=None)
@@ -455,9 +596,6 @@ class ConsumptionStatistics:
                 return None
             return float(amount) / seconds * per
 
-        ln_seconds = float(breakdown.get("light_novel", 0.0)) + float(
-            breakdown.get("light_novel+audiobook", 0.0)
-        )
         episodes = {
             str(media_uuid)
             for media_uuid, row in (volume.get("by_media") or {}).items()
@@ -478,19 +616,12 @@ class ConsumptionStatistics:
             if works
             else None,
             "anime_episodes": len(episodes),
-            "ln_characters_per_minute": rate("light_novel", ln_seconds, 60.0),
+            # Reading without audio only: read-along time and its characters used to
+            # count here, which mixed listening pace into the reading speed.
+            "ln_characters_per_minute": reading_speed["total"]["cpm"],
             "manga_pages_per_hour": rate("manga", float(breakdown.get("manga", 0.0)), 3600.0),
             "words": words,
         }
-
-    def _device_name(self, device_id: str) -> str:
-        with self.database.connect() as conn:
-            row = conn.execute(
-                "SELECT device_name FROM consumption_devices WHERE device_id=?", (str(device_id),)
-            ).fetchone()
-        if row is not None and str(row["device_name"] or "").strip():
-            return str(row["device_name"])
-        return str(device_id)[:8]
 
     def _scope(self, scope: dict[str, Any] | None, *, now: float | None = None) -> dict[str, Any]:
         raw = dict(scope or {})
@@ -548,7 +679,7 @@ class ConsumptionStatistics:
         return {(str(row["target_type"]), str(row["target_id"])): dict(row) for row in rows}
 
     def _raw_events(
-        self, normalized: dict[str, Any]
+        self, normalized: dict[str, Any], *, without_kinds: tuple[str, ...] = ()
     ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
         start = normalized["start_utc"]
         end = normalized["end_utc"]
@@ -557,6 +688,10 @@ class ConsumptionStatistics:
         if start is not None:
             conditions.append("e.interval_end_utc > ?")
             params.append(float(start))
+        if without_kinds:
+            # A caller that has no use for a kind (word counts: listening) does not load it.
+            conditions.append(f"e.kind NOT IN ({','.join('?' * len(without_kinds))})")
+            params.extend(str(kind) for kind in without_kinds)
         if normalized["kind"] != "all":
             requested_kind = normalized["kind"]
             if requested_kind in {"light_novel", "audiobook"}:
@@ -587,7 +722,8 @@ class ConsumptionStatistics:
             # Pull event + media links in one ordered scan. The previous R8 draft
             # queried the same event scope twice, which became visible at 100k
             # events. Multi-media events are reconstructed from duplicate join
-            # rows without changing ledger semantics.
+            # rows without changing ledger semantics. The rows are read one by one:
+            # fetching them all first held every row's text a second time.
             rows = conn.execute(
                 f"""
                 SELECT e.event_id,e.device_id,e.session_id,e.kind,
@@ -608,44 +744,67 @@ class ConsumptionStatistics:
                          CASE em.role WHEN 'primary' THEN 0 ELSE 1 END,m.title_snapshot
                 """,
                 tuple(params),
-            ).fetchall()
+            )
             sessions: dict[str, dict[str, Any]] = {}
             payload: list[dict[str, Any]] = []
             current_event_id = ""
             current: dict[str, Any] | None = None
+            # A long period is hundreds of thousands of rows. SQLite hands out a new string
+            # for every cell, though a session's rows repeat the same ids, names and (but
+            # for the position) the same payload: one copy of each is kept. Parsed payloads
+            # are shared between events and are read-only from here on.
+            strings: dict[str, str] = {}
+            payloads: dict[str, dict[str, Any]] = {}
+
+            def shared(value: Any, default: str = "") -> str:
+                text = str(value or default)
+                return strings.setdefault(text, text)
+
+            def parsed_payload(value: Any) -> dict[str, Any]:
+                text = str(value or "{}")
+                found = payloads.get(text)
+                if found is None:
+                    loaded = json.loads(text)
+                    found = loaded if isinstance(loaded, dict) else {}
+                    if len(payloads) >= 4096:
+                        payloads.clear()
+                    payloads[text] = found
+                return found
+
             for raw in rows:
                 event_id = str(raw["event_id"])
                 if event_id != current_event_id:
+                    session_id = shared(raw["session_id"])
                     current = {
                         "event_id": event_id,
-                        "device_id": str(raw["device_id"] or ""),
-                        "session_id": str(raw["session_id"]),
-                        "kind": str(raw["kind"] or "unknown"),
+                        "device_id": shared(raw["device_id"]),
+                        "session_id": session_id,
+                        "kind": shared(raw["kind"], "unknown"),
                         "interval_start_utc": float(raw["interval_start_utc"]),
                         "interval_end_utc": float(raw["interval_end_utc"]),
                         "elapsed_monotonic_ms": float(raw["elapsed_monotonic_ms"] or 0.0),
-                        "primary_media_uuid": str(raw["primary_media_uuid"] or ""),
-                        "activity_group_id": str(raw["activity_group_id"] or ""),
-                        "origin": str(raw["origin"] or "automatic"),
-                        "measurement_method": str(raw["measurement_method"] or "observation"),
-                        "device_name": str(raw["device_name"] or ""),
-                        "payload": json.loads(str(raw["payload_json"] or "{}")),
+                        "primary_media_uuid": shared(raw["primary_media_uuid"]),
+                        "activity_group_id": shared(raw["activity_group_id"]),
+                        "origin": shared(raw["origin"], "automatic"),
+                        "measurement_method": shared(raw["measurement_method"], "observation"),
+                        "device_name": shared(raw["device_name"]),
+                        "payload": parsed_payload(raw["payload_json"]),
                         "media": [],
                     }
                     payload.append(current)
-                    sessions.setdefault(str(raw["session_id"]), current)
+                    sessions.setdefault(session_id, current)
                     current_event_id = event_id
                 assert current is not None
-                media_uuid = str(raw["linked_media_uuid"] or "")
+                media_uuid = shared(raw["linked_media_uuid"])
                 if media_uuid:
                     current["media"].append(
                         {
                             "event_id": event_id,
                             "media_uuid": media_uuid,
-                            "role": str(raw["linked_media_role"] or "primary"),
-                            "source_revision": str(raw["linked_source_revision"] or ""),
-                            "media_kind": str(raw["linked_media_kind"] or ""),
-                            "title_snapshot": str(raw["linked_title_snapshot"] or ""),
+                            "role": shared(raw["linked_media_role"], "primary"),
+                            "source_revision": shared(raw["linked_source_revision"]),
+                            "media_kind": shared(raw["linked_media_kind"]),
+                            "title_snapshot": shared(raw["linked_title_snapshot"]),
                             "locator_start": json.loads(str(raw["linked_locator_start_json"] or "{}")),
                             "locator_end": json.loads(str(raw["linked_locator_end_json"] or "{}")),
                         }
@@ -714,17 +873,21 @@ class ConsumptionStatistics:
         return float(seconds) < MIN_AUTOMATIC_SESSION_SECONDS - 1e-6
 
     def _effective_segments(
-        self, normalized: dict[str, Any]
+        self, normalized: dict[str, Any], *, without_kinds: tuple[str, ...] = ()
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
-        events, session_rows, corrections = self._raw_events(normalized)
+        events, session_rows, corrections = self._raw_events(normalized, without_kinds=without_kinds)
         by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in events:
             by_session[str(event["session_id"])].append(event)
+        # Each session's rows are let go once its segments are made: a long period never
+        # holds every row and every segment at the same time.
+        del events
         segments: list[dict[str, Any]] = []
         journal: list[dict[str, Any]] = []
         lower = normalized["start_utc"]
         upper = float(normalized["end_utc"])
-        for session_id, session_events in by_session.items():
+        for session_id in list(by_session):
+            session_events = by_session.pop(session_id)
             first = session_rows[session_id]
             session_correction = corrections.get(("session", session_id))
             if len(session_events) == 1 and session_correction is None:
@@ -732,7 +895,7 @@ class ConsumptionStatistics:
                 # session. Keep that hot path allocation-light while preserving
                 # event-level correction semantics.
                 event = session_events[0]
-                event_media = list(event.get("media") or [])
+                event_media = event.get("media") or []
                 interval = self._corrected_interval(event, corrections.get(("event", str(event["event_id"]))))
                 raw_start = float(event["interval_start_utc"])
                 raw_end = float(event["interval_end_utc"])
@@ -754,7 +917,7 @@ class ConsumptionStatistics:
                             "measurement_method": str(event.get("measurement_method") or "observation"),
                             "device_id": str(event.get("device_id") or ""),
                             "activity_group_id": str(event.get("activity_group_id") or ""),
-                            "payload": dict(event.get("payload") or {}),
+                            "payload": event.get("payload") or {},
                         }
                 if session_segment is not None:
                     display_start = float(session_segment["start"])
@@ -879,12 +1042,12 @@ class ConsumptionStatistics:
                             "kind": _normalize_kind(str(event.get("kind") or "unknown")),
                             "session_id": session_id,
                             "event_id": str(event["event_id"]),
-                            "media": list(event.get("media") or []),
+                            "media": event.get("media") or [],
                             "origin": str(event.get("origin") or "automatic"),
                             "measurement_method": str(event.get("measurement_method") or "observation"),
                             "device_id": str(event.get("device_id") or ""),
                             "activity_group_id": str(event.get("activity_group_id") or ""),
-                            "payload": dict(event.get("payload") or {}),
+                            "payload": event.get("payload") or {},
                         }
                     )
             raw_session_start = min(float(event["interval_start_utc"]) for event in session_events)
@@ -1206,7 +1369,8 @@ class ConsumptionStatistics:
                 ).fetchall()
             ]
         active_session_ids = {str(row.get("session_id") or "") for row in segments if row.get("session_id")}
-        highlights = self._highlights(days, journal, works, breakdown, volume, words)
+        reading_speed = _reading_speed(native_segments, (row["day"] for row in days))
+        highlights = self._highlights(days, journal, works, breakdown, volume, words, reading_speed)
         return {
             "schema": 1,
             "policy_version": STATISTICS_POLICY_VERSION,
@@ -1223,6 +1387,7 @@ class ConsumptionStatistics:
             "volume": volume,
             "highlights": highlights,
             "days": days,
+            "reading_speed": reading_speed,
             "works": works,
             "journal": journal_page,
             "journal_total": journal_total,
@@ -1256,8 +1421,8 @@ class ConsumptionStatistics:
         current = float(now if now is not None else time.time())
         with self.database.connect() as conn:
             rows = conn.execute(
-                "SELECT key,value FROM state WHERE substr(key,1,?)=?",
-                (len(VOLUME_ROLLUP_PREFIX), VOLUME_ROLLUP_PREFIX),
+                f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}",
+                state_prefix_bounds(VOLUME_ROLLUP_PREFIX),
             ).fetchall()
             stored: list[tuple[float, str, str]] = []
             for row in rows:
@@ -1303,8 +1468,8 @@ class ConsumptionStatistics:
                     keys = [
                         str(row["key"])
                         for row in conn.execute(
-                            "SELECT key FROM state WHERE substr(key,1,?)=? ORDER BY updated_at DESC",
-                            (len(VOLUME_ROLLUP_PREFIX), VOLUME_ROLLUP_PREFIX),
+                            f"SELECT key FROM state WHERE {STATE_PREFIX_SQL} ORDER BY updated_at DESC",
+                            state_prefix_bounds(VOLUME_ROLLUP_PREFIX),
                         ).fetchall()
                     ]
                     for key in keys[_VOLUME_ROLLUPS_KEPT:]:
@@ -1445,30 +1610,6 @@ class ConsumptionStatistics:
 
     def delete_history(self) -> dict[str, Any]:
         return self.ledger.delete_history()
-
-    def rebuild_daily_rollups(self) -> dict[str, Any]:
-        payload = self.query({"period": "all"}, journal_limit=1)
-        now = time.time()
-        policy = f"{STATISTICS_POLICY_VERSION}:{system_local_timezone_label()}"
-        with self.database.connect() as conn:
-            conn.execute("DELETE FROM consumption_daily_rollups")
-            for row in payload["days"]:
-                conn.execute(
-                    """
-                    INSERT INTO consumption_daily_rollups(
-                        local_day,total_seconds,breakdown_json,event_count,policy_version,generated_at_utc
-                    ) VALUES(?,?,?,?,?,?)
-                    """,
-                    (
-                        str(row["day"]),
-                        float(row["seconds"]),
-                        json.dumps(row["breakdown"], sort_keys=True),
-                        int(row.get("event_count") or 0),
-                        policy,
-                        now,
-                    ),
-                )
-        return {"ok": True, "days": len(payload["days"]), "policy_version": policy}
 
     def export_csv(
         self, scope: dict[str, Any] | None = None, *, output_dir: Path | None = None

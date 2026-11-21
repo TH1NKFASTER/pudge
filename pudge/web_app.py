@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import base64
 import html
 import hashlib
 import http.server
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -13,8 +15,10 @@ import shutil
 import secrets
 import hmac
 import socket
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -22,19 +26,23 @@ import webbrowser
 import weakref
 import zipfile
 import httpx
-from rapidfuzz import fuzz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
-from contextlib import contextmanager
+import copy
+import contextvars
+import functools
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote, urlparse
 
 from . import __version__, js_bridge
 from .build_identity import build_identity
+from .fsutil import atomic_write_json, temporary_sibling
 from .app_session import app_session_window_active, mark_app_running, mark_app_stopped, set_app_window_active
+from .archive_limits import TEXT_MEMBER_LIMIT, read_member
 from .cache_management import cleanup_segment_audio_cache
 from .audiobooks import (
     AUDIOBOOK_EXTENSIONS,
@@ -49,14 +57,29 @@ from .screen_text import ScreenTextPanel
 from .backup import create_backup, make_daily_snapshot, restore_backup, restore_database_snapshot
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG, DATA_DIR
 from .cache_registry import CacheRegistry
-from .config import _skip_shortcut, load_config, write_config, write_torrents_enabled
-from .consumption import ConsumptionLedger
+from .config import (
+    ConfigUnreadableError,
+    _skip_shortcut,
+    apply_mpv_line_shortcut_settings,
+    load_config,
+    mpv_line_shortcut_settings,
+    write_config,
+    write_torrents_enabled,
+)
+from .consumption import ConsumptionLedger, VnReadingGate
 from .consumption_statistics import ConsumptionStatistics
 from .consumption_words import WordUnits, pairs_of
 from .debug_snapshot import DebugSnapshotService
 from .diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
-from .episode_state import watched_by_anilist_progress
+from .database import (
+    RESUME_MIN_POSITION,
+    STATE_PREFIX_SQL,
+    Database,
+    numbering_rules_version,
+    state_prefix_bounds,
+)
+from .episode_state import single_unit_title, watched_by_anilist_progress
 from .episode_numbering import resolve_episode_numbering
 from .presentation_state import derive_episode_presentation, download_complete
 from .personal_schedule import (
@@ -64,14 +87,18 @@ from .personal_schedule import (
     local_iso_from_epoch,
     normalize_schedule_rule,
     preview_schedule_dates,
+    ready_marker_is_stale,
 )
 from .first_experience import (
     check_jiten_mpv_update,
     configure_mpv_study_keys,
+    forget_jiten_api_key,
     dependency_status,
+    find_tool,
     install_jiten_mpv,
     install_media_tools,
     mpv_study_status,
+    replacement_tool,
     update_jiten_mpv as update_jiten_mpv_release,
 )
 from .jimaku_trial import (
@@ -85,9 +112,16 @@ from .jimaku_trial import (
 from .job_center import JobCenter
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .i18n import err, t, tn
-from .light_novels import LightNovelError, LightNovelService
+from .junk_files import junk_part, junk_path, software_path
+from .light_novels import (
+    JitenUnavailableError,
+    LightNovelError,
+    LightNovelImportConflict,
+    LightNovelService,
+    permanent_import_failure,
+)
 from .llm import OllamaClient, list_models
-from .library import VIDEO_EXTENSIONS
+from .library import VIDEO_EXTENSIONS, unfinished_video
 from .logging_utils import (
     DEFAULT_LOG_PATH,
     cleanup_debug_logs,
@@ -95,21 +129,44 @@ from .logging_utils import (
     debug_log_dir,
     tail_log,
     timed_step,
+    trim_agent_logs,
 )
 from .maintenance_lock import maintenance_lock
-from .manager import AnimeManager
+from .manager import AnimeManager, ManagerError, NotEnoughDiskSpaceError
+from .global_search import (  # noqa: F401 - kept importable from web_app
+    _global_search_keys,
+    _global_search_normalize,
+    _global_search_score,
+    _kana_to_romaji,
+)
+from .release_parser import parse_release_name
 from .manager_models import LibraryAnime, NyaaRelease
+from .queued_releases import QueuedReleaseStore
 from .manga import MangaService
 from .manga_mokuro_session import close_all as close_mokuro_sessions
+from .memory_diagnostics import MemoryReporter, memory_step, watch_heavy_imports
+from . import low_ram
 from .metadata_cache import MetadataCache
 from .notifications import send_native_notification
 from .permissions import request_folder_access, request_notification_permission
-from .providers.anilist import AniListClient
+from .providers.anilist import (
+    AniListAuthError,
+    AniListClient,
+    AniListError,
+    AniListHTTPError,
+    AniListNetworkError,
+)
+from .providers.anilist import bulk_requests as bulk_anilist_requests
+from .providers.anilist import interactive_requests as interactive_anilist_requests
+from .providers.anilist import probe_requests as probe_anilist_requests
 from .providers.aria2 import Aria2Client
-from .providers.nyaa import NyaaClient
+from .providers.nyaa import NoReleaseSourceError, NyaaClient, ReleaseSearchUnavailableError
 from .providers.anilist import configure_rate_limit_dir as configure_anilist_rate_limit_dir
-from .providers.qbittorrent import QBittorrentClient, connection_failed
+from . import jiten_client
+from .providers.qbittorrent import QBittorrentClient, connection_failed, same_web_ui_address
+from .player import MPV_MISSING_EXIT_CODE
 from .runtime import python_executable
+from .sources import SourcesError, import_sources, load_sources, parse_sources, save_sources
 from .review_gate import EpisodeReviewIdentity, ReviewGateStore, review_card_key
 from .review_episode_due import (
     build_episode_due_review_cards,
@@ -120,18 +177,20 @@ from .review_actions import action_set_payload, normalize_shortcuts, resolve_wir
 from .review_providers import ReviewOutcomeUnknown
 from .safe_mode import SafeModeController
 from .word_states import word_state_group
-from .secrets_store import keep_masked_secret, masked_secret
+from .secrets_store import SECRET_MASK, keep_masked_secret, masked_secret
+from .private_files import private_directory
+from .url_credentials import mask_url_password, redact_url_credentials, restore_url_password, same_server
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
 from .torrent_observation import normalize_torrent_state
 from .torrent_admission import TorrentAdmission
 from .task_supervisor import TaskSupervisor
 from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
-from .visual_novels import VisualNovelError, VisualNovelService
+from .visual_novels import VisualNovelError, VisualNovelService, _quartz_function
 from .work_scheduler import WorkPriority
 from .ui_push import StateVersionWatcher, TorrentTrafficMonitor, UiPush
 from .web_controllers import DiagnosticsController
-from .web_state import UIStateSnapshotCache
+from .web_state import UIStateSnapshotCache, read_snapshot_file, rebase_asset_urls, write_snapshot_file
 from .web_app_iphone import IPhoneApiMixin
 
 
@@ -142,6 +201,52 @@ def _disable_torrents_for_startup(config: Any) -> bool:
     return previous
 
 
+def _torrents_resume_after_relaunch(previous_enabled: bool, environ: Any = None) -> bool:
+    """An update relaunch continues a session whose Torrents were On: the installer's background
+    relaunch, or "Update now" inside Pudge, which reopens with its window."""
+    environ = os.environ if environ is None else environ
+    relaunch = (
+        environ.get("PUDGE_LAUNCH_BACKGROUND") == "1" or environ.get("PUDGE_LAUNCH_AFTER_UPDATE") == "1"
+    )
+    return bool(previous_enabled) and relaunch
+
+
+def _optional_float(value: Any) -> float | None:
+    """A finite number from a JSON payload, or None when absent or invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _optional_int(value: Any) -> int | None:
+    number = _optional_float(value)
+    return int(number) if number is not None and number == int(number) else None
+
+
+def _settings_hours_or_current(value: Any, current: float) -> float:
+    """A saved hours field, or the current value when it is empty or not a finite number.
+
+    The window sends null for an emptied number field. None, '' and non-numbers
+    keep the saved delay instead of becoming 0 (delete right after watching);
+    a typed 0 is still accepted.
+    """
+    if value is None or isinstance(value, bool):
+        return float(current)
+    if isinstance(value, str) and not value.strip():
+        return float(current)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(current)
+    if not math.isfinite(number):
+        return float(current)
+    return max(0.0, number)
+
+
 def _plain_anilist_description(value: Any) -> str:
     text = str(value or "")
     text = re.sub(r"(?i)<br\s*/?>|</p\s*>|</li\s*>", "\n", text)
@@ -149,215 +254,6 @@ def _plain_anilist_description(value: Any) -> str:
     text = html.unescape(text).replace("\xa0", " ")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line)
-
-
-# pudge-ui-v0.7.23-global-search-recent-v1
-def _global_search_normalize(value: Any) -> str:
-    text = unicodedata.normalize(
-        "NFKC",
-        html.unescape(str(value or "")),
-    ).casefold()
-    return "".join(char for char in text if char.isalnum())
-
-
-_KANA_ROMAJI = {
-    "きゃ": "kya",
-    "きゅ": "kyu",
-    "きょ": "kyo",
-    "しゃ": "sha",
-    "しゅ": "shu",
-    "しょ": "sho",
-    "ちゃ": "cha",
-    "ちゅ": "chu",
-    "ちょ": "cho",
-    "にゃ": "nya",
-    "にゅ": "nyu",
-    "にょ": "nyo",
-    "ひゃ": "hya",
-    "ひゅ": "hyu",
-    "ひょ": "hyo",
-    "みゃ": "mya",
-    "みゅ": "myu",
-    "みょ": "myo",
-    "りゃ": "rya",
-    "りゅ": "ryu",
-    "りょ": "ryo",
-    "ぎゃ": "gya",
-    "ぎゅ": "gyu",
-    "ぎょ": "gyo",
-    "じゃ": "ja",
-    "じゅ": "ju",
-    "じょ": "jo",
-    "びゃ": "bya",
-    "びゅ": "byu",
-    "びょ": "byo",
-    "ぴゃ": "pya",
-    "ぴゅ": "pyu",
-    "ぴょ": "pyo",
-    "てぃ": "ti",
-    "でぃ": "di",
-    "ふぁ": "fa",
-    "ふぃ": "fi",
-    "ふぇ": "fe",
-    "ふぉ": "fo",
-    "うぃ": "wi",
-    "うぇ": "we",
-    "うぉ": "wo",
-    "あ": "a",
-    "い": "i",
-    "う": "u",
-    "え": "e",
-    "お": "o",
-    "か": "ka",
-    "き": "ki",
-    "く": "ku",
-    "け": "ke",
-    "こ": "ko",
-    "さ": "sa",
-    "し": "shi",
-    "す": "su",
-    "せ": "se",
-    "そ": "so",
-    "た": "ta",
-    "ち": "chi",
-    "つ": "tsu",
-    "て": "te",
-    "と": "to",
-    "な": "na",
-    "に": "ni",
-    "ぬ": "nu",
-    "ね": "ne",
-    "の": "no",
-    "は": "ha",
-    "ひ": "hi",
-    "ふ": "fu",
-    "へ": "he",
-    "ほ": "ho",
-    "ま": "ma",
-    "み": "mi",
-    "む": "mu",
-    "め": "me",
-    "も": "mo",
-    "や": "ya",
-    "ゆ": "yu",
-    "よ": "yo",
-    "ら": "ra",
-    "り": "ri",
-    "る": "ru",
-    "れ": "re",
-    "ろ": "ro",
-    "わ": "wa",
-    "を": "o",
-    "ん": "n",
-    "が": "ga",
-    "ぎ": "gi",
-    "ぐ": "gu",
-    "げ": "ge",
-    "ご": "go",
-    "ざ": "za",
-    "じ": "ji",
-    "ず": "zu",
-    "ぜ": "ze",
-    "ぞ": "zo",
-    "だ": "da",
-    "ぢ": "ji",
-    "づ": "zu",
-    "で": "de",
-    "ど": "do",
-    "ば": "ba",
-    "び": "bi",
-    "ぶ": "bu",
-    "べ": "be",
-    "ぼ": "bo",
-    "ぱ": "pa",
-    "ぴ": "pi",
-    "ぷ": "pu",
-    "ぺ": "pe",
-    "ぽ": "po",
-    "ゔ": "vu",
-}
-
-
-def _kana_to_romaji(value: Any) -> str:
-    text = unicodedata.normalize("NFKC", str(value or ""))
-    # Katakana -> hiragana while leaving kanji/latin untouched.
-    text = "".join(chr(ord(ch) - 0x60) if "ァ" <= ch <= "ヶ" else ch for ch in text)
-    out: list[str] = []
-    geminate = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == "っ":
-            geminate = True
-            i += 1
-            continue
-        pair = text[i : i + 2]
-        roma = _KANA_ROMAJI.get(pair)
-        if roma is not None:
-            i += 2
-        else:
-            roma = _KANA_ROMAJI.get(ch)
-            i += 1
-        if roma is None:
-            if ch == "ー" and out:
-                last = out[-1]
-                vowel = next((v for v in reversed(last) if v in "aeiou"), "")
-                if vowel:
-                    out.append(vowel)
-            elif ch.isalnum():
-                out.append(ch.casefold())
-            continue
-        if geminate and roma:
-            consonant = "t" if roma.startswith("ch") else "s" if roma.startswith("sh") else roma[0]
-            if consonant not in "aeioun":
-                out.append(consonant)
-        geminate = False
-        out.append(roma)
-    return "".join(out)
-
-
-def _global_search_keys(value: Any) -> list[str]:
-    native = _global_search_normalize(value)
-    romaji = _global_search_normalize(_kana_to_romaji(value))
-    return list(dict.fromkeys(key for key in (native, romaji) if key))
-
-
-def _global_search_score(
-    query: str,
-    names: list[str],
-) -> tuple[float, str]:
-    cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
-    query_keys = _global_search_keys(cleaned)
-    query_key = query_keys[0] if query_keys else ""
-    if not query_key:
-        return 0.0, ""
-
-    best_score = 0.0
-    best_name = ""
-    for raw_name in names:
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        name_keys = _global_search_keys(name)
-        if not name_keys:
-            continue
-        score = 0.0
-        for qkey in query_keys:
-            for name_key in name_keys:
-                if name_key == qkey:
-                    candidate = 100.0
-                elif name_key.startswith(qkey):
-                    candidate = 97.0
-                elif qkey in name_key:
-                    candidate = 93.0
-                else:
-                    candidate = float(fuzz.ratio(qkey, name_key))
-                score = max(score, candidate)
-        score = max(score, float(fuzz.WRatio(cleaned.casefold(), name.casefold())))
-        if score > best_score:
-            best_score = score
-            best_name = name
-    return best_score, best_name
 
 
 _MEDIA_IDENTITY_ANILIST_KINDS = frozenset(
@@ -448,6 +344,42 @@ def _pinned_packages(text: str) -> dict[str, str]:
 
 # Stop signals of running word-stats jobs, so a process can stop them all at exit.
 _STATISTICS_WORD_STOPS: "weakref.WeakSet[threading.Event]" = weakref.WeakSet()
+# Rows loaded once per Home build (WebAppApi._build_memo).
+_BUILD_MEMO: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "pudge_home_build_memo", default=None
+)
+
+
+# A Home build this slow logs where its time went (one TIMING line); 100-600 ms is usual.
+STATE_BUILD_SLOW_MS = 800.0
+_STORAGE_CHECK_LOCK = threading.Lock()
+
+
+def _build_lap(section: str) -> None:
+    """End a section of the Home build being timed (a no-op outside a build)."""
+    memo = _BUILD_MEMO.get()
+    laps = memo.get("laps") if memo is not None else None
+    if laps is not None:
+        now = time.perf_counter()
+        laps.append((section, now - float(memo["lap_at"])))
+        memo["lap_at"] = now
+
+
+def _note_state_deadline(target: object) -> None:
+    """A time at which a value of the snapshot being built goes stale (WEBFLOW-11).
+
+    Countdowns, "released" episode counts and unlocks are computed from the clock; the
+    cached snapshot is kept only until the earliest of these times.
+    """
+    memo = _BUILD_MEMO.get()
+    if memo is None:
+        return
+    try:
+        value = float(target)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return
+    if value > time.time() and value < float(memo.get("deadline") or float("inf")):
+        memo["deadline"] = value
 
 
 def stop_statistics_word_jobs() -> None:
@@ -490,6 +422,31 @@ def _adopt_config_values(target: Any, source: Any) -> None:
             setattr(target, item.name, fresh)
 
 
+def _url_credentials_redacted(method: Any) -> Any:
+    """Errors of a connection test reach the page without a ``user:password@`` in them.
+
+    httpx names the full URL, user and password included, in its messages (a 401),
+    and the window shows the text in a toast; pywebview also sends the traceback, so a
+    fresh exception (no chained cause) replaces the original.
+    """
+
+    @functools.wraps(method)
+    def call(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(*args, **kwargs)
+        except Exception as exc:
+            message = redact_url_credentials(str(exc))
+            if message == str(exc):
+                raise
+            try:
+                clean = type(exc)(message)
+            except Exception:
+                clean = RuntimeError(message)
+            raise clean from None
+
+    return call
+
+
 class WebAppApi(IPhoneApiMixin):
     """Local bridge used by the WKWebView application.
 
@@ -503,6 +460,8 @@ class WebAppApi(IPhoneApiMixin):
         self.config_path = config_path.expanduser()
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
+        # "EVENT memory_import module=numpy by=pudge/x.py:12": who loads the heavy modules.
+        watch_heavy_imports(self.logger)
         from .config import CONFIG_LOAD_ERROR, CONFIG_WARNINGS
 
         for message in list(CONFIG_WARNINGS):
@@ -521,6 +480,9 @@ class WebAppApi(IPhoneApiMixin):
         self._closing = False
         self._owning_pid = os.getpid()
         startup_was_enabled = _disable_torrents_for_startup(self.config)
+        # An update relaunch (``--pudge-background``) is not a new session: Torrents On
+        # comes back once the app is up (``resume_torrents_after_update``).
+        self._resume_torrents_after_update = _torrents_resume_after_relaunch(startup_was_enabled)
         # Publish Off before backend shutdown so an agent with a stale config
         # cannot issue a new start while this GUI session is coming up.
         with TorrentAdmission(self.config.config_path).locked() as admission:
@@ -543,6 +505,7 @@ class WebAppApi(IPhoneApiMixin):
         self._watching_download_lock = threading.RLock()
         self._watching_download_jobs: dict[int, dict[str, Any]] = {}
         cleanup_debug_logs()
+        trim_agent_logs()
         cache_cleanup = cleanup_segment_audio_cache(self.config.paths.cache_dir, force=True)
         if int(cache_cleanup.get("removed_files") or 0):
             self.logger.info(
@@ -552,7 +515,9 @@ class WebAppApi(IPhoneApiMixin):
                 float(cache_cleanup.get("remaining_bytes") or 0) / (1024 * 1024),
             )
         configure_anilist_rate_limit_dir(self.config.paths.cache_dir)
-        self.manager = AnimeManager(self.config, log=self.logger.info)
+        jiten_client.configure(self.config.paths.cache_dir)  # one Jiten budget for all processes
+        self.manager = AnimeManager(self.config, log=self.logger.info, owns_database=True)
+        self._startup_integrity_check()
         self._background_quiet_lock = threading.Lock()
         self._background_quiet_done = False
         self._start_startup_qbittorrent_quiet()
@@ -563,6 +528,7 @@ class WebAppApi(IPhoneApiMixin):
         ).start()
         self._configure_database_services()
         self.light_novels = LightNovelService(self.config, logger=self.logger)
+        self._resume_light_novel_volume_downloads()
         self.manga = MangaService(
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
@@ -570,6 +536,7 @@ class WebAppApi(IPhoneApiMixin):
             mokuro_python=self.config.tools.manga_mokuro_python,
         )
         self.manga.asset_base = str(getattr(self, "asset_base", "") or "")
+        self.manga.parse_alias = self._alias_manga_text_parse
         self.audiobooks = AudiobookService(
             self.manager.db,
             ffprobe=self.config.tools.ffprobe,
@@ -635,6 +602,11 @@ class WebAppApi(IPhoneApiMixin):
                 target=self._manga_background_ocr_loop,
                 pass_cancel_event=True,
             )
+            self.task_supervisor.start(
+                name="personal-schedule-notifications",
+                target=self._personal_schedule_notify_loop,
+                pass_cancel_event=True,
+            )
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
@@ -658,11 +630,19 @@ class WebAppApi(IPhoneApiMixin):
             logger=self.logger,
             before_install=self._prepare_update_shutdown,
             request_quit=self._quit_after_update,
+            install_not_started=self._resume_after_failed_update,
         )
         self.debug_snapshots = DebugSnapshotService(
             self.manager,
             cache_dir=self.config.paths.cache_dir,
             runtime_log_path=DEFAULT_LOG_PATH,
+        )
+        # Hourly "EVENT memory rss_mb=… caches=…" (and idle caches let go every 10 minutes).
+        self._memory_reporter = MemoryReporter(self, self.logger)
+        self.task_supervisor.start(
+            name="memory-report",
+            target=self._memory_reporter.run,
+            pass_cancel_event=True,
         )
 
         self.logger.info(
@@ -672,6 +652,8 @@ class WebAppApi(IPhoneApiMixin):
             build_identity().get("installed_at", ""),
             platform.platform(),
         )
+        low_ram.log_state(self.logger, low_ram.enabled(self.config), "start")
+        self._page_unloader: low_ram.WindowPageUnloader | None = None
         self.window: Any | None = None
         self._audiobook_float = AudiobookFloatWindow(self)
         self._screen_text = ScreenTextPanel(self)
@@ -680,6 +662,7 @@ class WebAppApi(IPhoneApiMixin):
         self._macos_window_lifecycle: _MacWindowLifecycle | None = None
         self._macos_app_delegate_proxy: Any | None = None
         self.asset_base = ""
+        self.asset_origin = ""
         self._play_processes: dict[str, subprocess.Popen[Any]] = {}
         self._play_started_at: dict[str, float] = {}
         self._play_exit_codes: dict[str, tuple[int, float]] = {}
@@ -709,6 +692,11 @@ class WebAppApi(IPhoneApiMixin):
         self._review_gate_prefetch_provider_available: int | None = None
         self._review_gate_prefetch_retry_at = 0.0
         self._review_gate_prefetch_no_progress = 0
+        # Before the warm-up below: its count of ready titles reads display episode numbers,
+        # and an episode numbered past its title's count (absolute numbering) needs this cache.
+        # Set after it, the count failed (AttributeError) and no card was warmed at launch.
+        self._episode_offset_cache: dict[int, int] = {}
+        self._episode_offset_cache_version = numbering_rules_version()
         # Start warming review cards as soon as the backend exists, before the
         # WebView is interactive enough for the user to click an episode.
         if self.config.ui.review_gate_enabled:
@@ -754,10 +742,6 @@ class WebAppApi(IPhoneApiMixin):
         self._jiten_refresh_lock = threading.Lock()
         self._jiten_refresh_thread: threading.Thread | None = None
         self._jiten_refresh_job_id = ""
-        self._jiten_state_prefetch_lock = threading.Lock()
-        self._jiten_state_prefetch_thread: threading.Thread | None = None
-        self._jiten_state_prefetch_cancel_event = threading.Event()
-        self._jiten_state_prefetch_stats: dict[str, Any] = {}
         self._irodori_tts_lock = threading.RLock()
         self._irodori_tts_threads: dict[int, threading.Thread] = {}
         self._irodori_tts_job_ids: dict[int, str] = {}
@@ -787,6 +771,10 @@ class WebAppApi(IPhoneApiMixin):
             "total": 0,
             "current": 0,
             "episodes": [],
+            "phase": "",
+            "current_episode": None,
+            "phase_started_at": 0.0,
+            "local_episodes": [],
             "started_at": 0.0,
             "finished_at": 0.0,
         }
@@ -796,11 +784,11 @@ class WebAppApi(IPhoneApiMixin):
         self._startup_maintenance_stats: dict[str, Any] = {}
         self._startup_maintenance_error = ""
         self._last_storage_status: dict[str, int | float | bool] | None = None
-        self._episode_offset_cache: dict[int, int] = {}
         self.energy_monitor = EnergyDiagnosticsMonitor(
             interval_seconds=self.config.diagnostics.energy_sample_seconds,
             logger=self.logger,
             on_battery=lambda: self.manager.work_scheduler.power_snapshot().get("on_battery"),
+            window_active=lambda: bool(getattr(self, "_window_active", True)),
         )
         self._ensure_energy_monitor(reason="startup")
         threading.Thread(
@@ -808,8 +796,34 @@ class WebAppApi(IPhoneApiMixin):
         ).start()
         if not self.safe_mode.active:
             self._start_scheduled_agent()
-            self.jiten_state_prefetch()
+            # No Jiten state warm-up of the whole parsed corpus at launch: states are kept in
+            # SQLite and each reader asks for the words it shows.
             self.statistics_words_start(delay=90.0)
+
+    INTEGRITY_CHECKED_VERSION_KEY = "integrity_checked_version"
+
+    def _startup_integrity_check(self) -> None:
+        """``quick_check`` the library only when it can have changed under us (DB-6).
+
+        A full check reads the whole file (seconds for a large library on a slow
+        disk). It runs after the previous window did not quit cleanly and once per
+        app version (a migration already checks); a damaged file raises
+        sqlite3.DatabaseError here, which launch_web_app turns into the restore offer.
+        """
+        db = self.manager.db
+        if not isinstance(db, Database):
+            return
+        checked_version = db.get_state(self.INTEGRITY_CHECKED_VERSION_KEY, "")
+        # After an unclean exit Safe Mode has just run the same quick_check (read-only):
+        # an "ok" there is this launch's check, not a reason to read the file twice.
+        checked = db.integrity_checked or getattr(self.safe_mode, "startup_database_check", "") == "ok"
+        if not checked and (
+            bool(getattr(self.safe_mode, "interrupted", False)) or checked_version != __version__
+        ):
+            with timed_step(self.logger, "app.database_quick_check"):
+                db.check_integrity()
+        if checked_version != __version__:
+            db.set_state(self.INTEGRITY_CHECKED_VERSION_KEY, __version__)
 
     def _configure_database_services(self) -> None:
         """Rebind small controllers whenever configuration replaces the database."""
@@ -873,6 +887,15 @@ class WebAppApi(IPhoneApiMixin):
             return
         self._statistics_vn_last_line = (session_id, max(int(line.get("id") or 0) for line in fresh))
 
+    def _statistics_flush_vn_lines(self, session_id: str) -> None:
+        """The lines read since the last 5-second poll: a capture that ended is not polled again."""
+        if not session_id:
+            return
+        try:
+            self._statistics_record_vn_lines(session_id, self.visual_novels.state().get("transcript") or [])
+        except Exception:  # noqa: BLE001 - a partial app (closing, tests): statistics are optional
+            pass
+
     def statistics_words_state(self) -> dict[str, Any]:
         thread = getattr(self, "_statistics_words_thread", None)
         state = dict(getattr(self, "_statistics_words_state", None) or {"running": False, "paused": ""})
@@ -893,7 +916,8 @@ class WebAppApi(IPhoneApiMixin):
                 self._statistics_words_backfilled = now
                 units.enqueue(units.backfill_units())
             while not stop.is_set():
-                reason = self.manager.work_scheduler.background_wait_reason()
+                # Jiten rate limit or outage: pause the job instead of failing every unit.
+                reason = self.manager.work_scheduler.background_wait_reason() or jiten_client.pause_reason()
                 if reason:
                     # Energy saving, heat or the player in front: stop and pick up again on
                     # the next look at Statistics (or the next periodic check).
@@ -906,7 +930,15 @@ class WebAppApi(IPhoneApiMixin):
                 for unit in batch:
                     if stop.is_set():
                         return
-                    if self._statistics_word_unit(units, unit, memo):
+                    with jiten_client.background_requests():
+                        outcome = self._statistics_word_unit(units, unit, memo)
+                    if outcome is None:
+                        # Jiten held the request back (rate limit, outage): stop here and
+                        # pick up again on the next look at Statistics or periodic check.
+                        self._statistics_words_state = {"running": False, "paused": "jiten_unavailable"}
+                        self.logger.info("EVENT statistics.words paused reason=jiten done=%s", done)
+                        return
+                    if outcome:
                         done += 1
                     else:
                         missing += 1
@@ -929,7 +961,9 @@ class WebAppApi(IPhoneApiMixin):
         if timeout > 0 and thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
 
-    def _statistics_word_unit(self, units: WordUnits, unit: dict[str, Any], memo: dict[Any, Any]) -> bool:
+    def _statistics_word_unit(
+        self, units: WordUnits, unit: dict[str, Any], memo: dict[Any, Any]
+    ) -> bool | None:
         key, kind, source = unit["key"], unit["kind"], unit["source"]
         try:
             if kind == "anime":
@@ -945,6 +979,10 @@ class WebAppApi(IPhoneApiMixin):
                 words = {}
             else:
                 raise ValueError(f"unknown kind {kind}")
+        except JitenUnavailableError as exc:
+            # Nothing was sent (rate limit or outage pause): the unit stays due, not missing.
+            self.logger.info("WAIT step=statistics.words reason=%s", exc.reason or "jiten")
+            return None
         except Exception as exc:  # noqa: BLE001 - no text (yet) or Jiten unavailable: try later
             units.mark_missing(key, f"{type(exc).__name__}: {exc}", attempts=int(unit.get("attempts") or 0))
             self.logger.debug("SKIP step=statistics.words unit=%s error=%r", key[:60], str(exc)[:200])
@@ -1046,9 +1084,34 @@ class WebAppApi(IPhoneApiMixin):
             )
 
     @staticmethod
-    def _scheduled_agent_plist() -> Path:
-        label = f"{APP_BUNDLE_ID.removesuffix('.app')}.agent"
-        return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    def _scheduled_agent_label() -> str:
+        return f"{APP_BUNDLE_ID.removesuffix('.app')}.agent"
+
+    @classmethod
+    def _scheduled_agent_plist(cls) -> Path:
+        # Written by install.sh outside ~/Library/LaunchAgents: launchd loads that
+        # folder at every login, so after a reboot the agent ran all day with
+        # Pudge closed. The agent works only while Pudge is open: this window
+        # bootstraps it by path and boots it out when it quits.
+        return DATA_DIR / "launchd" / f"{cls._scheduled_agent_label()}.plist"
+
+    @classmethod
+    def _legacy_scheduled_agent_plist(cls) -> Path:
+        """Where installs before this change put the agent (install.sh removes it)."""
+        return Path.home() / "Library" / "LaunchAgents" / f"{cls._scheduled_agent_label()}.plist"
+
+    def _scheduled_agent_loaded(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{self._scheduled_agent_label()}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def _start_scheduled_agent(self) -> None:
         if sys.platform != "darwin":
@@ -1057,32 +1120,42 @@ class WebAppApi(IPhoneApiMixin):
         if not plist.is_file():
             return
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
+                capture_output=True,
+                text=True,
+                timeout=5,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            detail = str(exc)
+        else:
+            # Already loaded (a second start, or left loaded by a crash) is fine.
+            if result.returncode == 0 or self._scheduled_agent_loaded():
+                self._scheduled_agent_error = ""
+                return
+            detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+        # Background downloads and subtitle jobs need the agent: say so instead of
+        # failing silently (for example "Allow in the Background" turned off).
+        self._scheduled_agent_error = detail[:300]
+        self.logger.warning("FAIL step=agent.bootstrap plist=%s error=%r", plist, detail)
 
     def _stop_scheduled_agent(self) -> None:
         if sys.platform != "darwin":
             return
-        plist = self._scheduled_agent_plist()
-        if not plist.is_file():
-            return
-        try:
-            subprocess.run(
-                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        for plist in (self._scheduled_agent_plist(), self._legacy_scheduled_agent_plist()):
+            if not plist.is_file():
+                continue
+            try:
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     def _shutdown_aria2_from_config(self, *, reason: str) -> bool:
         """Stop an already-running Pudge aria2 sidecar without ever starting it."""
@@ -1110,6 +1183,14 @@ class WebAppApi(IPhoneApiMixin):
                 vpn_kill_switch=aria.vpn_kill_switch,
             )
             stopped = bool(client.shutdown(save_session=True))
+            # Down on purpose: later status reads skip it instead of failing on every poll
+            # until something is added ("aria2 RPC is not running" after Torrents On).
+            mark = getattr(client, "mark_deliberately_stopped", None)
+            if callable(mark):
+                try:
+                    mark()
+                except Exception:  # noqa: BLE001 - only quiets later status reads
+                    pass
             self.logger.info("EVENT torrent.aria2_quiet reason=%s stopped=%s", reason, stopped)
             return stopped
         except Exception as exc:
@@ -1137,6 +1218,23 @@ class WebAppApi(IPhoneApiMixin):
             or (category and str(raw.get("category") or "").strip().casefold() == category)
             or APP_SLUG.casefold() in tags
         )
+
+    def _note_pudge_torrent_pause(self, hashes: Any, *, reason: str) -> None:
+        """Record a stop Pudge applies, so cleanup never takes it for "seeding ended"."""
+        note = getattr(getattr(self, "manager", None), "note_torrents_paused_by_pudge", None)
+        if callable(note):
+            try:
+                note(list(hashes), reason=reason)
+            except Exception as exc:  # noqa: BLE001 - the stop itself must still happen
+                self.logger.warning("FAIL step=torrent.pause_note reason=%s error=%r", reason, str(exc)[:200])
+
+    def _note_pudge_torrent_resume(self, hashes: Any) -> None:
+        note = getattr(getattr(self, "manager", None), "note_torrents_resumed_by_pudge", None)
+        if callable(note):
+            try:
+                note(list(hashes))
+            except Exception as exc:  # noqa: BLE001 - only keeps the pack longer
+                self.logger.warning("FAIL step=torrent.resume_note error=%r", str(exc)[:200])
 
     def _quiesce_qbittorrent(self, *, reason: str, still_wanted: Any = None) -> int:
         """Pause persisted and live Pudge-owned hashes, including audiobooks.
@@ -1176,6 +1274,9 @@ class WebAppApi(IPhoneApiMixin):
                     reason,
                     type(exc).__name__,
                 )
+            # Stopped before this (by the user in qBittorrent, or a share limit): stopped again
+            # harmlessly but not recorded as Pudge's pause, so Torrent On does not start it.
+            already_stopped: set[str] = set()
             try:
                 live = client.torrents(category="")
                 category = str(qbt.category or "").strip().casefold()
@@ -1188,6 +1289,10 @@ class WebAppApi(IPhoneApiMixin):
                         torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().casefold()
                         if torrent_hash:
                             hashes.add(torrent_hash)
+                    torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().casefold()
+                    state = str(getattr(row, "state", "") or "").strip().casefold()
+                    if torrent_hash and state.startswith(("paused", "stopped")):
+                        already_stopped.add(torrent_hash)
             except Exception as exc:
                 if bool(getattr(client, "unreachable", False)) or connection_failed(exc):
                     # Nothing can transfer through a qBittorrent that is not
@@ -1206,6 +1311,11 @@ class WebAppApi(IPhoneApiMixin):
             if hashes and (still_wanted is None or still_wanted()):
                 ordered = sorted(hashes)
                 try:
+                    # Recorded first: cleanup never takes this temporary stop for
+                    # "seeding ended" (Torrent On only resumes unfinished torrents).
+                    self._note_pudge_torrent_pause(
+                        [value for value in ordered if value not in already_stopped], reason=f"quiet_{reason}"
+                    )
                     # qBittorrent takes several hashes separated by "|".
                     client.pause("|".join(ordered))
                     paused = len(ordered)
@@ -1311,6 +1421,13 @@ class WebAppApi(IPhoneApiMixin):
                 paused += 1
             return True, paused
         except Exception as exc:
+            host = (urlparse(str(qbt.base_url or "")).hostname or "").casefold()
+            if host in {"127.0.0.1", "localhost", "::1"} and (
+                bool(getattr(client, "unreachable", False)) or connection_failed(exc)
+            ):
+                # qBittorrent on this Mac is not running: nothing can transfer (as for aria2).
+                # "Not confirmed" stayed on the Off state forever while the app was closed.
+                return True, 0
             self.logger.debug("Torrent Off qBittorrent observation unavailable: %s", type(exc).__name__)
             return False, None
         finally:
@@ -1521,7 +1638,6 @@ class WebAppApi(IPhoneApiMixin):
             "_startup_maintenance_thread",
             "_planning_episode_download_thread",
             "_jiten_refresh_thread",
-            "_jiten_state_prefetch_thread",
             "_irodori_install_thread",
         ):
             thread = getattr(self, name, None)
@@ -1546,9 +1662,11 @@ class WebAppApi(IPhoneApiMixin):
 
     def _reload_runtime_services_after_restore(self) -> None:
         self.config = load_config(self.config_path)
-        self.manager = AnimeManager(self.config, log=self.logger.info)
+        # The restored copy passed quick_check before it was put back.
+        self.manager = AnimeManager(self.config, log=self.logger.info, owns_database=True)
         self._configure_database_services()
         self.light_novels = LightNovelService(self.config, logger=self.logger)
+        self._resume_light_novel_volume_downloads()
         self.manga = MangaService(
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
@@ -1556,6 +1674,7 @@ class WebAppApi(IPhoneApiMixin):
             mokuro_python=self.config.tools.manga_mokuro_python,
         )
         self.manga.asset_base = str(getattr(self, "asset_base", "") or "")
+        self.manga.parse_alias = self._alias_manga_text_parse
         self.audiobooks = AudiobookService(
             self.manager.db,
             ffprobe=self.config.tools.ffprobe,
@@ -1596,6 +1715,9 @@ class WebAppApi(IPhoneApiMixin):
             self._closing = True
             started = time.monotonic()
             failures: list[str] = []
+            unloader = getattr(self, "_page_unloader", None)
+            if unloader is not None:
+                unloader.close()
 
             def step(name: str, callback: Any) -> Any:
                 at = time.monotonic()
@@ -1625,6 +1747,9 @@ class WebAppApi(IPhoneApiMixin):
                 step("stop_admission", supervisor.suspend)
             # Nothing may call into the window once it starts closing.
             step("ui_push", self._stop_ui_push)
+            if unloader is not None:
+                # The next launch paints the window from it at once (get_state_snapshot).
+                step("ui_snapshot", self._persist_ui_state_snapshot)
             # Silence audio first; slower joins and network cleanup follow.
             audiobook_close = getattr(self.audiobooks, "close", None)
             if callable(audiobook_close):
@@ -1633,13 +1758,7 @@ class WebAppApi(IPhoneApiMixin):
                 step("audiobooks", self.audiobooks.stop_all)
                 audiobook_lingering = []
             step("background_quiet", lambda: self._enter_background_quiet(reason="close"))
-            cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
-            if isinstance(cancel, threading.Event):
-                cancel.set()
             step("statistics_words", lambda: self.statistics_words_stop(timeout=1.0))
-            prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
-            if isinstance(prefetch, threading.Thread) and prefetch.is_alive():
-                step("jiten_prefetch", lambda: prefetch.join(timeout=2.0))
             step("iphone_server", self._stop_iphone_server)
             step("energy", self.energy_monitor.stop)
             manga_lingering = list(step("manga", lambda: self._quiesce_manga_ocr(timeout=3.0)) or [])
@@ -1679,16 +1798,6 @@ class WebAppApi(IPhoneApiMixin):
     def _prepare_update_shutdown(self) -> None:
         # The installer has not spawned yet. Keep every service usable if
         # preflight refuses the update or spawning the detached installer fails.
-        # Cancellable warm-up work must not block an update the user asked for.
-        cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
-        prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
-        if (
-            isinstance(cancel, threading.Event)
-            and isinstance(prefetch, threading.Thread)
-            and prefetch.is_alive()
-        ):
-            cancel.set()
-            prefetch.join(timeout=3.0)
         blockers = self._restore_background_blockers()
         if blockers:
             raise RuntimeError(err("web.updateBackgroundActive", tasks=", ".join(blockers)))
@@ -1699,9 +1808,20 @@ class WebAppApi(IPhoneApiMixin):
             lingering.extend(self._quiesce_manga_ocr(timeout=3.0))
             if lingering:
                 raise RuntimeError(err("web.updateQuiesceFailed"))
-        finally:
+        except BaseException:
+            self._resume_after_failed_update()
+            raise
+        # The installer starts next and updates the Python packages before it stops
+        # the agent itself: the agent and new background tasks stay off until this
+        # app quits. If the installer cannot be started, the updater calls
+        # _resume_after_failed_update.
+
+    def _resume_after_failed_update(self) -> None:
+        """The update did not start: background work goes on as before the preflight."""
+        supervisor = getattr(self, "task_supervisor", None)
+        if supervisor is not None:
             supervisor.resume()
-            self._start_scheduled_agent()
+        self._start_scheduled_agent()
 
     def _preserve_playback_processes(self, tree: Any) -> None:
         # Anime launchers run in their own session and own mpv's final save.
@@ -1719,9 +1839,36 @@ class WebAppApi(IPhoneApiMixin):
         installer_pid = getattr(getattr(self, "app_updater", None), "installer_pid", None)
         if installer_pid:
             roots.append(int(installer_pid))
+        # The same for the uninstaller: it waits for this process to exit, then
+        # removes Pudge (it was killed here, so nothing was removed).
+        roots.extend(self._uninstaller_pids())
         tree.exclude_subtrees(roots)
 
+    def _uninstaller_pids(self) -> list[int]:
+        return self.__dict__.setdefault("_launched_uninstaller_pids", [])
+
+    # The installer waits 30 s for this process to exit and then gives up; a quit
+    # that was vetoed or never arrived must not leave background work off for the
+    # rest of the session.
+    UPDATE_QUIT_GRACE_SECONDS = 60.0
+
+    def _resume_if_update_quit_stalled(self) -> None:
+        if getattr(self, "_closing", False) or getattr(self, "_close_completed", False):
+            return  # quitting (or quit): the installer takes over
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.warning(
+                "FAIL step=app.update_quit pid=%s still running %.0fs after the update asked it to quit; "
+                "resuming background work",
+                os.getpid(),
+                self.UPDATE_QUIT_GRACE_SECONDS,
+            )
+        self._resume_after_failed_update()
+
     def _quit_after_update(self) -> None:
+        watchdog = threading.Timer(self.UPDATE_QUIT_GRACE_SECONDS, self._resume_if_update_quit_stalled)
+        watchdog.daemon = True
+        watchdog.start()
         lifecycle = getattr(self, "_macos_window_lifecycle", None)
         if lifecycle is not None:
             lifecycle.request_quit("update")
@@ -1756,7 +1903,7 @@ class WebAppApi(IPhoneApiMixin):
             database_path=self.config.library.database_path,
             library_root=self.config.library.root_dir,
         )
-        launch_uninstaller(plan)
+        launch_uninstaller(plan, on_started=self._uninstaller_pids().append)
         self.logger.info("EVENT app.uninstall_started targets=%s", len(plan.targets))
         close_timer = threading.Timer(0.2, self._close_window_for_uninstall)
         close_timer.daemon = True
@@ -1843,6 +1990,11 @@ class WebAppApi(IPhoneApiMixin):
                 if self._consumption_runtime_last_vn.get("session_id") == session_id
                 else {}
             )
+            # Time counts only while the game is read: not while the capture is paused
+            # (the game in the background) or left open without new text.
+            running = running and self.__dict__.setdefault("_vn_reading_gate", VnReadingGate()).reading(
+                session_id, vn_state, monotonic_now
+            )
             if running and previous_vn and bool(previous_vn.get("running")):
                 mono_delta = monotonic_now - float(previous_vn.get("monotonic") or monotonic_now)
                 wall_delta = wall_now - float(previous_vn.get("wall") or wall_now)
@@ -1891,13 +2043,34 @@ class WebAppApi(IPhoneApiMixin):
     def consumption_statistics_query(
         self, scope: dict[str, Any] | None = None, limit: int = 200, offset: int = 0
     ) -> dict[str, Any]:
-        result = self.consumption_statistics.query(
-            scope or {}, journal_limit=int(limit), journal_offset=int(offset)
-        )
+        with memory_step(self.logger, "statistics.query"):
+            result = low_ram.worker_or_inline(
+                "statistics_query",
+                {
+                    "config_path": str(self.config_path),
+                    "scope": scope or {},
+                    "limit": int(limit),
+                    "offset": int(offset),
+                },
+                lambda: self.consumption_statistics.query(
+                    scope or {}, journal_limit=int(limit), journal_offset=int(offset)
+                ),
+                use_worker=self._low_ram_workers(),
+                logger=self.logger,
+            )
         words = (result.get("highlights") or {}).get("words")
         if isinstance(words, dict):
+            if self._low_ram_workers() and int(words.get("pending") or 0) > 0:
+                # The worker queued what is still to parse; the job runs here.
+                self.statistics_words_start()
             words["job"] = self.statistics_words_state()
         return result
+
+    def _low_ram_workers(self) -> bool:
+        """Heavy one-off work goes to a worker process (both modes; a real config file, not
+        already in a worker). The worker's failure falls back to the work here."""
+        path = getattr(self, "config_path", None)
+        return low_ram.worker_allowed(self.config) and path is not None and Path(path).is_file()
 
     def consumption_statistics_correct(
         self,
@@ -1940,7 +2113,13 @@ class WebAppApi(IPhoneApiMixin):
         )
 
     def consumption_statistics_export(self, scope: dict[str, Any] | None = None) -> dict[str, Any]:
-        result = self.consumption_statistics.export_csv(scope or {})
+        result = low_ram.worker_or_inline(
+            "statistics_export",
+            {"config_path": str(self.config_path), "scope": scope or {}},
+            lambda: self.consumption_statistics.export_csv(scope or {}),
+            use_worker=self._low_ram_workers(),
+            logger=self.logger,
+        )
         if sys.platform == "darwin" and result.get("path"):
             try:
                 subprocess.Popen(["open", "-R", str(result["path"])])
@@ -1948,28 +2127,27 @@ class WebAppApi(IPhoneApiMixin):
                 pass
         return result
 
-    def consumption_statistics_rebuild_rollups(self) -> dict[str, Any]:
-        return self.consumption_statistics.rebuild_daily_rollups()
-
     def consumption_statistics_delete_history(self) -> dict[str, Any]:
         return self.consumption_statistics.delete_history()
 
-    def visual_novel_windows(self, force: bool = False) -> list[dict[str, Any]]:
-        # Entering the VN tab repeatedly must not enumerate native windows every
-        # time; the first Quartz import is prewarmed at startup.
-        now = time.monotonic()
-        cached = getattr(self, "_vn_windows_cache", None)
-        if not force and cached is not None and now - cached[0] < 3.0:
-            return [dict(row) for row in cached[1]]
-        started = time.perf_counter()
-        rows = self.visual_novels.windows()
-        self._vn_windows_cache = (now, [dict(row) for row in rows])
-        self.logger.info(
-            "TIMING step=vn.windows duration_ms=%.1f windows=%s",
-            (time.perf_counter() - started) * 1000.0,
-            len(rows),
-        )
-        return rows
+    VN_PREWARM_RECENT_SECONDS = 30 * 86400.0
+
+    def _visual_novels_used(self) -> bool:
+        """A visual novel was captured in the last 30 days (its window list is worth preloading).
+
+        "Ever" was not enough: one capture tried long ago kept Quartz (tens of MB) loaded in
+        every later run of someone who does not read visual novels."""
+        try:
+            with self.manager.db.connect() as conn:
+                return (
+                    conn.execute(
+                        "SELECT 1 FROM consumption_sessions WHERE kind='visual_novel' AND started_at_utc>=? LIMIT 1",
+                        (time.time() - self.VN_PREWARM_RECENT_SECONDS,),
+                    ).fetchone()
+                    is not None
+                )
+        except sqlite3.Error:
+            return False
 
     def _prewarm_visual_novel_windows(self) -> None:
         started = time.perf_counter()
@@ -1991,6 +2169,7 @@ class WebAppApi(IPhoneApiMixin):
         session_id = str(getattr(self, "_vn_consumption_session_id", "") or "")
         if session_id:
             self._vn_consumption_session_id = ""
+            self._statistics_flush_vn_lines(session_id)
             try:
                 self.consumption.end_vn_capture(session_id)
             except Exception as exc:
@@ -2002,6 +2181,8 @@ class WebAppApi(IPhoneApiMixin):
         # End a previous capture session first; window IDs are ephemeral and
         # must never become the game identity.
         if self._vn_consumption_session_id:
+            # Before the new capture clears the previous one's lines.
+            self._statistics_flush_vn_lines(self._vn_consumption_session_id)
             try:
                 self.consumption.end_vn_capture(self._vn_consumption_session_id)
             finally:
@@ -2057,6 +2238,7 @@ class WebAppApi(IPhoneApiMixin):
         session_id = str(getattr(self, "_vn_consumption_session_id", "") or "")
         if session_id:
             consumption = getattr(self, "consumption", None)
+            self._statistics_flush_vn_lines(session_id)
             try:
                 if consumption is not None:
                     consumption.end_vn_capture(session_id)
@@ -2069,9 +2251,6 @@ class WebAppApi(IPhoneApiMixin):
                 self._vn_consumption_session_id = ""
         state["vn_title_id"] = str(getattr(self, "_vn_title_id", "") or "")
         return state
-
-    def consumption_ledger_status(self) -> dict[str, Any]:
-        return {"schema": 1, **self.consumption.ledger_counts()}
 
     def visual_novel_set_dialogue_region(
         self, x: float, y: float, width: float, height: float
@@ -2141,10 +2320,6 @@ class WebAppApi(IPhoneApiMixin):
         else:
             window.evaluate_js(script)
 
-    def screen_recording_status(self) -> dict[str, Any]:
-        """Preflight only: never shows the macOS permission prompt."""
-        return {"allowed": self.visual_novels._screen_recording_access()}
-
     def screen_recording_request_access(self) -> dict[str, Any]:
         """The Allow button: ask macOS once ever (lists Pudge in Screen Recording), then open the pane.
 
@@ -2154,17 +2329,19 @@ class WebAppApi(IPhoneApiMixin):
         marker = self.config.paths.cache_dir / "screen-recording-requested"
         requested = False
         if allowed is False and not marker.exists():
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(str(time.time()), encoding="utf-8")
             try:
                 import Quartz  # type: ignore
 
-                request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+                request = _quartz_function(Quartz, "CGRequestScreenCaptureAccess")
                 if request is not None:
                     request()
                     requested = True
             except Exception as exc:
                 self.logger.warning("FALLBACK screen_recording.request error=%r", str(exc))
+            if requested:
+                # Only once macOS was really asked: a failed lookup used the one request up.
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(time.time()), encoding="utf-8")
         self.logger.info("EVENT screen_recording.allow_clicked preflight=%s requested=%s", allowed, requested)
         if sys.platform == "darwin":
             self.open_screen_recording_settings()
@@ -2205,6 +2382,9 @@ class WebAppApi(IPhoneApiMixin):
         if hub is None:
             return {"ok": False}
         hub.ready()
+        unloader = getattr(self, "_page_unloader", None)
+        if unloader is not None:
+            unloader.page_ready()
         startup_quiet = getattr(self, "_startup_quiet_window_ready", None)
         if startup_quiet is not None:
             startup_quiet.set()
@@ -2233,19 +2413,35 @@ class WebAppApi(IPhoneApiMixin):
         if hub is not None:
             hub.close(timeout=2.0)
 
-    def set_window_activity(self, active: bool) -> dict[str, Any]:
+    def set_window_activity(
+        self, active: bool, sequence: int | None = None, page: str = ""
+    ) -> dict[str, Any]:
         """Publish interactive-window state for the scheduled agent.
 
         The browser already owns the authoritative focus/visibility signal.
         Persisting just that boolean lets the separate LaunchAgent defer CPU-
-        heavy maintenance while the user is actively navigating Pudge.
+        heavy maintenance while the user is actively navigating Pudge. Each
+        call runs on its own thread: the page numbers its reports (``sequence``
+        within one page load ``page``) and one that arrives late is dropped.
         """
 
-        for name in ("_state_watcher", "_torrent_monitor"):
-            loop = getattr(self, name, None)
-            if loop is not None:
-                loop.set_active(bool(active))
-        updated = set_app_window_active(bool(active))
+        try:
+            order = int(sequence) if sequence is not None else None
+        except (TypeError, ValueError):
+            order = None
+        lock = self.__dict__.setdefault("_window_activity_lock", threading.Lock())
+        with lock:
+            if order is not None:
+                last_page, last_order = getattr(self, "_window_activity_order", ("", 0))
+                if str(page or "") == last_page and order <= last_order:
+                    return {"ok": True, "active": bool(active), "updated": False, "stale": True}
+                self._window_activity_order = (str(page or ""), order)
+            self._window_active = bool(active)
+            for name in ("_state_watcher", "_torrent_monitor"):
+                loop = getattr(self, name, None)
+                if loop is not None:
+                    loop.set_active(bool(active))
+            updated = set_app_window_active(bool(active))
         return {"ok": True, "active": bool(active), "updated": bool(updated)}
 
     def bind_drop_import(self) -> dict[str, Any]:
@@ -2278,41 +2474,7 @@ class WebAppApi(IPhoneApiMixin):
                 if not paths:
                     self.logger.warning("SKIP step=app.drop_import reason=no_absolute_paths")
                     return
-                self.logger.info("START step=app.drop_import paths=%r", paths)
-
-                def import_drop() -> None:
-                    try:
-                        result = self.import_dropped_paths(paths)
-                    except Exception as exc:
-                        result = {
-                            "ok": False,
-                            "imports": [],
-                            "focus": None,
-                            "errors": [str(exc)],
-                        }
-                    window = self.window
-                    if window is None:
-                        return
-                    try:
-                        payload = json.dumps(result, ensure_ascii=False).replace("</", "<\\/")
-                        script = (
-                            "window.dispatchEvent(new CustomEvent('pudge-files-imported',{detail:"
-                            + payload
-                            + "}));"
-                        )
-                        runner = getattr(window, "run_js", None)
-                        if callable(runner):
-                            runner(script)
-                        else:
-                            window.evaluate_js(script)
-                    except Exception as exc:
-                        self.logger.warning("FAIL step=drop.focus error=%r", str(exc))
-
-                threading.Thread(
-                    target=import_drop,
-                    name=f"{APP_SLUG}-drop-import",
-                    daemon=True,
-                ).start()
+                self._import_drop_in_background(paths)
 
             # HTML handles dragenter/dragover locally. Only the single drop event
             # crosses the JS/Python bridge, which keeps the Cocoa UI responsive.
@@ -2326,6 +2488,44 @@ class WebAppApi(IPhoneApiMixin):
         except Exception as exc:
             self.logger.warning("FALLBACK step=app.drop_import_bind error=%r", str(exc))
             return {"ok": False, "bound": False, "error": str(exc)}
+
+    def _import_drop_in_background(self, paths: list[str]) -> None:
+        """Import Finder-dropped paths off the bridge thread, then tell the page."""
+        self.logger.info("START step=app.drop_import paths=%r", paths)
+
+        def import_drop() -> None:
+            try:
+                result = self.import_dropped_paths(paths)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "imports": [],
+                    "focus": None,
+                    "errors": [str(exc)],
+                }
+            self._dispatch_drop_event("pudge-files-imported", result)
+
+        threading.Thread(
+            target=import_drop,
+            name=f"{APP_SLUG}-drop-import",
+            daemon=True,
+        ).start()
+
+    def _dispatch_drop_event(self, name: str, detail: dict[str, Any]) -> None:
+        """Fire a window event for a Finder drop (fire-and-forget run_js)."""
+        window = self.window
+        if window is None:
+            return
+        try:
+            payload = json.dumps(detail, ensure_ascii=False).replace("</", "<\\/")
+            script = "window.dispatchEvent(new CustomEvent('" + name + "',{detail:" + payload + "}));"
+            runner = getattr(window, "run_js", None)
+            if callable(runner):
+                runner(script)
+            else:
+                window.evaluate_js(script)
+        except Exception as exc:
+            self.logger.warning("FAIL step=drop.focus event=%s error=%r", name, str(exc))
 
     def _downloads_enabled(self) -> bool:
         # Session intent is the single UI/API owner. Manager config is mirrored
@@ -2342,7 +2542,10 @@ class WebAppApi(IPhoneApiMixin):
 
     @staticmethod
     def _remaining(target: int | None) -> int | None:
-        return max(0, int(target) - int(time.time())) if target else None
+        if not target:
+            return None
+        _note_state_deadline(target)
+        return max(0, int(target) - int(time.time()))
 
     COVER_LIST_WIDTH = 240
 
@@ -2387,14 +2590,17 @@ class WebAppApi(IPhoneApiMixin):
             try:
                 from PIL import Image
 
-                with Image.open(source) as image:
-                    image = image.convert("RGB")
-                    if image.width > self.COVER_LIST_WIDTH:
-                        height = max(1, round(image.height * self.COVER_LIST_WIDTH / image.width))
-                        image = image.resize((self.COVER_LIST_WIDTH, height), Image.LANCZOS)
-                    temporary = target.with_name(target.name + ".tmp")
-                    image.save(temporary, "JPEG", quality=85, optimize=True)
-                temporary.replace(target)
+                temporary = temporary_sibling(target)
+                try:
+                    with Image.open(source) as image:
+                        image = image.convert("RGB")
+                        if image.width > self.COVER_LIST_WIDTH:
+                            height = max(1, round(image.height * self.COVER_LIST_WIDTH / image.width))
+                            image = image.resize((self.COVER_LIST_WIDTH, height), Image.LANCZOS)
+                        image.save(temporary, "JPEG", quality=85, optimize=True)
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
                 made += 1
             except Exception as exc:  # noqa: BLE001 - the full cover keeps working
                 self.logger.info(
@@ -2523,7 +2729,7 @@ class WebAppApi(IPhoneApiMixin):
     def _relation_payload(self, anime: LibraryAnime) -> dict[str, Any]:
         current = {
             "media_id": anime.media_id,
-            "japanese_subtitles_required": self.manager.japanese_subtitles_required(anime.media_id),
+            "japanese_subtitles_required": self._build_japanese_subtitles_required(anime.media_id),
             "title": anime.title,
             "site_url": anime.site_url,
             "format": anime.format,
@@ -2614,6 +2820,12 @@ class WebAppApi(IPhoneApiMixin):
     def _episode_numbering_offset(self, anime: LibraryAnime | None) -> int:
         if anime is None or not anime.media_id:
             return 0
+        # The offset follows the title's numbering rules: saved or forgotten (a release chosen
+        # by hand, "Forget numbering rules"), every cached offset is worked out again.
+        version = numbering_rules_version()
+        if getattr(self, "_episode_offset_cache_version", None) != version:
+            self._episode_offset_cache.clear()
+            self._episode_offset_cache_version = version
         cached = self._episode_offset_cache.get(int(anime.media_id))
         if cached is not None:
             return cached
@@ -2648,6 +2860,33 @@ class WebAppApi(IPhoneApiMixin):
             return relative
         return value
 
+    # AniList progress hides watched local files only while the title is being watched
+    # (Current, Repeating) or was dropped. A Completed, Paused or Planning title, or one not
+    # on the list, shows every local file: a folder of anime the person already has.
+    _PROGRESS_HIDES_LOCAL_FILES = frozenset({"CURRENT", "REPEATING", "DROPPED"})
+
+    @classmethod
+    def _progress_hides_local_files(cls, anime: Any) -> bool:
+        return anime is None or str(anime.status or "").upper() in cls._PROGRESS_HIDES_LOCAL_FILES
+
+    def _nearest_local_episode_pending(self, anime: LibraryAnime) -> bool:
+        """The next episode to watch is on disk but not ready yet (subtitles being prepared)."""
+        if anime.episodes and int(anime.progress or 0) >= int(anime.episodes):
+            return False
+        local = self._local_episode_for_relative(anime, anime.next_episode)
+        return bool(
+            local is not None
+            and local.video_path.is_file()
+            and str(local.state or "") not in {"ready", "watched"}
+        )
+
+    @staticmethod
+    def _silent_local_file(item: Any) -> bool:
+        """An NCOP/NCED/PV of the person's own folder: Library only, no Home card, no subtitles."""
+        if str(getattr(item, "torrent_hash", "") or "").strip() or item.episode is not None:
+            return False
+        return bool(parse_release_name(item.video_path.name).extra)
+
     def _watched_on_anilist(self, anime: LibraryAnime | None, episode: int | None) -> bool:
         if anime is None:
             return False
@@ -2660,9 +2899,15 @@ class WebAppApi(IPhoneApiMixin):
 
     def _local_episode_for_relative(self, anime: LibraryAnime, relative_episode: int | None):
         exact = self.manager.db.ready_episode(anime.media_id, relative_episode)
-        if exact is not None and not AnimeManager._library_path_is_ignored(exact.video_path):
+        if exact is not None and AnimeManager._library_path_is_ignored(exact.video_path):
+            exact = None
+        if exact is not None and exact.video_path.is_file():
             return exact
-        for item in self.manager.db.episodes(anime.media_id):
+        # A copy of the episode that is on disk wins over a row whose file is gone
+        # (a deleted duplicate made the card wait for its subtitles). Without one,
+        # the gone row is still returned: callers check the file themselves.
+        fallback = exact
+        for item in self._build_episodes(anime.media_id):
             if item.state not in {
                 "ready",
                 "local",
@@ -2677,8 +2922,11 @@ class WebAppApi(IPhoneApiMixin):
             if relative_episode is None or self._display_episode_number(anime, item.episode) == int(
                 relative_episode
             ):
-                return item
-        return None
+                if item.video_path.is_file():
+                    return item
+                if fallback is None:
+                    fallback = item
+        return fallback
 
     def _download_is_hidden_from_home(self, item: Any) -> bool:
         # Isolated corpora may keep their episode/download rows for replay.
@@ -2732,28 +2980,32 @@ class WebAppApi(IPhoneApiMixin):
             if state not in invalid_states:
                 return True
 
-        if str(anime.format or "").upper() == "MOVIE":
-            return False
         if str(anime.media_status or "").upper() == "NOT_YET_RELEASED":
             return False
 
-        if str(anime.media_status or "").upper() == "FINISHED":
+        # A movie (or one-episode title) is one file, kept without an episode number.
+        single = self._planning_single_file_title(anime)
+        if single:
+            target = 1
+        elif str(anime.media_status or "").upper() == "FINISHED":
             target = int(anime.episodes or 0)
         else:
             target = int(anime.released_episodes or 0)
         if target < 1:
             return False
 
-        incomplete = self.manager.incomplete_download_paths()
+        incomplete = self._build_incomplete()
         local_numbers: set[int] = set()
-        for item in self.manager.db.episodes(anime.media_id):
+        for item in self._build_episodes(anime.media_id):
             if not item.video_path.is_file():
                 continue
             if AnimeManager._library_path_is_ignored(item.video_path):
                 continue
-            if self.manager._path_within(item.video_path, incomplete):
+            if self._build_path_within(item.video_path, incomplete):
                 continue
             display_episode = self._display_episode_number(anime, item.episode)
+            if display_episode is None and single:
+                display_episode = 1
             if display_episode is not None and 1 <= int(display_episode) <= target:
                 local_numbers.add(int(display_episode))
         return all(number in local_numbers for number in range(1, target + 1))
@@ -2767,7 +3019,7 @@ class WebAppApi(IPhoneApiMixin):
         if total < 2:
             return [], err("web.scheduleNeedsOrder")
         mapped: set[int] = set()
-        for item in self.manager.db.episodes(anime.media_id):
+        for item in self._build_episodes(anime.media_id):
             display = self._display_episode_number(anime, item.episode)
             if display is None:
                 continue
@@ -2783,7 +3035,7 @@ class WebAppApi(IPhoneApiMixin):
     def _personal_schedule_local_state(self, anime: LibraryAnime, local: Any, *, rewatch: bool) -> str:
         if local is None or not local.video_path.is_file():
             return ""
-        japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
+        japanese_subtitles_required = self._build_japanese_subtitles_required(anime.media_id)
         local_state = str(local.state or "")
         if rewatch and local_state == "watched":
             # Personal rewatch progress is independent of the old local ledger.
@@ -2804,10 +3056,45 @@ class WebAppApi(IPhoneApiMixin):
             local_state = "waiting_text_subtitles"
         return local_state
 
+    def _personal_schedule_catch_up_watched(self, anime: LibraryAnime, schedule: Any, *, now: float) -> Any:
+        """Count the scheduled episodes AniList or the library already has as watched.
+
+        The schedule marks an episode watched from Pudge's own playback check only. An
+        episode finished while Pudge restarted, or watched elsewhere, stayed the "next"
+        one: the title sat in "Waiting for preparation · All episodes ready".
+        """
+        if schedule is None or not schedule.enabled or schedule.rewatch:
+            return schedule
+        progress = int(anime.progress or 0)
+        caught: list[int] = []
+        for item in schedule.items:
+            if item.watched_at is not None:
+                continue
+            episode = int(item.episode)
+            watched = episode <= progress
+            if not watched and item.unlocked:
+                local = self._local_episode_for_relative(anime, episode)
+                watched = local is not None and str(local.state or "") == "watched"
+            if watched:
+                caught.append(episode)
+        if not caught:
+            return schedule
+        for episode in caught:
+            self.manager.db.mark_personal_release_watched(int(anime.media_id), episode)
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "EVENT personal_schedule.watched media_id=%s episodes=%s evidence=anilist_or_library",
+                anime.media_id,
+                caught,
+            )
+        return self.manager.db.personal_release_schedule(anime.media_id, now=now)
+
     def _personal_schedule_snapshot(self, anime: LibraryAnime, *, now: float | None = None) -> dict[str, Any]:
         current = time.time() if now is None else float(now)
         order, reason = self._personal_schedule_episode_order(anime)
         schedule = self.manager.db.personal_release_schedule(anime.media_id, now=current)
+        schedule = self._personal_schedule_catch_up_watched(anime, schedule, now=current)
         payload: dict[str, Any] = {
             "eligible": bool(order),
             "eligibility_reason": reason,
@@ -2919,17 +3206,21 @@ class WebAppApi(IPhoneApiMixin):
         """Downloaded episode files of a title (the menu offers Delete instead of Drop)."""
         return sum(
             1
-            for item in self.manager.db.episodes(int(media_id))
+            for item in self._build_episodes(int(media_id))
             if item.video_path.is_file() and not AnimeManager._library_path_is_ignored(item.video_path)
         )
 
     def _anime_payload(self, anime: LibraryAnime, *, relations: bool = True) -> dict[str, Any]:
         """One anime card. Only Planning cards draw the relation tree; others skip it."""
-        japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
+        japanese_subtitles_required = self._build_japanese_subtitles_required(anime.media_id)
         released = anime.released_episodes
         outdated = bool(released and released > anime.progress)
         local_target = None if str(anime.format or "").upper() == "MOVIE" else anime.next_episode
         local = self._local_episode_for_relative(anime, local_target)
+        if local is not None and not local.video_path.is_file():
+            # The row of a gone file is no local episode: the card showed the next
+            # episode "waiting for subtitles" although it was not downloaded.
+            local = None
         next_queue_count = 0
         franchise_queue_available = False
         if anime.media_status != "NOT_YET_RELEASED":
@@ -3033,18 +3324,37 @@ class WebAppApi(IPhoneApiMixin):
         anime_by_id: dict[int, LibraryAnime],
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
-        incomplete = self.manager.incomplete_download_paths()
-        for item in self.manager.db.resumable_episodes(limit=8):
+        incomplete = self._build_incomplete()
+        # An episode open in mpv stays here until mpv closes, also once it is counted
+        # (or played to the last minute): it went to "Recently watched" while still open.
+        open_paths = self._open_video_paths()
+        open_items = []
+        for key in sorted(open_paths):
+            item = self.manager.db.episode_by_path(Path(key))
+            if item is None:
+                continue
+            anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
+            counted = item.state == "watched" or self._watched_on_anilist(anime, item.last_episode)
+            # Played to the end (the position is cleared at 95 %) but not counted yet.
+            finished = item.playback_position is None and float(item.playback_duration or 0.0) > 0.0
+            if counted or finished or float(item.playback_position or 0.0) >= RESUME_MIN_POSITION:
+                open_items.append(item)
+        seen: set[str] = set()
+        for item in [*open_items, *self.manager.db.resumable_episodes(limit=8)]:
+            if str(item.video_path) in seen:
+                continue
+            seen.add(str(item.video_path))
+            is_open = str(item.video_path) in open_paths
             if (
                 not item.video_path.is_file()
-                or self.manager._path_within(item.video_path, incomplete)
+                or self._build_path_within(item.video_path, incomplete)
                 or AnimeManager._library_path_is_ignored(item.video_path)
             ):
                 continue
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             schedule_item = None
             schedule = None
-            if anime is not None:
+            if anime is not None and not is_open:
                 schedule = self.manager.db.personal_release_schedule(anime.media_id)
                 if schedule is not None and schedule.enabled:
                     display_episode = self._display_episode_number(anime, item.episode)
@@ -3057,7 +3367,7 @@ class WebAppApi(IPhoneApiMixin):
                     ):
                         continue
                     schedule_item = next_item
-            if schedule_item is None and self._watched_on_anilist(anime, item.last_episode):
+            if not is_open and schedule_item is None and self._watched_on_anilist(anime, item.last_episode):
                 continue
             position = float(item.playback_position or 0.0)
             duration = float(item.playback_duration or 0.0)
@@ -3086,16 +3396,34 @@ class WebAppApi(IPhoneApiMixin):
             )
         return payloads
 
+    def _open_video_paths(self) -> set[str]:
+        """Videos open in mpv right now (starting or running)."""
+        if getattr(self, "_play_lock", None) is None:
+            return set()
+        try:
+            return {
+                str(Path(str(item["video_path"])))
+                for item in self._active_playbacks_payload()
+                if item.get("video_path")
+            }
+        except Exception:  # noqa: BLE001 - Home never fails over the player state
+            return set()
+
     def _library_payloads(
         self,
         anime_by_id: dict[int, LibraryAnime],
     ) -> list[dict[str, Any]]:
-        """Group local episodes by anime for the compact Library page."""
+        """Group local episodes by anime for the compact Library page.
+
+        Only fields the window reads (index.html) and the per-title counts: the list is
+        sent with every changed snapshot, one entry per local episode (sizes, playback
+        place/duration, subtitle file name and summed durations were never shown; the
+        sizes cost a stat of every file per snapshot)."""
         groups: dict[tuple[str, object], dict[str, Any]] = {}
-        incomplete = self.manager.incomplete_download_paths()
+        incomplete = self._build_incomplete()
         watched_roots = tuple(path.expanduser().resolve() for path in self.config.paths.download_dirs)
-        for item in self.manager.db.episodes():
-            if self.manager._path_within(item.video_path, incomplete):
+        for item in self._build_episodes():
+            if self._build_path_within(item.video_path, incomplete):
                 continue
             key: tuple[str, object]
             if item.media_id is not None:
@@ -3118,15 +3446,9 @@ class WebAppApi(IPhoneApiMixin):
                     "personal_schedule": self._personal_schedule_snapshot(anime)
                     if anime is not None
                     else {"eligible": False, "enabled": False},
-                    "total_episodes": anime.episodes if anime is not None else None,
-                    "episode_duration_minutes": anime.duration if anime is not None else None,
                     "watched_folder": False,
                     "episodes": [],
                 }
-            try:
-                size_bytes = item.video_path.stat().st_size if item.video_path.is_file() else 0
-            except OSError:
-                size_bytes = 0
             if self.manager._path_within(item.video_path, watched_roots):
                 group["watched_folder"] = True
             effective_state = item.state
@@ -3151,7 +3473,6 @@ class WebAppApi(IPhoneApiMixin):
                     "video_path": str(item.video_path),
                     "filename": item.video_path.name,
                     "subtitle_path": str(item.subtitle_path) if item.subtitle_path else "",
-                    "subtitle_filename": item.subtitle_path.name if item.subtitle_path else "",
                     "subtitle_source": (
                         "image"
                         if (
@@ -3165,9 +3486,6 @@ class WebAppApi(IPhoneApiMixin):
                         else "none"
                     ),
                     "state": effective_state,
-                    "size_bytes": size_bytes,
-                    "playback_position": item.playback_position,
-                    "playback_duration": item.playback_duration,
                 }
             )
 
@@ -3188,12 +3506,6 @@ class WebAppApi(IPhoneApiMixin):
                 for item in group["episodes"]
                 if item["state"] in {"waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}
             )
-            group["size_bytes"] = sum(int(item["size_bytes"] or 0) for item in group["episodes"])
-            fallback_duration = max(0.0, float(group.get("episode_duration_minutes") or 0.0) * 60.0)
-            group["duration_seconds"] = sum(
-                max(0.0, float(item.get("playback_duration") or 0.0)) or fallback_duration
-                for item in group["episodes"]
-            )
 
         return sorted(payloads, key=lambda item: str(item["title"]).casefold())
 
@@ -3211,12 +3523,14 @@ class WebAppApi(IPhoneApiMixin):
         titles: dict[tuple[str, object], str] = {}
         media_ids: dict[tuple[str, object], int | None] = {}
 
-        incomplete = self.manager.incomplete_download_paths()
-        for item in self.manager.db.episodes():
+        incomplete = self._build_incomplete()
+        for item in self._build_episodes():
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             subtitle_optional = bool(
-                item.media_id is not None and not self.manager.japanese_subtitles_required(item.media_id)
+                item.media_id is not None and not self._build_japanese_subtitles_required(item.media_id)
             )
+            if self._silent_local_file(item):
+                continue
             if (
                 (item.state != "ready" and not subtitle_optional)
                 or (
@@ -3230,9 +3544,12 @@ class WebAppApi(IPhoneApiMixin):
                     and not self.config.matching.ocr_counts_as_ready
                 )
                 or not item.video_path.is_file()
-                or self.manager._path_within(item.video_path, incomplete)
+                or self._build_path_within(item.video_path, incomplete)
                 or AnimeManager._library_path_is_ignored(item.video_path)
-                or self._watched_on_anilist(anime, item.last_episode)
+                or (
+                    self._progress_hides_local_files(anime)
+                    and self._watched_on_anilist(anime, item.last_episode)
+                )
             ):
                 continue
             key: tuple[str, object]
@@ -3258,9 +3575,19 @@ class WebAppApi(IPhoneApiMixin):
                 episode_map,
                 key=lambda value: (value is None, value if value is not None else 10**9),
             )
-            first = episode_map[stored_episodes[0]]
             media_id = media_ids[key]
             anime = anime_by_id.get(media_id) if media_id is not None else None
+            if anime is not None and not self._progress_hides_local_files(anime):
+                # A Completed/Paused title shows every local file; the card opens the first
+                # one after the AniList progress, or the first one when all are watched.
+                after_progress = [
+                    value
+                    for value in stored_episodes
+                    if value is not None and not self._watched_on_anilist(anime, value)
+                ]
+                if after_progress:
+                    stored_episodes = after_progress + [v for v in stored_episodes if v not in after_progress]
+            first = episode_map[stored_episodes[0]]
             title = anime.title if anime is not None else titles[key]
             episodes = sorted(
                 {self._display_episode_number(anime, value) for value in stored_episodes},
@@ -3271,7 +3598,7 @@ class WebAppApi(IPhoneApiMixin):
                 {
                     "media_id": media_id,
                     "japanese_subtitles_required": (
-                        self.manager.japanese_subtitles_required(media_id) if media_id is not None else True
+                        self._build_japanese_subtitles_required(media_id) if media_id is not None else True
                     ),
                     "title": title,
                     "cover": self._cover_uri(anime) if anime is not None else "",
@@ -3292,11 +3619,14 @@ class WebAppApi(IPhoneApiMixin):
                         and display_first_episode is not None
                         and display_first_episode >= anime.episodes
                     ),
+                    # Every episode is here; files without a number (OVAs of a TV + Specials
+                    # pack) do not make Baccano!'s 13 of 13 "Episodes 1-13".
                     "all_episodes_ready": bool(
                         anime is not None
                         and anime.episodes is not None
                         and anime.episodes > 0
-                        and episodes == list(range(1, anime.episodes + 1))
+                        and set(range(1, anime.episodes + 1))
+                        <= {value for value in episodes if value is not None}
                     ),
                     "local": {
                         "episode": display_first_episode,
@@ -3318,7 +3648,7 @@ class WebAppApi(IPhoneApiMixin):
                         "state": (
                             "ready"
                             if media_id is not None
-                            and not self.manager.japanese_subtitles_required(media_id)
+                            and not self._build_japanese_subtitles_required(media_id)
                             and first.state != "watched"
                             else first.state
                         ),
@@ -3339,11 +3669,23 @@ class WebAppApi(IPhoneApiMixin):
         anime_by_id: dict[int, LibraryAnime],
     ) -> list[dict[str, Any]]:
         """Expose complete local files that are still waiting for preparation."""
-        incomplete = self.manager.incomplete_download_paths()
+        incomplete = self._build_incomplete()
+        # Extra files the person chose to keep (an OVA from a batch...) wait for nothing.
+        jobs = self.manager.db.subtitle_jobs()
+        kept_extras = {
+            str(row["video_path"])
+            for row in jobs
+            if str(row["action_code"] or "") == AnimeManager.EXTRA_FILE_KEPT
+        }
+        # One card per title: a file that waits for the person (preparation keeps
+        # failing, an extra to delete or keep) wins over the first waiting file.
+        asks_person = {str(row["video_path"]) for row in jobs if str(row["state"] or "") == "needs_action"}
         groups: dict[tuple[str, object], Any] = {}
-        for item in self.manager.db.episodes():
+        for item in self._build_episodes():
+            if str(item.video_path) in kept_extras or self._silent_local_file(item):
+                continue
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
-            if item.media_id is not None and not self.manager.japanese_subtitles_required(item.media_id):
+            if item.media_id is not None and not self._build_japanese_subtitles_required(item.media_id):
                 continue
             effective_ocr_waiting = bool(
                 item.state == "ready"
@@ -3353,8 +3695,11 @@ class WebAppApi(IPhoneApiMixin):
             if (
                 (item.state in {"ready", "watched"} and not effective_ocr_waiting)
                 or not item.video_path.is_file()
-                or self.manager._path_within(item.video_path, incomplete)
+                or self._build_path_within(item.video_path, incomplete)
                 or AnimeManager._library_path_is_ignored(item.video_path)
+                # A watched episode (here, on a phone, on AniList) needs no preparation card,
+                # whatever the list status: a Completed title watched on the iPad stayed
+                # under "Waiting for subs" for its unprepared files.
                 or self._watched_on_anilist(anime, item.last_episode)
             ):
                 continue
@@ -3363,7 +3708,11 @@ class WebAppApi(IPhoneApiMixin):
                 if item.media_id is not None
                 else ("title", item.title.casefold())
             )
-            groups.setdefault(key, item)
+            chosen = groups.get(key)
+            if chosen is None or (
+                str(item.video_path) in asks_person and str(chosen.video_path) not in asks_person
+            ):
+                groups[key] = item
 
         result: list[dict[str, Any]] = []
         for item in groups.values():
@@ -3635,6 +3984,77 @@ class WebAppApi(IPhoneApiMixin):
         return ("title", str(item.get("title") or "").strip().casefold())
 
     @staticmethod
+    def _download_covers_title(anime: Any, *, is_batch: bool, episode: int | None) -> bool:
+        """A title's download without the card's episode number that still is its download.
+
+        A batch holds every episode. A single file without an episode number is the
+        whole title when the title has one episode (a movie, a one-episode OVA or
+        special): aria2 keeps such a download as episode None and not a batch (one video
+        file), so Home matched it to no card (Suzume, Planning, 2026-10-23).
+        """
+        if is_batch:
+            return True
+        if episode is not None or anime is None:
+            return False
+        return single_unit_title(getattr(anime, "format", None), getattr(anime, "episodes", None))
+
+    @staticmethod
+    def _finished_download_file_gone(item: Any) -> bool:
+        """A finished download whose file is no longer on disk (watched and deleted, seeding)."""
+        if not download_complete(item):
+            return False
+        content = AnimeManager._download_content_path(item)
+        try:
+            return content is None or not content.exists()
+        except OSError:
+            return True
+
+    # A download in these states does not move by itself (paused, stopped, failed, or
+    # aria2 not running): a title without a card shows it only while it still holds
+    # something not watched and something was downloaded.
+    _HOME_IDLE_DOWNLOAD_STATES = frozenset(
+        {"paused", "pauseddl", "stopped", "stoppeddl", "error", "unknown", "missingfiles"}
+    )
+
+    def _download_wanted_without_card(self, item: Any, anime: Any) -> bool:
+        """An unfinished download of a title with no Home card that is worth a Waiting card.
+
+        A paused aria2 leftover at 0 %, an error row of a movie already watched or an
+        "unknown" row of a Completed title stayed on Home for good (review of N).
+        """
+        if download_complete(item):
+            return False
+        state = str(getattr(item, "state", "") or "").casefold()
+        if state in {"removed", "missing"}:
+            return False
+        if state not in self._HOME_IDLE_DOWNLOAD_STATES:
+            return True
+        if anime is not None:
+            episode = item.media_episode if item.media_episode is not None else item.episode
+            if episode is not None and getattr(item, "media_episode_end", None) is not None:
+                episode = int(item.media_episode_end)
+            if item.is_batch:
+                covered = bool(anime.episodes and int(anime.progress or 0) >= int(anime.episodes))
+            elif episode is None and not single_unit_title(anime.format, anime.episodes):
+                covered = False
+            else:
+                covered = watched_by_anilist_progress(
+                    episode,
+                    anime.progress,
+                    total_episodes=anime.episodes,
+                    media_format=anime.format,
+                )
+            if covered:
+                return False
+        raw = getattr(item, "raw", None) or {}
+        try:
+            progress = float(item.progress or 0.0)
+            speed = int(raw.get("download_speed") or raw.get("dlspeed") or raw.get("downloadSpeed") or 0)
+        except (TypeError, ValueError):
+            progress, speed = 0.0, 0
+        return progress > 0.001 or speed > 0
+
+    @staticmethod
     def _download_shadowed_by_local(card: dict[str, Any], download: dict[str, Any]) -> bool:
         # A completed local episode wins over stale transport metadata.
         if bool(download.get("is_batch")):
@@ -3647,6 +4067,10 @@ class WebAppApi(IPhoneApiMixin):
             return False
         local_episode = local.get("episode")
         download_episode = download.get("episode")
+        if single_unit_title(card.get("format"), card.get("episodes")):
+            # A movie's file and its download are episode 1 with or without the number.
+            local_episode = 1 if local_episode is None else local_episode
+            download_episode = 1 if download_episode is None else download_episode
         if local_episode is None or download_episode is None:
             return local_episode is None and download_episode is None
         try:
@@ -3755,11 +4179,15 @@ class WebAppApi(IPhoneApiMixin):
             return []
 
         cutoff = time.time() - ttl_hours * 3600.0
-        incomplete = self.manager.incomplete_download_paths()
+        incomplete = self._build_incomplete()
         latest: dict[int, Any] = {}
+        # Still open in mpv: it is under "Continue watching" until mpv closes.
+        open_paths = self._open_video_paths()
 
-        for item in self.manager.db.episodes():
+        for item in self._build_episodes():
             if item.media_id is None or item.watched_at is None:
+                continue
+            if str(item.video_path) in open_paths:
                 continue
             try:
                 watched_at = float(item.watched_at)
@@ -3769,7 +4197,7 @@ class WebAppApi(IPhoneApiMixin):
                 continue
             if not item.video_path.is_file():
                 continue
-            if self.manager._path_within(item.video_path, incomplete):
+            if self._build_path_within(item.video_path, incomplete):
                 continue
 
             if AnimeManager._library_path_is_ignored(item.video_path):
@@ -3832,6 +4260,7 @@ class WebAppApi(IPhoneApiMixin):
         self,
         current_anime: list[LibraryAnime],
         anime_by_id: dict[int, LibraryAnime],
+        queued_releases: list[dict[str, Any]] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Build the actionable groups shown on the main page.
 
@@ -3873,7 +4302,18 @@ class WebAppApi(IPhoneApiMixin):
                 if exact is not None:
                     return exact
             fallback = downloads_by_media.get(int(media_id))
-            return fallback if fallback is not None and fallback.is_batch else None
+            if fallback is None:
+                return None
+            covers = self._download_covers_title(
+                anime_by_id.get(int(media_id)),
+                is_batch=bool(fallback.is_batch),
+                episode=fallback.media_episode if fallback.media_episode is not None else fallback.episode,
+            )
+            if covers and not fallback.is_batch and self._finished_download_file_gone(fallback):
+                # A finished movie whose file is gone (the torrent still seeding) is no
+                # download any more: "Waiting for subs" for good, no Download button.
+                return None
+            return fallback if covers else None
 
         sections: dict[str, list[dict[str, Any]]] = {
             "continue_watching": self._continue_payloads(anime_by_id),
@@ -3926,6 +4366,10 @@ class WebAppApi(IPhoneApiMixin):
                         "progress": download.progress,
                         "is_batch": download.is_batch,
                     }
+                    if not download_complete(download):
+                        sections["waiting"].append(card)
+                        handled_media.add(int(anime.media_id))
+                        return True
                 sections["download_available"].append(card)
             elif status == "caught_up":
                 sections["caught_up"].append(card)
@@ -3933,6 +4377,48 @@ class WebAppApi(IPhoneApiMixin):
             # history rather than manufacturing another actionable section.
             handled_media.add(int(anime.media_id))
             return True
+
+        def append_next_not_ready(anime: LibraryAnime, base: dict[str, Any]) -> None:
+            """A finished title whose next unwatched episode is not ready: its real state."""
+            local_state = str(
+                (base.get("local") or {}).get("state") if isinstance(base.get("local"), dict) else ""
+            )
+            if local_state in {
+                "local",
+                "waiting_subtitles",
+                "waiting_text_subtitles",
+                "couldnt_sync",
+            }:
+                # The nearest unwatched episode is already local but not
+                # playable yet. Never replace that with a misleading batch
+                # download action just because later episodes are ready.
+                sections["waiting"].append(base)
+                return
+            # Finished/paused non-airing titles otherwise had no actionable home
+            # card. Offer a full batch download without changing their AniList
+            # list status. Existing qBittorrent work is attached so the UI cannot
+            # offer another duplicate download.
+            download = home_download(anime.media_id, anime.next_episode)
+            if download is not None:
+                raw_state = str(download.state or "")
+                effective_state = raw_state
+                if not download_complete(download) and not self._torrent_enabled_state():
+                    effective_state = "paused"
+                base["download"] = {
+                    "torrent_hash": download.torrent_hash,
+                    "name": download.name,
+                    "state": raw_state,
+                    "effective_state": effective_state,
+                    "progress": download.progress,
+                    "is_batch": download.is_batch,
+                }
+                if not download_complete(download):
+                    # A download under way is preparation like any other: it sat under
+                    # "Available to download" until its first file finished, while a title
+                    # with a finished file of the same pack was already "Waiting".
+                    sections["waiting"].append(base)
+                    return
+            sections["download_available"].append(base)
 
         for anime in current_anime:
             if append_personal_schedule(anime):
@@ -3976,39 +4462,7 @@ class WebAppApi(IPhoneApiMixin):
             elif anime.media_status not in {"RELEASING", "NOT_YET_RELEASED"} and (
                 anime.episodes is None or anime.progress < anime.episodes
             ):
-                local_state = str(
-                    (base.get("local") or {}).get("state") if isinstance(base.get("local"), dict) else ""
-                )
-                if local_state in {
-                    "local",
-                    "waiting_subtitles",
-                    "waiting_text_subtitles",
-                    "couldnt_sync",
-                }:
-                    # The nearest unwatched episode is already local but not
-                    # playable yet. Never replace that with a misleading batch
-                    # download action just because later episodes are ready.
-                    sections["waiting"].append(base)
-                else:
-                    # Finished/paused non-airing titles in Watching otherwise had no
-                    # actionable home card. Offer a full batch download without
-                    # changing their AniList list status. Existing qBittorrent work
-                    # is attached so the UI cannot offer another duplicate download.
-                    download = home_download(anime.media_id, anime.next_episode)
-                    if download is not None:
-                        raw_state = str(download.state or "")
-                        effective_state = raw_state
-                        if not download_complete(download) and not self._torrent_enabled_state():
-                            effective_state = "paused"
-                        base["download"] = {
-                            "torrent_hash": download.torrent_hash,
-                            "name": download.name,
-                            "state": raw_state,
-                            "effective_state": effective_state,
-                            "progress": download.progress,
-                            "is_batch": download.is_batch,
-                        }
-                    sections["download_available"].append(base)
+                append_next_not_ready(anime, base)
 
         # Active personal schedules are independent of the AniList list status,
         # so a COMPLETED title can behave like a local weekly release without
@@ -4034,11 +4488,31 @@ class WebAppApi(IPhoneApiMixin):
                 next_is_ready = anime.next_episode in ready_episodes
                 if anime.format == "MOVIE" and None in ready_episodes:
                     next_is_ready = True
+                finished_not_watching = bool(
+                    not self._progress_hides_local_files(anime)
+                    and str(anime.media_status or "").upper() != "RELEASING"
+                )
+                if (
+                    ready_episodes
+                    and finished_not_watching
+                    and anime.episodes
+                    and int(anime.progress or 0) >= int(anime.episodes)
+                ):
+                    # A finished title not being watched (Completed, Paused, Planning, not on
+                    # the list) with every episode watched: any ready local file makes it
+                    # ready (a rewatch opens the first). With an episode left the next one
+                    # decides: "any ready file" offered episode 2 of a Planning title whose
+                    # episode 1 was not downloaded.
+                    next_is_ready = True
                 if next_is_ready:
                     if anime.media_status == "RELEASING":
                         sections["new_ready"].append(item)
                     else:
                         sections["completed_ready"].append(item)
+                elif finished_not_watching and not self._nearest_local_episode_pending(anime):
+                    # The next episode is not on disk: its download (or a download
+                    # action), never a later ready episode.
+                    append_next_not_ready(anime, self._anime_payload(anime, relations=False))
                 else:
                     # Never skip the nearest unwatched episode merely because a
                     # later local episode is Ready. This applies to FINISHED /
@@ -4064,7 +4538,35 @@ class WebAppApi(IPhoneApiMixin):
             )
             if action is not None:
                 item["action_code"], item["action_error"] = action
+                if item["action_code"] == AnimeManager.EXTRA_FILE_REVIEW:
+                    video = Path(str(local.get("video_path") or ""))
+                    item["extra_file"] = {
+                        "name": video.name,
+                        "kind": AnimeManager._extra_file_kind(anime, video.name),
+                    }
+                    # Every extra of the title waiting for an answer (Tatami Galaxy: OP1, OP2
+                    # and ED): one card for all, the window lets each one be deleted or kept.
+                    item["extra_files"] = [
+                        {
+                            "name": Path(path).name,
+                            "kind": AnimeManager._extra_file_kind(anime, Path(path).name),
+                            "video_path": path,
+                        }
+                        for path, job in sorted(
+                            needs_action_by_path.items(), key=lambda pair: Path(pair[0]).name
+                        )
+                        if str(job["action_code"] or "") == AnimeManager.EXTRA_FILE_REVIEW
+                        and job["media_id"] is not None
+                        and media_id is not None
+                        and int(job["media_id"]) == int(media_id)
+                        and Path(path).is_file()
+                    ] or [{**item["extra_file"], "video_path": str(video)}]
                 sections["needs_action"].append(item)
+            elif media_id is not None and int(media_id) in handled_media:
+                # The title has its own card already (Ready, Caught up, its personal
+                # schedule...). Another local file of it waiting for subtitles must not
+                # replace that card with "Waiting for subs".
+                continue
             else:
                 sections["waiting"].append(item)
 
@@ -4076,7 +4578,7 @@ class WebAppApi(IPhoneApiMixin):
                 continue
             local_items = [
                 item
-                for item in self.manager.db.episodes(anime.media_id)
+                for item in self._build_episodes(anime.media_id)
                 if item.video_path.is_file() and not AnimeManager._library_path_is_ignored(item.video_path)
             ]
             if not local_items:
@@ -4113,7 +4615,25 @@ class WebAppApi(IPhoneApiMixin):
         sections["dropped"].sort(key=lambda item: str(item["title"]).casefold())
         sections = self._deduplicate_home_sections(sections)
         sections["completed_ready"] = self._group_completed_ready(sections["completed_ready"], anime_by_id)
-        for rows in sections.values():
+        queued_by_media: dict[int, list[dict[str, Any]]] = {}
+        if queued_releases is None:
+            queued_releases = self._queued_release_payloads()
+        for queued_row in queued_releases:
+            queued_by_media.setdefault(int(queued_row["media_id"]), []).append(queued_row)
+
+        def queued_for(media_id: int, episode: Any, batch_card: bool) -> dict[str, Any] | None:
+            for queued_row in queued_by_media.get(int(media_id), []):
+                if queued_row["batch"] or batch_card:
+                    return queued_row
+                if episode is not None and queued_row["episode"] is not None:
+                    try:
+                        if int(queued_row["episode"]) == int(episode):
+                            return queued_row
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        for section_name, rows in sections.items():
             for card in rows:
                 try:
                     media_id = int(card.get("media_id") or 0)
@@ -4142,6 +4662,15 @@ class WebAppApi(IPhoneApiMixin):
                     allow_ocr_ready=bool(self.config.matching.ocr_counts_as_ready),
                     downloads_enabled=self._torrent_enabled_state(),
                 )
+                queued = (
+                    queued_for(media_id, target_episode, section_name == "download_available")
+                    if media_id and download is None and card["presentation"].get("status") == "missing"
+                    else None
+                )
+                if queued is not None:
+                    # A release chosen while Torrents are off: "Waiting for torrents".
+                    card["queued_release"] = queued
+                    card["presentation"] = {**card["presentation"], "status": "queued_torrents_off"}
         return sections
 
     def _torrent_state_guard(self) -> threading.RLock:
@@ -4232,6 +4761,9 @@ class WebAppApi(IPhoneApiMixin):
         db = getattr(manager, "db", None)
         if db is None:
             return ""
+        bump = getattr(db, "bump_ui_state_version", None)
+        if callable(bump):
+            return str(bump())  # atomic: a read-then-set lost concurrent bumps (DB-8)
         try:
             version = int(db.get_state("ui_state_version", "0") or 0)
         except (TypeError, ValueError):
@@ -4260,11 +4792,16 @@ class WebAppApi(IPhoneApiMixin):
                 # Return the old marker and force the next poll to rebuild.
                 self._ui_state_cache.invalidate()
                 return payload
+            expires_at = payload.get("state_expires_at")
+            if expires_at:
+                return self._ui_state_cache.store(version, payload, expires_at=expires_at)
             return self._ui_state_cache.store(version, payload)
 
     def _settings_payload(self) -> dict[str, Any]:
         apply_jimaku_trial(self.config)
         cfg = self.config
+        if cfg.jimaku.trial_active:
+            _note_state_deadline(cfg.jimaku.trial_expires_at)
         ln_settings = self.light_novels.settings() if hasattr(self, "light_novels") else None
         study_plugins = mpv_study_status(
             jiten_api_key=str(getattr(ln_settings, "jiten_api_key", "") or ""),
@@ -4326,9 +4863,10 @@ class WebAppApi(IPhoneApiMixin):
             "subsplease_rss_preferred": True,
             "torrents_enabled": self._torrent_enabled_state(),
             "torrents_configured": self._downloads_configured(),
-            "nyaa_url": cfg.nyaa.base_url,
+            "sources": load_sources(cfg).to_dict(),
             "proxy_mode": cfg.nyaa.proxy_mode,
-            "proxy_url": cfg.nyaa.proxy_url,
+            # The window gets the address with its password masked (it stays in config.toml).
+            "proxy_url": mask_url_password(cfg.nyaa.proxy_url),
             "search_hook": cfg.nyaa.pre_search_command,
             "min_score": cfg.nyaa.min_release_score,
             "preferred_resolution": cfg.nyaa.preferred_resolution,
@@ -4337,6 +4875,7 @@ class WebAppApi(IPhoneApiMixin):
             "require_japanese_audio": cfg.nyaa.require_japanese_audio,
             "avoid_upscaled": cfg.nyaa.avoid_upscaled,
             "only_trusted_groups": cfg.nyaa.only_trusted_groups,
+            "allow_camrips": cfg.nyaa.allow_camrips,
             "trusted_groups": ", ".join(cfg.nyaa.trusted_groups),
             "preferred_groups": ", ".join(cfg.nyaa.preferred_groups),
             "blocked_groups": ", ".join(cfg.nyaa.blocked_groups),
@@ -4382,6 +4921,7 @@ class WebAppApi(IPhoneApiMixin):
             if cfg.jimaku.trial_active
             else 0,
             "jimaku_key_problem": jimaku_key_problem(cfg),
+            "anilist_removal_notice": self._anilist_removal_notice(),
             "ocr_image_subtitles": cfg.matching.ocr_image_subtitles,
             "ocr_counts_as_ready": cfg.matching.ocr_counts_as_ready,
             "auto_upgrade_subtitles": cfg.matching.auto_upgrade_subtitles,
@@ -4411,6 +4951,7 @@ class WebAppApi(IPhoneApiMixin):
             "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
             "shortcut_mpv_explain_subtitle": cfg.shortcuts.mpv_explain_subtitle,
             "shortcut_mpv_skip_segment": cfg.shortcuts.mpv_skip_segment,
+            **mpv_line_shortcut_settings(cfg.shortcuts),
             "shortcut_screen_text": cfg.shortcuts.screen_text_toggle,
             "screen_recording_allowed": self.visual_novels._screen_recording_access()
             if getattr(self, "visual_novels", None) is not None
@@ -4424,11 +4965,14 @@ class WebAppApi(IPhoneApiMixin):
             "manga_mokuro_python": cfg.tools.manga_mokuro_python,
             "manga_background_ocr": cfg.tools.manga_background_ocr,
             "mpv_study_plugins": study_plugins,
+            # mpv is optional: Settings says what needs it instead of failing at playback.
+            "mpv_installed": bool(find_tool("mpv", str(cfg.tools.mpv or ""))),
             "energy_monitoring_enabled": cfg.diagnostics.energy_monitoring_enabled,
             "energy_sample_seconds": cfg.diagnostics.energy_sample_seconds,
             "energy_log_path": str(ENERGY_LOG_PATH),
             "power_manual_energy_saving": cfg.power.manual_energy_saving,
             "power_auto_battery_energy_saving": cfg.power.auto_battery_energy_saving,
+            "low_ram_mode": cfg.power.low_ram_mode,
             "power_policy": power_policy,
             "light_novels": self.light_novels.settings_payload() if hasattr(self, "light_novels") else {},
         }
@@ -4436,19 +4980,50 @@ class WebAppApi(IPhoneApiMixin):
     def power_status(self, refresh: bool = False) -> dict[str, Any]:
         return self.manager.work_scheduler.power_snapshot(refresh=bool(refresh))
 
+    STORAGE_STATUS_MAX_AGE_SECONDS = 30.0
+    # What the window shows of it at once (the pause banner): a background check that changes
+    # one of these brings a new state; changed numbers come with the next build.
+    STORAGE_BANNER_KEYS = ("downloads_paused", "paused_reason", "over_limit", "limited", "space_limited")
+
     def _storage_payload(self, *, refresh: bool) -> dict[str, int | float | bool]:
+        """The library's storage status. One older than 30 s is answered as it is and checked
+        again in the background: the check walks every file of the library, and every Home
+        build after a pause (a window reopened after hours, a cold disk) walked it first."""
         now = time.monotonic()
-        if (
-            refresh
-            or self._last_storage_status is None
-            or now - getattr(self, "_last_storage_checked_at", 0.0) >= 30.0
-        ):
+        if refresh or self._last_storage_status is None:
             invalidate = getattr(self.manager, "invalidate_storage_snapshot", None)
             if refresh and callable(invalidate):
                 invalidate()
             self._last_storage_status = self.manager.storage_status()
             self._last_storage_checked_at = now
+        elif now - getattr(self, "_last_storage_checked_at", 0.0) >= self.STORAGE_STATUS_MAX_AGE_SECONDS:
+            self._last_storage_checked_at = now  # one check per period, also when it fails
+            self._check_storage_later()
         return dict(self._last_storage_status)
+
+    def _check_storage_later(self) -> None:
+        with _STORAGE_CHECK_LOCK:
+            running = getattr(self, "_storage_check_thread", None)
+            if running is not None and running.is_alive():
+                return
+
+            def check() -> None:
+                previous = dict(self._last_storage_status or {})
+                try:
+                    status = self.manager.storage_status()
+                    self._last_storage_status = status
+                    self._last_storage_checked_at = time.monotonic()
+                    if any(previous.get(key) != status.get(key) for key in self.STORAGE_BANNER_KEYS):
+                        self._ui_state_cache.invalidate()
+                        self._bump_ui_state_version()
+                except Exception as exc:  # noqa: BLE001 - the last status stays until the next check
+                    logger = getattr(self, "logger", None)
+                    if logger is not None:
+                        logger.warning("FAIL step=storage.status_check error=%r", str(exc)[:200])
+
+            thread = threading.Thread(target=check, name=f"{APP_SLUG}-storage-check", daemon=True)
+            self._storage_check_thread = thread
+            thread.start()
 
     @staticmethod
     def _download_number(raw: dict[str, Any], *keys: str) -> int:
@@ -4527,25 +5102,183 @@ class WebAppApi(IPhoneApiMixin):
             "error": str(raw.get("error_message") or raw.get("error") or ""),
         }
 
+    WEEKLY_LOAD_SECONDS = 7 * 86400
+
+    def _weekly_load_payload(
+        self, current_anime: list[LibraryAnime], *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Episodes the watched titles bring in the next 7 days (the Anime page header).
+
+        A personal schedule counts its items unlocking in that time and replaces the
+        airing schedule of its title. An airing title counts its next episode when it
+        airs in that time (AniList gives only the next one). One query, no network.
+        """
+        current = time.time() if now is None else float(now)
+        until = current + self.WEEKLY_LOAD_SECONDS
+        scheduled = self.manager.db.personal_release_upcoming_counts(current, until)
+        items: list[dict[str, Any]] = []
+        for anime in current_anime:
+            media_id = int(anime.media_id)
+            if media_id in scheduled:
+                count, source = scheduled[media_id], "schedule"
+            elif str(anime.media_status or "").upper() == "RELEASING":
+                airs_at = anime.next_airing_at
+                count, source = (1 if airs_at and current < float(airs_at) <= until else 0), "airing"
+            else:
+                continue
+            if count > 0:
+                items.append(
+                    {"media_id": media_id, "title": str(anime.title), "count": count, "source": source}
+                )
+        items.sort(key=lambda row: (-int(row["count"]), str(row["title"]).casefold()))
+        return {"total": sum(int(row["count"]) for row in items), "items": items}
+
     def _get_state(self, *, refresh_storage: bool) -> dict[str, Any]:
         # A Home snapshot fans out through many repository helpers. Reusing one
         # per-thread SQLite connection avoids reparsing the full schema for every
         # helper while keeping ordinary DB calls independently transactional.
-        with self.manager.db.connection_scope():
+        with (
+            memory_step(self.logger, "ui.state_build"),
+            self.manager.db.connection_scope(),
+            AnimeManager.library_ignore_memo(),
+            self._build_memo(),
+        ):
+            memo = _BUILD_MEMO.get()
+            if memo is not None and "laps" not in memo:
+                memo["laps"], memo["lap_at"] = [], time.perf_counter()
+            started = time.perf_counter()
             version = self.manager.db.get_state("ui_state_version", "")
             payload = self._get_state_scoped(refresh_storage=refresh_storage)
             payload["ui_state_version"] = version
+            # When a clock-computed value (an airing, unlock or deletion time) passes:
+            # the cache treats the snapshot as stale then and the page asks again.
+            memo = _BUILD_MEMO.get() or {}
+            payload["state_expires_at"] = memo.get("deadline")
+            self._log_slow_state_build((time.perf_counter() - started) * 1000, memo.get("laps") or [])
             return payload
+
+    def _log_slow_state_build(self, total_ms: float, laps: list[tuple[str, float]]) -> None:
+        """One TIMING line for a slow Home build: its sections, and how long ago the last build
+        ran (a build after hours closed met a cold process and cold caches)."""
+        now = time.monotonic()
+        previous = float(getattr(self, "_last_state_build_at", 0.0) or 0.0)
+        self._last_state_build_at = now
+        if total_ms < STATE_BUILD_SLOW_MS:
+            return
+        timed = [(name, seconds * 1000) for name, seconds in laps]
+        timed.append(("rest", max(0.0, total_ms - sum(ms for _, ms in timed))))
+        sections = ",".join(f"{name}:{ms:.0f}" for name, ms in timed)
+        self.logger.info(
+            "TIMING step=ui.state_build total_ms=%.0f since_last_build_s=%s thread=%s sections=%s",
+            total_ms,
+            f"{now - previous:.0f}" if previous else "first",
+            threading.current_thread().name,
+            sections,
+        )
+
+    @contextmanager
+    def _build_memo(self) -> Iterator[None]:
+        """Rows every Home helper re-read, loaded once per build (WEBFLOW-6).
+
+        The episodes table was read about eight times in full plus two to three times
+        per title, and the unfinished downloads seven times. Outside a build the
+        helpers read the database as before.
+        """
+        if _BUILD_MEMO.get() is not None:
+            yield
+            return
+        token = _BUILD_MEMO.set({})
+        try:
+            yield
+        finally:
+            _BUILD_MEMO.reset(token)
+
+    def _build_episodes(self, media_id: int | None = None) -> list[Any]:
+        memo = _BUILD_MEMO.get()
+        if memo is None:
+            return self.manager.db.episodes(media_id) if media_id is not None else self.manager.db.episodes()
+        if "episodes" not in memo:
+            rows = list(self.manager.db.episodes())
+            by_media: dict[int, list[Any]] = {}
+            for item in rows:
+                if item.media_id is not None:
+                    by_media.setdefault(int(item.media_id), []).append(item)
+            memo["episodes"], memo["by_media"] = rows, by_media
+        if media_id is None:
+            return list(memo["episodes"])
+        return list(memo["by_media"].get(int(media_id), ()))
+
+    def _build_incomplete(self) -> tuple[Path, ...]:
+        memo = _BUILD_MEMO.get()
+        if memo is None:
+            return self.manager.incomplete_download_paths()
+        if "incomplete" not in memo:
+            memo["incomplete"] = tuple(self.manager.incomplete_download_paths())
+        return memo["incomplete"]
+
+    def _build_path_within(self, path: Path, roots: tuple[Path, ...]) -> bool:
+        """``manager._path_within`` answered once per file and roots inside a Home build.
+
+        Five helpers ask it for the same episodes, each a realpath walk of the file
+        (about a third of a build on a 200-title probe library).
+        """
+        memo = _BUILD_MEMO.get()
+        if memo is None:
+            return self.manager._path_within(path, roots)
+        answers = memo.setdefault("path_within", {})
+        key = (str(path), roots)
+        if key not in answers:
+            answers[key] = bool(self.manager._path_within(path, roots))
+        return answers[key]
+
+    def _build_japanese_subtitles_required(self, media_id: int | None) -> bool:
+        """The title's subtitle policy, read once per title inside a Home build.
+
+        Each episode of each title asked again: one SQLite query per episode (2,675 of them
+        for a 120-title probe library). Outside a build the manager is asked as before.
+        """
+        memo = _BUILD_MEMO.get()
+        if memo is None or media_id is None:
+            return self.manager.japanese_subtitles_required(media_id)
+        policy = memo.setdefault("japanese_subtitles_required", {})
+        key = int(media_id)
+        if key not in policy:
+            policy[key] = bool(self.manager.japanese_subtitles_required(key))
+        return policy[key]
+
+    def _state_build_guard(self) -> threading.RLock:
+        """One Home snapshot build at a time (WEBFLOW-6).
+
+        Push, the poll bridge and the poll worker that missed the cache after one
+        version bump each built the full snapshot (~1.4 s on a large library) at once.
+        """
+        guard = getattr(self, "_state_build_lock", None)
+        if guard is None:
+            with self._torrent_state_guard():
+                guard = getattr(self, "_state_build_lock", None)
+                if guard is None:
+                    guard = self._state_build_lock = threading.RLock()
+        return guard
 
     def _get_state_scoped(self, *, refresh_storage: bool) -> dict[str, Any]:
         all_anime = self.manager.db.anime_list()
+        for anime in all_anime:
+            _note_state_deadline(anime.next_airing_at)  # released_episodes counts it then
         current_anime = [anime for anime in all_anime if anime.status == "CURRENT"]
         planned_anime = [anime for anime in all_anime if anime.status == "PLANNING"]
         anime_by_id = {anime.media_id: anime for anime in all_anime}
+        memo = _BUILD_MEMO.get()
+        if memo is not None:
+            # Every row of the table (_ready_queue_items looks the relations of each card up here).
+            memo["anime_by_id"] = anime_by_id
+        _build_lap("anime_list")
         download_rows = self.manager.db.downloads()
         downloads = [self._download_payload(item, anime_by_id) for item in download_rows]
         download_by_media: dict[int, dict[str, Any]] = {}
         download_by_episode: dict[tuple[int, int], dict[str, Any]] = {}
+        # The title's download still under way, whatever episode it holds.
+        unfinished_by_media: dict[int, dict[str, Any]] = {}
+        finished_without_file: set[str] = set()
 
         def download_rank(download: dict[str, Any]) -> tuple[int, float]:
             return (
@@ -4563,6 +5296,14 @@ class WebAppApi(IPhoneApiMixin):
             previous = download_by_media.get(key)
             if previous is None or download_rank(download) < download_rank(previous):
                 download_by_media[key] = download
+            if not row.is_batch and self._finished_download_file_gone(row):
+                finished_without_file.add(str(row.torrent_hash))
+            if self._download_wanted_without_card(row, anime_by_id.get(key)):
+                previous_unfinished = unfinished_by_media.get(key)
+                if previous_unfinished is None or download_rank(download) < download_rank(
+                    previous_unfinished
+                ):
+                    unfinished_by_media[key] = download
             raw_episode = download.get("media_episode")
             if raw_episode is None:
                 raw_episode = download.get("episode")
@@ -4578,13 +5319,29 @@ class WebAppApi(IPhoneApiMixin):
                 if exact is not None:
                     return exact
             fallback = download_by_media.get(int(media_id))
-            return fallback if fallback is not None and bool(fallback.get("is_batch")) else None
+            if fallback is None:
+                return None
+            fallback_episode = fallback.get("media_episode")
+            covers = self._download_covers_title(
+                anime_by_id.get(int(media_id)),
+                is_batch=bool(fallback.get("is_batch")),
+                episode=fallback_episode if fallback_episode is not None else fallback.get("episode"),
+            )
+            if (
+                covers
+                and not fallback.get("is_batch")
+                and str(fallback.get("torrent_hash")) in finished_without_file
+            ):
+                return None
+            return fallback if covers else None
 
+        _build_lap("downloads")
         ready_by_media = {
             int(item["media_id"]): item
             for item in self._downloaded_payloads(anime_by_id)
             if item.get("media_id") is not None
         }
+        _build_lap("ready")
         current = [self._anime_payload(a, relations=False) for a in current_anime]
         for payload in current:
             download = download_for_episode(int(payload["media_id"]), payload.get("next_episode"))
@@ -4598,8 +5355,20 @@ class WebAppApi(IPhoneApiMixin):
                 payload["ready_episodes"] = list(ready.get("ready_episodes") or [])
                 payload["ready_count"] = int(ready.get("ready_count") or 0)
                 payload["all_episodes_ready"] = bool(ready.get("all_episodes_ready"))
-                if payload.get("local") is None:
-                    payload["local"] = ready.get("local")
+                ready_local = ready.get("local") if isinstance(ready.get("local"), dict) else None
+                # Only the next unwatched episode is offered: the card said "episode 2
+                # ready" with a Watch button while episode 1 was not downloaded. A movie,
+                # an unnumbered file or a title watched to the end keeps its first file.
+                if (
+                    payload.get("local") is None
+                    and ready_local is not None
+                    and (
+                        str(anime.format or "").upper() == "MOVIE"
+                        or ready_local.get("episode") in (None, anime.next_episode)
+                        or bool(anime.episodes and int(anime.progress or 0) >= int(anime.episodes))
+                    )
+                ):
+                    payload["local"] = ready_local
             download = download_for_episode(int(anime.media_id), payload.get("next_episode"))
             if download is not None and not self._download_shadowed_by_local(payload, download):
                 payload["download"] = download
@@ -4608,10 +5377,13 @@ class WebAppApi(IPhoneApiMixin):
                 downloads=download_rows,
             )
             planned.append(payload)
+        _build_lap("current_planned")
         # Episodes reach the window once, inside "library" (the flat "episodes"
         # copy and the unused "downloaded" list are gone from this payload).
-        home = self._home_sections(current_anime, anime_by_id)
+        queued_releases = self._queued_release_payloads()
+        home = self._home_sections(current_anime, anime_by_id, queued_releases)
         home["recently_watched"] = self._recently_watched_payloads(anime_by_id)
+        _build_lap("home")
 
         def _attach_download(card: dict[str, Any]) -> None:
             if card.get("kind") == "watch_sequence":
@@ -4645,13 +5417,24 @@ class WebAppApi(IPhoneApiMixin):
         # A Planning batch has no local episode yet, so historically it vanished
         # from Home until the entire batch finished. Surface it immediately in
         # Waiting for preparation and keep the live torrent status attached.
+        # Any other download still under way for a title without a card is shown the
+        # same way (a title not on the list, Completed or Rewatching, a file without an
+        # episode number): only the matched downloads of Current and Planning titles
+        # were. Once finished it gives way to the file's own card (Ready, waiting for
+        # subtitles); a torrent left seeding after its file was watched brings no card.
+        # A Dropped or removed title's leftover (Torrents off then) stays in Downloads.
         for media_id in download_by_media:
             anime = anime_by_id.get(media_id)
             if anime is None or media_id in represented:
                 continue
-            if str(anime.status or "").upper() not in {"CURRENT", "PLANNING"}:
+            if self._is_future_unreleased(anime):
                 continue
-            download = download_for_episode(media_id, anime.next_episode)
+            list_status = str(anime.status or "").upper()
+            download = None
+            if list_status in {"CURRENT", "PLANNING"}:
+                download = download_for_episode(media_id, anime.next_episode)
+            if download is None and list_status not in {"DROPPED", "REMOVED"}:
+                download = unfinished_by_media.get(media_id)
             if download is None:
                 continue
             card = self._anime_payload(anime, relations=False)
@@ -4659,7 +5442,7 @@ class WebAppApi(IPhoneApiMixin):
             home.setdefault("waiting", []).append(card)
             represented.add(media_id)
         episode_title_by_path = {
-            str(item.video_path): str(item.title or "") for item in self.manager.db.episodes()
+            str(item.video_path): str(item.title or "") for item in self._build_episodes()
         }
         jobs = []
         for row in self.manager.db.subtitle_jobs():
@@ -4690,13 +5473,23 @@ class WebAppApi(IPhoneApiMixin):
                     "error": str(row["last_error"] or ""),
                 }
             )
+        _build_lap("waiting_jobs")
+        weekly_load = self._weekly_load_payload(current_anime)
+        library = self._library_payloads(anime_by_id)
+        _build_lap("library")
+        settings = self._settings_payload()
+        _build_lap("settings")
+        storage = self._storage_payload(refresh=refresh_storage)
+        _build_lap("storage")
         return {
             "branding": {"name": APP_NAME, "slug": APP_SLUG, "bundle_id": APP_BUNDLE_ID},
             "current": current,
             "planned": planned,
             "home": home,
-            "library": self._library_payloads(anime_by_id),
+            "weekly_load": weekly_load,
+            "library": library,
             "downloads": downloads,
+            "queued_releases": queued_releases,
             "torrent_waiting_count": sum(
                 1
                 for item in downloads
@@ -4708,17 +5501,33 @@ class WebAppApi(IPhoneApiMixin):
             "playlists": self._playlist_payloads(),
             "active_playbacks": self._active_playbacks_payload(),
             "integrity_last_run": self.manager.db.get_state("integrity_last_run", ""),
-            "settings": self._settings_payload(),
+            "settings": settings,
             "synced_at": self.manager.db.get_state("anilist_synced_at", ""),
+            "anilist_status": self._anilist_status_payload(),
             "ready_state_version": self.manager.db.get_state("ready_state_version", ""),
             "ui_state_version": self.manager.db.get_state("ui_state_version", ""),
-            "storage": self._storage_payload(refresh=refresh_storage),
+            "storage": storage,
             "safe_mode": self.safe_mode.status(run_checks=False),
+            "background_agent": {"error": str(getattr(self, "_scheduled_agent_error", "") or "")},
         }
 
-    def ready_state_version(self) -> str:
-        """Cheap cross-process marker for newly prepared Ready episodes."""
-        return self.manager.db.get_state("ready_state_version", "")
+    def _anilist_status_payload(self) -> dict[str, Any]:
+        """What waits for AniList and why, for Settings → AniList."""
+        from .anilist_tracking import pending_summary
+        from .providers.anilist import anilist_refusal, token_marked_invalid
+
+        db = self.manager.db
+        try:
+            summary = pending_summary(db)
+        except Exception:  # noqa: BLE001 - a status line must never break the window
+            summary = {"episodes": 0, "titles": 0, "statuses": 0}
+        token = str(self.config.anilist.access_token or "").strip()
+        return {
+            **summary,
+            "last_error": db.get_state("anilist_last_error", ""),
+            "token_invalid": bool(token) and token_marked_invalid(token),
+            "refused": anilist_refusal(),
+        }
 
     def ui_state_versions(self) -> dict[str, str]:
         """Return tiny cross-process invalidation markers without rebuilding UI state."""
@@ -4734,7 +5543,7 @@ class WebAppApi(IPhoneApiMixin):
         # follows reuses one SQLite connection instead of reopening/reparsing the
         # schema for every repository helper.
         with timed_step(self.logger, "web.get_state"):
-            with self.manager.db.connection_scope():
+            with self.manager.db.connection_scope(), self._state_build_guard():
                 payload = self._get_state(refresh_storage=False)
                 return self._store_ui_state_snapshot(payload)
 
@@ -4749,24 +5558,113 @@ class WebAppApi(IPhoneApiMixin):
         # one connection. The torrent lock is still held only around cache state,
         # never around the expensive snapshot build.
         with self.manager.db.connection_scope():
-            lock = self._torrent_state_guard()
-            with lock:
-                version = self.manager.db.get_state("ui_state_version", "")
-                cached = self._ui_state_cache.get(version)
+            cached = self._cached_ui_state()
+            if cached is not None:
+                return cached
+            # Callers that miss together wait for one build and take its result.
+            with self._state_build_guard():
+                cached = self._cached_ui_state()
                 if cached is not None:
-                    settings = cached.get("settings")
-                    if isinstance(settings, dict):
-                        settings["torrents_enabled"] = bool(self._torrent_session_enabled)
                     return cached
-            payload = self._get_state(refresh_storage=False)
-            return self._store_ui_state_snapshot(payload)
+                payload = self._get_state(refresh_storage=False)
+                return self._store_ui_state_snapshot(payload)
 
-    def get_state_delta(self, ui_state_version: str = "") -> dict[str, Any]:
-        version = self.manager.db.get_state("ui_state_version", "")
-        if str(ui_state_version) == version:
-            return {"changed": False, "ui_state_version": version}
-        state = self.get_state_fast()
-        return {"changed": True, "ui_state_version": version, "state": state}
+    UI_SNAPSHOT_FILE = "window-state.json.gz"
+
+    def get_state_snapshot(self) -> dict[str, Any]:
+        """The last Home snapshot at once, for the window's first paint (stale-while-revalidate).
+
+        A window coming back (Low RAM mode or a close ended its process; a new launch) drew
+        nothing until a full build finished: 1.7 s after a night closed, then two more builds
+        followed. The page paints this answer and builds the real state with get_state() at the
+        same time. Nothing is built here: the snapshot in memory (also a stale one), else the one
+        saved on disk when the page was let go. ``fresh``: it still matches the library.
+        """
+        empty: dict[str, Any] = {"state": None, "source": "", "fresh": False}
+        if bool(getattr(getattr(self, "safe_mode", None), "active", False)):
+            return empty
+        started = time.perf_counter()
+        cache = getattr(self, "_ui_state_cache", None)
+        snapshot, source = (cache.latest() if cache is not None else None), "memory"
+        if snapshot is None:
+            snapshot, source = read_snapshot_file(self._ui_snapshot_path(), self._ui_snapshot_stamp()), "disk"
+            if snapshot is not None:
+                # Saved by an earlier launch: its covers point at that launch's page server.
+                rebase_asset_urls(snapshot.payload, snapshot.asset_base, str(getattr(self, "asset_base", "")))
+        if snapshot is None:
+            return empty
+        try:
+            fresh = snapshot.fresh(self.manager.db.get_state("ui_state_version", ""))
+        except Exception:  # noqa: BLE001 - a first paint never fails the window
+            fresh = False
+        settings = snapshot.payload.get("settings")
+        if isinstance(settings, dict):
+            with self._torrent_state_guard():
+                settings["torrents_enabled"] = bool(getattr(self, "_torrent_session_enabled", False))
+        self.logger.info(
+            "EVENT ui.state_snapshot source=%s fresh=%s age_s=%.0f ms=%.1f",
+            source,
+            fresh,
+            max(0.0, time.time() - float(snapshot.stored_at)),
+            (time.perf_counter() - started) * 1000,
+        )
+        return {"state": snapshot.payload, "source": source, "fresh": fresh}
+
+    def _ui_snapshot_path(self) -> Path:
+        return Path(self.config.paths.cache_dir).expanduser() / self.UI_SNAPSHOT_FILE
+
+    def _ui_snapshot_stamp(self) -> dict[str, Any]:
+        """What a snapshot on disk must match to be painted: this code (an update changes the
+        page and the payload) and this library file (a restore or another library replaces it)."""
+        code = []
+        for path in (Path(__file__), Path(__file__).with_name("web") / "index.html"):
+            try:
+                info = path.stat()
+                code.append(f"{info.st_size}:{info.st_mtime_ns}")
+            except OSError:
+                code.append("")
+        db_path = Path(self.manager.db.path)
+        try:
+            info = db_path.stat()
+            db_id: list[int] | None = [int(info.st_dev), int(info.st_ino)]
+        except OSError:
+            db_id = None
+        return {"app": __version__, "code": code, "db": str(db_path), "db_id": db_id}
+
+    def _persist_ui_state_snapshot(self, *, release_memory: bool = False) -> int:
+        """Save the last Home snapshot for the window's next first paint (bytes written).
+
+        ``release_memory`` (Low RAM mode, the page let go): the copy in memory goes too; nothing
+        here needs it while the window is closed, and the next poll or iPhone request builds it.
+        """
+        cache = getattr(self, "_ui_state_cache", None)
+        snapshot = cache.latest() if cache is not None else None
+        if snapshot is None:
+            return 0
+        try:
+            written = write_snapshot_file(
+                self._ui_snapshot_path(),
+                snapshot,
+                self._ui_snapshot_stamp(),
+                asset_base=str(getattr(self, "asset_base", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - only a faster next paint is lost
+            self.logger.warning("FAIL step=ui.state_snapshot_save error=%r", str(exc)[:200])
+            return 0
+        released = bool(release_memory) and cache.discard(snapshot)
+        self.logger.info("EVENT ui.state_snapshot_saved kb=%.0f released=%s", written / 1024, released)
+        return written
+
+    def _cached_ui_state(self) -> dict[str, Any] | None:
+        lock = self._torrent_state_guard()
+        with lock:
+            version = self.manager.db.get_state("ui_state_version", "")
+            cached = self._ui_state_cache.get(version)
+            if cached is not None:
+                settings = cached.get("settings")
+                if isinstance(settings, dict):
+                    settings["torrents_enabled"] = bool(self._torrent_session_enabled)
+            return cached
 
     def torrent_downloads(
         self,
@@ -4802,6 +5700,7 @@ class WebAppApi(IPhoneApiMixin):
             "enabled": self._downloads_enabled(),
             "configured": self._downloads_configured(),
             "downloads": [self._download_payload(item, anime_by_id) for item in rows],
+            "queued": self._queued_release_payloads(media_id),
             "storage": self._storage_payload(refresh=False),
             "network_guard": network_guard,
             "warning": warning,
@@ -4963,16 +5862,6 @@ class WebAppApi(IPhoneApiMixin):
         finally:
             self._torrent_traffic_lock.release()
 
-    def _paused_torrent_count(self) -> int:
-        db = getattr(getattr(self, "manager", None), "db", None)
-        loader = getattr(db, "downloads", None)
-        if not callable(loader):
-            return 0
-        try:
-            return sum(1 for item in loader() if not download_complete(item))
-        except Exception:
-            return 0
-
     def _resume_incomplete_torrent_jobs(self) -> int:
         with self._torrent_start_guard():
             if not self._torrent_enabled_state():
@@ -4989,9 +5878,67 @@ class WebAppApi(IPhoneApiMixin):
             rows = [item for item in loader() if not download_complete(item)]
         except Exception:
             return 0
-        if not rows:
-            return 0
+        resumed = self._resume_unfinished_torrents(rows, clients) if rows else 0
+        return resumed + self._resume_torrents_paused_by_pudge(clients)
 
+    def _resume_torrents_paused_by_pudge(self, clients: Any) -> int:
+        """Torrent On: start again what Pudge stopped while torrents were off, finished ones too.
+
+        A finished pack then seeds to the client's ratio/time goal, after which its
+        watched episodes are deleted one by one. The window's Pause/Stop all stay.
+        A record is cleared once its torrent started, or every client said it has none;
+        a client that could not be asked keeps it for the next Torrent On.
+        """
+        listing = getattr(getattr(self, "manager", None), "torrents_paused_by_pudge_temporarily", None)
+        if not callable(listing):
+            return 0
+        try:
+            wanted = list(listing())
+        except Exception as exc:  # noqa: BLE001 - the regular resume already ran
+            self.logger.warning("FAIL step=torrent.resume_pudge_paused error=%r", str(exc)[:200])
+            return 0
+        if not wanted:
+            return 0
+        started: set[str] = set()
+        unknown: set[str] = set()
+        # Hashes at least one client answered for: "every client said it has none" needs a
+        # client that said so (none running, a backend off: the records stay for next time).
+        asked: set[str] = set()
+        for backend, client in clients():
+            try:
+                for torrent_hash in wanted:
+                    if torrent_hash in started:
+                        continue
+                    lookup = getattr(client, "lookup_torrent", None)
+                    try:
+                        snapshot = (lookup if callable(lookup) else client.torrent_status)(torrent_hash)
+                        asked.add(torrent_hash)
+                        if snapshot is None:
+                            continue
+                        client.start(torrent_hash)
+                        started.add(torrent_hash)
+                    except Exception as exc:  # noqa: BLE001 - tried again at the next Torrent On
+                        unknown.add(torrent_hash)
+                        self.logger.info(
+                            "SKIP step=torrent.resume_pudge_paused backend=%s hash=%s error=%r",
+                            backend,
+                            torrent_hash,
+                            str(exc)[:200],
+                        )
+            finally:
+                client.close()
+        self._note_pudge_torrent_resume(
+            [value for value in wanted if value in started or (value in asked and value not in unknown)]
+        )
+        self.logger.info(
+            "DONE step=torrent.resume_pudge_paused started=%s kept=%s gone=%s",
+            len(started),
+            len(set(wanted) - started - (asked - unknown)),
+            len((asked - unknown) - started),
+        )
+        return len(started)
+
+    def _resume_unfinished_torrents(self, rows: list[Any], clients: Any) -> int:
         resumed = 0
         for backend, client in clients():
             try:
@@ -5010,6 +5957,7 @@ class WebAppApi(IPhoneApiMixin):
                         continue
                     try:
                         client.start(torrent_hash)
+                        self._note_pudge_torrent_resume([torrent_hash])
                         resumed += 1
                     except Exception as exc:
                         self.logger.debug(
@@ -5052,7 +6000,31 @@ class WebAppApi(IPhoneApiMixin):
                     # Resume retained jobs before discovering new downloads.
                     resumed = int(self._resume_incomplete_torrent_jobs() or 0)
                 if current and self._torrent_enabled_state():
-                    started = int(self.manager.auto_search_current() or 0)
+                    # Turned on: queued releases that gave up get their tries back.
+                    store = getattr(self.manager, "queued_releases", None)
+                    if store is not None:
+                        try:
+                            store.reset_attempts()
+                        except Exception as exc:  # noqa: BLE001 - the search still runs
+                            self.logger.warning("RETRY step=release.queue_reset error=%r", str(exc))
+
+                    # Torrent Off (or a newer click) cancels the search between requests:
+                    # Off's background half waits for this guard and must not wait for
+                    # minutes of release searches.
+                    def still_on() -> bool:
+                        return (
+                            generation is None
+                            or generation == int(getattr(self, "_torrent_toggle_generation", 0))
+                        ) and bool(self._torrent_enabled_state())
+
+                    cancellable = getattr(self.manager, "release_search_cancellable", None)
+                    # Turning Torrents On asks for a search now: missed episodes are searched too.
+                    bypass = getattr(self.manager, "ignore_auto_search_backoff", None)
+                    with (
+                        cancellable(still_on) if callable(cancellable) else nullcontext(),
+                        bypass() if callable(bypass) else nullcontext(),
+                    ):
+                        started = int(self.manager.auto_search_current() or 0)
         except Exception as exc:
             self.logger.warning("RETRY step=torrent.toggle_start error=%r", str(exc))
         finally:
@@ -5064,6 +6036,26 @@ class WebAppApi(IPhoneApiMixin):
                 resumed,
                 started,
             )
+
+    def resume_torrents_after_update(self) -> bool:
+        """Turn torrents back On after an update relaunch that found them On.
+
+        Every real launch starts Off; an installer relaunch in the background is
+        the same session continued, so the user's On is restored (once).
+        """
+        if not getattr(self, "_resume_torrents_after_update", False):
+            return False
+        self._resume_torrents_after_update = False
+        self.logger.info("EVENT torrent.resume_after_update")
+
+        def resume() -> None:
+            try:
+                self.set_torrents_enabled(True)
+            except Exception:  # noqa: BLE001 - the user can still turn them on
+                self.logger.exception("FAIL step=torrent.resume_after_update")
+
+        threading.Thread(target=resume, name="torrent-resume-after-update", daemon=True).start()
+        return True
 
     def set_torrents_enabled(self, enabled: bool) -> dict[str, Any]:
         requested = bool(enabled)
@@ -5172,17 +6164,17 @@ class WebAppApi(IPhoneApiMixin):
             )
         # On becomes visible to the background agent only after its config
         # was persisted, and only if a newer Off did not supersede this click.
+        # Not behind the start guard: an earlier On's release search (or an Off
+        # still waiting for it) holds that one, and the click must answer at
+        # once. The generation check under the shared lock keeps the order with
+        # Off's own publish.
         if requested and persisted:
-            with self._torrent_start_guard():
-                shared = self._torrent_shared_admission()
-                if shared is not None:
-                    with shared.locked():
-                        with lock:
-                            if (
-                                self._torrent_toggle_generation == generation
-                                and self._torrent_session_enabled
-                            ):
-                                shared.publish(True)
+            shared = self._torrent_shared_admission()
+            if shared is not None:
+                with shared.locked():
+                    with lock:
+                        if self._torrent_toggle_generation == generation and self._torrent_session_enabled:
+                            shared.publish(True)
         scheduled = False
         if requested and persisted and self._downloads_configured():
             supervisor = getattr(self, "task_supervisor", None)
@@ -5351,6 +6343,7 @@ class WebAppApi(IPhoneApiMixin):
                     )
                     for item in rows:
                         try:
+                            self._note_pudge_torrent_pause([item.torrent_hash], reason="stop_all")
                             client.pause(item.torrent_hash)
                             stopped += 1
                         except Exception as exc:
@@ -5397,9 +6390,11 @@ class WebAppApi(IPhoneApiMixin):
         try:
             for name, client in selected:
                 if command == "pause":
+                    self._note_pudge_torrent_pause([value], reason="window_pause")
                     client.pause(value)
                 elif command == "resume":
                     client.start(value)
+                    self._note_pudge_torrent_resume([value])
                 elif command == "reconnect":
                     reconnect = getattr(client, "reconnect", None)
                     if not callable(reconnect):
@@ -5421,14 +6416,27 @@ class WebAppApi(IPhoneApiMixin):
 
     def _sync_anilist(self) -> dict[str, Any]:
         with self._anilist_sync_lock:
-            with timed_step(self.logger, "web.anilist_sync"):
+            # The user asked for AniList now: one request may test a 403 cool-down,
+            # so a recovered AniList is noticed at once instead of after up to an hour.
+            with (
+                timed_step(self.logger, "web.anilist_sync"),
+                interactive_anilist_requests(),
+                probe_anilist_requests(),
+            ):
                 stats = self.manager.refresh_anilist_cache()
         return {"skipped": False, "stats": stats, "state": self.get_state()}
 
-    def startup_sync_anilist(self) -> dict[str, Any]:
+    def startup_sync_anilist(self, known_ui_state_version: str = "") -> dict[str, Any]:
+        """``known_ui_state_version``: the snapshot the page holds. A skipped sync (a window
+        reopened in a running app) rebuilt the whole Home snapshot (4.7 s on a cold reopen) for
+        a page that ignores a skipped answer's state: the page now gets none."""
         with self._anilist_sync_lock:
             if self._startup_anilist_sync_done:
-                return {"skipped": True, "stats": {"anime": 0, "covers": 0}, "state": self.get_state()}
+                return {
+                    "skipped": True,
+                    "stats": {"anime": 0, "covers": 0},
+                    **self._skipped_startup_state(known_ui_state_version),
+                }
             self._startup_anilist_sync_done = True
             try:
                 last_sync = float(self.manager.db.get_state("anilist_synced_at", "0") or 0)
@@ -5437,10 +6445,19 @@ class WebAppApi(IPhoneApiMixin):
             # run_startup_once may already have performed the periodic refresh.
             # Avoid contacting AniList twice within the same startup sequence.
             if time.time() - last_sync < 60:
-                return {"skipped": True, "stats": {"anime": 0, "covers": 0}, "state": self.get_state()}
-            with timed_step(self.logger, "startup.phase.anilist", order=2):
+                return {
+                    "skipped": True,
+                    "stats": {"anime": 0, "covers": 0},
+                    **self._skipped_startup_state(known_ui_state_version),
+                }
+            with timed_step(self.logger, "startup.phase.anilist", order=2), interactive_anilist_requests():
                 stats = self.manager.refresh_anilist_cache()
         return {"skipped": False, "stats": stats, "state": self.get_state()}
+
+    def _skipped_startup_state(self, known_ui_state_version: str) -> dict[str, Any]:
+        if str(known_ui_state_version or ""):
+            return {"state": None, "ui_state_version": self.manager.db.get_state("ui_state_version", "")}
+        return {"state": self.get_state_fast()}  # Python callers: the old shape, from the cache
 
     def sync_anilist(self) -> dict[str, Any]:
         return self._sync_anilist()
@@ -5465,6 +6482,8 @@ class WebAppApi(IPhoneApiMixin):
 
     def scan_watched_media_folders(self) -> dict[str, int]:
         """Cheap first-pass import of mixed watched folders before Refresh work."""
+        from .anime_audiobooks import is_anime_audiobook_path
+
         stats = {
             "light_novels": 0,
             "manga": 0,
@@ -5493,7 +6512,9 @@ class WebAppApi(IPhoneApiMixin):
                 for path in iterator:
                     if remaining <= 0:
                         break
-                    if not path.is_file():
+                    # AppleDouble "._x.mp3"/"._x.epub" (exFAT, NAS shares), __MACOSX/,
+                    # hidden folders: never media, and they failed again on every scan.
+                    if junk_path(path, root) or not path.is_file():
                         continue
                     candidates.append(path)
                     remaining -= 1
@@ -5506,6 +6527,8 @@ class WebAppApi(IPhoneApiMixin):
                 if suffix not in {".epub", ".txt", ".cbz", ".zip"}:
                     continue
                 kind = "light_novels" if suffix in {".epub", ".txt"} else "manga"
+                if kind == "light_novels" and software_path(path.relative_to(root)):
+                    continue  # package metadata / venv / repository text: never a book
                 signature = self._watched_import_signature([path])
                 if not signature or not self._watched_import_changed(kind, path, signature):
                     continue
@@ -5524,12 +6547,37 @@ class WebAppApi(IPhoneApiMixin):
                     self.logger.debug(
                         "Watched media import skipped kind=%s path=%s error=%s", kind, path, exc
                     )
+                    if kind == "light_novels" and permanent_import_failure(exc):
+                        # Not parsed again on every Refresh while the file stays as it is.
+                        self._mark_watched_import(kind, path, signature)
+
+            # Audio inside a video release (a BD batch's CDs/OST/, a soundtrack next to
+            # the episodes) is music, not an audiobook: it became one and queued hours
+            # of speech-to-text. The watched folder itself is no release.
+            video_dirs = {
+                path.parent.resolve() for path in candidates if path.suffix.casefold() in VIDEO_EXTENSIONS
+            }
+
+            def inside_video_release(folder: Path) -> bool:
+                for candidate in (folder, *folder.parents):
+                    if candidate == root or root not in candidate.parents:
+                        return False
+                    if candidate in video_dirs:
+                        return True
+                return False
 
             audio_by_parent: dict[Path, list[Path]] = {}
             for path in candidates:
                 if path.suffix.casefold() in AUDIOBOOK_EXTENSIONS:
                     audio_by_parent.setdefault(path.parent.resolve(), []).append(path.resolve())
             for parent, audio_files in audio_by_parent.items():
+                if inside_video_release(parent):
+                    continue
+                if is_anime_audiobook_path(parent):
+                    # Episodes made into audiobooks (the library folder is watched too): they
+                    # are books already. Imported again, every episode book lost its title and
+                    # chapter name to the file name and the folder became one more book.
+                    continue
                 audio_files.sort(key=lambda item: item.name.casefold())
                 grouped = parent != root and len(audio_files) > 1
                 targets = [(parent, audio_files)] if grouped else [(item, [item]) for item in audio_files]
@@ -5538,10 +6586,12 @@ class WebAppApi(IPhoneApiMixin):
                     if not signature or not self._watched_import_changed("audiobooks", target, signature):
                         continue
                     try:
+                        # No speech-to-text for what a folder scan finds: an audiobook
+                        # is transcribed once it is linked to its book or opened.
                         if grouped:
-                            self.audiobooks.import_folder(target)
+                            self.audiobooks.import_folder(target, prepare_transcription=False)
                         else:
-                            self.audiobooks.import_file(target)
+                            self.audiobooks.import_file(target, prepare_transcription=False)
                         self._mark_watched_import("audiobooks", target, signature)
                         stats["audiobooks"] += 1
                     except Exception as exc:
@@ -5635,10 +6685,6 @@ class WebAppApi(IPhoneApiMixin):
         finally:
             self._local_refresh_lock.release()
 
-    def refresh_all(self) -> dict[str, Any]:
-        # Backwards-compatible alias. This no longer contacts AniList.
-        return self.refresh_local()
-
     def set_anime_japanese_subtitles_required(self, media_id: int, required: bool) -> dict[str, Any]:
         value = self.manager.set_japanese_subtitles_required(int(media_id), bool(required))
         return {
@@ -5672,33 +6718,12 @@ class WebAppApi(IPhoneApiMixin):
                 fresh_jobs.append(row)
 
         preferred_paths = tuple(Path(str(row["video_path"])).expanduser().resolve() for row in fresh_jobs)
-        processed = 0
-        queued = False
         if preferred_paths:
-            with maintenance_lock(
-                self.config.paths.cache_dir,
-                blocking=False,
-            ) as maintenance_acquired:
-                if maintenance_acquired:
-                    with timed_step(
-                        self.logger,
-                        "web.subtitle_new_only",
-                        videos=len(preferred_paths),
-                    ):
-                        processed = int(
-                            self.manager.process_subtitle_jobs(
-                                limit=max(1, len(preferred_paths)),
-                                preferred_paths=preferred_paths,
-                            )
-                            or 0
-                        )
-                else:
-                    queued = True
-
+            self._prepare_subtitles_in_background("subtitle-new-only", preferred_paths)
         return {
             "eligible": len(preferred_paths),
-            "processed": processed,
-            "queued": queued,
+            "processed": 0,
+            "queued": bool(preferred_paths),
             "state": self.get_state(),
         }
 
@@ -5708,7 +6733,11 @@ class WebAppApi(IPhoneApiMixin):
         started = 0
         synced = 0
         warning = ""
-        with timed_step(self.logger, "web.release_search_manual"):
+        bypass = getattr(self.manager, "ignore_auto_search_backoff", None)
+        with (
+            timed_step(self.logger, "web.release_search_manual"),
+            bypass() if callable(bypass) else nullcontext(),
+        ):
             try:
                 started = int(self.manager.auto_search_current() or 0)
             except Exception as exc:
@@ -5733,10 +6762,84 @@ class WebAppApi(IPhoneApiMixin):
             "state": self.get_state(),
         }
 
+    def _manga_import_history_paths(self, log_paths: list[Path] | None = None) -> Iterator[Path]:
+        """Folders manga was imported or dropped from: import jobs and the log's drop lines."""
+        values: list[str] = []
+        with self.manga.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM app_jobs WHERE kind='import' ORDER BY created_at DESC"
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("media_kind") == "manga_folder":
+                values.extend(str(item) for item in payload.get("paths") or [])
+        if log_paths is None:
+            log_paths = [
+                DEFAULT_LOG_PATH,
+                *(DEFAULT_LOG_PATH.with_name(f"{DEFAULT_LOG_PATH.name}.{n}") for n in (1, 2, 3)),
+            ]
+        marker = "START step=app.drop_import paths="
+        for log_path in log_paths:
+            try:
+                with Path(log_path).open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        at = line.find(marker)
+                        if at < 0:
+                            continue
+                        try:
+                            dropped = ast.literal_eval(line[at + len(marker) :].strip())
+                        except (ValueError, SyntaxError):
+                            continue
+                        if isinstance(dropped, list):
+                            values.extend(str(item) for item in dropped)
+            except OSError:
+                continue
+        seen: set[Path] = set()
+        for value in values:
+            path = Path(value).expanduser()
+            # Dropped page images: the folder they are in.
+            if path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}:
+                path = path.parent
+            if path not in seen:
+                seen.add(path)
+                yield path
+
+    def _relink_manga_import_copies(self) -> None:
+        """Once: volumes earlier versions packed from dropped folders read those folders again."""
+        try:
+            if self.manga.imported_copies_relinked():
+                return
+            with timed_step(self.logger, "startup.manga_copies_relink"):
+                result = self.manga.relink_imported_copies(self._manga_import_history_paths())
+            self.logger.info(
+                "RESULT step=startup.manga_copies_relink copies=%s relinked=%s kept=%s roots=%s failed=%s freed_mb=%s",
+                result.get("copies", 0),
+                result.get("relinked", 0),
+                result.get("kept", 0),
+                result.get("roots", 0),
+                result.get("failed", 0),
+                result.get("freed_mb", 0),
+            )
+        except Exception as exc:
+            self.logger.warning("FAIL step=startup.manga_copies_relink error=%r", str(exc))
+
     def _run_startup_maintenance_background(self) -> None:
         stats: dict[str, Any] = {}
         error = ""
+        # Its own thread: walking the import folders never delays the launch steps.
+        threading.Thread(
+            target=self._relink_manga_import_copies, name=f"{APP_SLUG}-manga-copies-relink", daemon=True
+        ).start()
+        # Covers of entries Pudge made off the list (an OVA split from its series): from the
+        # cached relation graphs at once, not after the next AniList refresh.
+        threading.Thread(
+            target=self._repair_off_list_entries, name=f"{APP_SLUG}-off-list-metadata", daemon=True
+        ).start()
         try:
+            self._startup_planned_release_discovery(stats)
             try:
                 with timed_step(self.logger, "startup.light_novel_audiobook_recovery", order=0):
                     recovery = self._recover_light_novel_audiobook_downloads()
@@ -5764,8 +6867,63 @@ class WebAppApi(IPhoneApiMixin):
                 self._startup_maintenance_error = error
                 self._startup_maintenance_done = True
 
-    def startup_maintenance(self) -> dict[str, Any]:
-        """Start the complete launch maintenance pass without blocking the UI."""
+    def _repair_leaked_library_rows(self) -> int:
+        """Rows something other than Pudge's own scan left in this library (a benchmark run
+        against the real data): episodes in folders marked ``.pudge-ignore-library-scan``,
+        and anime rows titled with a release or file name. Idempotent, at every launch."""
+        changed = 0
+        try:
+            changed += self.manager.forget_isolated_library_episodes()
+        except Exception as exc:  # noqa: BLE001 - a repair never blocks the launch
+            self.logger.warning("FAIL step=library.isolated_episode error=%r", str(exc)[:200])
+        try:
+            titles = self.manager.repair_placeholder_anime_titles()
+            changed += int(titles.get("renamed", 0)) + int(titles.get("fetched", 0))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("FAIL step=anime.placeholder_titles error=%r", str(exc)[:200])
+        return changed
+
+    def _repair_off_list_entries(self) -> int:
+        changed = self._repair_leaked_library_rows()
+        try:
+            changed += self.manager.refresh_off_list_entry_metadata(cache_covers=True)
+        except Exception as exc:  # noqa: BLE001 - a cover never blocks the launch
+            self.logger.warning("FAIL step=anime.off_list_metadata error=%r", str(exc)[:200])
+        if changed:
+            # The next poll draws the cards again with their covers.
+            self._ui_state_cache.invalidate()
+            self._bump_ui_state_version()
+        return changed
+
+    def _startup_planned_release_discovery(self, stats: dict[str, Any]) -> None:
+        """Search premieres that came out while Pudge was closed, first thing at launch.
+
+        The scheduled agent is unloaded while Pudge is closed and launchd runs it
+        only after its first interval (5 minutes) once the window opens, so a
+        premiere that came out in between was offered minutes after the launch.
+        """
+        engine = getattr(self.manager, "planned_release_discovery", None)
+        db = getattr(self.manager, "db", None)
+        if not callable(engine) or db is None:
+            return
+        try:
+            from .planned_release_discovery import discovery_work_due
+
+            if not discovery_work_due(db):
+                return
+            with timed_step(self.logger, "startup.planned_release_discovery", order=0):
+                result = engine().tick(max_searches=4)
+            stats["planned_release_discovery"] = result
+            self.logger.info("RESULT step=startup.planned_release_discovery result=%s", result)
+        except Exception as exc:  # noqa: BLE001 - the agent searches again later
+            self.logger.warning("FALLBACK step=startup.planned_release_discovery error=%r", str(exc))
+
+    def startup_maintenance(self, known_ui_state_version: str = "") -> dict[str, Any]:
+        """Start the complete launch maintenance pass without blocking the UI.
+
+        ``known_ui_state_version``: the snapshot the page holds. A window reopened after the
+        pass finished got a forced full rebuild here (2.9 s on a cold reopen) of the state it
+        had just loaded: now the cached state, or none when the page's is current."""
         if bool(getattr(getattr(self, "safe_mode", None), "active", False)):
             return {
                 "skipped": True,
@@ -5785,7 +6943,7 @@ class WebAppApi(IPhoneApiMixin):
                     "done": True,
                     "stats": self._startup_maintenance_stats,
                     "error": self._startup_maintenance_error,
-                    "state": self.get_state(),
+                    **self._foreground_poll_state_payload(known_ui_state_version),
                 }
             if thread is None or not thread.is_alive():
                 thread = threading.Thread(
@@ -5799,8 +6957,11 @@ class WebAppApi(IPhoneApiMixin):
                     sys.platform == "darwin"
                     and self.manager.work_scheduler.background_wait_reason() is None
                     and not getattr(self, "_vn_prewarm_started", False)
+                    and self._visual_novels_used()
                 ):
                     # First PyObjC/Quartz import costs seconds; do it off the tab click.
+                    # Only for someone who captures visual novels: Quartz then stays loaded
+                    # (tens of MB) in every Pudge window that never opens that page.
                     self._vn_prewarm_started = True
                     threading.Thread(
                         target=self._prewarm_visual_novel_windows,
@@ -5816,20 +6977,27 @@ class WebAppApi(IPhoneApiMixin):
             "state": self.get_state_fast(),
         }
 
-    def startup_maintenance_status(self) -> dict[str, Any]:
+    def startup_maintenance_status(self, known_ui_state_version: str = "") -> dict[str, Any]:
+        """Startup maintenance progress, polled every second while it runs.
+
+        The page keeps the snapshot of a running poll only to render it once
+        maintenance ends (and the final answer carries a full one), so a caller that
+        says which version it holds gets no snapshot while maintenance runs: every
+        poll used to rebuild and send the whole Home snapshot (WEBFLOW-13).
+        """
         with self._startup_maintenance_lock:
             thread = self._startup_maintenance_thread
             running = bool(thread is not None and thread.is_alive())
             done = bool(self._startup_maintenance_done)
             stats = dict(self._startup_maintenance_stats)
             error = self._startup_maintenance_error
-        return {
-            "running": running,
-            "done": done,
-            "stats": stats,
-            "error": error,
-            "state": self.get_state_fast() if running else self.get_state(),
-        }
+        result: dict[str, Any] = {"running": running, "done": done, "stats": stats, "error": error}
+        if running and str(known_ui_state_version or ""):
+            result["state"] = None
+            result["ui_state_version"] = self.manager.db.get_state("ui_state_version", "")
+            return result
+        result["state"] = self.get_state_fast() if running else self.get_state()
+        return result
 
     def _foreground_poll_state_payload(self, known_ui_state_version: str = "") -> dict[str, Any]:
         """Return a full Home snapshot only when the caller is actually stale.
@@ -5853,13 +7021,71 @@ class WebAppApi(IPhoneApiMixin):
             "state": state,
         }
 
+    # A part of the Home snapshot at least this large is left out of a poll's answer when it
+    # did not change since the answer the page holds; smaller parts always go (the page edits
+    # some of them in place, e.g. settings, and a full answer used to reset them).
+    POLL_PATCH_MIN_BYTES = 16 * 1024
+
+    def _poll_state_digests(self, state: dict[str, Any]) -> dict[str, tuple[str, int]]:
+        """key -> (digest, encoded bytes) of each top-level part of a Home snapshot (only when a
+        changed state is answered; nothing of the snapshot is kept here)."""
+        digests: dict[str, tuple[str, int]] = {}
+        for key, value in state.items():
+            try:
+                data = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode(
+                    "utf-8", errors="surrogatepass"
+                )
+            except (TypeError, ValueError):
+                digests[key] = ("", 0)  # never left out
+                continue
+            digests[key] = (hashlib.blake2b(data, digest_size=16).hexdigest(), len(data))
+        return digests
+
+    def _poll_state_answer(self, payload: dict[str, Any], state_token: str) -> dict[str, Any]:
+        """A full poll answer, or (the page holds the last poll's snapshot: ``state_token``) only
+        the parts that changed since then (``state_patch``) and the ones gone (``state_removed``).
+        The page merges them over the snapshot it holds: the same state as a full answer.
+        Every answer with a state carries the token the page sends back next time."""
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            if payload.get("state") is None and "ui_state_version" in payload:
+                sent = getattr(self, "_poll_state_sent", None)
+                if sent is not None and state_token and state_token == sent[0]:
+                    payload["state_token"] = sent[0]  # unchanged: the page's snapshot stays valid
+            return payload
+        digests = self._poll_state_digests(state)
+        sent = getattr(self, "_poll_state_sent", None)
+        token = secrets.token_hex(8)
+        self._poll_state_sent = (token, {key: digest for key, (digest, _size) in digests.items()})
+        payload["state_token"] = token
+        if not state_token or sent is None or state_token != sent[0]:
+            return payload
+        previous = sent[1]
+        patch = {
+            key: value
+            for key, value in state.items()
+            if not digests[key][0]
+            or digests[key][1] < self.POLL_PATCH_MIN_BYTES
+            or previous.get(key) != digests[key][0]
+        }
+        payload["state"] = None
+        payload["state_patch"] = patch
+        payload["state_removed"] = [key for key in previous if key not in state]
+        payload["state_base"] = state_token
+        return payload
+
     def poll_downloads_and_subtitles(
         self,
         known_ui_state_version: str = "",
         has_active_downloads: bool = True,
         window_active: bool = True,
+        state_token: str = "",
     ) -> dict[str, Any]:
-        """Coalesce expensive work; never await subtitle preparation on the bridge."""
+        """Coalesce expensive work; never await subtitle preparation on the bridge.
+
+        ``state_token``: the page holds exactly the snapshot of the poll answer that carried
+        it; a changed state then comes back as the parts that changed (a large library's
+        snapshot is MBs, sent again on every download-progress version)."""
         lock = getattr(self, "_download_poll_schedule_lock", None)
         if lock is None:
             lock = self._download_poll_schedule_lock = threading.Lock()
@@ -5884,13 +7110,16 @@ class WebAppApi(IPhoneApiMixin):
             hint = self.manager.db.subtitle_job_poll_hint()
         except Exception:
             hint = {}
-        return {
-            "skipped": False,
-            "running": worker.is_alive(),
-            "stats": dict(getattr(self, "_download_poll_result", {})),
-            "subtitle_poll_hint": hint,
-            **self._foreground_poll_state_payload(known_ui_state_version),
-        }
+        return self._poll_state_answer(
+            {
+                "skipped": False,
+                "running": worker.is_alive(),
+                "stats": dict(getattr(self, "_download_poll_result", {})),
+                "subtitle_poll_hint": hint,
+                **self._foreground_poll_state_payload(known_ui_state_version),
+            },
+            str(state_token or ""),
+        )
 
     FOREGROUND_POLL_SUMMARY_SECONDS = 300.0
 
@@ -5966,7 +7195,11 @@ class WebAppApi(IPhoneApiMixin):
             # Polls run up to every 2 s: START/DONE are DEBUG, with an INFO summary every 5 minutes.
             with timed_step(self.logger, "foreground.poll", level=logging.DEBUG, mode="downloads-only"):
                 try:
-                    self.manager.reconcile_completed_download_rows()
+                    reconcile = getattr(self.manager, "reconcile_completed_download_rows_from_poll", None)
+                    if callable(reconcile):
+                        reconcile()  # reruns only on a change (WEBFLOW-8)
+                    else:
+                        self.manager.reconcile_completed_download_rows()
                     self.manager.reconcile_prepared_subtitle_rows()
                     completed_paths: tuple[Path, ...] = ()
                     qbt_synced = False
@@ -5978,9 +7211,17 @@ class WebAppApi(IPhoneApiMixin):
                         # User-visible active downloads retain the old cadence.
                         qbt_interval = 15.0 if bool(has_active_downloads) else 60.0
                         if now_mono - last_qbt >= qbt_interval:
+                            sync_error: Exception | None = None
                             with timed_step(self.logger, "foreground.qbittorrent", level=logging.DEBUG):
-                                stats["downloads"] = self.manager.sync_downloads()
+                                try:
+                                    stats["downloads"] = self.manager.sync_downloads()
+                                except Exception as exc:  # noqa: BLE001 - reported once below, no traceback
+                                    sync_error = exc
+                            # A failed sync (aria2 idle, qBittorrent closed) waits the same interval:
+                            # it used to be retried on every 1-2 s poll, logging a traceback each time.
                             self._last_foreground_qbt_sync = time.monotonic()
+                            if sync_error is not None:
+                                raise sync_error
                             completed_paths = self.manager.last_completed_video_paths
                             qbt_synced = True
                         else:
@@ -6077,6 +7318,19 @@ class WebAppApi(IPhoneApiMixin):
                                         limit=min(2, max(1, due_count))
                                     )
 
+                        if completed_paths:
+                            # OP/ED detection for the new episodes right away (its own
+                            # thread and rules), not at the end of the next maintenance pass:
+                            # an episode played minutes after it finished had no skip.
+                            request_intro = getattr(self.manager, "request_intro_detection", None)
+                            if callable(request_intro):
+                                try:
+                                    request_intro(completed_paths, reason="download_complete")
+                                except Exception as exc:  # noqa: BLE001 - optional feature
+                                    self.logger.warning(
+                                        "FAIL step=intro_skipper.new_episodes error=%r", str(exc)[:200]
+                                    )
+
                         post_hint = subtitle_hint()
                         queued_manual = int(post_hint.get("priority_count", 0) or 0)
                         if queued_manual:
@@ -6099,6 +7353,9 @@ class WebAppApi(IPhoneApiMixin):
                             stats["qbittorrent_tag_cleanup_throttled"] = 1
 
                     missing_rows = int(self.manager._last_missing_episode_rows or 0)
+                    # Read once: only sync_downloads resets it, and it is throttled,
+                    # so every poll until then repeated the whole search.
+                    self.manager._last_missing_episode_rows = 0
                     if missing_rows:
                         # An externally deleted torrent/file used to leave a stale
                         # episode row that blocked the missing-episode search. Run
@@ -6129,8 +7386,52 @@ class WebAppApi(IPhoneApiMixin):
         finally:
             self._download_poll_lock.release()
 
+    def _drop_shelf_snapshot(self) -> dict[str, dict[int, str]]:
+        """Series key of every book already in the literature libraries, before a drop."""
+        readers = {
+            "light_novel": self.light_novels.shelf_keys,
+            "manga": self.manga.shelf_keys,
+            "audiobook": self._audiobook_ids_for_drop,
+        }
+        snapshot: dict[str, dict[int, str]] = {}
+        for kind, read in readers.items():
+            try:
+                snapshot[kind] = read()
+            except Exception as exc:
+                self.logger.debug("SKIP step=app.drop_import_snapshot kind=%s error=%r", kind, str(exc))
+                snapshot[kind] = {}
+        return snapshot
+
+    def _audiobook_ids_for_drop(self) -> dict[int, str]:
+        with self.audiobooks.db.connect() as conn:
+            return {int(row["id"]): "" for row in conn.execute("SELECT id FROM audiobooks")}
+
+    @staticmethod
+    def _dropped_folder_videos(folder: Path, *, limit: int = 2000) -> list[Path]:
+        """Video files in a dropped folder and its subfolders (hidden ones skipped)."""
+        # Hidden folders are pruned instead of walked (a dropped project folder with a
+        # .git, or a whole disk, listed every entry and sorted them all before this).
+        found: list[Path] = []
+        for current, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            base = Path(current)
+            for name in filenames:
+                if name.startswith(".") or Path(name).suffix.casefold() not in VIDEO_EXTENSIONS:
+                    continue
+                path = base / name
+                if path.is_file():
+                    found.append(path)
+        return sorted(found)[:limit]
+
     def import_dropped_paths(self, values: list[str]) -> dict[str, Any]:
-        """Route Finder drops without doing post-import network/audio work inline."""
+        """Route Finder drops without doing post-import network/audio work inline.
+
+        Each import says what became of its file (``status``): ``new``, ``series``
+        (it joined a series that was already in the library, ``series_title``) or
+        ``existing`` (the same file was already there and was refreshed in place).
+        Files that could not be imported are listed in ``failed`` with the reason.
+        A drop of several files used to tell the window only about the first one.
+        """
         started_at = time.monotonic()
         paths: list[Path] = []
         for raw in values or []:
@@ -6143,26 +7444,104 @@ class WebAppApi(IPhoneApiMixin):
 
         imports: list[dict[str, Any]] = []
         errors: list[str] = []
+        failed: list[dict[str, str]] = []
         image_paths: list[Path] = []
+        ln_conflicts: list[dict[str, Any]] = []
         image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+        before = self._drop_shelf_snapshot() if paths else {}
+        shelves = {kind: set(keys.values()) for kind, keys in before.items()}
 
-        def record(kind: str, page: str, payload: dict[str, Any], source: Path) -> None:
-            row = {"kind": kind, "page": page, "source": str(source), **payload}
+        def record(
+            kind: str, page: str, payload: dict[str, Any], source: Path, status: str | None = None
+        ) -> None:
+            row = {"kind": kind, "page": page, "source": str(source), "name": source.name, **payload}
+            book = payload.get("book") if isinstance(payload.get("book"), dict) else {}
+            if status is None:
+                series_key = str(book.get("series_key") or "")
+                if int(payload.get("id") or 0) in before.get(kind, {}):
+                    status = "existing"
+                elif series_key and series_key in shelves.get(kind, set()):
+                    status = "series"
+                else:
+                    status = "new"
+            row["status"] = status
+            if status == "series":
+                row["series_title"] = str(book.get("series_title") or payload.get("title") or "")
             imports.append(row)
 
+        def fail(name: str, source: Path, reason: object) -> None:
+            errors.append(f"{name}: {reason}")
+            failed.append({"name": name, "source": str(source), "error": str(reason)})
+
+        # Big files take a while: a drop of several tells the window which one it is on.
+        # Loose images are collected below and imported together as one step.
+        steps = [path for path in paths if path.is_dir() or path.suffix.casefold() not in image_extensions]
+        total_steps = len(steps) + (1 if len(steps) < len(paths) else 0)
+        done_steps = 0
+
+        def progress(name: str) -> None:
+            nonlocal done_steps
+            done_steps += 1
+            if total_steps > 1:
+                self._dispatch_drop_event(
+                    "pudge-files-import-progress",
+                    {"current": done_steps, "total": total_steps, "name": name},
+                )
+
         for path in paths:
+            if path.is_dir() or path.suffix.casefold() not in image_extensions:
+                progress(path.name)
             if path.is_dir():
                 try:
                     audio_files = [
                         item
                         for item in path.iterdir()
-                        if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+                        if item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+                        and not junk_part(item.name)
+                        and item.is_file()
                     ]
                     # pudge-v0.7.23-nested-manga-drop-v1
                     # Manga torrents are often unpacked as pack/volume/page trees.
-                    images = self.manga.discover_image_files(path, limit=50000)
+                    # An audiobook folder's cover.jpg is not a manga: it used to
+                    # add a one-page manga next to the audiobook.
+                    videos = [] if audio_files else self._dropped_folder_videos(path)
+                    # Audio only in subfolders: a multi-disc book (CD1/, CD2/) or a
+                    # collection of books. Videos come first, so an anime folder with
+                    # an OST/ subfolder stays anime; images come last (the covers).
+                    nested_audio = (
+                        not audio_files and not videos and bool(self.audiobooks._folder_files(path))
+                    )
+                    images = (
+                        []
+                        if audio_files or videos or nested_audio
+                        else self.manga.discover_image_files(path, limit=50000)
+                    )
                 except OSError as exc:
-                    errors.append(f"{path.name}: {exc}")
+                    fail(path.name, path, exc)
+                    continue
+                if videos:
+                    # An anime folder (a season pack, episodes) from anywhere, also outside
+                    # the Library and the watched folders: matched as a watched folder is.
+                    try:
+                        episodes = self.manager.import_dropped_media_folder(path)
+                    except Exception as exc:
+                        fail(path.name, path, exc)
+                        continue
+                    if not episodes:
+                        fail(path.name, path, err("web.dropFolderNoAnime"))
+                    for episode in episodes:
+                        record(
+                            "anime",
+                            "current",
+                            {
+                                "media_id": episode.media_id,
+                                "episode": episode.episode,
+                                "title": episode.title,
+                                "video_path": str(episode.video_path),
+                            },
+                            episode.video_path,
+                            "new",
+                        )
                     continue
                 if audio_files:
                     try:
@@ -6178,7 +7557,29 @@ class WebAppApi(IPhoneApiMixin):
                             path,
                         )
                     except Exception as exc:
-                        errors.append(f"{path.name}: {exc}")
+                        fail(path.name, path, exc)
+                if nested_audio:
+                    try:
+                        targets = self.audiobooks.folder_import_targets(path)
+                    except Exception as exc:
+                        fail(path.name, path, exc)
+                        targets = []
+                    for target in targets:
+                        try:
+                            book = self.audiobooks.import_folder(target)
+                        except Exception as exc:
+                            fail(target.name, target, exc)
+                            continue
+                        record(
+                            "audiobook",
+                            "audiobooks",
+                            {
+                                "id": int(book["id"]),
+                                "title": str(book.get("title") or target.name),
+                                "book": book,
+                            },
+                            target,
+                        )
                 if images:
                     image_paths.extend(images)
                 continue
@@ -6186,7 +7587,11 @@ class WebAppApi(IPhoneApiMixin):
             suffix = path.suffix.casefold()
             try:
                 if suffix in {".epub", ".txt"}:
-                    imported = self.light_novels.import_file(path, explicit=True)
+                    try:
+                        imported = self.light_novels.import_file(path, explicit=True, on_conflict="ask")
+                    except LightNovelImportConflict as conflict:
+                        ln_conflicts.append(self._remember_ln_import_conflict(conflict))
+                        continue
                     book = self.light_novels.drop_card(int(imported["id"]))
                     book["paired_audio"] = self.audiobooks.link_for_light_novel(int(book["id"]))
                     record(
@@ -6246,6 +7651,10 @@ class WebAppApi(IPhoneApiMixin):
                         path,
                     )
                 elif suffix in VIDEO_EXTENSIONS:
+                    try:
+                        known_episode = self.manager.db.episode_by_path(path) is not None
+                    except Exception:
+                        known_episode = False
                     episode = self.manager.import_local_video(path)
                     record(
                         "anime",
@@ -6257,13 +7666,16 @@ class WebAppApi(IPhoneApiMixin):
                             "video_path": str(episode.video_path),
                         },
                         path,
+                        "existing" if known_episode else "new",
                     )
                 else:
-                    errors.append(f"{path.name}: unsupported file type")
+                    fail(path.name, path, err("web.dropUnsupportedType"))
             except Exception as exc:
-                errors.append(f"{path.name}: {exc}")
+                fail(path.name, path, exc)
 
         if image_paths:
+            if len(steps) < len(paths):
+                progress(image_paths[0].parent.name)
             try:
                 books = self.manga.import_image_groups(image_paths)
                 for book in books:
@@ -6279,20 +7691,35 @@ class WebAppApi(IPhoneApiMixin):
                     )
             except Exception as exc:
                 errors.append(f"images: {exc}")
+                failed.append(
+                    {"name": image_paths[0].parent.name, "source": str(image_paths[0]), "error": str(exc)}
+                )
 
         result = {
             "ok": bool(imports),
             "imports": imports,
             "focus": imports[0] if imports else None,
             "errors": errors,
+            "failed": failed,
+            # Books whose title is already in the library: the window asks Keep both / Replace.
+            "ln_conflicts": ln_conflicts,
         }
+        if any(item.get("kind") == "light_novel" for item in imports):
+            # The window may have read the library while the drop was still running
+            # (after the first volume, before the last): a snapshot older than this
+            # version lacks some of the dropped books.
+            try:
+                result["light_novel_state_version"] = self.light_novels.mark_changed()
+            except Exception as exc:
+                self.logger.debug("SKIP step=app.drop_import_version error=%r", str(exc))
         self.logger.info(
-            "DONE step=app.drop_import duration_ms=%.1f paths=%s imports=%s errors=%s kinds=%s",
+            "DONE step=app.drop_import duration_ms=%.1f paths=%s imports=%s errors=%s kinds=%s statuses=%s",
             (time.monotonic() - started_at) * 1000.0,
             len(paths),
             len(imports),
             len(errors),
             [item.get("kind") for item in imports],
+            [item.get("status") for item in imports],
         )
         return result
 
@@ -6307,24 +7734,33 @@ class WebAppApi(IPhoneApiMixin):
         output_dir.mkdir(parents=True, exist_ok=True)
         path = self._audiobook_generation_manifest_path(output_dir)
         data = {"schema": 1, **payload, "updated_at": time.time()}
-        temporary = path.with_suffix(".tmp.json")
-        try:
-            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        atomic_write_json(path, data, ensure_ascii=False, indent=2)
 
-    def _audiobook_generation_manifest(self, book_id: int) -> dict[str, Any] | None:
+    # A v92 generation folder: "<title> [Generated 12]" / "<title> [Irodori 12]" (book 12).
+    _GENERATION_FOLDER_BOOK = re.compile(r"\[(?:Generated|Irodori) (0|[1-9][0-9]*)\]$")
+
+    def _audiobook_generation_manifests(self) -> dict[int, dict[str, Any]]:
+        """The unfinished audiobook generation of every book, by book id (one walk of the folder).
+
+        The Light novels state asked for each book on its own, and each ask read every manifest
+        in "Generated Audiobooks" (and listed the folder again): books × generations file reads
+        whenever the tab was opened or refreshed.
+        """
         root = self._audiobook_generation_root()
         if not root.is_dir():
-            return None
-        best: tuple[float, dict[str, Any]] | None = None
+            return {}
+        best: dict[int, tuple[float, dict[str, Any]]] = {}
         for path in root.glob("*/.pudge-audiobook-generation.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
                 continue
-            if not isinstance(payload, dict) or int(payload.get("book_id") or 0) != int(book_id):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                book_id = int(payload.get("book_id") or 0)
+                stamp = float(payload.get("updated_at") or 0.0)
+            except (TypeError, ValueError):
                 continue
             state = str(payload.get("state") or "")
             if state in {"succeeded", "cancelled"}:
@@ -6334,35 +7770,46 @@ class WebAppApi(IPhoneApiMixin):
                 continue
             payload = dict(payload)
             payload["output_dir"] = str(output_dir)
-            stamp = float(payload.get("updated_at") or 0.0)
-            if best is None or stamp > best[0]:
-                best = (stamp, payload)
-        if best is not None:
-            return best[1]
+            if book_id not in best or stamp > best[book_id][0]:
+                best[book_id] = (stamp, payload)
+        manifests = {book_id: payload for book_id, (_stamp, payload) in best.items()}
 
         # v92 compatibility: a process killed before v93 has no manifest yet.
         # A stale marker or chunk directory is enough to offer an explicit resume.
-        suffixes = (f"[Generated {int(book_id)}]", f"[Irodori {int(book_id)}]")
         for output_dir in root.iterdir():
-            if not output_dir.is_dir() or not output_dir.name.endswith(suffixes):
+            match = self._GENERATION_FOLDER_BOOK.search(output_dir.name)
+            if match is None or int(match.group(1)) in manifests or not output_dir.is_dir():
                 continue
             if not (
                 (output_dir / ".pudge-audiobook-generating").exists()
                 or (output_dir / ".pudge-audiobook-parts").is_dir()
             ):
                 continue
-            return {
+            try:
+                updated_at = output_dir.stat().st_mtime
+            except OSError:
+                continue
+            book_id = int(match.group(1))
+            manifests[book_id] = {
                 "schema": 0,
-                "book_id": int(book_id),
+                "book_id": book_id,
                 "mode": "generate",
                 "state": "interrupted",
                 "current": 0.0,
                 "total": 0.0,
                 "output_dir": str(output_dir),
                 "message": t("web.audiobookGenerationInterrupted"),
-                "updated_at": output_dir.stat().st_mtime,
+                "updated_at": updated_at,
             }
-        return None
+        return manifests
+
+    def _audiobook_generation_manifest(
+        self, book_id: int, manifests: dict[int, dict[str, Any]] | None = None
+    ) -> dict[str, Any] | None:
+        """The book's unfinished generation; ``manifests``: an index made for many books at once."""
+        index = self._audiobook_generation_manifests() if manifests is None else manifests
+        found = index.get(int(book_id))
+        return dict(found) if found is not None else None
 
     def _audiobook_link_kind(self, book_id: int, link: dict[str, Any] | None = None) -> str:
         link = (
@@ -6376,22 +7823,50 @@ class WebAppApi(IPhoneApiMixin):
         raw_path = str(book.get("path") or "").strip()
         if not raw_path:
             return "ordinary"
-        path = Path(raw_path).expanduser()
+        return "generated" if self._generated_audiobook_folder(Path(raw_path).expanduser()) else "ordinary"
+
+    def _generated_audiobook_folder(self, path: Path) -> bool:
+        """A folder Pudge's own audiobook generation made (the only audiobook files it deletes)."""
         try:
             root = self._audiobook_generation_root().resolve()
             resolved = path.resolve()
-            under_generated_root = resolved == root or root in resolved.parents
+            under_generated_root = root in resolved.parents
         except OSError:
             under_generated_root = self._audiobook_generation_root() in path.parents
-        if under_generated_root and path.is_dir() and (path / ".pudge-audiobook-profile.json").is_file():
-            return "generated"
-        return "ordinary"
+        return bool(
+            under_generated_root and path.is_dir() and (path / ".pudge-audiobook-profile.json").is_file()
+        )
+
+    def _remove_generation_output(self, output_dir: Path) -> bool:
+        """Delete an audiobook generation's folder, only when it is one Pudge made under
+        "Generated Audiobooks" (a manifest without ``output_dir`` named "." — the current folder,
+        "/" for the app — and a stale one could name anything)."""
+        text = str(output_dir or "").strip()
+        try:
+            root = self._audiobook_generation_root().resolve()
+            resolved = Path(text).expanduser().resolve() if text else None
+        except OSError:
+            resolved = None
+        if (
+            resolved is None
+            or root not in resolved.parents
+            or not resolved.is_dir()
+            or not (
+                (resolved / ".pudge-audiobook-profile.json").is_file()
+                or self._audiobook_generation_manifest_path(resolved).is_file()
+            )
+        ):
+            self.logger.warning("SKIP step=audiobook_generation.remove reason=not_generated path=%r", text)
+            return False
+        shutil.rmtree(resolved, ignore_errors=True)
+        return True
 
     def _irodori_tts_status(
         self,
         book_id: int,
         *,
         paired_audio: dict[str, Any] | None = None,
+        manifests: dict[int, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         book_id = int(book_id)
         with self._irodori_tts_lock:
@@ -6400,7 +7875,7 @@ class WebAppApi(IPhoneApiMixin):
             thread_alive = bool(thread is not None and thread.is_alive())
             control = str(self._audiobook_generation_controls.get(book_id) or "")
         paired_kind = self._audiobook_link_kind(book_id, paired_audio)
-        manifest = self._audiobook_generation_manifest(book_id)
+        manifest = self._audiobook_generation_manifest(book_id, manifests)
         job = self.job_center.get(job_id) if job_id else None
         if thread_alive and job is not None:
             state = str(job.get("state") or "running")
@@ -6469,11 +7944,13 @@ class WebAppApi(IPhoneApiMixin):
         self._schedule_light_novel_audiobook_recovery("state", min_interval=60.0)
         state = self.light_novels.state()
         active_irodori = False
+        # One walk of "Generated Audiobooks" for every book (it was one per book).
+        manifests = self._audiobook_generation_manifests()
         for book in state.get("books", []):
             book_id = int(book["id"])
             paired_audio = self.audiobooks.link_for_light_novel(book_id)
             book["paired_audio"] = paired_audio
-            status = self._irodori_tts_status(book_id, paired_audio=paired_audio)
+            status = self._irodori_tts_status(book_id, paired_audio=paired_audio, manifests=manifests)
             book["irodori_tts"] = status
             active_irodori = active_irodori or bool(status.get("active"))
         state["irodori_tts_active"] = active_irodori
@@ -6746,10 +8223,11 @@ class WebAppApi(IPhoneApiMixin):
             tried = self._manga_background_ocr_tried = {}
         now = time.time()
         with self.manga.db.connect() as conn:
-            ids = [
-                int(row["id"])
-                for row in conn.execute("SELECT id FROM manga_books ORDER BY updated_at DESC, id DESC")
-            ]
+            rows = conn.execute(
+                "SELECT id,path FROM manga_books ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        # A volume whose archive or folder is gone waits for Find….
+        ids = [int(row["id"]) for row in rows if not self.manga.source_missing(str(row["path"] or ""))]
         for book_id in ids:
             # Finished volumes are remembered for a day and a volume that still
             # has unreadable pages is retried twice a day at most, so an idle
@@ -6941,6 +8419,8 @@ class WebAppApi(IPhoneApiMixin):
                         "-m",
                         "pip",
                         "install",
+                        # pip kept every download (~800 MB with torch) in ~/Library/Caches/pip.
+                        "--no-cache-dir",
                         "--upgrade",
                         "pip",
                         f"mokuro=={version}",
@@ -7214,6 +8694,7 @@ class WebAppApi(IPhoneApiMixin):
                     "-m",
                     "pip",
                     "install",
+                    "--no-cache-dir",
                     "--upgrade",
                     "pip",
                     "mokuro",
@@ -7323,6 +8804,25 @@ class WebAppApi(IPhoneApiMixin):
             + packages,
             encoding="utf-8",
         )
+
+    def manga_ocr_running_books(self, book_ids: list[int]) -> dict[str, bool]:
+        """Which of these volumes still have an OCR job (no database work; FE-3).
+
+        The library's OCR pollers ask this for every active volume at once and fetch
+        the full status of a volume only when its job has ended.
+        """
+        wanted = []
+        for value in book_ids or []:
+            try:
+                wanted.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        with self._manga_book_ocr_lock:
+            threads = {book_id: self._manga_book_ocr_threads.get(book_id) for book_id in wanted}
+        return {
+            str(book_id): bool(thread is not None and thread.is_alive())
+            for book_id, thread in threads.items()
+        }
 
     def manga_ocr_book_status(self, book_id: int) -> dict[str, Any]:
         book_id = int(book_id)
@@ -7494,7 +8994,12 @@ class WebAppApi(IPhoneApiMixin):
             region_texts = self.manga.cached_region_texts(book_id)
             parse_errors: list[str] = []
             parsed_count = 0
-            for page_index, text in region_texts:
+            # Bubbles go to Jiten as arrays (a few requests per volume, background priority),
+            # each stored under its own study key for the reader.
+            chunk_size = 200
+            for chunk_start in range(0, len(region_texts), chunk_size):
+                chunk = region_texts[chunk_start : chunk_start + chunk_size]
+                page_index = chunk[0][0]
                 if cancel_event is not None and cancel_event.is_set():
                     with self._manga_book_ocr_lock:
                         self._manga_book_ocr_state[book_id] = {
@@ -7520,8 +9025,13 @@ class WebAppApi(IPhoneApiMixin):
                         "errors": parse_errors,
                     }
                 try:
-                    self.light_novels.parse_study_text(text)
-                    parsed_count += 1
+                    parse_many = getattr(self.light_novels, "parse_study_texts", None)
+                    if parse_many is not None:
+                        parse_many([text for _page, text in chunk])
+                    else:
+                        for _page, text in chunk:
+                            self.light_novels.parse_study_text(text)
+                    parsed_count += len(chunk)
                 except LightNovelError as exc:
                     if not parse_errors:
                         parse_errors.append(str(exc))
@@ -7726,14 +9236,35 @@ class WebAppApi(IPhoneApiMixin):
                 thread.start()
         return self.manga_ocr_book_status(book_id)
 
-    def manga_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
-        return self.manga.nearby_mokuro(int(book_id))
-
-    def import_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
+    def choose_manga_location(self, book_id: int) -> dict[str, Any]:
+        """Find…: pick where a volume's moved archive or image folder is now (native picker)."""
         book_id = int(book_id)
-        if self.manga_ocr_book_status(book_id).get("running"):
-            raise RuntimeError(err("manga.stopOcrBeforeMokuro"))
-        return self.manga.import_nearby_mokuro(book_id)
+        if self.window is None:
+            return {"cancelled": True}
+        row = self.manga._book(book_id)
+        old = Path(str(row["path"] or ""))
+        start = next((item for item in old.parents if item.is_dir()), Path.home())
+        try:
+            import webview
+
+            if self.manga.folder_volume(old):
+                result = self.window.create_file_dialog(
+                    webview.FOLDER_DIALOG, directory=str(start), allow_multiple=False
+                )
+            else:
+                result = self.window.create_file_dialog(
+                    webview.OPEN_DIALOG,
+                    directory=str(start),
+                    allow_multiple=False,
+                    file_types=("Manga (*.cbz;*.zip)",),
+                )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        chosen = result[0] if isinstance(result, (list, tuple)) else result
+        book = self.manga.relink_book(book_id, Path(str(chosen)))
+        return {"cancelled": False, "book": book, "state": self._manga_state_payload()}
 
     def choose_manga_mokuro(self, book_id: int) -> dict[str, Any]:
         """Use a native file picker; never accept untrusted browser-supplied paths."""
@@ -7759,97 +9290,6 @@ class WebAppApi(IPhoneApiMixin):
         if self.manga_ocr_book_status(book_id).get("running"):
             raise RuntimeError(err("manga.ocrStartedDuringMokuro"))
         return {"cancelled": False, **self.manga.import_mokuro(book_id, Path(str(chosen)))}
-
-    def choose_manga_file(self) -> dict[str, Any]:
-        if self.window is None:
-            return {"cancelled": True}
-        try:
-            import webview
-
-            result = self.window.create_file_dialog(
-                webview.OPEN_DIALOG,
-                directory=str(Path.home()),
-                allow_multiple=True,
-                file_types=("Manga / Mokuro (*.cbz;*.zip;*.mokuro)",),
-            )
-        except Exception as exc:
-            return {"cancelled": True, "error": str(exc)}
-        if not result:
-            return {"cancelled": True}
-        selected = list(result) if isinstance(result, (list, tuple)) else [result]
-        paths = [str(value) for value in selected]
-        planned: dict[Path, Path | None] = {}
-        errors: list[str] = []
-        for raw in selected:
-            path = Path(str(raw)).expanduser().resolve()
-            if path.suffix.casefold() == ".mokuro":
-                try:
-                    archive = self.manga.archive_for_mokuro(path)
-                except Exception as exc:
-                    errors.append(f"{path.name}: {exc}")
-                    continue
-                previous = planned.get(archive)
-                if previous is not None and previous != path:
-                    errors.append(
-                        f"{path.name}: more than one Mokuro sidecar was selected for {archive.name}"
-                    )
-                    continue
-                planned[archive] = path
-            elif path.suffix.casefold() in {".cbz", ".zip"}:
-                planned.setdefault(path, None)
-            else:
-                errors.append(err("manga.unsupportedFile", name=path.name))
-        job_id = self.job_center.start(
-            "import",
-            t("web.jobImportManga"),
-            payload={"media_kind": "manga", "paths": paths},
-            total=max(1, len(planned)),
-        )
-        cancel_event = threading.Event()
-        self._import_cancel_events[job_id] = cancel_event
-        books: list[dict[str, Any]] = []
-        for index, (archive_path, explicit_mokuro) in enumerate(planned.items(), 1):
-            if cancel_event.is_set():
-                break
-            try:
-                book = self.manga.import_file(archive_path)
-                books.append(book)
-                mokuro_attempted = False
-                if explicit_mokuro is not None:
-                    mokuro_attempted = True
-                    self.manga.import_mokuro(
-                        int(book["id"]),
-                        explicit_mokuro,
-                        require_full_coverage=True,
-                    )
-                else:
-                    nearby = self.manga.nearby_mokuro(int(book["id"]))
-                    if nearby.get("available"):
-                        mokuro_attempted = True
-                        self.manga.import_nearby_mokuro(int(book["id"]))
-                if not mokuro_attempted and self._manga_ocr_backend_available():
-                    self.start_manga_ocr_book(int(book["id"]))
-            except Exception as exc:
-                errors.append(f"{archive_path.name}: {exc}")
-            self.job_center.update(
-                job_id,
-                state="running",
-                current=index,
-                total=max(1, len(planned)),
-                message=t("web.importProgress", done=len(books), total=max(1, len(planned))),
-            )
-        self._import_cancel_events.pop(job_id, None)
-        if cancel_event.is_set():
-            self.job_center.cancelled(job_id)
-        elif books:
-            self.job_center.finish(
-                job_id,
-                message=t("web.importedWithErrors", done=len(books), errors=len(errors)),
-                result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
-            )
-        else:
-            self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
-        return {"cancelled": False, "books": books, "errors": errors, "state": self._manga_state_payload()}
 
     def choose_manga_folder(self) -> dict[str, Any]:
         # Import all manga content recursively under one selected folder.
@@ -7879,7 +9319,9 @@ class WebAppApi(IPhoneApiMixin):
             [
                 path.resolve()
                 for path in source_root.rglob("*")
-                if path.is_file() and path.suffix.casefold() in {".cbz", ".zip"}
+                if path.suffix.casefold() in {".cbz", ".zip"}
+                and not junk_path(path, source_root)
+                and path.is_file()
             ],
             key=lambda path: str(path).casefold(),
         )
@@ -8047,6 +9489,32 @@ class WebAppApi(IPhoneApiMixin):
     def manga_mark_read(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.mark_read(int(book_id), int(page_index))
 
+    def _alias_manga_text_parse(self, text: str, raw_text: str) -> None:
+        """A manga box served with ellipses ("あ…い") uses the cached parse of its text as
+        recognized ("あ．．．い"): in the forms the reader and the statistics look it up by."""
+        from .manga_text_cleanup import remap_parse
+
+        forms = {
+            (re.sub(r"[\r\n]+", " ", text).strip(), re.sub(r"[\r\n]+", " ", raw_text).strip()),
+            (" ".join(text.split()), " ".join(raw_text.split())),
+        }
+        for served, recognized in forms:
+            self.light_novels.alias_study_parse(
+                served, recognized, lambda parsed, a=recognized, b=served: remap_parse(parsed, a, b)
+            )
+
+    def manga_spreads(self, book_id: int) -> dict[str, Any]:
+        """What the two-page mode shows together: the same table as the iPhone/iPad."""
+        return self.manga.spread_pages(int(book_id))
+
+    def manga_set_pair_shift(self, book_id: int, shift: bool = False) -> dict[str, Any]:
+        """ "Shift pairs by one page" for one volume (kept on the Mac, sent to phones)."""
+        return self.manga.set_pair_shift(int(book_id), bool(shift))
+
+    def manga_set_page_align(self, book_id: int, align: bool = True) -> dict[str, Any]:
+        """ "Align scanned pages" for one volume (kept on the Mac, sent to phones)."""
+        return self.manga.set_page_align(int(book_id), bool(align))
+
     def manga_text_regions(
         self,
         book_id: int,
@@ -8173,9 +9641,6 @@ class WebAppApi(IPhoneApiMixin):
             "unknown_state_unique": unique_by_state.get("unknown", 0),
             "top_new": top,
         }
-
-    def manga_ocr_artifact(self, book_id: int) -> dict[str, Any]:
-        return self.manga.ocr_artifact(int(book_id))
 
     def manga_export_ocr_debug(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         source = dict(payload) if isinstance(payload, dict) else {}
@@ -8552,8 +10017,42 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             + str(int(book_id))
             + ")"
         )
-        self.window.evaluate_js(script)
+        unloader = getattr(self, "_page_unloader", None)
+        if unloader is not None:
+            unloader.run_js(
+                script
+            )  # with the page let go (window process ended, or Low RAM mode): once it is back
+        else:
+            self.window.evaluate_js(script)
         return {"ok": True}
+
+    def _log_memory_window_unloaded(self) -> None:
+        """The memory line a minute after the hidden window's page was let go (its window process ended).
+
+        First the last Home snapshot goes to disk for the next first paint (get_state_snapshot);
+        in Low RAM mode its copy in memory goes with it."""
+        self._persist_ui_state_snapshot(release_memory=low_ram.enabled(getattr(self, "config", None)))
+        reporter = getattr(self, "_memory_reporter", None)
+        if reporter is not None:
+            reporter.log_once("window_unloaded")
+
+    def _low_ram_unload_veto(self) -> str:
+        """Python's reason to keep the hidden window's page ('' when it may go)."""
+        try:
+            if self._active_playbacks_payload():
+                return "mpv"
+        except Exception as exc:  # noqa: BLE001 - unknown: keep the page
+            return f"mpv_unknown:{type(exc).__name__}"
+        return ""
+
+    def _before_page_reload(self) -> None:
+        """The page comes back (a new window process, or Low RAM mode in-process): fresh preferences in index.html, new drop binding."""
+        web_root = getattr(self, "_web_root", None)
+        if web_root is not None:
+            _write_index_page(
+                self, Path(__file__).resolve().parent / "web" / "index.html", web_root / "index.html"
+            )
+        self._drop_import_bound = False
 
     def sidebar_reader_book(self, book_id: int) -> dict[str, Any]:
         """Warm reader metadata without touching the active audio transport."""
@@ -8574,64 +10073,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.audiobooks.state(queue_missing=True)
         except Exception as exc:
             self.logger.warning("FAIL step=audiobook.queue_missing error=%r", str(exc))
-
-    def _retry_import_worker(
-        self,
-        job_id: str,
-        media_kind: str,
-        paths: list[str],
-        cancel_event: threading.Event,
-    ) -> None:
-        imported = 0
-        errors: list[str] = []
-        try:
-            for index, raw in enumerate(paths, 1):
-                if cancel_event.is_set():
-                    self.job_center.cancelled(job_id)
-                    return
-                path = Path(str(raw))
-                try:
-                    if media_kind == "manga":
-                        self.manga.import_file(path)
-                    elif media_kind == "audiobook_folder":
-                        self.audiobooks.import_folder_collection(path)
-                    elif media_kind == "audiobook":
-                        self.audiobooks.import_file(path)
-                    else:
-                        book = self.light_novels.import_file(path)
-                        self.audiobooks.auto_link_light_novel(int(book["id"]))
-                        irodori = self.light_novels.settings()
-                        if (
-                            irodori.irodori_tts_enabled
-                            and irodori.irodori_tts_auto_generate
-                            and self.manager.work_scheduler.background_wait_reason() is None
-                            and self.manager.work_scheduler.background_wait_reason() is None
-                            and self._audiobook_link_kind(int(book["id"])) == "none"
-                        ):
-                            self.generate_light_novel_tts(int(book["id"]))
-                    imported += 1
-                except Exception as exc:
-                    errors.append(f"{path.name}: {exc}")
-                self.job_center.update(
-                    job_id,
-                    state="running",
-                    current=index,
-                    total=len(paths),
-                    message=t("web.importProgress", done=imported, total=len(paths)),
-                )
-            if cancel_event.is_set():
-                self.job_center.cancelled(job_id)
-                return
-            if imported:
-                self.job_center.finish(
-                    job_id,
-                    message=t("web.importedWithErrors", done=imported, errors=len(errors)),
-                    result={"imported": imported, "errors": errors},
-                )
-            else:
-                self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
-        finally:
-            self._import_cancel_events.pop(job_id, None)
 
     def choose_audiobook_file(self) -> dict[str, Any]:
         if self.window is None:
@@ -8755,6 +10196,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return payload
 
     def audiobook_play(self, book_id: int, start: float | None = None, speed: float = 1.0) -> dict[str, Any]:
+        self._adopt_installed_mpv()
         result = self.audiobooks.play(
             int(book_id), None if start is None else float(start), float(speed or 1.0)
         )
@@ -8774,6 +10216,27 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def audiobook_seek_to(self, book_id: int, position: float) -> dict[str, Any]:
         return self.audiobooks.seek_to(int(book_id), float(position))
+
+    def audiobook_read_along(self, book_id: int) -> dict[str, Any]:
+        """Timed read-along lines of one audiobook (the text the iPhone's Read along shows).
+
+        Loaded once per book by the player's Text panel; ``lines`` is empty when the book
+        has no text (no linked light novel / not aligned yet, or an anime audiobook
+        without prepared subtitles).
+        """
+        from . import read_along
+
+        started = time.perf_counter()
+        source, document = read_along.audiobook_document(self.audiobooks.db, self.audiobooks, int(book_id))
+        payload = read_along.transcript(document)
+        self.logger.info(
+            "TIMING step=audiobook.read_along book=%s source=%s lines=%s duration_ms=%.1f",
+            int(book_id),
+            source or "none",
+            len(payload["lines"]),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return {"ok": True, "book_id": int(book_id), "source": source, **payload}
 
     def audiobook_stop(self, book_id: int) -> dict[str, Any]:
         return self.audiobooks.stop(int(book_id))
@@ -8833,24 +10296,341 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if not source.exists():
             return {"ok": False, "error": err("audiobook.sourceMissing")}
         if sys.platform == "darwin":
-            if source.is_dir():
-                subprocess.Popen(["open", str(source.resolve())])
-            else:
-                subprocess.Popen(["open", "-R", str(source.resolve())])
+            # Always reveal (select it in Finder), never `open` the folder: a book
+            # folder can be an app bundle (Foo.app from a download), which `open` runs.
+            subprocess.Popen(["open", "-R", str(source.resolve())])
         return {"ok": True, "path": str(source.resolve())}
 
     def audiobook_mark_finished(self, book_id: int, finished: bool = True) -> dict[str, Any]:
         return self.audiobooks.mark_finished(int(book_id), bool(finished))
 
+    # Background recovery imports the audio still sitting in a light novel's
+    # "Volume XX" folder and links it to a book that has no audiobook. It
+    # undid the user's unlink or library delete within a minute, so those
+    # are remembered per book until the user links or downloads again.
+    @staticmethod
+    def _ln_audiobook_detached_key(book_id: int) -> str:
+        return f"ln_audiobook_user_detached:{int(book_id)}"
+
+    def _set_ln_audiobook_detached(self, book_ids: Any, detached: bool) -> None:
+        db = getattr(getattr(self, "manager", None), "db", None)
+        if db is None:
+            return
+        for book_id in book_ids:
+            key = self._ln_audiobook_detached_key(int(book_id))
+            if detached:
+                db.set_state(key, str(time.time()))
+            else:
+                db.delete_state(key)
+
+    def _ln_audiobook_detached_ids(self, book_ids: list[int]) -> set[int]:
+        db = getattr(getattr(self, "manager", None), "db", None)
+        if db is None or not book_ids:
+            return set()
+        keys = {self._ln_audiobook_detached_key(book_id): int(book_id) for book_id in book_ids}
+        return {keys[key] for key in db.get_states(tuple(keys))}
+
+    def _ln_books_linked_to_audiobooks(self, audiobook_ids: list[int]) -> list[int]:
+        db = getattr(getattr(self, "audiobooks", None), "db", None)
+        ids = [int(value) for value in audiobook_ids if int(value) > 0]
+        if db is None or not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})", ids
+            ).fetchall()
+        return [int(row["ln_book_id"]) for row in rows]
+
     def audiobook_delete(self, book_id: int) -> dict[str, Any]:
         local_id = int(book_id)
+        self._set_ln_audiobook_detached(self._ln_books_linked_to_audiobooks([local_id]), True)
+        made = self._anime_audiobook_files([local_id])
         result = self.audiobooks.delete(local_id, delete_files=False)
+        self._prune_anime_audiobook_files(made)
         self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
         return result
 
+    # ---- Anime episodes made into audiobooks (pudge/anime_audiobooks.py)
+
+    def _anime_audiobook_maker(self) -> Any:
+        from .anime_audiobooks import ROOT_NAME, AnimeAudiobookMaker
+
+        root = Path(self.config.library.root_dir) / ROOT_NAME
+        # One maker: the status poll and "Make" arrive on different bridge threads, and two
+        # makers would run two jobs of one title into the same files.
+        with self.__dict__.setdefault("_anime_audiobook_maker_lock", threading.Lock()):
+            maker = self.__dict__.get("_anime_audiobook_maker_instance")
+            if maker is None:
+                maker = AnimeAudiobookMaker(
+                    audiobooks=self.audiobooks,
+                    root=root,
+                    cache_dir=Path(self.config.paths.cache_dir),
+                    ffmpeg=self.config.tools.ffmpeg,
+                    ffprobe=self.config.tools.ffprobe,
+                    job_center=getattr(self, "job_center", None),
+                )
+                self._anime_audiobook_maker_instance = maker
+        maker.audiobooks = self.audiobooks  # rebuilt services: the current one
+        if maker.root != root and not maker.busy_any():
+            maker.root = root  # the library folder was changed in Settings
+        return maker
+
+    def _anime_audiobook_files(self, book_ids: list[int]) -> list[str]:
+        """Files of the books that were made from anime (pruned once no book uses them)."""
+        from .anime_audiobooks import is_anime_audiobook_path
+
+        ids = [int(value) for value in book_ids if int(value) > 0]
+        if not ids:
+            return []
+        try:
+            with self.audiobooks.db.connect() as conn:
+                marks = ",".join("?" for _ in ids)
+                rows = conn.execute(
+                    f"SELECT path FROM audiobook_files WHERE book_id IN ({marks})", ids
+                ).fetchall()
+        except Exception:  # noqa: BLE001 - deletion goes on without the clean-up
+            return []
+        return [str(row["path"]) for row in rows if is_anime_audiobook_path(str(row["path"]))]
+
+    def _prune_anime_audiobook_files(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        try:
+            removed = self._anime_audiobook_maker().prune_unreferenced(paths)
+            if removed:
+                self.logger.info("Anime audiobook files removed count=%s", len(removed))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("SKIP step=anime_audiobook.prune error=%r", str(exc)[:300])
+
+    _ANIME_AUDIOBOOK_SUBTITLE_STATES = frozenset({"ready", "watched"})
+
+    def _anime_audiobook_sources(self, anime: LibraryAnime, *, full: bool) -> tuple[dict[int, Any], int]:
+        """Downloaded episodes of a title by episode number (and the released count).
+
+        ``full``: also the remembered subtitle delay and the opening/ending (start only).
+        """
+        from .anime_audiobooks import EpisodeSource
+
+        total = self._planning_released_episode_count(anime)
+        single = self._planning_single_file_title(anime)
+        sources: dict[int, Any] = {}
+        for item in self.manager.db.episodes(anime.media_id):
+            video = item.video_path
+            try:
+                if (
+                    not video.is_file()
+                    or unfinished_video(video)
+                    or AnimeManager._library_path_is_ignored(video)
+                ):
+                    continue
+            except OSError:
+                continue
+            number = self._display_episode_number(anime, item.episode)
+            if number is None:
+                if not single:
+                    continue
+                number = 1
+            end = (
+                self._display_episode_number(anime, item.media_episode_end)
+                if item.media_episode_end
+                else None
+            )
+            subtitle = item.subtitle_path
+            if not (
+                subtitle is not None
+                and item.state in self._ANIME_AUDIOBOOK_SUBTITLE_STATES
+                and subtitle.suffix.casefold() in {".srt", ".ass", ".ssa"}
+                and subtitle.is_file()
+            ):
+                subtitle = None
+            known = sources.get(int(number))
+            if known is not None and (known.subtitle is not None or subtitle is None):
+                continue  # several files of one episode: the one with prepared subtitles
+            source = EpisodeSource(
+                episode=int(number),
+                video=video,
+                episode_end=int(end) if end and int(end) > int(number) else None,
+                subtitle=subtitle,
+            )
+            if full:
+                from .intro_skipper import segments_for_video
+                from .subtitle_delay import remembered_subtitle_delay
+
+                if subtitle is not None:
+                    source.subtitle_delay = float(
+                        remembered_subtitle_delay(
+                            self.manager.db,
+                            video,
+                            subtitle=subtitle,
+                            embedded_sid=item.embedded_subtitle_id,
+                            source=str(subtitle),
+                        )
+                        or 0.0
+                    )
+                try:
+                    source.segments = [
+                        (float(segment.start_seconds), float(segment.end_seconds))
+                        for segment in segments_for_video(Path(self.config.paths.cache_dir), video)
+                    ]
+                except Exception:  # noqa: BLE001 - without them the whole episode is kept
+                    source.segments = []
+            sources[int(number)] = source
+        return sources, total
+
+    @staticmethod
+    def _anime_audiobook_covered(sources: dict[int, Any]) -> set[int]:
+        covered: set[int] = set()
+        for number, source in sources.items():
+            covered.update(range(int(number), int(source.episode_end or number) + 1))
+        return covered
+
+    def anime_audiobook_status(self, media_id: int) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            raise KeyError(err("web.unknownAnime", mediaId=media_id))
+        maker = self._anime_audiobook_maker()
+        sources, total = self._anime_audiobook_sources(anime, full=False)
+        covered = self._anime_audiobook_covered(sources)
+        made = maker.made_episodes(anime.media_id, anime.title)
+        # Made by a "whole anime" run that failed half way: no book uses them yet. "Make"
+        # again reuses them; closing the dialog removes them (anime_audiobook_discard).
+        unfinished = set(maker.unfinished_episodes(anime.media_id, anime.title))
+        episodes = [
+            {
+                "episode": number,
+                "episode_end": getattr(sources.get(number), "episode_end", None),
+                "local": number in sources,
+                "subtitles": bool(number in sources and sources[number].subtitle is not None),
+                "audiobook_id": made.get(number),
+                "made": number in unfinished,
+            }
+            for number in sorted(set(sources) | set(made) | unfinished)
+        ]
+        return {
+            "media_id": int(anime.media_id),
+            "title": anime.title,
+            "released": int(total),
+            "episodes": episodes,
+            "all_local": bool(total > 0 and all(number in covered for number in range(1, total + 1))),
+            "whole_audiobook_id": maker.whole_book(anime.media_id, anime.title),
+            "unfinished": sorted(unfinished),
+            "job": maker.job(anime.media_id),
+            "busy": maker.busy(anime.media_id),
+        }
+
+    def anime_audiobook_start(
+        self,
+        media_id: int,
+        episode: int | None = None,
+        whole: bool = False,
+        skip_op_ed: bool = True,
+    ) -> dict[str, Any]:
+        """Make an episode's audiobook, or (``whole``) one book of every released episode."""
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            raise KeyError(err("web.unknownAnime", mediaId=media_id))
+        sources, total = self._anime_audiobook_sources(anime, full=True)
+        if whole:
+            covered = self._anime_audiobook_covered(sources)
+            if total < 1 or not all(number in covered for number in range(1, total + 1)):
+                raise ValueError(err("animeAudiobook.notAllLocal"))
+            chosen = [sources[number] for number in sorted(sources) if number <= total]
+        else:
+            source = sources.get(int(episode or 0))
+            if source is None:
+                raise ValueError(err("animeAudiobook.episodeMissing", episode=episode))
+            chosen = [source]
+        try:
+            cover = self.manager.cached_cover_path(anime)
+        except Exception:  # noqa: BLE001 - a book without a cover is still a book
+            cover = None
+        self._anime_audiobook_maker().start(
+            media_id=anime.media_id,
+            title=anime.title,
+            sources=chosen,
+            whole=bool(whole),
+            cover=cover,
+            skip_op_ed=bool(skip_op_ed),
+        )
+        self.logger.info(
+            "Anime audiobook started media_id=%s episodes=%s whole=%s skip_op_ed=%s",
+            anime.media_id,
+            [source.episode for source in chosen],
+            bool(whole),
+            bool(skip_op_ed),
+        )
+        return self.anime_audiobook_status(anime.media_id)
+
+    def anime_audiobook_cancel(self, media_id: int) -> dict[str, Any]:
+        self._anime_audiobook_maker().cancel(int(media_id))
+        return self.anime_audiobook_status(int(media_id))
+
+    def anime_audiobook_discard(self, media_id: int) -> dict[str, Any]:
+        """The dialog was closed without "Make" again: the episodes a failed run made for a
+        book that never came are removed (nothing while a job runs, never a book's file)."""
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            return {"ok": True, "removed": 0}
+        removed = self._anime_audiobook_maker().discard_unfinished(anime.media_id, anime.title)
+        if removed:
+            self.logger.info(
+                "Anime audiobook unfinished files removed media_id=%s count=%s", anime.media_id, len(removed)
+            )
+        return {"ok": True, "removed": len(removed)}
+
+    # ---- Word lists: "Episode words" of an anime (pudge/episode_words.py) and
+    # "Met often, not in deck" on Statistics (pudge/met_words.py)
+
+    def anime_episode_words_options(self, media_id: int) -> dict[str, Any]:
+        from . import episode_words
+
+        return episode_words.options(self, int(media_id))
+
+    def anime_episode_words_start(
+        self, media_id: int, episode: int | None = None, limit: int = 40, force: bool = False
+    ) -> dict[str, Any]:
+        from . import episode_words
+
+        return episode_words.manager_for(self).start(
+            int(media_id), None if episode is None else int(episode), int(limit or 40), bool(force)
+        )
+
+    def anime_episode_words_status(self, media_id: int) -> dict[str, Any]:
+        from . import episode_words
+
+        return episode_words.manager_for(self).status(int(media_id))
+
+    def anime_episode_words_cancel(self, media_id: int) -> dict[str, Any]:
+        from . import episode_words
+
+        return episode_words.manager_for(self).cancel(int(media_id))
+
+    def study_word_names(self, pairs: list[Any] | None = None) -> dict[str, Any]:
+        from . import episode_words
+
+        return episode_words.word_names_payload(self.light_novels, pairs or [])
+
+    def consumption_statistics_met_words(
+        self,
+        scope: dict[str, Any] | None = None,
+        limit: int = 50,
+        hide_names: bool = False,
+        check: bool = False,
+    ) -> dict[str, Any]:
+        from . import met_words
+
+        with memory_step(self.logger, "statistics.met_words"):
+            return met_words.manager_for(self).query(
+                scope or {}, limit=int(limit or 50), hide_names=bool(hide_names), check=bool(check)
+            )
+
     def audiobook_delete_many(self, book_ids: list[int]) -> dict[str, Any]:
         ids = [int(value) for value in book_ids]
+        self._set_ln_audiobook_detached(self._ln_books_linked_to_audiobooks(ids), True)
+        made = self._anime_audiobook_files(ids)
         result = self.audiobooks.delete_many(ids, delete_files=False)
+        self._prune_anime_audiobook_files(made)
         # A book whose player failed to stop is kept, so keep its history link too.
         failed = {int(item.get("book_id") or 0) for item in result.get("errors") or []}
         for local_id in ids:
@@ -8867,10 +10647,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def light_novel_link_audiobook(self, book_id: int, audiobook_id: int) -> dict[str, Any]:
         result = self.audiobooks.link_light_novel(int(book_id), int(audiobook_id))
+        self._set_ln_audiobook_detached([int(book_id)], False)
         result["state"] = self.audiobooks.state()
         return result
 
     def light_novel_unlink_audiobook(self, book_id: int) -> dict[str, Any]:
+        self._set_ln_audiobook_detached([int(book_id)], True)
         return self.audiobooks.unlink_light_novel(int(book_id))
 
     def light_novel_play_paired(
@@ -8880,6 +10662,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         chapter_progress: float,
         speed: float | None = None,
     ) -> dict[str, Any]:
+        self._adopt_installed_mpv()
         return self.audiobooks.play_paired(
             int(book_id),
             int(chapter_index),
@@ -8894,6 +10677,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         character_offset: int,
         speed: float | None = None,
     ) -> dict[str, Any]:
+        self._adopt_installed_mpv()
         return self.audiobooks.play_paired_at_offset(
             int(book_id),
             int(chapter_index),
@@ -8906,17 +10690,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def light_novel_prepare_audio_alignment(self, book_id: int, force: bool = False) -> dict[str, Any]:
         return self.audiobooks.prepare_alignment(int(book_id), force=bool(force))
-
-    def light_novel_audio_alignment_report(self, book_id: int) -> dict[str, Any]:
-        return self.audiobooks.alignment_report(int(book_id))
-
-    def light_novel_reprocess_audio_alignment(
-        self, book_id: int, clear_transcription: bool = False
-    ) -> dict[str, Any]:
-        return self.audiobooks.reprocess_alignment(
-            int(book_id),
-            clear_transcription=bool(clear_transcription),
-        )
 
     def light_novel_export_audio_sync_trace(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         source = dict(payload) if isinstance(payload, dict) else {}
@@ -8947,9 +10720,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except OSError:
             pass
         return {"ok": True, "path": str(output), "event_count": len(events)}
-
-    def light_novel_refresh(self) -> dict[str, Any]:
-        return self.light_novels.refresh_state()
 
     def study_word(self, card: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
@@ -9061,9 +10831,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             scope = ""
         if scope:
             result["account_scope"] = scope
-        if hasattr(self.light_novels, "jiten_optimal_word_stats"):
+        # The N+1 ceiling never waits for Jiten here: the cached value, refreshed in the background.
+        stats = getattr(self.light_novels, "jiten_optimal_word_stats_cached", None) or getattr(
+            self.light_novels, "jiten_optimal_word_stats", None
+        )
+        if stats is not None:
             try:
-                result.update(self.light_novels.jiten_optimal_word_stats())
+                result.update(stats())
             except Exception:
                 pass
         return result
@@ -9182,6 +10956,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 int(schedule.anime_id): schedule
                 for schedule in self.manager.db.active_personal_release_schedules()
             }
+            # The subtitle policy of a title, read once per title (it was one SQLite query per
+            # episode, every minute while the review gate warms its cards).
+            subtitle_optional_by_media: dict[int, bool] = {}
             for item in self.manager.db.episodes():
                 if item.media_id is None:
                     continue
@@ -9209,10 +10986,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 knows_subtitle_policy = hasattr(self.manager, "japanese_subtitles_required")
                 subtitle_optional = False
                 if knows_subtitle_policy:
-                    try:
-                        subtitle_optional = not bool(self.manager.japanese_subtitles_required(media_id))
-                    except Exception:
-                        subtitle_optional = False
+                    if media_id not in subtitle_optional_by_media:
+                        try:
+                            subtitle_optional_by_media[media_id] = not bool(
+                                self.manager.japanese_subtitles_required(media_id)
+                            )
+                        except Exception:
+                            subtitle_optional_by_media[media_id] = False
+                    subtitle_optional = subtitle_optional_by_media[media_id]
                 effective_state = "ready" if scheduled_target and item.state == "watched" else item.state
                 if effective_state != "ready" and not subtitle_optional:
                     continue
@@ -9286,6 +11067,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "retry_after_seconds": max(0.0, float(self._review_gate_prefetch_retry_at or 0.0) - time.time()),
             "error": str(self._review_gate_prefetch_error or ""),
         }
+
+    def _review_gate_prefetch_in_background(self, account_key: str, target: int) -> None:
+        # The warm-up is background work within the Jiten budget: the window keeps its share.
+        with jiten_client.background_requests():
+            self._review_gate_prefetch_worker(account_key, target)
 
     def _review_gate_prefetch_worker(self, account_key: str, target: int) -> None:
         started = time.perf_counter()
@@ -9517,7 +11303,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if self._review_gate_prefetch_thread is not None and self._review_gate_prefetch_thread.is_alive():
                 return {"started": False, "reason": "inflight", **snapshot}
             thread = threading.Thread(
-                target=self._review_gate_prefetch_worker,
+                target=self._review_gate_prefetch_in_background,
                 args=(account_key, target),
                 name="pudge-review-prefetch",
                 daemon=True,
@@ -10129,7 +11915,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if not settings.jiten_api_key or settings.study_backend != "jiten":
             return {"ok": True, "configured": False, "cards": [], "card": None}
         try:
-            result = self.light_novels.strict_review_candidates(required=sample, exclude_keys=excluded)
+            result = self._sidebar_due_candidates(sample, wanted, excluded)
             cards = [
                 dict(card)
                 for card in (result.get("cards") or [])
@@ -10185,6 +11971,48 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.logger.info("Sidebar due review unavailable: %s", exc)
             return {"ok": False, "cards": [], "card": None, "error": str(exc)}
 
+    # The review gate's warm pool is reused by the sidebar while it is this young.
+    SIDEBAR_GATE_POOL_SECONDS = 180.0
+
+    def _sidebar_due_candidates(self, sample: int, wanted: int, excluded: set[str]) -> dict[str, Any]:
+        """Due cards for the sidebar: the review gate's verified pool when it holds enough,
+        else a provider fetch that trusts the cards already proven this run (no second
+        review-history read for them)."""
+        lock = getattr(self, "_review_gate_lock", None)
+        try:
+            caps = self.light_novels.study_provider_capabilities("jiten")
+            account = str(caps.get("account_key") or "") if bool(caps.get("configured", True)) else ""
+        except Exception:  # noqa: BLE001 - a minimal service: no shared pool
+            account = ""
+        trusted: set[str] = set()
+        pool: list[dict[str, Any]] = []
+        if lock is not None and account:
+            with lock:
+                if getattr(self, "_review_gate_prefetch_account_key", "") == account:
+                    trusted = set(getattr(self, "_review_gate_verified_keys", set()) or set())
+                    age = time.time() - float(getattr(self, "_review_gate_prefetch_fetched_at", 0.0) or 0.0)
+                    if age <= self.SIDEBAR_GATE_POOL_SECONDS:
+                        pool = [
+                            dict(card)
+                            for card in getattr(self, "_review_gate_prefetch_cards", []) or []
+                            if isinstance(card, dict) and str(card.get("pudgeCardKey") or "") not in excluded
+                        ]
+        if len(pool) >= wanted:
+            return {"cards": pool[:sample], "source": "review_gate_pool"}
+        extra = {"trusted_previous_keys": trusted} if trusted else {}
+        result = self.light_novels.strict_review_candidates(required=sample, exclude_keys=excluded, **extra)
+        if lock is not None and account:
+            with lock:
+                if getattr(self, "_review_gate_prefetch_account_key", "") in {"", account} and hasattr(
+                    self, "_review_gate_verified_keys"
+                ):
+                    self._review_gate_verified_keys.update(
+                        str(card.get("pudgeCardKey") or "")
+                        for card in result.get("cards") or []
+                        if isinstance(card, dict) and str(card.get("pudgeCardKey") or "")
+                    )
+        return result
+
     def sidebar_due_review_card(self) -> dict[str, Any]:
         """Backward-compatible one-card endpoint for older WebViews."""
         result = self.sidebar_due_review_cards(1)
@@ -10205,6 +12033,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             int(word_id), int(reading_index), wire_grade, attempt_id=str(attempt_id)
         )
         self._sidebar_due_last_review = (int(word_id), int(reading_index), time.monotonic())
+        lock = getattr(self, "_review_gate_lock", None)
+        if lock is not None:
+            # A card graded here is no longer due: the gate (and the sidebar) stop offering it.
+            reviewed = f"{int(word_id)}:{int(reading_index)}"
+            with lock:
+                cards = getattr(self, "_review_gate_prefetch_cards", None)
+                if isinstance(cards, list):
+                    self._review_gate_prefetch_cards = [
+                        card for card in cards if str(card.get("pudgeCardKey") or "") != reviewed
+                    ]
         return {"ok": True, "outcome": "confirmed", **(result if isinstance(result, dict) else {})}
 
     def sidebar_due_review_undo(self, word_id: int, reading_index: int) -> dict[str, Any]:
@@ -10278,12 +12116,49 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             str(attempt_id)[:80],
         )
         try:
-            result = self.light_novels.strict_review_submit(
-                int(word_id),
-                int(reading_index),
-                str(grade),
-                attempt_id=str(attempt_id),
+            try:
+                result = self.light_novels.strict_review_submit(
+                    int(word_id),
+                    int(reading_index),
+                    str(grade),
+                    attempt_id=str(attempt_id),
+                )
+            except (LightNovelError, ReviewOutcomeUnknown):
+                raise
+            except Exception as exc:
+                # Anything else (a response that did not parse, a failure after the POST)
+                # may follow a grade Jiten recorded: the card is handled as an unknown
+                # outcome, never left on offer for a second grade.
+                self.logger.warning(
+                    "FAIL step=review_gate.submit media_id=%s episode=%s card=%s error=%r",
+                    identity.media_id,
+                    identity.episode,
+                    card_key,
+                    str(exc)[:200],
+                )
+                raise ReviewOutcomeUnknown(
+                    "jiten", str(attempt_id), err("review.jitenOutcomeUnknown", error=exc)
+                ) from exc
+        except JitenUnavailableError as exc:
+            # Pudge's own Jiten budget (or a Retry-After) held the grade back: nothing was
+            # sent, so the card stays on offer and the page sends the same grade again
+            # after ``retry_after`` (it was dropped as a rejected card, and its grade lost).
+            self.logger.info(
+                "EVENT review_gate.submit_deferred media_id=%s episode=%s card=%s retry_after_s=%.1f",
+                identity.media_id,
+                identity.episode,
+                card_key,
+                float(exc.retry_after),
             )
+            with self._review_gate_lock:
+                current = self._review_gate_local_status(video_path)
+            return {
+                **current,
+                "ok": False,
+                "outcome": "retry",
+                "retry_after": round(float(exc.retry_after), 1),
+                "message": str(exc),
+            }
         except LightNovelError as exc:
             self.logger.info(
                 "EVENT review_gate.submit_error media_id=%s episode=%s card=%s outcome=rejected provider_ms=%.1f error=%s",
@@ -10579,6 +12454,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             sequence=int(payload.get("sequence") or 0),
             active_total=float(payload.get("active_total") or 0),
             ledger=self.consumption,
+            sub_delay=_optional_float(payload.get("sub_delay")),
+            subtitle=str(payload.get("subtitle") or "")[:4096],
+            subtitle_sid=_optional_int(payload.get("subtitle_sid")),
+            cache_dir=getattr(getattr(getattr(self, "config", None), "paths", None), "cache_dir", None),
         )
         return {"ok": True}
 
@@ -10697,11 +12576,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self._import_cancel_events[job_id] = cancel_event
         books: list[dict[str, Any]] = []
         errors: list[str] = []
+        conflicts: list[dict[str, Any]] = []
         for index, value in enumerate(selected, 1):
             if cancel_event.is_set():
                 break
             try:
-                book = self.light_novels.import_file(Path(str(value)))
+                try:
+                    book = self.light_novels.import_file(Path(str(value)), on_conflict="ask")
+                except LightNovelImportConflict as conflict:
+                    conflicts.append(self._remember_ln_import_conflict(conflict))
+                    continue
                 books.append(book)
                 self.audiobooks.auto_link_light_novel(int(book["id"]))
                 irodori = self.light_novels.settings()
@@ -10724,7 +12608,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
             self.job_center.cancelled(job_id)
-        elif books:
+        elif books or conflicts:
             self.job_center.finish(
                 job_id,
                 message=t("web.importedWithErrors", done=len(books), errors=len(errors)),
@@ -10738,8 +12622,50 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "books": books,
             "book": books[0] if books else None,
             "errors": errors,
+            "conflicts": conflicts,
             "state": state,
         }
+
+    def _remember_ln_import_conflict(self, conflict: LightNovelImportConflict) -> dict[str, Any]:
+        """A book the window asks about (Keep both / Replace / Cancel). The page answers with
+        the token, never with a path."""
+        pending = getattr(self, "_ln_import_conflicts", None)
+        if pending is None:
+            pending = self._ln_import_conflicts = {}
+        token = secrets.token_hex(8)
+        pending[token] = Path(conflict.source)
+        self.logger.info(
+            "WAIT step=ln.import_conflict name=%r existing_id=%s title=%r",
+            Path(conflict.source).name,
+            conflict.existing.get("id"),
+            conflict.existing.get("title"),
+        )
+        return {
+            "token": token,
+            "name": Path(conflict.source).name,
+            "title": str(conflict.existing.get("title") or ""),
+            "existing_id": int(conflict.existing.get("id") or 0),
+        }
+
+    def light_novel_resolve_import_conflict(self, token: str, choice: str) -> dict[str, Any]:
+        """The user's answer for a book whose title is already in the library."""
+        pending = getattr(self, "_ln_import_conflicts", None) or {}
+        source = pending.pop(str(token or ""), None)
+        choice = str(choice or "").strip()
+        if source is None:
+            return {"ok": False, "error": err("ln.importConflictGone")}
+        if choice not in {"keep_both", "replace"}:
+            self.logger.info("SKIP step=ln.import_conflict name=%r choice=cancel", source.name)
+            return {"ok": True, "cancelled": True}
+        book = self.light_novels.import_file(source, explicit=True, on_conflict=choice)
+        self.logger.info(
+            "DONE step=ln.import_conflict name=%r choice=%s book_id=%s", source.name, choice, book.get("id")
+        )
+        try:
+            self.audiobooks.auto_link_light_novel(int(book["id"]))
+        except Exception as exc:  # noqa: BLE001 - the book is imported
+            self.logger.debug("SKIP step=ln.import_conflict_audio_link error=%r", str(exc))
+        return {"ok": True, "book": book, "state": self.light_novels.state()}
 
     def light_novel_open(self, book_id: int) -> dict[str, Any]:
         started_at = time.monotonic()
@@ -10831,15 +12757,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         return payload
 
-    def light_novel_stop_paired(self, book_id: int) -> dict[str, Any]:
-        return self.audiobooks.stop_for_light_novel(int(book_id))
-
     def light_novel_cancel_reader_background(self) -> dict[str, Any]:
         self.light_novels.cancel_reader_background()
         return {"ok": True}
 
     def light_novel_position(self, book_id: int, chapter_index: int, offset: float) -> dict[str, Any]:
-        self.light_novels.update_position(int(book_id), int(chapter_index), float(offset))
+        # The phone's place (iphone_media.ln_position moves the read marker for its device).
+        self.light_novels.set_position(int(book_id), int(chapter_index), float(offset))
         return {"ok": True}
 
     def light_novel_bookmark(
@@ -10848,12 +12772,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         chapter_index: int,
         offset: float,
         source: str = "manual",
+        char_offset: int | None = None,
+        known_at: float | None = None,
     ) -> dict[str, Any]:
+        """The reader's place and its "read up to here" marker (``char_offset``: the marker's
+        character; manual exactly there, automatic by the marker's rules, ln_read_marker).
+        ``known_at``: the place's version the reader has (an older automatic save is kept out)."""
         bookmark = self.light_novels.save_bookmark(
             int(book_id),
             int(chapter_index),
             float(offset),
             source=str(source or "manual"),
+            char_offset=None if char_offset is None else int(char_offset),
+            known_at=None if known_at is None else float(known_at),
         )
         progress = self.light_novels.progress_summary(int(book_id))
         return {
@@ -10862,14 +12793,33 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             **progress,
             "bookmark_source": bookmark["source"],
             "bookmark_updated_at": bookmark["updated_at"],
+            "read_marker": bookmark["read_marker"],
+            "marker_moved": bookmark["moved"],
+            **({"kept": bookmark["kept"]} if bookmark.get("kept") else {}),
         }
+
+    def light_novel_read_marker(self, book_id: int) -> dict[str, Any]:
+        """The volume's "read up to here" marker (set here or on a paired iPhone/iPad)."""
+        return {"ok": True, "read_marker": self.light_novels.read_marker(int(book_id))}
+
+    def light_novel_move_read_marker(
+        self, book_id: int, chapter_index: int, char_offset: int, source: str = "auto"
+    ) -> dict[str, Any]:
+        """The marker alone, e.g. following the sentence the paired audiobook reads."""
+        moved = self.light_novels.move_read_marker(
+            int(book_id), int(chapter_index), source=str(source or "auto"), char_offset=int(char_offset)
+        )
+        return {"ok": True, "read_marker": moved["marker"], "marker_moved": moved["moved"]}
 
     def light_novel_reset_position(self, book_id: int) -> dict[str, Any]:
         book = self.light_novels.reset_position(int(book_id))
         return {"ok": True, "book": book, "state": self.light_novel_state()}
 
     def light_novel_finish_volume(self, book_id: int) -> dict[str, Any]:
-        return self.light_novels.finish_volume(int(book_id))
+        book = self.light_novels.finish_volume(int(book_id))
+        # The reader takes this book as its own: its "read up to here" marker stays on screen.
+        book["read_marker"] = self.light_novels.read_marker(int(book_id))
+        return book
 
     def light_novel_set_finished(self, book_id: int, finished: bool) -> dict[str, Any]:
         return self.light_novels.set_finished(int(book_id), bool(finished))
@@ -10929,9 +12879,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.audiobooks.auto_link_light_novel(int(book_id))
         return result
 
-    def light_novel_unbind_anilist(self, book_id: int) -> dict[str, Any]:
-        return self.light_novels.unbind_anilist(int(book_id))
-
     def light_novel_search_jiten(self, query: str) -> list[dict[str, Any]]:
         return self.light_novels.search_jiten_books(str(query))
 
@@ -10940,9 +12887,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def light_novel_jiten_stats(self, book_id: int) -> dict[str, Any]:
         return self.light_novels.jiten_book_stats(int(book_id))
-
-    def light_novel_search_anilist(self, query: str) -> list[dict[str, Any]]:
-        return self.light_novels.search_anilist_novels(str(query or "").strip())
 
     def character_glossary(self, media_id: int) -> list[dict[str, str]]:
         return self.light_novels.character_glossary(int(media_id))
@@ -11177,8 +13121,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ]
             for name in candidates:
                 try:
-                    payload = json.loads(zf.read(name).decode("utf-8"))
-                except (KeyError, UnicodeDecodeError, ValueError):
+                    # Capped read: a tiny zip can unpack to gigabytes (ArchiveTooLargeError is a ValueError).
+                    payload = json.loads(read_member(zf, name, limit=TEXT_MEMBER_LIMIT).decode("utf-8"))
+                except (KeyError, UnicodeDecodeError, ValueError, RuntimeError, NotImplementedError):
                     continue
                 if isinstance(payload, dict) and payload.get("kind") == "pudge-speaker-annotations":
                     return payload
@@ -11276,6 +13221,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         imported_chapters = 0
         imported_assignments = 0
         skipped_unknown = 0
+        # Every chapter is checked before any file is written: a later
+        # missing volume or changed text used to fail after earlier chapters
+        # were already overwritten.
+        pending_writes: list[tuple[Path, str]] = []
         for book_row in payload.get("books", []) if isinstance(payload.get("books"), list) else []:
             if not isinstance(book_row, dict):
                 continue
@@ -11354,24 +13303,28 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         assignment["anilist_character_id"] = character_id
                     assignments.append(assignment)
                 target = self._audiobook_manual_chapter_cache(book_dir, chapter_index, chapter_text)
-                target.write_text(
-                    json.dumps(
-                        {
-                            "schema": 2,
-                            "source": "chatgpt-import",
-                            "source_sha256": digest,
-                            "assignments": assignments,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
+                pending_writes.append(
+                    (
+                        target,
+                        json.dumps(
+                            {
+                                "schema": 2,
+                                "source": "chatgpt-import",
+                                "source_sha256": digest,
+                                "assignments": assignments,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                    )
                 )
                 imported_chapters += 1
                 imported_assignments += len(assignments)
 
         if imported_chapters <= 0:
             raise LightNovelError(err("ln.speakerNoMatches"))
+        for target, text in pending_writes:
+            target.write_text(text, encoding="utf-8")
         self._write_audiobook_speaker_profiles(
             profiles_path,
             profiles,
@@ -11488,11 +13441,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if normalized not in {"manga", "novel", "light_novel"}:
             raise ValueError("Literature kind must be manga or novel")
         value = max(1.0, min(10.0, float(score)))
-        client = self._anilist_client()
-        try:
-            client.set_score(int(media_id), value)
-        finally:
-            client.close()
+        self._set_anilist_score_or_queue(int(media_id), value)
         if normalized == "manga":
             book = self.manga.set_score(int(book_id), value)
             return {"ok": True, "book": book, "state": self._manga_state_payload()}
@@ -11551,7 +13500,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "query": query,
             "category": "2_0",
             "target_volume": volume or None,
-            "releases": self.light_novels.search_nyaa(query, target_volume=volume or None),
+            "releases": [
+                # The linked book names the novel's folder (download_folder).
+                {**row, "book_id": int(linked.get("id") or 0), "media_id": int(linked.get("anilist_id") or 0)}
+                for row in self.light_novels.search_nyaa(query, target_volume=volume or None)
+            ],
         }
 
     @staticmethod
@@ -11735,8 +13688,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         query = self.light_novels._nyaa_title(series_title)
         if not query:
             raise LightNovelError(err("audiobook.noSearchTitle"))
+        sources = load_sources(self.config)
         client = NyaaClient(
-            self.config.nyaa.base_url,
+            sources.release_search,
+            mirrors=sources.mirrors,
             category="2_0",
             proxy_mode=self.config.nyaa.proxy_mode,
             proxy_url=self.config.nyaa.proxy_url,
@@ -11787,6 +13742,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         key = str(release.info_hash or release.torrent_url or release.link)
                         if key:
                             discovered[key] = (release, False)
+                except NoReleaseSourceError:
+                    raise  # one clear message, not one per query
                 except Exception as exc:
                     errors.append(f"{search_query}: {exc}")
             for search_query in collection_queries:
@@ -12037,19 +13994,63 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "created_at": time.time(),
         }
         path = self._ln_audiobook_selection_manifest_path(destination)
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        atomic_write_json(path, payload, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _normalized_audiobook_relative_path(value: object) -> str:
         return unicodedata.normalize("NFKC", str(value or "")).replace("\\", "/").strip("/")
+
+    def _mark_ln_audiobook_selection_complete(self, destination: Path) -> None:
+        """Record in the selection manifest that the torrent client finished the selected files."""
+        path = self._ln_audiobook_selection_manifest_path(destination)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+            if isinstance(payload, dict) and not payload.get("completed_at"):
+                payload["completed_at"] = time.time()
+                atomic_write_json(path, payload, ensure_ascii=False, indent=2)
+        except (OSError, ValueError, TypeError) as exc:
+            self.logger.warning("LN audiobook manifest completion not saved path=%s error=%s", path, exc)
+
+    def _ln_audiobook_torrent_reports_complete(self, torrent_hash: str, names: list[str]) -> bool:
+        """Whether the torrent client says every selected file is downloaded.
+
+        False whenever it cannot tell (no client, client not running, unknown hash):
+        recovery then waits.  The client is never launched for this check.
+        """
+        expected = [
+            self._normalized_audiobook_relative_path(name) for name in names if str(name or "").strip()
+        ]
+        if not str(torrent_hash or "").strip() or not expected:
+            return False
+        try:
+            _backend, torrent = self._audiobook_torrent_client()
+        except Exception:
+            return False
+        try:
+            if hasattr(torrent, "auto_start_app"):
+                torrent.auto_start_app = False
+            rows = list(torrent.files(str(torrent_hash)) or [])
+        except Exception:
+            return False
+        finally:
+            try:
+                torrent.close()
+            except Exception:
+                pass
+        progress: dict[str, float] = {}
+        for row in rows:
+            name = self._normalized_audiobook_relative_path(row.get("name"))
+            if name:
+                progress[name] = float(row.get("progress") or 0.0)
+        for wanted in expected:
+            values = [
+                value
+                for name, value in progress.items()
+                if name == wanted or name.endswith("/" + wanted) or wanted.endswith("/" + name)
+            ]
+            if not values or min(values) < 0.999:
+                return False
+        return True
 
     def _recoverable_light_novel_audiobook_paths(
         self,
@@ -12104,6 +14105,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             and int(manifest.get("book_id") or 0) == int(book.get("id") or 0)
             and int(manifest.get("volume") or 0) == target_volume
         ):
+            torrent_hash = str(manifest.get("torrent_hash") or "").strip()
+            if torrent_hash and torrent_hash in getattr(self, "_ln_audiobook_monitored_hashes", set()):
+                # This process's monitor thread imports it when the client reports completion.
+                return []
             resolved: list[Path] = []
             seen: set[Path] = set()
             for expected_raw in manifest.get("selected_files") or []:
@@ -12162,6 +14167,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     except (OSError, ValueError):
                         complete = False
                         break
+                if complete and not manifest.get("completed_at"):
+                    # Full-size files are no evidence of a finished download: pieces arrive
+                    # out of order, so a sparse or preallocated file reaches its full size
+                    # long before its last piece.  Ask the client (once it says so, the
+                    # manifest remembers).
+                    complete = self._ln_audiobook_torrent_reports_complete(
+                        torrent_hash, [str(value or "") for value in manifest.get("selected_files") or []]
+                    )
+                    if complete:
+                        self._mark_ln_audiobook_selection_complete(destination)
+                    else:
+                        self.logger.info(
+                            "LN audiobook recovery waits for the torrent client book_id=%s hash=%s",
+                            int(book.get("id") or 0),
+                            torrent_hash or "-",
+                        )
                 if complete:
                     return sorted(resolved, key=lambda path: str(path).casefold())
                 return []
@@ -12238,11 +14259,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             # The common root also contains other volumes/books.  Build a
             # hidden hard-link view containing only the selected tracks; this
             # costs no duplicate media storage and prevents import_folder from
-            # swallowing the rest of a giant collection.
-            import_root = destination / ".pudge-volume-import"
-            if import_root.exists():
-                shutil.rmtree(import_root)
-            import_root.mkdir(parents=True, exist_ok=True)
+            # swallowing the rest of a giant collection.  Each import gets its own
+            # view: an earlier imported audiobook's rows point into its view, so a
+            # re-import must never delete that.
+            views = destination / ".pudge-volume-import"
+            views.mkdir(parents=True, exist_ok=True)
+            import_root = Path(tempfile.mkdtemp(prefix="view-", dir=str(views)))
             for index, source in enumerate(audio_paths):
                 target = import_root / f"{index:04d}-{source.name}"
                 os.link(source, target)
@@ -12265,10 +14287,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not callable(state_reader):
                 return {"skipped": True, "reason": "light_novels_unavailable", "recovered": 0}
             state = state_reader()
-            for book in state.get("books", []):
+            books = list(state.get("books", []))
+            try:
+                detached = self._ln_audiobook_detached_ids(
+                    [int(book.get("id") or 0) for book in books if int(book.get("id") or 0) > 0]
+                )
+            except Exception as exc:
+                self.logger.warning("LN audiobook recovery skipped error=%s", exc)
+                return {"skipped": True, "reason": "detached_state_unavailable", "recovered": 0}
+            for book in books:
                 try:
                     book_id = int(book.get("id") or 0)
                     if book_id <= 0 or int(book.get("volume") or 0) <= 0:
+                        continue
+                    # The user unlinked or deleted this book's audiobook.
+                    if book_id in detached:
                         continue
                     if self.audiobooks.link_for_light_novel(
                         book_id, include_alignment=False, include_transcription=False
@@ -12362,6 +14395,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             else:
                 self.logger.warning("Audiobook torrent timed out hash=%s", torrent_hash)
                 return
+            self._mark_ln_audiobook_selection_complete(destination)
             torrent.delete(torrent_hash, delete_files=False)
 
             audio_paths: list[Path] = []
@@ -12395,6 +14429,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 exc,
             )
         finally:
+            getattr(self, "_ln_audiobook_monitored_hashes", set()).discard(str(torrent_hash))
             torrent.close()
 
     def light_novel_download_audiobook_nyaa(
@@ -12430,9 +14465,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         destination = self._light_novel_audiobook_download_destination(book)
         destination.mkdir(parents=True, exist_ok=True)
         backend_name, torrent = self._audiobook_torrent_client()
+        # Set only by add_release after the check below: the except branch
+        # deletes a torrent this call really added, never one already there.
         torrent_hash = ""
+        added_new = False
         try:
             with self._audiobook_torrent_start_admission():
+                # Both clients return the hash of a torrent they already have.
+                # That torrent (another volume still downloading from the same
+                # pack) was then narrowed to this volume's files, and deleted
+                # with its files when a later step failed.
+                has_torrent = getattr(torrent, "has_torrent", None)
+                if callable(has_torrent) and item.info_hash and has_torrent(item.info_hash):
+                    raise LightNovelError(err("audiobook.torrentAlreadyInClient"))
+                # Without a hash to check (only a .torrent URL) or a client that cannot
+                # tell, the hash add_release returns may be a torrent already there.
+                added_new = bool(callable(has_torrent) and item.info_hash)
                 torrent_hash = torrent.add_release(
                     item,
                     save_path=destination,
@@ -12524,14 +14572,26 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             with self._audiobook_torrent_start_admission():
                 torrent.start(torrent_hash)
         except Exception:
-            if torrent_hash:
+            if torrent_hash and added_new:
                 try:
                     torrent.delete(torrent_hash, delete_files=True)
                 except Exception:
                     pass
+            elif torrent_hash:
+                self.logger.info(
+                    "LN audiobook download failed; torrent left in the client (it may not be ours) hash=%s",
+                    torrent_hash,
+                )
             raise
         finally:
             torrent.close()
+        # A new download is the user's choice again: recovery may link it.
+        self._set_ln_audiobook_detached([int(book_id)], False)
+        monitored = getattr(self, "_ln_audiobook_monitored_hashes", None)
+        if monitored is None:
+            monitored = self._ln_audiobook_monitored_hashes = set()
+        # Recovery leaves this download to the monitor (no second import of the same files).
+        monitored.add(str(torrent_hash))
         threading.Thread(
             target=self._finish_light_novel_audiobook_torrent,
             args=(str(torrent_hash), int(book_id), destination, selected_ids),
@@ -12612,19 +14672,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         ).start()
         return dict(job)
 
-    def light_novel_audiobook_download_status(self, book_id: int) -> dict[str, Any]:
-        jobs = getattr(self, "_ln_audiobook_download_jobs", {})
-        lock = getattr(self, "_ln_audiobook_download_lock", None)
-        if lock is None:
-            return {}
-        with lock:
-            return dict(jobs.get(int(book_id)) or {})
-
     def light_novel_download_nyaa(self, release: dict[str, Any]) -> dict[str, Any]:
         return self.light_novels.download_nyaa_release(release or {})
 
-    def light_novel_auto_download(self) -> list[dict[str, Any]]:
-        return self.light_novels.auto_download_missing()
+    def light_novel_dismiss_volume_download(self, torrent_hash: str, volume: int) -> dict[str, Any]:
+        return self.light_novels.dismiss_volume_download(str(torrent_hash or ""), int(volume or 0))
+
+    def _resume_light_novel_volume_downloads(self) -> None:
+        """Volume downloads that were waiting when Pudge quit: extract them when they finish."""
+        try:
+            self.light_novels.resume_volume_downloads()
+        except Exception as exc:  # noqa: BLE001 - never block start-up on it
+            self.logger.warning("WARN step=ln.volume_downloads_resume error=%r", exc)
 
     def scan_library(self) -> dict[str, Any]:
         if self._downloads_enabled():
@@ -12632,8 +14691,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.manager.sync_downloads()
             except Exception as exc:
                 self.manager.log(str(exc))
-        self.manager.scan_library(reuse_unchanged=True, user_requested=True)
-        return self.get_state()
+        outcome: dict[str, Any] = {}
+        self.manager.scan_library(reuse_unchanged=True, user_requested=True, outcome=outcome)
+        state = self.get_state()
+        if outcome.get("skipped") != "busy":
+            return {**state, "library_scan": {"done": True}}
+        # Other heavy work holds the lease: say so, and scan as soon as it is free (one
+        # waiting scan at a time; the window refreshes from the state version afterwards).
+        queued = False
+        try:
+            result = self.task_supervisor.start_with_admission(
+                "library-scan-requested",
+                self.manager.scan_library_when_free,
+                pass_cancel_event=True,
+            )
+            queued = result.admission in {"started", "already_running"}
+        except RuntimeError as exc:  # quitting or updating: nothing more is started
+            self.logger.info("SKIP step=library.scan_queued reason=%s", exc)
+        return {**state, "library_scan": {"done": False, "busy": True, "queued": queued}}
 
     def _ignore_hook_change(self, name: str, values: dict[str, Any], current: str) -> None:
         requested = values.get(name)
@@ -12738,7 +14813,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
 
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
-        cfg = self.config
+        # Parsed into a copy: a value rejected halfway (int("x"), a bad interval) left
+        # the live config, which the agent and scheduler read, half-changed, and the
+        # next successful save persisted that half. The copy is adopted once written.
+        cfg = copy.deepcopy(self.config)
+        if "library_root" in values:
+            # Checked before anything changes: a cleared field was saved as root_dir = "."
+            # (the process's cwd, "/" for a Dock launch) and the Light Novels mkdir then failed.
+            root_text = str(values.get("library_root") or "").strip()
+            if not root_text or not Path(root_text).expanduser().is_absolute():
+                raise ValueError(err("settings.libraryRootNotAbsolute"))
+        new_sources = None
+        if isinstance(values.get("sources"), dict):
+            # Settings → Sources; checked first so a bad address saves nothing.
+            new_sources = parse_sources(values["sources"])
         requested_mokuro_python = self._requested_mokuro_python(values, cfg.tools.manga_mokuro_python)
         ln_current = self.light_novels.settings()
         ln_values = {
@@ -12769,6 +14857,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "translation_google_fallback": values.get(
                 "ln_translation_google_fallback", ln_current.translation_google_fallback
             ),
+            "google_translate": values.get("ln_google_translate", ln_current.google_translate),
             "translation_prewarm_remote": values.get(
                 "ln_translation_prewarm_remote", ln_current.translation_prewarm_remote
             ),
@@ -12888,9 +14977,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.nyaa.torrents_enabled = self._torrent_enabled_state()
         cfg.nyaa.subsplease_rss_enabled = True
         cfg.nyaa.subsplease_rss_preferred = True
-        cfg.nyaa.base_url = str(values.get("nyaa_url", cfg.nyaa.base_url)).strip().rstrip("/")
         cfg.nyaa.proxy_mode = str(values.get("proxy_mode", cfg.nyaa.proxy_mode)).strip()
-        cfg.nyaa.proxy_url = str(values.get("proxy_url", cfg.nyaa.proxy_url)).strip()
+        cfg.nyaa.proxy_url = restore_url_password(
+            str(values.get("proxy_url", cfg.nyaa.proxy_url)).strip(), cfg.nyaa.proxy_url
+        )
         # Shell hooks are set only in config.toml: a settings call from the web
         # UI (or anything injected into it) must never become a command on the Mac.
         self._ignore_hook_change("search_hook", values, cfg.nyaa.pre_search_command)
@@ -12922,6 +15012,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.nyaa.require_japanese_audio = True
         cfg.nyaa.avoid_upscaled = True
         cfg.nyaa.only_trusted_groups = bool(values.get("only_trusted_groups", cfg.nyaa.only_trusted_groups))
+        cfg.nyaa.allow_camrips = bool(values.get("allow_camrips", cfg.nyaa.allow_camrips))
         cfg.nyaa.trusted_groups = [
             part.strip()
             for part in str(values.get("trusted_groups", ", ".join(cfg.nyaa.trusted_groups))).split(",")
@@ -12982,6 +15073,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 cfg.power.auto_battery_energy_saving,
             )
         )
+        old_low_ram_mode = bool(cfg.power.low_ram_mode)
+        cfg.power.low_ram_mode = bool(values.get("low_ram_mode", cfg.power.low_ram_mode))
+        if cfg.power.low_ram_mode != old_low_ram_mode:
+            low_ram.log_state(self.logger, cfg.power.low_ram_mode, "settings")
         cfg.agent.enabled = bool(values.get("agent_enabled", cfg.agent.enabled))
         cfg.agent.poll_minutes = max(5, int(values.get("agent_poll", cfg.agent.poll_minutes)))
         cfg.agent.anilist_refresh_minutes = max(
@@ -12990,8 +15085,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.agent.subtitle_poll_minutes = max(
             5, int(values.get("subtitle_poll", cfg.agent.subtitle_poll_minutes))
         )
-        cfg.agent.delete_after_watched_hours = max(
-            0.0, float(values.get("delete_hours", cfg.agent.delete_after_watched_hours))
+        cfg.agent.delete_after_watched_hours = _settings_hours_or_current(
+            values.get("delete_hours"), cfg.agent.delete_after_watched_hours
         )
         cfg.anilist.enabled = bool(values.get("anilist_enabled", cfg.anilist.enabled))
         cfg.anilist.client_id = str(values.get("anilist_client_id", cfg.anilist.client_id)).strip()
@@ -13021,6 +15116,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         ).strip()
         if "shortcut_mpv_skip_segment" in values:
             cfg.shortcuts.mpv_skip_segment = _skip_shortcut(values.get("shortcut_mpv_skip_segment")) or "Tab"
+        apply_mpv_line_shortcut_settings(cfg.shortcuts, values)
         if "shortcut_screen_text" in values:
             cfg.shortcuts.screen_text_toggle = str(values.get("shortcut_screen_text") or "").strip()
         # One option: the skip button (OP/ED detection follows it).
@@ -13107,7 +15203,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             str(values.get("japanese_stt_model", cfg.sync.japanese_stt_model)).strip()
             or "mlx-community/whisper-tiny"
         )
+        if new_sources is not None:
+            save_sources(cfg, new_sources)
         write_config(cfg, self.config_path)
+        _adopt_config_values(self.config, cfg)
         self._apply_saved_settings(old_delete_hours=old_delete_hours)
         self._ui_state_cache.invalidate()
         self._planning_search_cache = MetadataCache(
@@ -13117,10 +15216,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         self.light_novels.save_settings(ln_values)
         self._screen_text_settings_changed()
+        # The saved tokens, not the form's values (a kept token arrives as the mask).
+        saved_ln = self.light_novels.settings()
         configure_mpv_study_keys(
-            jiten_api_key=str(ln_values.get("jiten_api_key") or ""),
-            jpdb_api_token=str(ln_values.get("jpdb_api_token") or ""),
+            jiten_api_key=str(saved_ln.jiten_api_key or ""),
+            jpdb_api_token=str(saved_ln.jpdb_api_token or ""),
         )
+        if (
+            str(ln_current.jiten_api_key or "").strip()
+            and not str(ln_values.get("jiten_api_key") or "").strip()
+        ):
+            # The key was removed here: JitenMPV must not stay signed in with it.
+            try:
+                forget_jiten_api_key(str(ln_current.jiten_api_key))
+            except OSError as exc:
+                self.logger.warning("FAIL step=jiten_mpv.forget_key error=%r", str(exc)[:200])
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
         self._ensure_energy_monitor(reason="settings_saved")
         screen_text_shortcut = getattr(self, "_screen_text_shortcut", None)
@@ -13207,7 +15317,54 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.logger.info("EVENT onboarding.completed")
         return result
 
+    def _adopt_installed_mpv(self) -> None:
+        """Use an mpv installed after setup (brew install mpv in Terminal).
+
+        install.sh no longer installs mpv, so the config can still say "mpv", which an app
+        opened from the Dock does not find (no Homebrew on its PATH): playback then failed
+        although mpv was there. A configured mpv that resolves is never touched.
+        """
+        tools = getattr(getattr(self, "config", None), "tools", None)
+        found = replacement_tool("mpv", str(getattr(tools, "mpv", "") or "")) if tools else ""
+        if not found:
+            return
+        tools.mpv = found
+        if getattr(self, "config_path", None) is not None:
+            try:
+                write_config(self.config, self.config_path)
+            except ConfigUnreadableError:
+                pass  # used for this session; the broken config.toml is left as it is
+        audiobooks = getattr(self, "audiobooks", None)
+        if audiobooks is not None and hasattr(audiobooks, "mpv"):
+            audiobooks.mpv = found
+        configure_logging().info("EVENT tools.mpv_found path=%s", found)
+
+    def _apply_media_tool_paths(self, status: dict[str, Any]) -> None:
+        # Without mpv the configured value stays: writing its empty path would hide an mpv
+        # installed later (mpv is optional now).
+        mpv_path = str(status["mpv"].get("path") or "")
+        if mpv_path:
+            self.config.tools.mpv = mpv_path
+        self.config.tools.ffmpeg = str(status["ffmpeg"]["path"])
+        ffprobe = shutil.which("ffprobe")
+        ffmpeg_path = Path(self.config.tools.ffmpeg)
+        sibling_ffprobe = ffmpeg_path.with_name("ffprobe")
+        if sibling_ffprobe.is_file():
+            ffprobe = str(sibling_ffprobe)
+        if ffprobe:
+            self.config.tools.ffprobe = str(ffprobe)
+
+    def _push_media_tool_paths(self) -> None:
+        for service, name, value in (
+            (self.audiobooks, "mpv", self.config.tools.mpv),
+            (self.audiobooks, "ffmpeg", self.config.tools.ffmpeg),
+            (self.audiobooks, "ffprobe", self.config.tools.ffprobe),
+        ):
+            if hasattr(service, name):
+                setattr(service, name, value)
+
     def first_experience_dependencies(self) -> dict[str, Any]:
+        self._adopt_installed_mpv()
         ln = self.light_novels.settings()
         status = dependency_status(
             mpv=self.config.tools.mpv,
@@ -13262,24 +15419,33 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         return self._jiten_mpv_action_payload(status)
 
-    def install_first_experience_dependencies(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
-        options = values or {}
+    def install_first_experience_mpv(self) -> dict[str, Any]:
+        """The guide's "Install mpv": brew install mpv (and ffmpeg when it is missing too)."""
         status = install_media_tools(
             mpv=self.config.tools.mpv,
             ffmpeg=self.config.tools.ffmpeg,
+            include_mpv=True,
         )
-        self.config.tools.mpv = str(status["mpv"]["path"])
-        self.config.tools.ffmpeg = str(status["ffmpeg"]["path"])
-        ffprobe = shutil.which("ffprobe")
-        ffmpeg_path = Path(self.config.tools.ffmpeg)
-        sibling_ffprobe = ffmpeg_path.with_name("ffprobe")
-        if sibling_ffprobe.is_file():
-            ffprobe = str(sibling_ffprobe)
-        if ffprobe:
-            self.config.tools.ffprobe = str(ffprobe)
-        key = str(options.get("jiten_api_key") or self.light_novels.settings().jiten_api_key or "").strip()
+        self._apply_media_tool_paths(status)
+        write_config(self.config, self.config_path)
+        self._push_media_tool_paths()
+        self.logger.info("EVENT onboarding.mpv_installed path=%s", self.config.tools.mpv)
+        return self.first_experience_dependencies()
+
+    def install_first_experience_dependencies(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = values or {}
+        # mpv has its own button (about 1 GB): "Install missing" adds it only when asked.
+        status = install_media_tools(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+            include_mpv=bool(options.get("install_mpv")),
+        )
+        self._apply_media_tool_paths(status)
+        saved = self.light_novels.settings()
+        # The guide's fields hold the mask for a saved key ("keep it").
+        key = str(keep_masked_secret(options.get("jiten_api_key"), "") or saved.jiten_api_key or "").strip()
         jpdb_key = str(
-            options.get("jpdb_api_token") or self.light_novels.settings().jpdb_api_token or ""
+            keep_masked_secret(options.get("jpdb_api_token"), "") or saved.jpdb_api_token or ""
         ).strip()
         if bool(options.get("install_jiten_mpv")):
             status = install_jiten_mpv(
@@ -13317,13 +15483,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         manga_ocr["version"] = t("web.mangaOcrPackageReady")
         status["manga_ocr"] = manga_ocr
         write_config(self.config, self.config_path)
-        for service, name, value in (
-            (self.audiobooks, "mpv", self.config.tools.mpv),
-            (self.audiobooks, "ffmpeg", self.config.tools.ffmpeg),
-            (self.audiobooks, "ffprobe", self.config.tools.ffprobe),
-        ):
-            if hasattr(service, name):
-                setattr(service, name, value)
+        self._push_media_tool_paths()
         self.logger.info(
             "EVENT onboarding.dependencies mpv=%s ffmpeg=%s jiten_mpv=%s",
             status["mpv"]["installed"],
@@ -13343,10 +15503,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def _anilist_client(self) -> AniListClient:
         if not self.config.anilist.enabled or not self.config.anilist.access_token.strip():
             raise RuntimeError(err("anilist.notConfigured"))
-        return AniListClient(
+        client = AniListClient(
             self.config.anilist.endpoint,
             access_token=self.config.anilist.access_token,
         )
+        # Made for a click in the window: never sleeps for AniList's rate limit.
+        client.interactive = True
+        return client
+
+    def _anilist_client_or_none(self) -> AniListClient | None:
+        """The AniList client, or None without AniList (no token or turned off): a local-only change."""
+        try:
+            return self._anilist_client()
+        except AniListError:
+            raise
+        except RuntimeError:
+            return None
 
     @staticmethod
     def _find_relation_metadata(
@@ -13394,6 +15566,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def _set_local_anilist_status(self, media_id: int, status: str) -> None:
         media_id = int(media_id)
         status = str(status or "").upper()
+        # A suggestion of this title as the next entry offered other buttons (final_sequel_cache).
+        self._invalidate_final_sequel(sequel_id=media_id)
+        from .anilist_tracking import clear_pending_status, pending_statuses
+
+        unsent = pending_statuses(self.manager.db).get(media_id)
+        if unsent and unsent != status:
+            # A later change that reached AniList replaces one still waiting to be sent.
+            clear_pending_status(self.manager.db, media_id)
         anime = self.manager.db.get_anime(media_id)
         if anime is not None:
             self.manager.db.set_anime_status(media_id, status)
@@ -13431,7 +15611,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _refresh_anilist_after_mutation(self) -> tuple[dict[str, object], str]:
         try:
-            stats = self.manager.refresh_anilist_cache()
+            with interactive_anilist_requests():
+                stats = self.manager.refresh_anilist_cache()
         except Exception as exc:
             warning = err("anilist.savedButNoList")
             self.logger.warning(
@@ -13442,16 +15623,38 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         warning = str(stats.get("warning") or "")
         return stats, warning
 
-    def set_anilist_score(self, media_id: int, score: float, episode: int | None = None) -> dict[str, Any]:
-        client = self._anilist_client()
+    def _set_anilist_score_or_queue(self, media_id: int, score: float) -> tuple[float, bool]:
+        """Send a score to AniList; queue it when AniList cannot be reached (local-only without a token).
+
+        Returns the score AniList saved (or the given one) and whether it waits for the next refresh.
+        """
+        from .anilist_tracking import clear_pending_score, queue_pending_score
+
+        value = float(score)
+        if value < 1 or value > 10:
+            raise AniListError(err("anilist.scoreRange"))
+        client = self._anilist_client_or_none()
+        if client is None:
+            return value, False
         try:
-            saved = client.set_score(int(media_id), float(score))
+            saved = client.set_score(int(media_id), value)
+        except AniListError as exc:
+            queue_pending_score(self.manager.db, int(media_id), value)
+            self.logger.warning(
+                "FALLBACK step=anilist.set_score media_id=%s queued=true error=%r", media_id, str(exc)
+            )
+            return value, True
         finally:
             client.close()
+        clear_pending_score(self.manager.db, int(media_id))
+        return float(saved.get("score") or value), False
+
+    def set_anilist_score(self, media_id: int, score: float, episode: int | None = None) -> dict[str, Any]:
+        saved, anilist_pending = self._set_anilist_score_or_queue(int(media_id), float(score))
         self.manager.db.set_anime_score(int(media_id), float(score))
         if episode is not None:
             self.manager.db.mark_rating_prompted(int(media_id), int(episode))
-        return {"ok": True, "score": float(saved.get("score") or score), "state": self.get_state()}
+        return {"ok": True, "score": saved, "anilist_pending": anilist_pending, "state": self.get_state()}
 
     def skip_rating(self, media_id: int, episode: int) -> dict[str, Any]:
         self.manager.db.mark_rating_prompted(int(media_id), int(episode))
@@ -13466,11 +15669,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # A relation/local title with no AniList list status is shown as New.
         # Sending SaveMediaListEntry(progress=0) for it creates a CURRENT entry,
         # so a purely local reset must not contact AniList in that state.
-        if list_status:
+        # Without AniList (no token) the reset is local only.
+        client = self._anilist_client_or_none() if list_status in self.ANIME_LIST_STATUSES else None
+        if client is not None:
             remote_status = "CURRENT" if list_status in {"COMPLETED", "REPEATING"} else list_status
-            client = self._anilist_client()
             try:
                 saved = client.set_progress(media_id, 0, remote_status)
+            except AniListError as exc:
+                # There is no queue for lowering progress: a later refresh would
+                # put the old AniList progress back. Say so instead of half-resetting.
+                raise RuntimeError(err("web.resetProgressNeedsAniList", error=str(exc))) from exc
             finally:
                 client.close()
             saved_progress = int(saved.get("progress") or 0)
@@ -13504,12 +15712,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             raise ValueError(f"unknown list status: {status!r}")
         anime = self.manager.db.get_anime(media_id)
         previous = str(anime.status or "").strip().upper() if anime is not None else ""
+        local_status = target
+        anilist_pending = False
         if status is None or target != previous:
-            client = self._anilist_client()
-            try:
-                client.set_list_status(media_id, target)
-            finally:
-                client.close()
+            if status is not None and previous in {"", "REMOVED"}:
+                # The Delete dialog on a title that is not on the AniList list
+                # (a local folder, a removed entry): only its files go. Its
+                # default "Dropped" must not create an AniList entry.
+                local_status = previous
+            else:
+                # Queued when AniList refuses or cannot be reached; local-only
+                # without a token. Deleting files never waits for AniList.
+                anilist_pending = self._set_anilist_status_or_queue(media_id, target)
         # "Keep" in the Deleting soon group puts the status and episode states back.
         self.manager.db.save_drop_restore(media_id, previous)
         # A title kept in the list must not download the deleted episodes again.
@@ -13519,7 +15733,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.config.agent.delete_after_watched_hours,
         )
         # schedule_anime_cleanup marks the title DROPPED locally; keep the chosen status.
-        self._set_local_anilist_status(media_id, target)
+        self._set_local_anilist_status(media_id, local_status)
         cancelled = self._cancel_running_anime_downloads(media_id) if target == "DROPPED" else 0
         self.logger.info(
             "SCHEDULE step=anime.drop media_id=%s local_files=%s delete_after_hours=%s status=%s previous=%s "
@@ -13535,7 +15749,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {
             "ok": True,
             "queued": queued,
-            "status": target,
+            "status": local_status,
+            "anilist_pending": anilist_pending,
             "cancelled_downloads": cancelled,
             "state": self.get_state(),
         }
@@ -13588,13 +15803,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         current = str(anime.status or "").strip().upper() if anime is not None else ""
         warning = ""
         status_restored = ""
+        anilist_pending = False
         if kept and current == "DROPPED" and previous in self.ANIME_LIST_STATUSES and previous != "DROPPED":
             try:
-                client = self._anilist_client()
-                try:
-                    client.set_list_status(media_id, previous)
-                finally:
-                    client.close()
+                # Queued like the drop itself: a Dropped still waiting to be sent is
+                # replaced (or cancelled), never sent after "Keep".
+                anilist_pending = self._set_anilist_status_or_queue(media_id, previous)
                 self._set_local_anilist_status(media_id, previous)
                 status_restored = previous
             except Exception as exc:  # noqa: BLE001 - the files are kept even if AniList fails
@@ -13608,7 +15822,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             lifted,
             status_restored or current or "none",
         )
-        result = {"ok": True, "kept": kept, "status": status_restored or current, "state": self.get_state()}
+        result = {
+            "ok": True,
+            "kept": kept,
+            "status": status_restored or current,
+            "anilist_pending": anilist_pending,
+            "state": self.get_state(),
+        }
         if warning:
             result["warning"] = warning
         return result
@@ -13647,9 +15867,97 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             media_id = 0
         return start, media_id
 
+    def _final_sequel_cache_store(self) -> Any:
+        """The answers of ``final_sequel_option`` by title (memory + a small file, final_sequel_cache)."""
+        cache = getattr(self, "_final_sequel_cache", None)
+        if cache is None:
+            from .final_sequel_cache import FinalSequelCache
+
+            config = getattr(self, "config", None)
+            cache_dir = getattr(getattr(config, "paths", None), "cache_dir", None)
+            manager = getattr(self, "manager", None)
+
+            def status_of(sequel_id: int) -> str | None:
+                db = getattr(manager, "db", None)
+                anime = db.get_anime(int(sequel_id)) if db is not None and hasattr(db, "get_anime") else None
+                return str(anime.status or "") if anime is not None else None
+
+            cache = FinalSequelCache(
+                lambda value, background: self._compute_final_sequel_option(value, background=background),
+                path=(Path(cache_dir) / "final-sequel.json") if cache_dir else None,
+                status_of=status_of,
+                logger=getattr(self, "logger", None),
+            )
+            self._final_sequel_cache = cache
+        return cache
+
+    def _invalidate_final_sequel(self, media_id: int | None = None, *, sequel_id: int | None = None) -> None:
+        cache = getattr(self, "_final_sequel_cache", None)
+        if cache is None and getattr(self, "config", None) is None:
+            return
+        try:
+            self._final_sequel_cache_store().invalidate(media_id, sequel_id=sequel_id)
+        except Exception as exc:  # noqa: BLE001 - the status change goes on
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("FAIL step=final_sequel.invalidate error=%r", exc)
+
+    def warm_final_sequel(self, media_id: int, episode: int | None = None) -> bool:
+        """The final episode of ``media_id`` starts (mpv, a phone): compute its next entry now,
+        in the background, so the rating sheet shows it at once. ``episode`` given: only when it
+        is the title's final one (iphone_finale.finale) and the rating was not asked yet."""
+        try:
+            if episode is not None:
+                from .final_sequel_cache import ends_title
+
+                if not ends_title(self.manager.db, media_id, episode):
+                    return False
+            return bool(self._final_sequel_cache_store().warm(int(media_id)))
+        except Exception as exc:  # noqa: BLE001 - only a warm-up
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("FAIL step=final_sequel.warmup media_id=%s error=%r", media_id, exc)
+            return False
+
+    def _warm_final_sequel_for_path(self, path: Path) -> None:
+        try:
+            played = self.manager.db.episode_by_path(path)
+            if played is None or played.media_id is None:
+                return
+            number = played.last_episode if played.last_episode is not None else (played.episode or 0)
+            self.warm_final_sequel(int(played.media_id), int(number or 0))
+        except Exception as exc:  # noqa: BLE001 - only a warm-up
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("FAIL step=final_sequel.warmup_play error=%r", exc)
+
     def final_sequel_option(self, media_id: int) -> dict[str, Any]:
-        """Return the earliest direct SEQUEL for the score/final-episode surface."""
+        """Return the earliest direct SEQUEL for the score/final-episode surface (cached per
+        title for a few hours, computed ahead by ``warm_final_sequel``). Whether the sequel is
+        already in the library is read now, not cached: files can land after the warm-up."""
+        option = self._final_sequel_cache_store().option(int(media_id))
+        sequel = option.get("sequel") if isinstance(option, dict) else None
+        if not isinstance(sequel, dict) or not sequel.get("can_download"):
+            return option
+        try:
+            downloaded = self._local_file_count(int(sequel["media_id"])) > 0
+        except Exception as exc:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning(
+                    "FALLBACK step=final_sequel.local_files media_id=%s error=%r", sequel.get("media_id"), exc
+                )
+            downloaded = False
+        if not downloaded:
+            return option
+        return {**option, "sequel": {**sequel, "can_download": False, "downloaded": True}}
+
+    def _compute_final_sequel_option(self, media_id: int, *, background: bool = False) -> dict[str, Any]:
+        """The earliest direct SEQUEL, read from the relations graph now; ``background``: a
+        warm-up, paced as bulk AniList work instead of a click."""
         media_id = int(media_id)
+        requests = bulk_anilist_requests if background else interactive_anilist_requests
+        partial = False
 
         def direct_sequels(graph: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], list[int]]:
             nodes = {
@@ -13672,23 +15980,28 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     sequel_ids.append(target)
             return nodes, sequel_ids
 
-        graph = self.manager.relation_graph(media_id, force_refresh=False)
+        with requests():
+            graph = self.manager.relation_graph(media_id, force_refresh=False)
+        partial = bool(isinstance(graph, dict) and graph.get("refresh_failed"))
         nodes, sequel_ids = direct_sequels(graph)
         if not sequel_ids:
             # A newly announced sequel can be newer than the normal 3-5 day graph
             # cache. The score surface is user-driven, so one focused refresh is
             # preferable to silently saying that no sequel exists.
             try:
-                refreshed = self.manager.relation_graph(media_id, force_refresh=True)
+                with requests():
+                    refreshed = self.manager.relation_graph(media_id, force_refresh=True)
+                partial = bool(isinstance(refreshed, dict) and refreshed.get("refresh_failed"))
                 nodes, sequel_ids = direct_sequels(refreshed)
             except Exception as exc:
+                partial = True
                 self.logger.warning(
                     "FALLBACK step=final_sequel.relation_refresh media_id=%s error=%r",
                     media_id,
                     exc,
                 )
         if not sequel_ids:
-            return {"ok": True, "sequel": None}
+            return {"ok": True, "sequel": None, **({"partial": True} if partial else {})}
 
         sequel = min((nodes[value] for value in sequel_ids), key=self._final_sequel_sort_key)
         sequel_id = int(sequel["media_id"])
@@ -13717,7 +16030,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "can_watching": bool(released and list_status == "PLANNING"),
             "can_download": bool(released and not already_active),
         }
-        return {"ok": True, "sequel": payload}
+        return {"ok": True, "sequel": payload, **({"partial": True} if partial else {})}
 
     def _ensure_final_sequel_local(self, sequel: dict[str, Any]) -> LibraryAnime:
         media_id = int(sequel["media_id"])
@@ -13747,6 +16060,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"ok": False, "reason": "no_sequel"}
         if not sequel.get("released"):
             return {"ok": False, "reason": "not_released", "sequel": sequel}
+        if sequel.get("downloaded"):
+            return {"ok": False, "reason": "already_downloaded", "sequel": sequel}
         if not self.manager.downloads_enabled():
             return {"ok": False, "reason": "downloads_disabled", "sequel": sequel}
 
@@ -13776,14 +16091,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 anime.relations = previous.relations
             self.manager.db.upsert_anime(anime)
 
-        single = str(anime.format or "").upper() == "MOVIE" or anime.episodes == 1
-        if single:
-            release = self.manager.search_and_add_best(
-                anime.media_id,
-                episode=None,
-                batch=False,
-                automatic=False,
-            )
+        if self._planning_single_file_title(anime):
+            # The whole title, as Planning and Watching search it (an episode-less
+            # single search sent no Nyaa query: a movie sequel was never found).
+            release = None
+            for episode, batch in self._single_file_searches(anime):
+                release = self.manager.search_and_add_best(
+                    anime.media_id,
+                    episode=episode,
+                    batch=batch,
+                    automatic=False,
+                )
+                if release is not None:
+                    break
             if release is None:
                 return {
                     "ok": False,
@@ -13914,17 +16234,61 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.manager.db.set_state(cache_key, json.dumps(cached, ensure_ascii=False))
         return {"ok": True}
 
+    def _set_anilist_status_or_queue(self, media_id: int, status: str) -> bool:
+        """Set the AniList list status; when AniList cannot be reached, queue it for later.
+
+        True when the change waits for the next AniList refresh (HTTP 403/5xx, rate
+        limit, no network): Watching, Drop, Planning and file deletion must not
+        depend on AniList answering right now. Without AniList (no token) the
+        change is local only. ``"REMOVED"`` deletes the list entry.
+        """
+        from .anilist_tracking import QUEUED_REMOVAL, clear_pending_status, queue_pending_status
+
+        media_id = int(media_id)
+        status = str(status or "").strip().upper()
+        anime = self.manager.db.get_anime(media_id)
+        # What AniList has now, as far as Pudge knows: the queued change is sent
+        # later only while AniList still has it.
+        previous = str(anime.status or "").strip().upper() if anime is not None else ""
+        client: Any = None
+        try:
+            client = self._anilist_client_or_none()
+            if client is None:
+                self.logger.info(
+                    "SKIP step=anilist.set_list_status media_id=%s status=%s reason=not_configured",
+                    media_id,
+                    status,
+                )
+                return False
+            if status == QUEUED_REMOVAL:
+                client.delete_list_entry(media_id)
+            else:
+                client.set_list_status(media_id, status)
+        except AniListError as exc:
+            queue_pending_status(self.manager.db, media_id, status, previous=previous)
+            self.logger.warning(
+                "FALLBACK step=anilist.set_list_status media_id=%s status=%s queued=true error=%r",
+                media_id,
+                status,
+                str(exc),
+            )
+            return True
+        finally:
+            if client is not None:
+                client.close()
+        clear_pending_status(self.manager.db, media_id)
+        return False
+
     def move_planned_to_watching(self, media_id: int) -> dict[str, Any]:
         media_id = int(media_id)
-        client = self._anilist_client()
-        try:
-            client.set_list_status(media_id, "CURRENT")
-        finally:
-            client.close()
+        anilist_pending = self._set_anilist_status_or_queue(media_id, "CURRENT")
         self._set_local_anilist_status(media_id, "CURRENT")
         download_pending = False
         download_error = ""
-        if self.config.nyaa.enabled and self._downloads_enabled():
+        already_local = self._watching_download_not_needed(media_id)
+        if already_local:
+            self.logger.info("SKIP step=watching.download media_id=%s reason=already_in_library", media_id)
+        elif self.config.nyaa.enabled and self._downloads_enabled():
             # Provider searches can take tens of seconds. The AniList mutation
             # is already saved; let the UI render CURRENT before searching.
             with self._watching_download_lock:
@@ -13949,8 +16313,32 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "ok": True,
             "download_pending": download_pending,
             "download_error": download_error,
+            "anilist_pending": anilist_pending,
+            "already_local": already_local,
             "state": self.get_state_fast(),
         }
+
+    def _watching_download_not_needed(self, media_id: int) -> bool:
+        """The library already has what Watching would download (a dropped season pack, say).
+
+        Airing: the next episode is there. Finished: every episode is there (or, for a
+        movie or an entry without an episode count, any file).
+        """
+        db = self.manager.db
+        anime = db.get_anime(int(media_id))
+        if anime is None:
+            return False
+        try:
+            local = {item.episode for item in db.episodes(int(media_id)) if Path(item.video_path).is_file()}
+        except (OSError, TypeError, ValueError):
+            return False
+        if not local:
+            return False
+        if str(anime.media_status or "").upper() in {"RELEASING", "NOT_YET_RELEASED"}:
+            return anime.next_episode in local
+        if str(anime.format or "").upper() == "MOVIE" or not anime.episodes:
+            return True
+        return {number for number in local if number} >= set(range(1, int(anime.episodes) + 1))
 
     def _download_after_watching(
         self,
@@ -13983,24 +16371,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def set_anime_watching(self, media_id: int) -> dict[str, Any]:
         """Move an AniList entry to CURRENT without implicitly starting a download."""
-        client = self._anilist_client()
-        try:
-            client.set_list_status(int(media_id), "CURRENT")
-        finally:
-            client.close()
+        anilist_pending = self._set_anilist_status_or_queue(int(media_id), "CURRENT")
         self._set_local_anilist_status(int(media_id), "CURRENT")
-        return {"ok": True, "state": self.get_state()}
+        return {"ok": True, "anilist_pending": anilist_pending, "state": self.get_state()}
 
     def add_to_planning(self, media_id: int) -> dict[str, Any]:
-        client = self._anilist_client()
-        try:
-            client.set_list_status(int(media_id), "PLANNING")
-        finally:
-            client.close()
+        anilist_pending = self._set_anilist_status_or_queue(int(media_id), "PLANNING")
         self._set_local_anilist_status(int(media_id), "PLANNING")
-        stats, warning = self._refresh_anilist_after_mutation()
+        return self._after_list_change(anilist_pending)
+
+    def _after_list_change(self, anilist_pending: bool) -> dict[str, Any]:
+        """Refresh the list after a sent change; a queued one has nothing to fetch yet."""
+        if anilist_pending:
+            stats, warning = {"anime": 0, "covers": 0, "cached": True}, ""
+        else:
+            stats, warning = self._refresh_anilist_after_mutation()
         return {
             "ok": True,
+            "anilist_pending": anilist_pending,
             "refresh_pending": bool(warning),
             "warning": warning,
             "stats": stats,
@@ -14082,10 +16470,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
         anime_rows = self.manager.db.anime_list()
         ln_state = self.light_novels.state()
-        manga_state = self.manga.state()
+        # Cards only: the Manga tab's state reads every volume's OCR status as well.
+        manga_catalog = self.manga.search_catalog()
         audiobook_books = self.audiobooks.search_catalog()
         ln_books = [dict(item) for item in (ln_state.get("books") or []) if isinstance(item, dict)]
-        manga_books = [dict(item) for item in (manga_state.get("books") or []) if isinstance(item, dict)]
+        manga_books = [dict(item) for item in manga_catalog if isinstance(item, dict)]
 
         linked_ids = {int(anime.media_id) for anime in anime_rows if anime.media_id}
         linked_ids.update(
@@ -14306,15 +16695,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "manga": 3,
             "audiobook": 4,
         }
+
         # pudge-ui-v0.7.23-global-search-priority-v4
         # Search priority:
         #   0 = ready/imported/local
         #   1 = current/local but not fully ready
         #   2 = Planning
         #   3 = remote/random AniList
-        # Text score only orders items inside the same bucket.
+        # Text score only orders items inside the same bucket. A loose fuzzy match never
+        # outranks a title that contains the query ("fable" → "The Fable" first, then
+        # "Kakegurui - Compulsive Gambler"): close typos come next, then loose matches.
+        def relevance_band(item: dict[str, Any]) -> int:
+            score = float(item.get("score") or 0.0)
+            return 0 if score >= 90.0 else 1 if score >= 75.0 else 2
+
         results.sort(
             key=lambda item: (
+                relevance_band(item),
                 int(item.get("priority_tier", 3)),
                 -float(item.get("score") or 0.0),
                 kind_rank.get(str(item.get("kind") or ""), 9),
@@ -14357,12 +16754,62 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "recheck_subtitles": bool(saved.get("recheck_subtitles")),
         }
 
+    def _anilist_removal_notice(self) -> dict[str, Any]:
+        """Titles held back from a mass removal on AniList, for the window's notice."""
+        notice = getattr(getattr(self, "manager", None), "anilist_removal_notice", None)
+        if not callable(notice):
+            return {}
+        try:
+            return dict(notice() or {})
+        except Exception as exc:  # noqa: BLE001 - the notice waits for the next state
+            self.logger.debug("SKIP step=anilist.removal_notice error=%r", str(exc))
+            return {}
+
+    def resolve_anilist_removal_notice(self, action: str, notice_id: str = "") -> dict[str, Any]:
+        """The user's answer to the held mass removal: ``remove`` (from Pudge) or ``keep``."""
+        result = dict(self.manager.resolve_anilist_removal_notice(str(action or ""), str(notice_id or "")))
+        ui_state_cache = getattr(self, "_ui_state_cache", None)
+        if ui_state_cache is not None:
+            ui_state_cache.invalidate()
+        result["state"] = self.get_state_fast()
+        return result
+
     def mark_jimaku_key_notice_seen(self, notice_id: str) -> dict[str, Any]:
         """The Jimaku key notice was shown: do not open it by itself again for this trial or
         this refused personal key."""
 
         mark_jimaku_key_notice_seen(self.config.paths.cache_dir, str(notice_id or ""))
         return {"ok": True}
+
+    def _check_anilist_token(self, token: str) -> dict[str, Any]:
+        """Ask AniList who owns the token, and tell a bad token from AniList refusing everyone.
+
+        AniList answers an expired, revoked or mistyped token with HTTP 400
+        "Invalid token" (401 for some clients); a 403 is the API switched off or
+        a block of this Mac, so the token may well be fine.
+        """
+        client = AniListClient(self.config.anilist.endpoint, access_token=token)
+        client.interactive = True
+        try:
+            with probe_anilist_requests():
+                viewer = client.viewer()
+        except AniListAuthError as exc:
+            return {"service": "AniList", "status": "invalid", "detail": exc.detail or str(exc)}
+        except AniListHTTPError as exc:
+            if exc.status_code == 429:
+                return {"service": "AniList", "status": "rate_limited", "detail": str(exc)}
+            if exc.status_code == 403:
+                return {"service": "AniList", "status": "refused", "detail": exc.detail or str(exc)}
+            return {"service": "AniList", "status": "error", "detail": str(exc)}
+        except AniListNetworkError as exc:
+            return {"service": "AniList", "status": "unreachable", "detail": str(exc)}
+        except AniListError as exc:
+            if str(exc) == err("anilist.viewerUnknown"):
+                return {"service": "AniList", "status": "empty"}
+            return {"service": "AniList", "status": "error", "detail": str(exc)}
+        finally:
+            client.close()
+        return {"service": "AniList", "status": "ok" if viewer.get("id") else "empty"}
 
     def test_saved_credentials(
         self,
@@ -14384,47 +16831,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not token:
                 checks.append({"service": "AniList", "status": "missing"})
             else:
-                try:
-                    response = httpx.post(
-                        self.config.anilist.endpoint,
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/json",
-                            "Content-Type": "application/json",
-                        },
-                        json={"query": "query{Viewer{id name}}"},
-                        timeout=8.0,
-                    )
-                    if response.status_code in {401, 403}:
-                        checks.append({"service": "AniList", "status": "invalid"})
-                    else:
-                        response.raise_for_status()
-                        payload = response.json()
-                        viewer = (
-                            (payload.get("data") or {}).get("Viewer") if isinstance(payload, dict) else None
-                        )
-                        checks.append(
-                            {
-                                "service": "AniList",
-                                "status": "ok" if viewer else "empty",
-                            }
-                        )
-                except httpx.HTTPError as exc:
-                    checks.append(
-                        {
-                            "service": "AniList",
-                            "status": "unreachable",
-                            "detail": str(exc),
-                        }
-                    )
-                except ValueError as exc:
-                    checks.append(
-                        {
-                            "service": "AniList",
-                            "status": "error",
-                            "detail": str(exc),
-                        }
-                    )
+                checks.append(self._check_anilist_token(token))
 
         for backend, service in (("jiten", "Jiten"), ("jpdb", "JPDB")):
             if backend not in requested:
@@ -14544,7 +16951,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         rows = rows[:12]
         self._planning_search_cache.put(cache_key, rows)
-        self._planning_search_cache.prune(older_than_seconds=30 * 24 * 3600, max_entries=300)
+        self._planning_search_cache.prune(
+            older_than_seconds=30 * 24 * 3600, max_entries=300, min_interval_seconds=600
+        )
         return rows
 
     def planning_jiten_stats(
@@ -14561,55 +16970,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             [str(value) for value in (titles or []) if str(value or "").strip()],
         )
 
-    def _jiten_state_prefetch_worker(self, cancel_event: threading.Event) -> None:
-        started_at = time.time()
-        try:
-            result = self.light_novels.jiten_prefetch_corpus_states(cancel_event=cancel_event)
-            result = {**result, "started_at": started_at, "finished_at": time.time()}
-            self._jiten_state_prefetch_stats = result
-            self.logger.info(
-                "EVENT jiten.state_prefetch reason=%s warmed=%s total=%s batches=%s",
-                result.get("reason"),
-                result.get("warmed", 0),
-                result.get("total", 0),
-                result.get("batches", 0),
-            )
-        except Exception as exc:
-            self._jiten_state_prefetch_stats = {
-                "ok": False,
-                "reason": "error",
-                "error": str(exc),
-                "started_at": started_at,
-                "finished_at": time.time(),
-            }
-            self.logger.info("Jiten state corpus prefetch skipped: %s", exc)
-        finally:
-            with self._jiten_state_prefetch_lock:
-                if self._jiten_state_prefetch_thread is threading.current_thread():
-                    self._jiten_state_prefetch_thread = None
-
-    def jiten_state_prefetch(self, force: bool = False) -> dict[str, Any]:
-        settings = self.light_novels.settings()
-        if settings.study_backend != "jiten" or not str(settings.jiten_api_key or "").strip():
-            return {"started": False, "reason": "jiten_disabled"}
-        with self._jiten_state_prefetch_lock:
-            thread = self._jiten_state_prefetch_thread
-            if thread is not None and thread.is_alive():
-                return {"started": False, "reason": "running", **self._jiten_state_prefetch_stats}
-            if not force and self._jiten_state_prefetch_stats.get("reason") == "complete":
-                return {"started": False, "reason": "complete", **self._jiten_state_prefetch_stats}
-            cancel_event = threading.Event()
-            thread = threading.Thread(
-                target=self._jiten_state_prefetch_worker,
-                args=(cancel_event,),
-                name=f"{APP_SLUG}-jiten-state-prefetch",
-                daemon=True,
-            )
-            self._jiten_state_prefetch_cancel_event = cancel_event
-            self._jiten_state_prefetch_thread = thread
-            thread.start()
-        return {"started": True, "reason": "scheduled"}
-
     def _jiten_refresh_worker(
         self,
         job_id: str,
@@ -14620,16 +16980,42 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         parsed_manga = 0
         errors: list[str] = []
         total = len(ln_pending) + len(manga_pending)
+
+        def cancelled() -> bool:
+            return str((self.job_center.get(job_id) or {}).get("state") or "") == "cancel_requested"
+
+        def waited_out(exc: JitenUnavailableError) -> bool:
+            """Wait for Jiten's pause to end; False when the job was cancelled meanwhile."""
+            deadline = time.monotonic() + max(1.0, min(float(exc.retry_after or 60.0), 900.0))
+            while time.monotonic() < deadline:
+                if cancelled():
+                    return False
+                time.sleep(1.0)
+            return True
+
+        def preparse(parse: Any, *args: Any) -> bool:
+            # Background priority within the shared Jiten budget; a rate limit or an
+            # outage pause is waited out (cancellable) instead of failing every item.
+            for attempt in range(4):
+                try:
+                    with jiten_client.background_requests():
+                        parse(*args)
+                    return True
+                except JitenUnavailableError as exc:
+                    if attempt == 3:
+                        raise
+                    if not waited_out(exc):
+                        return False
+            return False
+
         try:
             self.job_center.update(job_id, state="running", total=total, message=t("web.refreshingJiten"))
             for index, (text, digest) in enumerate(ln_pending, 1):
-                state = self.job_center.get(job_id) or {}
-                if str(state.get("state") or "") == "cancel_requested":
+                if cancelled():
                     self.job_center.cancelled(job_id)
                     return
                 try:
-                    self.light_novels.jiten_preparse(text, digest)
-                    parsed_ln += 1
+                    parsed_ln += int(preparse(self.light_novels.jiten_preparse, text, digest))
                 except Exception as exc:
                     errors.append(f"LN: {exc}")
                 self.job_center.update(
@@ -14640,16 +17026,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     message=t("web.jitenLnProgress", done=index, total=len(ln_pending)),
                 )
             offset = len(ln_pending)
-            for index, text in enumerate(manga_pending, 1):
-                state = self.job_center.get(job_id) or {}
-                if str(state.get("state") or "") == "cancel_requested":
+            # Manga bubbles go to Jiten as arrays (each kept under its own study key).
+            parse_many = getattr(self.light_novels, "parse_study_texts", None)
+            step = 200 if parse_many is not None else 1
+            for start in range(0, len(manga_pending), step):
+                chunk = manga_pending[start : start + step]
+                if cancelled():
                     self.job_center.cancelled(job_id)
                     return
                 try:
-                    self.light_novels.jiten_preparse(text)
-                    parsed_manga += 1
+                    if parse_many is not None:
+                        parsed_manga += len(chunk) if preparse(parse_many, chunk) else 0
+                    else:
+                        parsed_manga += int(preparse(self.light_novels.jiten_preparse, chunk[0]))
                 except Exception as exc:
                     errors.append(f"Manga: {exc}")
+                index = start + len(chunk)
                 self.job_center.update(
                     job_id,
                     state="running",
@@ -14670,10 +17062,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if self._jiten_refresh_job_id == job_id:
                     self._jiten_refresh_thread = None
                     self._jiten_refresh_job_id = ""
-            try:
-                self.jiten_state_prefetch(force=True)
-            except Exception as exc:
-                self.logger.info("Jiten state prefetch after parse refresh skipped: %s", exc)
 
     def refresh_jiten_data(self) -> dict[str, Any]:
         """Invalidate Jiten metadata immediately and lazily parse local reading material."""
@@ -14692,18 +17080,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             manga_pending: list[str] = []
             try:
                 with self.manager.db.connect() as conn:
-                    rows = conn.execute(
-                        "SELECT DISTINCT text FROM manga_ocr_cache "
-                        "WHERE TRIM(COALESCE(text,''))<>'' AND region_key<>'full' ORDER BY book_id,page_index"
-                    ).fetchall()
-                seen: set[str] = set()
-                for row in rows:
-                    text = str(row["text"] or "").strip()[:20000]
-                    if text and text not in seen:
-                        seen.add(text)
-                        digest = hashlib.sha256(("study-v1\0" + text).encode("utf-8")).hexdigest()
-                        if self.light_novels._cached_parse(digest, provider="jiten") is None:
-                            manga_pending.append(text)
+                    book_ids = [
+                        int(row[0])
+                        for row in conn.execute(
+                            "SELECT DISTINCT book_id FROM manga_ocr_cache ORDER BY book_id"
+                        )
+                    ]
+                # The bubbles as the reader shows and looks them up (one study key each). The
+                # cache's text column holds a page's regions as JSON: whole pages of it, boxes
+                # and all, used to be sent to Jiten as Japanese text.
+                found: dict[str, str] = {}
+                for book_id in book_ids:
+                    for _page, region_text in self.manga.cached_region_texts(book_id):
+                        text, digest = self.light_novels._study_text_key(region_text)
+                        if text:
+                            found.setdefault(text, digest)
+                stored = self.light_novels.stored_jiten_parses(found.values())
+                manga_pending = [text for text, digest in found.items() if digest not in stored]
             except Exception as exc:
                 self.logger.info("Jiten manga preparse discovery skipped: %s", exc)
             job_id = self.job_center.start(
@@ -14744,6 +17137,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _irodori_managed_python(self) -> Path:
         return self._irodori_repo_dir() / ".venv" / "bin" / "python"
+
+    def _irodori_uv_cache_dir(self) -> Path:
+        """uv's cache for one install or update, removed when it ends (it left GBs in ~/.cache/uv)."""
+        return Path(self.config.paths.cache_dir).expanduser() / "irodori-uv-cache"
 
     @staticmethod
     def _irodori_local_url(url: str) -> bool:
@@ -14923,7 +17320,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if completed.returncode != 0 or not python.is_file():
             raise RuntimeError(err("setup.uvBootstrapFailed", code=completed.returncode))
         completed = subprocess.run(
-            [str(python), "-m", "pip", "install", "--upgrade", "uv"],
+            [str(python), "-m", "pip", "install", "--no-cache-dir", "--upgrade", "uv"],
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -14967,7 +17364,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             text=True,
             check=False,
             timeout=90 * 60,
-            env={**os.environ, "UV_LINK_MODE": "copy"},
+            # Packages are copied into the server's venv, so the cache can go afterwards.
+            env={**os.environ, "UV_LINK_MODE": "copy", "UV_CACHE_DIR": str(self._irodori_uv_cache_dir())},
         )
         if completed.returncode != 0:
             raise RuntimeError(err("setup.uvSyncExit", code=completed.returncode))
@@ -15000,6 +17398,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         rollback_to = ""
         git = ""
         uv: Path | None = None
+        # A crashed install's cache is still there: start empty.
+        shutil.rmtree(self._irodori_uv_cache_dir(), ignore_errors=True)
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 git = shutil.which("git") or ("/usr/bin/git" if Path("/usr/bin/git").is_file() else "")
@@ -15144,6 +17544,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self._set_irodori_install_state("failed", reason)
             if platform.system() == "Darwin" and log_path.exists():
                 subprocess.run(["open", "-R", str(log_path)], check=False)
+        finally:
+            shutil.rmtree(self._irodori_uv_cache_dir(), ignore_errors=True)
 
     def install_irodori_tts(self) -> dict[str, Any]:
         """Install, or repair: puts the last good commit (else the pin, else main) on the Mac."""
@@ -15183,7 +17585,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def reveal_irodori_install_log(self) -> dict[str, Any]:
         path = self._irodori_install_log_path()
         if not path.exists():
-            return {"ok": False, "path": str(path)}
+            return {"ok": False, "path": str(path), "error": err("irodori.installLogMissing")}
         if platform.system() == "Darwin":
             subprocess.run(["open", "-R", str(path)], check=False)
         return {"ok": True, "path": str(path)}
@@ -15311,6 +17713,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             headers["Authorization"] = f"Bearer {str(api_key).strip()}"
         return headers
 
+    @_url_credentials_redacted
     def test_irodori_tts(
         self,
         values: dict[str, Any] | None = None,
@@ -15320,8 +17723,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     ) -> dict[str, Any]:
         settings = self.light_novels.settings()
         values = values or {}
-        url = str(values.get("url") or settings.irodori_tts_url or "http://127.0.0.1:8088").rstrip("/")
-        key = str(values.get("api_key") or settings.irodori_tts_api_key or "")
+        url = restore_url_password(
+            str(values.get("url") or settings.irodori_tts_url or "http://127.0.0.1:8088"),
+            settings.irodori_tts_url,
+        ).rstrip("/")
+        saved_url = str(settings.irodori_tts_url or "http://127.0.0.1:8088")
+        # The saved key (behind the mask or a blank field) only goes to the saved server.
+        saved_key = str(settings.irodori_tts_api_key or "") if same_server(url, saved_url) else ""
+        key = str(keep_masked_secret(values.get("api_key"), saved_key) or saved_key)
         started_here = False
         try:
             try:
@@ -15358,13 +17767,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 payload = {}
             return {
                 "ok": True,
-                "url": url,
+                "url": mask_url_password(url),
                 "health": payload if isinstance(payload, dict) else {},
                 "managed": self._irodori_local_url(url) and self._irodori_managed_python().is_file(),
             }
         finally:
             if started_here and not keep_managed_alive:
-                self._stop_managed_irodori_server()
+                # A generation started meanwhile uses this server (it found it running):
+                # that worker stops it when it ends.
+                with self._irodori_tts_lock:
+                    generating = any(thread.is_alive() for thread in self._irodori_tts_threads.values())
+                if not generating:
+                    self._stop_managed_irodori_server()
 
     def test_llm_provider(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         values = values or {}
@@ -15373,8 +17787,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             raise RuntimeError(err("setup.llmProviderUnsupported", provider=provider))
         base_url = str(values.get("url") or self.config.llm.base_url or "").strip().rstrip("/")
         api_key = str(values.get("api_key") or "")
-        if api_key == "••••••••":
-            api_key = self.config.llm.api_key
+        if api_key == SECRET_MASK:
+            # The saved key only goes to the saved server, never to an address the page sent.
+            saved_url = str(self.config.llm.base_url or "")
+            api_key = str(self.config.llm.api_key or "") if same_server(base_url, saved_url) else ""
         model = str(values.get("model") or self.config.llm.model or "").strip()
         reasoning_effort = (
             str(values.get("reasoning_effort") or self.config.llm.reasoning_effort or "low").strip().lower()
@@ -15444,10 +17860,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "managed": True,
             }
         if provider == "external":
+            base_url = restore_url_password(
+                str(values.get("url") or settings.irodori_tts_url or ""), settings.irodori_tts_url
+            ).rstrip("/")
+            # The saved key (behind the mask or a blank field) only goes to the saved server.
+            saved_key = (
+                str(settings.irodori_tts_api_key or "")
+                if same_server(base_url, str(settings.irodori_tts_url or ""))
+                else ""
+            )
             return {
                 "provider": "external",
-                "base_url": str(values.get("url") or settings.irodori_tts_url or "").strip().rstrip("/"),
-                "api_key": str(values.get("api_key") or settings.irodori_tts_api_key or ""),
+                "base_url": base_url,
+                "api_key": str(keep_masked_secret(values.get("api_key"), saved_key) or saved_key),
                 "model": str(values.get("model") or settings.audiobook_tts_model or "tts-1").strip()
                 or "tts-1",
                 "voice": str(values.get("voice") or settings.irodori_tts_voice or "alloy").strip() or "alloy",
@@ -15457,6 +17882,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
         raise LightNovelError(err("audiobook.generationDisabled"))
 
+    @_url_credentials_redacted
     def test_audiobook_generation(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         values = values or {}
         runtime = self._audiobook_generation_runtime(values)
@@ -15474,7 +17900,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             try:
                 response = httpx.get(f"{url}{endpoint}", headers=headers, timeout=5.0)
                 response.raise_for_status()
-                return {"ok": True, "provider": "external", "url": url}
+                return {"ok": True, "provider": "external", "url": mask_url_password(url)}
             except Exception as exc:
                 last_error = exc
         raise RuntimeError(err("audiobook.apiUnreachable", error=last_error))
@@ -15794,11 +18220,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "book_dir": book_dir,
             "profiles_path": profiles_path,
         }
-
-    def _audiobook_speaker_cache_dir(self, book_id: int) -> Path:
-        # Kept as a compatibility helper for existing tests/callers. New data is
-        # volume-specific under a series-scoped root.
-        return Path(self._audiobook_speaker_cache_context(book_id)["book_dir"])
 
     def _audiobook_character_profiles_path(self) -> Path:
         """Global AniList-character voice registry shared by every LN series."""
@@ -16294,7 +18715,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return True
         if control == "cancel_requested":
             self.job_center.cancelled(job_id, message=t("web.audiobookGenerationCancelled"))
-            shutil.rmtree(output_dir, ignore_errors=True)
+            self._remove_generation_output(output_dir)
             return True
         return False
 
@@ -16635,7 +19056,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             with self._irodori_tts_lock:
                 if self._audiobook_generation_controls.get(int(book_id)) == "cancel_requested":
                     self.job_center.cancelled(job_id, message=t("web.sourceRemoved"))
-                    shutil.rmtree(output_dir, ignore_errors=True)
+                    self._remove_generation_output(output_dir)
                     return
                 self.light_novels.book(int(book_id))
                 audiobook = self.audiobooks.import_folder(
@@ -16650,7 +19071,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 )
             if mode == "regenerate" and old_audiobook_id and int(audiobook["id"]) != old_audiobook_id:
                 try:
-                    self.audiobooks.delete(old_audiobook_id, delete_files=True)
+                    # Its folder is deleted only when it still is a generated one (the id may
+                    # come from a manifest written hours or launches ago), never this output.
+                    old_path = Path(
+                        str(self.audiobooks.book(old_audiobook_id).get("path") or "")
+                    ).expanduser()
+                    if (
+                        self._generated_audiobook_folder(old_path)
+                        and old_path.resolve() != output_dir.resolve()
+                    ):
+                        self.audiobooks.delete(old_audiobook_id, delete_files=True)
+                    else:
+                        self.logger.warning(
+                            "SKIP step=audiobook.regenerate_cleanup id=%s reason=not_generated path=%s",
+                            old_audiobook_id,
+                            old_path,
+                        )
                 except Exception as exc:
                     self.logger.warning(
                         "Could not remove superseded generated audiobook id=%s: %s",
@@ -16877,7 +19313,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if manifest is None:
             return {"ok": True, "pending": False, "deleted": False, "job": self._irodori_tts_status(book_id)}
         output_dir = Path(str(manifest.get("output_dir") or "")).expanduser()
-        shutil.rmtree(output_dir, ignore_errors=True)
+        self._remove_generation_output(output_dir)
         manifest_job_id = str(manifest.get("job_id") or job_id)
         if manifest_job_id:
             self.job_center.cancelled(manifest_job_id, message=t("web.audiobookGenerationCancelled"))
@@ -16900,28 +19336,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         }
 
     def remove_from_planning(self, media_id: int) -> dict[str, Any]:
-        client = self._anilist_client()
-        try:
-            client.delete_list_entry(int(media_id))
-        finally:
-            client.close()
+        anilist_pending = self._set_anilist_status_or_queue(int(media_id), "REMOVED")
         self._set_local_anilist_status(int(media_id), "REMOVED")
-        stats, warning = self._refresh_anilist_after_mutation()
-        return {
-            "ok": True,
-            "refresh_pending": bool(warning),
-            "warning": warning,
-            "stats": stats,
-            "state": self.get_state(),
-        }
+        return self._after_list_change(anilist_pending)
 
+    @_url_credentials_redacted
     def test_nyaa_proxy(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         values = values or {}
         cfg = self.config.nyaa
+        # The addresses on the form (not yet saved) are what the user tests.
+        form_sources = values.get("sources")
+        sources = parse_sources(form_sources) if isinstance(form_sources, dict) else load_sources(self.config)
         client = NyaaClient(
-            str(values.get("nyaa_url", cfg.base_url)).strip(),
+            sources.release_search,
+            mirrors=sources.mirrors,
             proxy_mode=str(values.get("proxy_mode", cfg.proxy_mode)).strip(),
-            proxy_url=str(values.get("proxy_url", cfg.proxy_url)).strip(),
+            proxy_url=restore_url_password(
+                str(values.get("proxy_url", cfg.proxy_url)).strip(), cfg.proxy_url
+            ),
             pre_search_command=cfg.pre_search_command,
             category=cfg.category,
             timeout=20.0,
@@ -16930,25 +19362,90 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {
             "ok": True,
             "count": len(releases),
-            "proxy_url": client.proxy_url,
+            "host": sources.release_host,
+            "proxy_url": mask_url_password(client.proxy_url),
             "proxy_mode": client.proxy_mode,
         }
 
+    def sources_import(self, only_missing: bool = False) -> dict[str, Any]:
+        """Settings → Sources → Import…: replace (or fill in) the sources from a .json file."""
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                directory=str(Path.home()),
+                allow_multiple=False,
+                file_types=(f"{t('web.fileTypeSources')} (*.json)",),
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        selected = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
+        try:
+            text = selected.read_bytes()
+        except OSError as exc:
+            raise SourcesError(err("sources.readFailed", error=exc)) from exc
+        sources = import_sources(self.config, text, only_missing=bool(only_missing))
+        cache = getattr(self, "_ui_state_cache", None)
+        if cache is not None:
+            cache.invalidate()  # the next state poll must not bring back the old sources
+        self.logger.info("EVENT sources.imported only_missing=%s", bool(only_missing))
+        return {"ok": True, "sources": sources.to_dict()}
+
+    def sources_export(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Settings → Sources → Export…: write the sources on the form to a chosen file."""
+        sources = parse_sources(values) if isinstance(values, dict) else load_sources(self.config)
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                directory=str(Path.home()),
+                save_filename="sources.json",
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        target = Path(str(result[0] if isinstance(result, (list, tuple)) else result)).expanduser()
+        try:
+            target.write_text(
+                json.dumps(sources.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            raise SourcesError(err("sources.writeFailed", error=exc)) from exc
+        return {"ok": True, "path": str(target)}
+
+    @_url_credentials_redacted
     def test_qbittorrent(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         values = values or {}
         cfg = self.config.qbittorrent
+        url = str(values.get("qbt_url", cfg.base_url)).strip()
+        # The form holds the mask for a saved password or key: test the saved one, but
+        # only against the saved address (an edited address never gets them).
+        saved_address = same_web_ui_address(url, cfg.base_url)
         client = QBittorrentClient(
-            str(values.get("qbt_url", cfg.base_url)).strip(),
+            url,
             str(values.get("qbt_user", cfg.username)).strip(),
-            str(values.get("qbt_password", cfg.password)),
-            str(values.get("qbt_api_key", cfg.api_key)).strip(),
+            keep_masked_secret(
+                values.get("qbt_password", SECRET_MASK), cfg.password if saved_address else ""
+            ),
+            keep_masked_secret(
+                values.get("qbt_api_key", SECRET_MASK), cfg.api_key if saved_address else ""
+            ).strip(),
             verify_tls=cfg.verify_tls,
             pre_download_command=cfg.pre_download_command,
             auto_start_app=cfg.auto_start_app,
         )
         try:
             version = client.version()
-            return {"ok": True, "version": version, "url": client.base_url}
+            return {"ok": True, "version": version, "url": mask_url_password(client.base_url)}
         finally:
             client.close()
 
@@ -16997,12 +19494,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def _save_play_registry(self) -> None:
         path = self._play_registry_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(self._play_registry, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        atomic_write_json(path, self._play_registry, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -17013,6 +19505,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except (OSError, ProcessLookupError):
             return False
         return True
+
+    # Wall-clock time of the last boot, to the second. The clock used keeps
+    # counting through sleep (macOS CLOCK_MONOTONIC, Linux CLOCK_BOOTTIME), so
+    # the value stays put until the next reboot.
+    PLAY_BOOT_TOLERANCE_SECONDS = 120.0
+
+    @staticmethod
+    def _play_boot_marker() -> float:
+        clock = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+        return float(round(time.time() - time.clock_gettime(clock)))
+
+    @staticmethod
+    def _play_pid_is_launcher(pid: int) -> bool:
+        from .foreground import _pid_command
+
+        return "pudge.cli" in _pid_command(int(pid))
 
     @staticmethod
     def _play_ack_payload(record: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -17075,7 +19583,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except (TypeError, ValueError):
             pid = 0
             started_at = 0.0
-        if not self._pid_is_alive(pid):
+        # The registry file survives a reboot, and its PID may then belong to
+        # any other process: a row from another boot is forgotten unsignalled.
+        try:
+            boot = float(record.get("boot") or 0.0)
+        except (TypeError, ValueError):
+            boot = 0.0
+        other_boot = bool(boot) and abs(boot - self._play_boot_marker()) > self.PLAY_BOOT_TOLERANCE_SECONDS
+        if other_boot or not self._pid_is_alive(pid):
             self._cleanup_play_ack(record)
             self._play_registry.pop(key, None)
             self._save_play_registry()
@@ -17103,6 +19618,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
         if age < self.PLAY_STARTUP_TIMEOUT_SECONDS:
             return {"status": "starting", "pid": pid, "age": age, "restored": True}
+        # A reused PID (rows written before the boot marker, or a PID reused
+        # without a reboot) is not Pudge's launcher: forget it, never signal it.
+        if not self._play_pid_is_launcher(pid):
+            self.logger.info(
+                "EVENT play.registry_stale video=%s pid=%s reason=not_launcher", Path(key).name, pid
+            )
+            self._cleanup_play_ack(record)
+            self._play_registry.pop(key, None)
+            self._save_play_registry()
+            return None
         self.logger.error(
             "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=True",
             Path(key).name,
@@ -17205,6 +19730,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if last is not None:
             code, finished_at = last
             if time.time() - finished_at < 8.0 and code != 0:
+                if code == MPV_MISSING_EXIT_CODE:
+                    # mpv is optional now: the window offers to install it.
+                    return {
+                        "status": "failed",
+                        "exit_code": code,
+                        "reason": "mpv_missing",
+                        "error": err("media.mpvMissing"),
+                    }
                 return {"status": "failed", "exit_code": code, "reason": "launcher_exit"}
             self._play_exit_codes.pop(key, None)
         return {"status": "idle"}
@@ -17360,47 +19893,117 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         }
 
     def personal_schedule_tick(self) -> dict[str, Any]:
-        delivered: list[dict[str, Any]] = []
-        for schedule in self.manager.db.active_personal_release_schedules():
-            anime = self.manager.db.get_anime(schedule.anime_id)
-            if anime is None:
-                continue
-            snapshot = self._personal_schedule_snapshot(anime)
-            if snapshot.get("status") != "new_ready" or snapshot.get("next_episode") is None:
-                continue
-            episode = int(snapshot["next_episode"])
-            key = f"personal_schedule_notification:{schedule.schedule_id}:{schedule.cycle_id}:{episode}:ready"
-            if self.manager.db.get_state(key, ""):
-                continue
-            if not self.config.ui.notifications_enabled:
-                self.manager.db.set_state(key, "disabled")
-                continue
-            subtitle = t("notify.scheduledEpisodeReady")
-            message = t("notify.scheduledEpisodeReadyMessage", title=anime.title, episode=episode)
+        """The page's tick at an unlock time; the background loop delivers the same way."""
+        delivered = self._personal_schedule_deliver_notifications(source="page")
+        return {"ok": True, "delivered": delivered, "state": self._get_state(refresh_storage=False)}
+
+    # Waits are capped so a sleeping Mac, a hidden window or a throttled page still
+    # gets the unlock notification a few minutes after the unlock or the wake-up.
+    PERSONAL_SCHEDULE_TICK_MAX_WAIT = 300.0
+    PERSONAL_SCHEDULE_LATE_SECONDS = 15 * 60.0
+
+    def _personal_schedule_notify_loop(self, cancel_event: threading.Event) -> None:
+        """Unlock notifications of personal schedules without the page (closed window, App Nap, sleep)."""
+        if cancel_event.wait(20.0):
+            return
+        while not cancel_event.is_set():
+            wait = self.PERSONAL_SCHEDULE_TICK_MAX_WAIT
             try:
-                ok = bool(send_native_notification(subtitle, message))
-            except Exception as exc:
-                ok = False
-                self.logger.warning(
-                    "EVENT personal_schedule.notification_failed media_id=%s episode=%s error=%r",
+                self._personal_schedule_deliver_notifications(source="background")
+                wait = self._personal_schedule_next_wait(now=time.time())
+            except Exception:
+                self.logger.exception("FAIL step=personal_schedule.background_tick")
+            if cancel_event.wait(wait):
+                return
+
+    def _personal_schedule_next_wait(self, *, now: float) -> float:
+        wait = self.PERSONAL_SCHEDULE_TICK_MAX_WAIT
+        for schedule in self.manager.db.active_personal_release_schedules(now=now):
+            for item in schedule.items:
+                if item.watched_at is None and not item.unlocked:
+                    wait = min(wait, float(item.unlock_at_utc) - now + 1.0)
+                    break
+        return max(1.0, wait)
+
+    def _personal_schedule_unlock_time_text(self, unlock_at: float, now: float) -> str:
+        unlocked = time.localtime(float(unlock_at))
+        if time.strftime("%Y-%m-%d", unlocked) == time.strftime("%Y-%m-%d", time.localtime(float(now))):
+            return time.strftime("%H:%M", unlocked)
+        return time.strftime("%d.%m %H:%M", unlocked)
+
+    def _personal_schedule_deliver_notifications(self, *, source: str) -> list[dict[str, Any]]:
+        """Notify once per unlocked, locally ready scheduled episode (page and background share the key)."""
+        lock = self.__dict__.setdefault("_personal_schedule_tick_lock", threading.Lock())
+        delivered: list[dict[str, Any]] = []
+        with lock:
+            now = time.time()
+            for schedule in self.manager.db.active_personal_release_schedules(now=now):
+                next_item = next((item for item in schedule.items if item.watched_at is None), None)
+                if next_item is not None and not next_item.unlocked:
+                    continue  # cheap path: nothing unlocked to announce yet
+                anime = self.manager.db.get_anime(schedule.anime_id)
+                if anime is None:
+                    continue
+                snapshot = self._personal_schedule_snapshot(anime, now=now)
+                if snapshot.get("status") != "new_ready" or snapshot.get("next_episode") is None:
+                    continue
+                episode = int(snapshot["next_episode"])
+                schedule = self.manager.db.personal_release_schedule(anime.media_id, now=now) or schedule
+                key = f"personal_schedule_notification:{schedule.schedule_id}:{schedule.cycle_id}:{episode}:ready"
+                marker = self.manager.db.get_state(key, "")
+                if marker and ready_marker_is_stale(schedule, episode, marker):
+                    self.manager.db.delete_state(key)
+                    marker = ""
+                if marker:
+                    continue
+                if not self.config.ui.notifications_enabled:
+                    self.manager.db.set_state(key, "disabled")
+                    continue
+                item = next((row for row in schedule.items if int(row.episode) == episode), None)
+                unlock_at = float(item.unlock_at_utc) if item is not None else now
+                language = getattr(self.config.ui, "language", None)
+                subtitle = t("notify.scheduledEpisodeReady", lang=language)
+                if now - unlock_at >= self.PERSONAL_SCHEDULE_LATE_SECONDS:
+                    message = t(
+                        "notify.scheduledEpisodeReadyLateMessage",
+                        lang=language,
+                        title=anime.title,
+                        episode=episode,
+                        time=self._personal_schedule_unlock_time_text(unlock_at, now),
+                    )
+                else:
+                    message = t(
+                        "notify.scheduledEpisodeReadyMessage",
+                        lang=language,
+                        title=anime.title,
+                        episode=episode,
+                    )
+                try:
+                    ok = bool(send_native_notification(subtitle, message))
+                except Exception as exc:
+                    ok = False
+                    self.logger.warning(
+                        "EVENT personal_schedule.notification_failed media_id=%s episode=%s error=%r",
+                        anime.media_id,
+                        episode,
+                        exc,
+                    )
+                if ok:
+                    self.manager.db.set_state(key, "delivered")
+                    self.manager.db.set_state(
+                        f"personal_schedule_notification:{schedule.schedule_id}:{episode}:ready",
+                        "delivered",
+                    )
+                    delivered.append({"media_id": anime.media_id, "episode": episode})
+                self.logger.info(
+                    "EVENT personal_schedule.notification media_id=%s episode=%s delivered=%s source=%s late_seconds=%.0f",
                     anime.media_id,
                     episode,
-                    exc,
+                    ok,
+                    source,
+                    max(0.0, now - unlock_at),
                 )
-            if ok:
-                self.manager.db.set_state(key, "delivered")
-                self.manager.db.set_state(
-                    f"personal_schedule_notification:{schedule.schedule_id}:{episode}:ready",
-                    "delivered",
-                )
-                delivered.append({"media_id": anime.media_id, "episode": episode})
-            self.logger.info(
-                "EVENT personal_schedule.notification media_id=%s episode=%s delivered=%s",
-                anime.media_id,
-                episode,
-                ok,
-            )
-        return {"ok": True, "delivered": delivered, "state": self._get_state(refresh_storage=False)}
+        return delivered
 
     def personal_schedule_disable(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
@@ -17420,6 +20023,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         schedule = self.manager.db.personal_release_schedule(anime.media_id)
         if schedule is None or not schedule.enabled:
             return {"allowed": True}
+        schedule = self._personal_schedule_catch_up_watched(anime, schedule, now=time.time())
         display_episode = self._display_episode_number(anime, episode.episode)
         if display_episode is None:
             return {"allowed": True}
@@ -17472,6 +20076,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         path = Path(key)
         if not path.is_file():
             raise FileNotFoundError(err("library.videoNotFound", path=path))
+        self._adopt_installed_mpv()
 
         with self._play_lock:
             if getattr(self, "_closing", False):
@@ -17762,7 +20367,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 env = worker_environment(
                     {
                         "PUDGE_MPV_START_ACK": str(ack_path),
-                        "PUDGE_ASSISTANT_URL": getattr(self, "asset_base", "") + "/api/mpv/explain",
+                        "PUDGE_ASSISTANT_URL": (
+                            getattr(self, "asset_origin", "") or getattr(self, "asset_base", "")
+                        )
+                        + "/api/mpv/explain",
                         "PUDGE_ASSISTANT_TOKEN": getattr(self, "_http_session_token", ""),
                     }
                 )
@@ -17782,6 +20390,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "pid": int(process.pid),
                 "started_at": float(self._play_started_at[key]),
                 "ack_file": str(ack_path),
+                "boot": self._play_boot_marker(),
             }
             self.logger.info(
                 "EVENT play.launcher_spawned video=%s launcher_pid=%s ack=%s",
@@ -17791,6 +20400,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             self._save_play_registry()
             self._play_exit_codes.pop(key, None)
+            # The final episode: its next entry is ready when mpv closes (final_sequel_cache).
+            self._warm_final_sequel_for_path(path)
             if schedule_admission.get("scheduled"):
                 scheduled_episode = self.manager.db.episode_by_path(path)
                 self._schedule_play_sessions[key] = {
@@ -17806,6 +20417,51 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     else 0.0,
                 }
             return {"ok": True, "duplicate": False, "status": "starting", "pid": process.pid}
+
+    def extra_file_delete(self, video_path: str) -> dict[str, Any]:
+        """Delete an extra file a batch brought along (Home: Action required → Delete)."""
+        deleted = self.manager.delete_extra_download_file(Path(video_path))
+        if not deleted:
+            return {"ok": False, "error": err("web.extraFileNotFound")}
+        self._ui_state_cache.invalidate()
+        return {"ok": True, "state": self.get_state()}
+
+    def extra_file_keep(self, video_path: str, episode: int | None = None) -> dict[str, Any]:
+        """Keep an extra file in the library and stop asking about it (``episode``: the number a
+        set-aside season-0 file gets, default its S00 number)."""
+        try:
+            number = int(episode) if episode not in (None, "") else None
+        except (TypeError, ValueError):
+            number = None
+        kept = self.manager.keep_extra_download_file(Path(video_path), episode=number)
+        if not kept:
+            return {"ok": False, "error": err("web.extraFileNotFound")}
+        self._ui_state_cache.invalidate()
+        return {"ok": True, "state": self.get_state()}
+
+    def focus_playback(self, video_path: str) -> dict[str, Any]:
+        """A card of an episode that is already open shows its mpv instead of a toast."""
+        from .window_focus import bring_process_to_front
+
+        key = self._play_key(video_path)
+        with self._play_lock:
+            state = self._play_state_locked(key)
+        mpv_pid = int(state.get("mpv_pid") or 0)
+        focused = False
+        if state.get("status") == "running" and mpv_pid:
+            # With the window in its own process that process is the active app and does it
+            # (window_process.RemoteWindow.focus_process); otherwise this one is.
+            remote = getattr(self.window, "focus_process", None)
+            answer = remote(mpv_pid) if callable(remote) else None
+            focused = bool(answer) if answer is not None else bool(bring_process_to_front(mpv_pid))
+        self.logger.info(
+            "EVENT play.focus video=%s status=%s mpv_pid=%s focused=%s",
+            Path(key).name,
+            state.get("status"),
+            mpv_pid,
+            focused,
+        )
+        return {"ok": True, "status": str(state.get("status") or ""), "focused": focused}
 
     def play_status(self, video_path: str) -> dict[str, Any]:
         key = self._play_key(video_path)
@@ -17867,10 +20523,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 started_at, float(session.get("baseline_playback_updated_at") or 0.0)
             )
             watched_evidence = watched_at > max(started_at, float(session.get("baseline_watched_at") or 0.0))
+            # Same rule as the AniList count in mpv (pudge_anilist.lua): past the threshold AND
+            # at most N minutes left. "Or" counted a 24-minute episode with 10 minutes still to go.
             threshold_evidence = bool(
                 fresh_progress
                 and duration > 0
-                and (position / duration >= threshold or duration - position <= remaining_limit)
+                and position / duration >= threshold
+                and duration - position <= remaining_limit
             )
             if watched_evidence or threshold_evidence:
                 marked = self.manager.db.mark_personal_release_watched(
@@ -17899,32 +20558,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.config.library.root_dir.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(["open", str(self.config.library.root_dir)])
         return {"ok": True}
-
-    def reveal_subtitle_file(self, path: str) -> dict[str, Any]:
-        """Open Finder and select a text/image subtitle or its video container."""
-        source_path = Path(str(path)).expanduser()
-        if not source_path.is_file():
-            return {"ok": False, "error": err("web.subtitleSourceMissing")}
-        allowed = {
-            ".srt",
-            ".ass",
-            ".ssa",
-            ".vtt",
-            ".sub",
-            ".idx",
-            ".sup",
-            ".pgs",
-            ".mkv",
-            ".mp4",
-            ".m4v",
-            ".mov",
-            ".avi",
-            ".webm",
-        }
-        if source_path.suffix.casefold() not in allowed:
-            return {"ok": False, "error": err("web.subtitleSourceUnsupported")}
-        subprocess.Popen(["open", "-R", str(source_path.resolve())])
-        return {"ok": True, "path": str(source_path.resolve())}
 
     def get_recent_logs(self, limit: int = 300) -> dict[str, Any]:
         return {
@@ -17980,6 +20613,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def export_runtime_debug_bundle(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         output_dir = debug_log_dir()
+        reporter = getattr(self, "_memory_reporter", None)
+        if reporter is not None:
+            try:
+                reporter.log_once("debug_bundle")  # the runtime log in the bundle ends with it
+            except Exception:  # noqa: BLE001 - the bundle matters more than the line
+                self.logger.exception("FAIL step=memory.report reason=debug_bundle")
         frontend = dict(payload) if isinstance(payload, dict) else {}
         target = self.diagnostics_controller.export(
             output_dir,
@@ -18092,18 +20731,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.logger.exception("FAIL step=app.exit_fullscreen.schedule")
             return {"ok": False, "exited": False}
 
-    def test_notification(self) -> dict[str, Any]:
-        permission = request_notification_permission(timeout=4.0)
-        subtitle = t("notify.test")
-        message = t("notify.testMessage", app=APP_NAME)
-        delivered = bool(permission.get("granted")) and send_native_notification(subtitle, message)
-        self.logger.info(
-            "EVENT notification.test granted=%s delivered=%s",
-            permission.get("granted"),
-            delivered,
-        )
-        return {"ok": delivered, "delivered": delivered, "permission": permission}
-
     def request_permissions(self) -> dict[str, Any]:
         """Request protected-folder/notification access only during first-run preflight."""
         if self.config.ui.permissions_requested:
@@ -18181,9 +20808,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         return {"ok": True}
 
-    def safe_mode_status(self) -> dict[str, Any]:
-        return self.safe_mode.status(run_checks=True)
-
     def safe_mode_restart_normally(self) -> dict[str, Any]:
         self.safe_mode.leave_on_restart()
         self._ui_state_cache.invalidate()
@@ -18215,10 +20839,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.manager.cached_relation_graphs(media_ids)
 
     def get_relation_graph(self, media_id: int) -> dict[str, Any]:
-        return self.manager.relation_graph(int(media_id), force_refresh=False)
+        with interactive_anilist_requests():
+            return self.manager.relation_graph(int(media_id), force_refresh=False)
 
     def refresh_relation_graph(self, media_id: int) -> dict[str, Any]:
-        return self.manager.relation_graph(int(media_id), force_refresh=True)
+        with interactive_anilist_requests():
+            return self.manager.relation_graph(int(media_id), force_refresh=True)
 
     def open_url(self, url: str) -> dict[str, Any]:
         # URLs come from AniList/Jiten metadata: never hand file:, javascript:,
@@ -18233,7 +20859,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         webbrowser.open(value)
         return {"ok": True}
 
-    _UI_PREFERENCE_KEYS = ("pudge.assistant.v1", "pudge.assistant.geometry.v1", "pudge.readTogether.v1")
+    _UI_PREFERENCE_KEYS = (
+        "pudge.assistant.v1",
+        "pudge.assistant.geometry.v1",
+        "pudge.assistant.dock.v1",
+        "pudge.readTogether.v1",
+    )
 
     def ui_preferences(self) -> dict[str, Any]:
         result = {}
@@ -18282,17 +20913,124 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def diagnose_episode(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         return self.manager.diagnose_episode(int(media_id), episode)
 
-    def media_identity_lock(self, canonical_id: str, locked: bool = True) -> dict[str, Any]:
-        return {
-            "ok": self.manager.identity_resolver.lock(str(canonical_id), bool(locked)),
-            "canonical_id": str(canonical_id),
-            "locked": bool(locked),
-        }
+    def diagnose_video_file(self, video_path: str) -> dict[str, Any]:
+        """ "Why not ready?" of one file: also for a file without an AniList entry."""
+        return self.manager.diagnose_video(Path(str(video_path)))
+
+    def identify_episode_search(self, query: str) -> dict[str, Any]:
+        """AniList entries for Identify…: fitting titles of the local list first (they work
+        while AniList is unreachable), then AniList's anime search."""
+        rows: list[dict[str, Any]] = []
+        for anime in self.manager.identify_search_local(str(query or "")):
+            rows.append(
+                {
+                    "media_id": int(anime.media_id),
+                    "media_kind": "anime",
+                    "format": str(anime.format or ""),
+                    "title": anime.title,
+                    "native_title": "",
+                    "year": anime.season_year,
+                    "episodes": anime.episodes,
+                    "cover": str(anime.cover_url or ""),
+                    "site_url": anime.site_url or f"https://anilist.co/anime/{int(anime.media_id)}",
+                    "media_status": str(anime.media_status or ""),
+                    "list_status": str(anime.status or ""),
+                    "in_library": True,
+                }
+            )
+        seen = {int(row["media_id"]) for row in rows}
+        error = ""
+        try:
+            remote = self.planning_search_anilist(str(query or ""))
+        except Exception as exc:  # noqa: BLE001 - the local titles are still offered
+            self.logger.warning("FALLBACK step=identify.search_anilist error=%r", str(exc))
+            remote, error = [], str(exc)
+        for item in remote:
+            if item.get("media_kind") != "anime" or int(item.get("media_id") or 0) in seen:
+                continue
+            seen.add(int(item["media_id"]))
+            rows.append({**item, "in_library": False})
+        return {"rows": rows, "error": error}
+
+    def identify_episode_file(
+        self,
+        video_path: str,
+        media_id: int,
+        episode: int | None = None,
+        entry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Identify…: the AniList entry and episode the person chose for a local file."""
+        try:
+            result = self.manager.identify_episode_file(Path(str(video_path)), media_id, episode, entry)
+        except ManagerError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **result, "state": self.get_state()}
 
     def anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         return DebugSnapshotService(
             self.manager, cache_dir=self.config.paths.cache_dir, runtime_log_path=DEFAULT_LOG_PATH
         ).snapshot(int(media_id), None if episode is None else int(episode))
+
+    def _prepare_subtitles_in_background(self, kind: str, videos: tuple[Path, ...] | list[Path]) -> bool:
+        """Prepare these videos' queued subtitle jobs on a supervised worker; True when one started.
+
+        "Find subtitles for new episodes", Retry and a chosen subtitle file ran the whole
+        preparation (Jimaku, ffmpeg, alignment) on the bridge call: minutes with no
+        reply after a 12-episode batch (WEBFLOW-12). The worker does what the call did
+        under the maintenance lock and the call returns at once. It waits for a running
+        maintenance pass by polling the lock, and stops at its cancel event between
+        jobs, so quitting or "Update now" is not held up by it. A failure is written on
+        the jobs (their cards and diagnostics show it). When no worker can start (the
+        supervisor is paused for an update), the jobs stay queued for the next poll.
+        """
+        paths = tuple(dict.fromkeys(Path(value).expanduser().resolve() for value in videos))
+        if not paths:
+            return False
+        key = hashlib.sha256("\n".join(sorted(map(str, paths))).encode("utf-8")).hexdigest()[:16]
+        log = getattr(self.logger, "info", None)
+
+        def worker(cancel: threading.Event) -> None:
+            try:
+                while not cancel.is_set():
+                    with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
+                        if acquired:
+                            for path in paths:
+                                if cancel.is_set():
+                                    return
+                                self.manager.process_subtitle_jobs(limit=1, preferred_paths=[path])
+                            return
+                    if cancel.wait(1.0):
+                        return
+            except Exception as exc:
+                self.logger.exception(
+                    "FAIL step=%s_background videos=%s error=%r", kind, len(paths), str(exc)
+                )
+                note = getattr(self.manager.db, "note_subtitle_job_error", None)
+                if callable(note):
+                    message = err("jobs.backgroundFailed", error=str(exc) or type(exc).__name__)
+                    for path in paths:
+                        try:
+                            note(path, message)
+                        except Exception:  # noqa: BLE001 - the log already has the failure
+                            pass
+
+        start = getattr(self.task_supervisor, "start_with_admission", None)
+        name = f"{APP_SLUG}-{kind}-{key}"
+        try:
+            if callable(start):
+                result = start(name=name, target=worker, pass_cancel_event=True, replace=False)
+                admitted = result.admission == "started"
+            else:
+                self.task_supervisor.start(name=name, target=worker, pass_cancel_event=True, replace=False)
+                admitted = True
+        except RuntimeError as exc:
+            # Paused for an update or closing: the jobs stay queued and the poll takes them.
+            if callable(log):
+                log("SKIP step=%s_background reason=%r jobs_stay_queued=True", kind, str(exc))
+            return False
+        if callable(log):
+            log("QUEUE step=%s_background videos=%s started=%s", kind, len(paths), admitted)
+        return admitted
 
     def debug_reselect_subtitles(self, video_path: str) -> dict[str, Any]:
         video = Path(str(video_path)).expanduser().resolve()
@@ -18418,7 +21156,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             item = self.manager.db.episode_by_path(video) or item
 
-        if item.subtitle_path is not None or item.embedded_subtitle_id is not None:
+        if item.state in {"couldnt_sync", "waiting_text_subtitles"} and item.subtitle_path is not None:
+            # A raw unsynced or OCR fallback stays playable while the retry runs. It is no
+            # Ready selection to restore afterwards: restoring it made it Ready unsynced.
+            pass
+        elif item.subtitle_path is not None or item.embedded_subtitle_id is not None:
             latest = self.manager.db.latest_selected_subtitle(video)
             request = {
                 "previous_subtitle_path": str(item.subtitle_path or ""),
@@ -18435,6 +21177,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "requested_at": time.time(),
                 "forced": True,
                 "manual_retry": True,
+                "requeue_priority": 220,
+                "requeue_reason": err("jobs.manualRetry"),
             }
             self.manager.db.set_state(
                 self.manager._subtitle_upgrade_state_key(video),
@@ -18446,64 +21190,42 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.manager.db.queue_subtitle_job(
             video, item.media_id, item.episode, priority=220, error=err("jobs.manualRetry")
         )
-        prepared = 0
-        acquired_now = False
-        with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
-            acquired_now = bool(acquired)
-            if acquired_now:
-                prepared = self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
-        if not acquired_now:
+        self._prepare_subtitles_in_background("manual-subtitle-retry", [video])
+        return {"ok": True, "prepared": 0, "queued": True, "state": self.get_state()}
 
-            def worker() -> None:
-                try:
-                    with maintenance_lock(self.config.paths.cache_dir, blocking=True) as acquired:
-                        if acquired:
-                            self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
-                except Exception as exc:
-                    self.logger.exception(
-                        "FAIL step=subtitle.manual_retry_background video=%r error=%r",
-                        str(video),
-                        str(exc),
-                    )
-
-            self.task_supervisor.start(
-                name=f"{APP_SLUG}-manual-subtitle-retry",
-                target=worker,
-                replace=True,
-            )
-        return {"ok": True, "prepared": prepared, "state": self.get_state()}
-
-    def cancel_subtitle_job(self, video_path: str) -> dict[str, Any]:
-        video = Path(str(video_path)).expanduser()
-        self.manager.db.delete_subtitle_job(video)
-        self.logger.info("EVENT subtitle_job.cancelled video=%r", str(video))
-        return {"ok": True, "state": self.get_state()}
-
-    def choose_manual_subtitle(self, video_path: str) -> dict[str, Any]:
+    def choose_manual_subtitle(self, video_path: str, as_is: bool = False) -> dict[str, Any]:
+        """Pick a subtitle file for one episode: aligned to the video, or (``as_is``) used unchanged."""
         if self.window is None:
             return {"ok": False, "cancelled": True}
         video = Path(str(video_path)).expanduser()
         try:
             import webview
 
+            patterns = "*.srt;*.ass;*.ssa;*.vtt" if as_is else "*.srt;*.ass;*.ssa;*.vtt;*.sup;*.pgs"
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 directory=str(Path.home() / "Downloads"),
                 allow_multiple=False,
                 file_types=(
-                    f"{t('web.fileTypeSubtitles')} (*.srt;*.ass;*.ssa;*.vtt;*.sup;*.pgs)",
+                    f"{t('web.fileTypeSubtitles')} ({patterns})",
                     f"{t('web.fileTypeAll')} (*.*)",
                 ),
             )
             if not result:
                 return {"ok": False, "cancelled": True}
             selected = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
+            if as_is:
+                target = self.manager.use_manual_subtitle_as_is(video, selected)
+                return {
+                    "ok": True,
+                    "path": str(target),
+                    "prepared": 1,
+                    "as_is": True,
+                    "state": self.get_state(),
+                }
             target = self.manager.set_manual_subtitle(video, selected)
-            prepared = 0
-            with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
-                if acquired:
-                    prepared = self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
-            return {"ok": True, "path": str(target), "prepared": prepared, "state": self.get_state()}
+            self._prepare_subtitles_in_background("manual-subtitle-choice", [video])
+            return {"ok": True, "path": str(target), "prepared": 0, "queued": True, "state": self.get_state()}
         except Exception as exc:
             self.logger.warning("FAIL step=subtitle.manual_choose video=%r error=%r", str(video), str(exc))
             return {"ok": False, "cancelled": False, "error": str(exc)}
@@ -18544,23 +21266,33 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # requested media IDs, reusing already-loaded LibraryAnime rows when
         # the caller has them.
         known_anime = dict(anime_by_id or {})
+        # Inside a Home build the whole anime table is loaded already: each card asked for its
+        # relations one query at a time (most are not in the library: a miss every card again).
+        memo = _BUILD_MEMO.get()
+        build_anime = memo.get("anime_by_id") if memo is not None else None
         items: list[dict[str, object]] = []
         seen_paths: set[str] = set()
         for media_id in media_ids:
             media_id = int(media_id)
             anime = known_anime.get(media_id)
             if anime is None:
-                anime = self.manager.db.get_anime(media_id)
+                anime = (
+                    build_anime.get(media_id)
+                    if build_anime is not None
+                    else self.manager.db.get_anime(media_id)
+                )
                 if anime is not None:
                     known_anime[media_id] = anime
             episodes = sorted(
-                self.manager.db.episodes(media_id),
+                self._build_episodes(media_id),
                 key=lambda episode: (
                     episode.episode is None,
                     int(episode.episode or 0),
                     str(episode.video_path),
                 ),
             )
+            if anime is not None and str(anime.format or "").upper() != "MOVIE":
+                episodes = self._queue_episodes_in_order(anime, episodes)
             for episode in episodes:
                 if episode.state == "watched" or episode.state != "ready":
                     continue
@@ -18591,22 +21323,43 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     return items
         return items
 
-    def create_next_episodes_queue(self, media_id: int, count: int = 5) -> dict[str, Any]:
-        anime = self.manager.db.get_anime(int(media_id))
-        if anime is None:
-            return {"ok": False, "error": err("web.animeNotFound"), "state": self.get_state_fast()}
-        if anime.media_status == "NOT_YET_RELEASED":
-            return {"ok": False, "error": err("web.animeNotAired"), "state": self.get_state_fast()}
-        items = self._ready_queue_items([anime.media_id], limit=max(1, min(50, int(count))))
-        if not items:
-            return {"ok": False, "error": err("web.noReadyEpisodes"), "state": self.get_state_fast()}
-        queue_id = self.manager.db.create_playlist(
-            name=f"{anime.title} — next {len(items)}",
-            kind="next_episodes",
-            media_id=anime.media_id,
-            items=items,
-        )
-        return {"ok": True, "playlist_id": queue_id, "state": self.get_state_fast()}
+    def _queue_episodes_in_order(self, anime: LibraryAnime, episodes: list[Any]) -> list[Any]:
+        """The ready files from the next unwatched episode on, up to the first one not ready.
+
+        "Play next" listed every ready file: with episode 1 not downloaded it
+        started at episode 2, and a gap was skipped. Files without an episode
+        number (a single-file title) keep the old order.
+        """
+        if not any(self._display_episode_number(anime, row.episode) is not None for row in episodes):
+            return episodes
+        ready: dict[int, Any] = {}
+        watched: set[int] = set()
+        for row in episodes:
+            first = self._display_episode_number(anime, row.episode)
+            if first is None:
+                continue
+            last = self._display_episode_number(anime, row.last_episode)
+            numbers = range(int(first), int(last if last is not None else first) + 1)
+            if str(row.state or "") == "watched":
+                watched.update(numbers)
+            elif (
+                str(row.state or "") == "ready"
+                and row.video_path.is_file()
+                and not AnimeManager._library_path_is_ignored(row.video_path)
+            ):
+                ready.setdefault(int(first), row)
+        ordered: list[Any] = []
+        number = int(anime.next_episode)
+        while True:
+            row = ready.get(number)
+            if row is not None:
+                ordered.append(row)
+                last = self._display_episode_number(anime, row.last_episode)
+                number = max(number, int(last if last is not None else number)) + 1
+            elif number in watched:
+                number += 1  # watched here, AniList not updated yet
+            else:
+                return ordered
 
     def create_franchise_queue(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
@@ -18654,14 +21407,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     break
         return {"ok": True, "next": next_item, "state": self.get_state_fast()}
 
-    def skip_playlist_item(self, item_id: int) -> dict[str, Any]:
-        self.manager.db.mark_playlist_item(int(item_id), "skipped")
-        return {"ok": True, "state": self.get_state_fast()}
-
-    def delete_playlist(self, playlist_id: int) -> dict[str, Any]:
-        self.manager.db.delete_playlist(int(playlist_id))
-        return {"ok": True, "state": self.get_state_fast()}
-
     def check_release_upgrades(self) -> dict[str, Any]:
         with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
             if not acquired:
@@ -18700,7 +21445,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
 
     def _daily_snapshot_loop(self, cancel_event: threading.Event) -> None:
-        # A copy of the library a day (7 kept), made after start-up has settled;
+        # A copy of the library a day (3 kept), made after start-up has settled;
         # checked hourly because the app can stay open for days.
         if cancel_event.wait(120.0):
             return
@@ -18737,9 +21482,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except Exception:  # noqa: BLE001 - an unreadable registry is not a running player
             return []
 
-    def restore_full_backup(self) -> dict[str, Any]:
+    def restore_full_backup(self, iphone_identity: str = "replace") -> dict[str, Any]:
+        """Restore a backup. ``iphone_identity``: "replace" (this Mac replaces the one backed up)
+        or "new" (another Mac set up from it: it keeps its own iPhone identity)."""
         if self.window is None:
             return {"ok": False, "cancelled": True}
+        identity = "new" if str(iphone_identity or "") == "new" else "replace"
         try:
             import webview
 
@@ -18759,6 +21507,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     database_path=self.config.library.database_path,
                     cache_dir=self.config.paths.cache_dir,
                     post_commit=post_commit,
+                    iphone_identity=identity,
                 ),
                 source=selected,
             )
@@ -18883,10 +21632,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     )
                     self._start_daily_snapshots()
                 self.logger.info(
-                    "DONE step=backup.restore path=%r undo=%r iphone_identity=%s",
+                    "DONE step=backup.restore path=%r undo=%r iphone_identity=%s mac=%s",
                     str(source),
                     restored.get("undo_snapshot", ""),
                     restored.get("restored_iphone_identity", 0),
+                    restored.get("iphone_identity", ""),
                 )
                 return {"ok": True, **restored, "state": self.get_state()}
 
@@ -18970,11 +21720,26 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         allowed = set(NyaaRelease.__dataclass_fields__)
         payload = {key: value for key, value in release.items() if key in allowed}
         item = NyaaRelease(**payload)
+        if self._release_must_wait_for_torrents():
+            # Torrents are off: keep the choice, start it when they are turned on.
+            queued = self.manager.queue_release(int(media_id), item, episode=episode, batch=bool(batch))
+            self._release_queue_changed()
+            return {
+                "ok": True,
+                "added": False,
+                "queued": bool(queued.get("queued")),
+                "already_queued": bool(queued.get("already_queued")),
+                "already_downloading": bool(queued.get("already_downloading")),
+            }
         self._torrent_changed(2.0)
         rules_of = getattr(self.manager.db, "release_numbering_rules", None)
         rules = (lambda: rules_of(int(media_id))) if callable(rules_of) else (lambda: [])
         rules_before = {(str(row["release_group"]), str(row["season_key"])) for row in rules()}
         added = self.manager.add_release(int(media_id), item, episode=episode, batch=bool(batch), manual=True)
+        forget = getattr(self.manager, "forget_queued_release", None)
+        if callable(forget):
+            # Picked by hand with Torrents on: a release queued earlier for it must not start too.
+            forget(int(media_id), episode, bool(batch))
         learned = [
             {
                 "group": str(row["release_group"]),
@@ -18988,6 +21753,175 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if learned:
             result["learned_numbering_rule"] = learned[0]
         return result
+
+    def _release_must_wait_for_torrents(self) -> bool:
+        """A chosen release is queued (not refused) while Torrents are off."""
+        if not self._downloads_configured() or not callable(getattr(self.manager, "queue_release", None)):
+            return False
+        if not self._torrent_enabled_state():
+            return True
+        # The cross-process admission (the background agent's view) can still be Off.
+        checker = getattr(self.manager, "downloads_enabled", None)
+        return callable(checker) and not bool(checker())
+
+    def _release_queue_changed(self) -> None:
+        try:
+            self._bump_ui_state_version()
+        except Exception as exc:  # noqa: BLE001 - the queue itself is saved
+            self.logger.warning("RETRY step=release.queue_ui_version error=%r", str(exc))
+        cache = getattr(self, "_ui_state_cache", None)
+        if cache is not None:
+            cache.invalidate()
+
+    def _queued_release_payloads(self, media_id: int | None = None) -> list[dict[str, Any]]:
+        """Releases waiting for Torrents to be turned on, for Downloads and Home.
+
+        The user's own choices (cancellable), and while Torrents are off also the
+        automatic downloader's picks: it journals them as "waiting" and searches
+        again when Torrents are turned on.
+        """
+        manager = getattr(self, "manager", None)
+        store = getattr(manager, "queued_releases", None)
+        rows: list[dict[str, Any]] = []
+        try:
+            entries = store.list() if store is not None else []
+        except Exception:
+            entries = []
+        seen: set[str] = set()
+        for entry in entries:
+            release = dict(entry.get("release") or {})
+            seen.add(str(entry.get("id")))
+            rows.append(
+                {
+                    "id": str(entry.get("id")),
+                    "media_id": int(entry.get("media_id") or 0),
+                    "episode": entry.get("episode"),
+                    "batch": bool(entry.get("batch")),
+                    "title": str(release.get("title") or ""),
+                    "size_text": str(release.get("size_text") or ""),
+                    "anime_title": str(entry.get("anime_title") or ""),
+                    "queued_at": float(entry.get("queued_at") or 0),
+                    "error": str(entry.get("error") or ""),
+                    "attempts": int(entry.get("attempts") or 0),
+                    "exhausted": QueuedReleaseStore.exhausted(entry),
+                    "origin": "manual",
+                    "cancellable": True,
+                }
+            )
+        intents = getattr(manager, "download_intents", None)
+        db = getattr(manager, "db", None)
+        connect = getattr(db, "connect", None)
+        if intents is not None and callable(connect) and not self._torrent_enabled_state():
+            try:
+                with connect() as conn:
+                    values = [
+                        row["value"]
+                        for row in conn.execute(
+                            f"SELECT value FROM state WHERE {STATE_PREFIX_SQL}",
+                            state_prefix_bounds("download_intent:"),
+                        )
+                    ]
+            except Exception:
+                values = []
+            # A journal entry outlives the episode it waited for (downloaded by hand,
+            # or found locally): only episodes with no download and no file count.
+            try:
+                have = {
+                    (
+                        int(item.media_id),
+                        int(item.media_episode if item.media_episode is not None else item.episode),
+                    )
+                    for item in db.downloads()
+                    if item.media_id is not None
+                    and (item.media_episode is not None or item.episode is not None)
+                }
+            except Exception:
+                have = set()
+            has_episode = getattr(db, "has_episode", None)
+            for raw in values:
+                payload = intents._decode(raw)
+                if str(payload.get("state") or "") != "waiting" or not payload.get("selected_title"):
+                    continue
+                try:
+                    key = QueuedReleaseStore.entry_id(
+                        int(payload.get("media_id") or 0), payload.get("episode"), bool(payload.get("batch"))
+                    )
+                except (TypeError, ValueError):
+                    continue  # a journal entry with no usable title/episode number
+                if key in seen:
+                    continue
+                episode_number = payload.get("episode")
+                if bool(payload.get("batch")) and self._queued_title_complete(
+                    db, int(payload.get("media_id") or 0)
+                ):
+                    continue
+                if episode_number is not None:
+                    try:
+                        pair = (int(payload.get("media_id") or 0), int(episode_number))
+                    except (TypeError, ValueError):
+                        continue
+                    if pair in have:
+                        continue
+                    try:
+                        if callable(has_episode) and has_episode(*pair):
+                            continue
+                    except Exception:
+                        pass
+                seen.add(key)
+                rows.append(
+                    {
+                        "id": key,
+                        "media_id": int(payload.get("media_id") or 0),
+                        "episode": payload.get("episode"),
+                        "batch": bool(payload.get("batch")),
+                        "title": str(payload.get("selected_title") or ""),
+                        "size_text": "",
+                        "anime_title": "",
+                        "queued_at": float(payload.get("updated_at") or 0),
+                        "error": "",
+                        "attempts": 0,
+                        "exhausted": False,
+                        "origin": "auto",
+                        "cancellable": False,
+                    }
+                )
+        if media_id is not None:
+            rows = [row for row in rows if row["media_id"] == int(media_id)]
+        if rows and db is not None:
+            titles = {}
+            for row in rows:
+                if not row["anime_title"] and row["media_id"] not in titles:
+                    anime = (
+                        db.get_anime(row["media_id"]) if callable(getattr(db, "get_anime", None)) else None
+                    )
+                    titles[row["media_id"]] = str(getattr(anime, "title", "") or "")
+                if not row["anime_title"]:
+                    row["anime_title"] = titles.get(row["media_id"], "")
+        rows.sort(key=lambda row: row["queued_at"])
+        return rows
+
+    @staticmethod
+    def _queued_title_complete(db: Any, media_id: int) -> bool:
+        """Every episode of the title is local: an automatic whole-title pick waits for nothing."""
+        try:
+            anime = db.get_anime(media_id)
+            total = int(getattr(anime, "episodes", 0) or 0)
+            has_episode = getattr(db, "has_episode", None)
+            return (
+                bool(total)
+                and callable(has_episode)
+                and all(has_episode(media_id, number) for number in range(1, total + 1))
+            )
+        except Exception:
+            return False
+
+    def cancel_queued_release(self, entry_id: str) -> dict[str, Any]:
+        store = getattr(self.manager, "queued_releases", None)
+        removed = bool(store.remove(str(entry_id))) if store is not None else False
+        self.logger.info("EVENT step=release.queue_cancelled id=%r removed=%s", str(entry_id), removed)
+        if removed:
+            self._release_queue_changed()
+        return {"ok": True, "removed": removed, "queued": self._queued_release_payloads()}
 
     def release_numbering_rules(self, media_id: int) -> list[dict[str, Any]]:
         """Split-stage numbering learned from manual release choices for one title."""
@@ -19006,50 +21940,43 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.logger.info("RULE step=release_numbering.forgotten media_id=%s removed=%s", media_id, removed)
         return {"ok": True, "removed": removed}
 
-    def add_best_planning_episode(self, media_id: int, episode: int) -> dict[str, Any]:
-        anime = self.manager.db.get_anime(int(media_id))
-        if anime is None:
-            raise KeyError(err("web.unknownAnime", mediaId=media_id))
-        finished = str(anime.media_status or "").upper() == "FINISHED"
-        available = int(
-            (anime.episodes if finished else anime.released_episodes)
-            or max(0, int(anime.next_airing_episode or 1) - 1)
-            or 0
+    @staticmethod
+    def _planning_single_file_title(anime: Any) -> bool:
+        """A movie or a one-episode title: one release holds all of it.
+
+        Planning's auto-download looks for that one release
+        (``_run_planning_single_download``) instead of season packs and episodes.
+        """
+        return (
+            str(getattr(anime, "format", "") or "").upper() == "MOVIE"
+            or getattr(anime, "episodes", None) == 1
         )
-        episode = int(episode)
-        if episode < 1 or (available and episode > available):
-            raise ValueError(err("web.episodeNotReleased", episode=episode))
-        local = self._local_episode_for_relative(anime, episode)
-        if local is not None and local.video_path.is_file():
-            return {
-                "ok": True,
-                "episode": episode,
-                "local": True,
-                "release": None,
-            }
-        release = self.manager.search_and_add_best(
-            int(media_id),
-            episode=episode,
-            batch=False,
-            # This is a user-requested background job, not the short periodic
-            # agent pass. Use the complete alias search so later title aliases
-            # such as "Goodbye Lara" are not lost to the automatic time budget.
-            automatic=False,
-        )
-        return {
-            "ok": release is not None,
-            "episode": episode,
-            "local": False,
-            "release": asdict(release) if release is not None else None,
-        }
 
     @staticmethod
-    def _planning_released_episode_count(anime: LibraryAnime) -> int:
+    def _single_file_searches(anime: Any) -> list[tuple[int | None, bool]]:
+        """The (episode, batch) searches for a movie or one-episode title, in order.
+
+        A movie: the whole title (episode None, batch), as Watching and "Download
+        only" search it; an episode-less single search sends no Nyaa query at all.
+        A one-episode OVA/ONA/special: episode 1 first ("Title - 01"), then the
+        whole title ("Title OVA [BD]" has no episode number).
+        """
+        if str(getattr(anime, "format", "") or "").upper() == "MOVIE":
+            return [(None, True)]
+        return [(1, False), (None, True)]
+
+    @classmethod
+    def _planning_released_episode_count(cls, anime: LibraryAnime) -> int:
         finished = str(anime.media_status or "").upper() == "FINISHED"
         if finished:
-            return max(0, int(anime.episodes or anime.released_episodes or 0))
-        before_next = max(0, int(anime.next_airing_episode or 1) - 1)
-        return max(0, int(anime.released_episodes or 0), before_next, int(anime.progress or 0))
+            count = max(0, int(anime.episodes or anime.released_episodes or 0))
+            # AniList leaves the episode count of some finished movies empty.
+            if not count and str(anime.format or "").upper() == "MOVIE":
+                count = 1
+        else:
+            before_next = max(0, int(anime.next_airing_episode or 1) - 1)
+            count = max(0, int(anime.released_episodes or 0), before_next, int(anime.progress or 0))
+        return min(count, 1) if cls._planning_single_file_title(anime) else count
 
     def _planning_local_episodes(
         self,
@@ -19061,13 +21988,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         active_manager = manager or self.manager
         local: list[int] = []
         rows = active_manager.db.episodes(anime.media_id)
+        unfinished = getattr(active_manager, "unfinished_library_video", None) or unfinished_video
+        # A movie's (or one-episode title's) file is kept without an episode number.
+        single = self._planning_single_file_title(anime)
         for episode in range(1, int(total) + 1):
             match = next(
                 (
                     item
                     for item in rows
                     if item.video_path.is_file()
-                    and self._display_episode_number(anime, item.episode) == episode
+                    # Empty/unfinished leftovers of a removed torrent are not local.
+                    and not unfinished(item.video_path)
+                    and (
+                        self._display_episode_number(anime, item.episode) == episode
+                        or (single and episode == 1 and item.episode is None)
+                    )
                 ),
                 None,
             )
@@ -19100,16 +22035,229 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _planning_episode_download_payload(self) -> dict[str, Any]:
         with self._planning_episode_download_lock:
-            payload = dict(self._planning_episode_download_state)
-            payload["episodes"] = [
-                dict(item) for item in self._planning_episode_download_state.get("episodes", [])
-            ]
-            thread = self._planning_episode_download_thread
-            payload["running"] = bool(thread is not None and thread.is_alive())
-        return payload
+            return self._planning_episode_download_payload_unlocked()
+
+    def _set_planning_episode_phase(self, phase: str, episode: int | None = None) -> None:
+        # The window showed one static line for minutes: say which step runs now
+        # (local check, season pack, episode N) and since when.
+        with self._planning_episode_download_lock:
+            self._planning_episode_download_state.update(
+                {"phase": phase, "current_episode": episode, "phase_started_at": time.time()}
+            )
 
     def planning_episode_download_status(self) -> dict[str, Any]:
         return self._planning_episode_download_payload()
+
+    # The season-pack step is tried once more after this pause when the release
+    # search could not be reached at all.
+    PLANNING_SEARCH_RETRY_SECONDS = 15.0
+
+    @staticmethod
+    def _planning_download_hashes(manager: Any) -> set[str] | None:
+        """Hashes of the downloads Pudge tracks now; None when they cannot be read."""
+        downloads = getattr(getattr(manager, "db", None), "downloads", None)
+        if not callable(downloads):
+            return None
+        try:
+            return {str(item.torrent_hash or "").strip().casefold() for item in downloads()}
+        except Exception:  # noqa: BLE001 - nothing to roll back against
+            return None
+
+    def _planning_rollback(self, manager: Any, media_id: int, before: set[str] | None) -> int:
+        """Remove, with their files, the downloads of this title added since ``before``."""
+        if before is None:
+            return 0
+        removed = 0
+        for item in list(manager.db.downloads()):
+            value = str(item.torrent_hash or "").strip()
+            if not value or value.casefold() in before or int(item.media_id or 0) != int(media_id):
+                continue
+            try:
+                self.torrent_download_action(value, "remove", delete_files=True)
+                removed += 1
+                self.logger.info(
+                    "CLEANUP step=planning_episode.rollback media_id=%s hash=%s episode=%s",
+                    media_id,
+                    value,
+                    item.episode,
+                )
+            except Exception as exc:  # noqa: BLE001 - the others still go
+                self.logger.warning(
+                    "FAIL step=planning_episode.rollback media_id=%s hash=%s error=%r",
+                    media_id,
+                    value,
+                    str(exc),
+                )
+        return removed
+
+    def _planning_batch_first(
+        self, manager: AnimeManager, media_id: int
+    ) -> tuple[Any, Exception | None, bool]:
+        """(added pack or None, the "release search unavailable" error, cancelled)."""
+        unavailable: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                return (
+                    manager.search_and_add_best(
+                        media_id,
+                        episode=None,
+                        batch=True,
+                        automatic=False,
+                        require_explicit_batch=True,
+                        raise_when_unavailable=True,
+                    ),
+                    None,
+                    False,
+                )
+            except ReleaseSearchUnavailableError as exc:
+                unavailable = exc
+                self.logger.warning(
+                    "FALLBACK step=planning_episode.batch_first media_id=%s attempt=%s "
+                    "reason=release_search_unavailable error=%r",
+                    media_id,
+                    attempt,
+                    str(exc)[:500],
+                )
+            except NotEnoughDiskSpaceError:
+                # Not "no pack": single episodes in its place took the same space from
+                # dying old torrents (Given: 12 HorribleSubs files, episode 1 missing).
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=planning_episode.batch_first media_id=%s error=%r",
+                    media_id,
+                    str(exc),
+                )
+                return None, None, False
+            if attempt == 1:
+                # A failed search used to go on with one doomed search per
+                # episode (each ~30 s), marking every episode "not found".
+                self._set_planning_episode_phase("batch_retry")
+                cancel_event = getattr(self, "_planning_episode_cancel_event", None) or threading.Event()
+                if cancel_event.wait(float(self.PLANNING_SEARCH_RETRY_SECONDS)):
+                    return None, None, True
+                self._set_planning_episode_phase("batch")
+        return None, unavailable, False
+
+    def _run_planning_single_download(
+        self,
+        manager: AnimeManager,
+        anime: LibraryAnime,
+        local_episodes: set[int],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """A movie or a one-episode title: its best release as one download; (status, rows).
+
+        The same search and add as the episode loop, the card's manual release search
+        ("Download only") and Watching (ranking, cinema-recording filter, SeaDex
+        preference, the race, duplicate check). A movie is searched as the whole title
+        (episode None, batch: an episode-less single search sends no Nyaa query at
+        all). A one-episode OVA/ONA/special is searched as episode 1 first (the series
+        path: "Title - 01"), then as the whole title ("Title OVA [BD]" has no episode
+        number, so the episode search called it "episode not specified").
+        The list status is not touched: the title stays where it is (Planning).
+        """
+        media_id = int(anime.media_id)
+        if 1 in local_episodes:
+            return "done", [{"episode": 1, "status": "local", "error": ""}]
+        searches = self._single_file_searches(anime)
+
+        def cancel_requested() -> bool:
+            cancel_event = getattr(self, "_planning_episode_cancel_event", None)
+            return bool(cancel_event is not None and cancel_event.is_set())
+
+        def publish(rows: list[dict[str, Any]], message_key: str) -> None:
+            with self._planning_episode_download_lock:
+                self._planning_episode_download_state["episodes"] = [dict(item) for item in rows]
+            job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
+            if job_id and getattr(self, "job_center", None) is not None:
+                self.job_center.update(job_id, state="running", current=0, total=1, message=t(message_key))
+
+        if cancel_requested():
+            return "cancelled", []
+        if not manager.downloads_enabled():
+            # Searching first only to say "torrents are off" afterwards took half a minute.
+            self.logger.info("SKIP step=planning_single.search media_id=%s reason=torrents_off", media_id)
+            return "failed", [
+                {"episode": 1, "status": "error", "release": "", "error": err("manager.torrentsDisabled")}
+            ]
+        self._set_planning_episode_phase("episodes", 1)
+        publish([], "web.releaseSearching")
+        eligible: list[Any] = []
+        episode: int | None = None
+        batch = False
+        for episode, batch in searches:
+            if cancel_requested():
+                return "cancelled", []
+            try:
+                eligible = list(
+                    manager.release_candidates(
+                        media_id, episode=episode, batch=batch, automatic=False, raise_when_unavailable=True
+                    )
+                )
+            except ReleaseSearchUnavailableError as exc:
+                self.logger.warning(
+                    "STOP step=planning_single.search media_id=%s reason=release_search_unavailable error=%r",
+                    media_id,
+                    str(exc)[:500],
+                )
+                return "failed", [
+                    {
+                        "episode": 1,
+                        "status": "error",
+                        "release": "",
+                        "error": err("web.releaseSearchUnavailable"),
+                    }
+                ]
+            except Exception as exc:
+                if not isinstance(exc, NoReleaseSourceError):
+                    self.logger.exception("FAIL step=planning_single.search media_id=%s", media_id)
+                return "failed", [{"episode": 1, "status": "error", "release": "", "error": str(exc)}]
+            self.logger.info(
+                "RESULT step=planning_single.search media_id=%s episode=%s batch=%s eligible=%s",
+                media_id,
+                episode,
+                batch,
+                len(eligible),
+            )
+            if eligible:
+                break
+        if not eligible:
+            self.logger.warning("STOP step=planning_single.search media_id=%s reason=not_found", media_id)
+            return "failed", [
+                {"episode": 1, "status": "missing", "release": "", "error": ""},
+                {"episode": None, "status": "error", "error": err("manager.noSuitableRelease")},
+            ]
+        rows = [{"episode": 1, "status": "found", "release": str(eligible[0].title or ""), "error": ""}]
+        publish(rows, "web.releaseSearching")
+        if cancel_requested():
+            return "cancelled", [{**rows[0], "status": "skipped"}]
+        self._set_planning_episode_phase("adding", 1)
+        publish(rows, "web.releaseStarting")
+        before = self._planning_download_hashes(manager)
+        error = ""
+        try:
+            release = manager.add_release_candidates(media_id, eligible, episode=episode, batch=batch)
+        except Exception as exc:
+            self.logger.exception("FAIL step=planning_single.download media_id=%s", media_id)
+            release, error = None, str(exc)
+        if release is None:
+            removed = self._planning_rollback(manager, media_id, before)
+            self.logger.warning(
+                "STOP step=planning_single.download media_id=%s reason=did_not_start removed=%s",
+                media_id,
+                removed,
+            )
+            return "failed", [
+                {"episode": 1, "status": "error", "release": "", "error": error},
+                {"episode": None, "status": "error", "error": err("web.releaseDidNotStart")},
+            ]
+        self.logger.info(
+            "DONE step=planning_single.download media_id=%s title=%r score=%.1f",
+            media_id,
+            release.title,
+            float(getattr(release, "score", 0.0) or 0.0),
+        )
+        return "done", [{"episode": 1, "status": "added", "release": str(release.title or ""), "error": ""}]
 
     def _run_planning_episode_download(
         self,
@@ -19120,7 +22268,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         media_id = int(anime.media_id)
         results: list[dict[str, Any]] = []
         cancelled = False
+        single = self._planning_single_file_title(anime) and int(total) == 1
         try:
+            self._set_planning_episode_phase("local")
             if manager.downloads_enabled():
                 try:
                     manager.sync_downloads()
@@ -19133,6 +22283,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             manager.scan_library()
             local_episodes = set(self._planning_local_episodes(anime, total, manager=manager))
             missing_episodes = [episode for episode in range(1, total + 1) if episode not in local_episodes]
+            # Local episodes are known now: the window marks them at once instead of
+            # only when the episode loop reaches them.
+            with self._planning_episode_download_lock:
+                self._planning_episode_download_state["local_episodes"] = sorted(local_episodes)
+
+            if single:
+                status, results = self._run_planning_single_download(manager, anime, local_episodes)
+                return
 
             # Prefer one real season pack over N independent episode searches.
             # Size alone is deliberately not enough evidence for this path.
@@ -19141,28 +22299,89 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
                 else:
+                    self._set_planning_episode_phase("batch")
+                    batch_started = time.time()
                     try:
-                        batch_release = manager.search_and_add_best(
-                            media_id,
-                            episode=None,
-                            batch=True,
-                            automatic=False,
-                            require_explicit_batch=True,
-                        )
-                    except Exception as exc:
-                        batch_release = None
+                        batch_release, unavailable, cancelled = self._planning_batch_first(manager, media_id)
+                    except NotEnoughDiskSpaceError as exc:
                         self.logger.warning(
-                            "FALLBACK step=planning_episode.batch_first media_id=%s error=%r",
+                            "STOP step=planning_episode.batch_first media_id=%s reason=disk_space error=%r",
                             media_id,
                             str(exc),
                         )
-                    if batch_release is not None:
+                        results = [
+                            {"episode": episode, "status": "local", "error": ""}
+                            for episode in sorted(local_episodes)
+                        ]
+                        results.append(
+                            {
+                                "episode": None,
+                                "status": "error",
+                                "error": err("web.seriesPackNoSpace", error=str(exc)),
+                            }
+                        )
+                        status = "failed"
+                        return
+                    batch_title, batch_failure = "", ""
+                    batch_status = getattr(manager, "planning_batch_status", None)
+                    if (
+                        batch_release is None
+                        and unavailable is None
+                        and not cancelled
+                        and callable(batch_status)
+                    ):
+                        # The race can end without a pack while one of this title is
+                        # still in the client (kept, reused or being raced): per-episode
+                        # downloads then went next to it. A failed race is said, not
+                        # turned into one search per episode.
+                        try:
+                            batch_title, batch_failure = batch_status(media_id, since=batch_started)
+                        except Exception as exc:
+                            self.logger.warning(
+                                "FALLBACK step=planning_episode.batch_status media_id=%s error=%r",
+                                media_id,
+                                str(exc),
+                            )
+                        if batch_title or batch_failure:
+                            self.logger.info(
+                                "RESULT step=planning_episode.batch_first media_id=%s pack=%r failure=%r",
+                                media_id,
+                                batch_title,
+                                batch_failure,
+                            )
+                    if batch_failure:
+                        results = [
+                            {"episode": episode, "status": "local", "error": ""}
+                            for episode in sorted(local_episodes)
+                        ]
+                        results.append(
+                            {
+                                "episode": None,
+                                "status": "error",
+                                "error": err("web.seriesPackFailed", error=batch_failure),
+                            }
+                        )
+                        status = "failed"
+                        return
+                    if unavailable is not None:
+                        # Still unreachable: one clear result instead of N "not found".
+                        results = [
+                            {"episode": episode, "status": "local", "error": ""}
+                            for episode in sorted(local_episodes)
+                        ]
+                        results.append(
+                            {"episode": None, "status": "error", "error": err("web.releaseSearchUnavailable")}
+                        )
+                        status = "failed"
+                        return
+                    if batch_release is not None or batch_title:
+                        pack_title = batch_release.title if batch_release is not None else batch_title
                         results = [
                             {
                                 "episode": episode,
                                 "status": "local" if episode in local_episodes else "added",
                                 "source": "" if episode in local_episodes else "batch",
-                                "release": "" if episode in local_episodes else batch_release.title,
+                                "release": "" if episode in local_episodes else pack_title,
                                 "error": "",
                             }
                             for episode in range(1, total + 1)
@@ -19184,50 +22403,159 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         status = "done"
                         return
 
-            for episode in range(1, total + 1):
+            # All or nothing: every missing episode is searched first and they are added
+            # only when each one was found; one that does not start removes the others
+            # this search added. Three random episodes of a season were of no use and
+            # had to be removed by hand.
+            found: dict[int, list[Any]] = {}
+            failed = False
+
+            def publish(episode: int | None, message_key: str = "web.episodeProgress") -> None:
+                with self._planning_episode_download_lock:
+                    self._planning_episode_download_state["episodes"] = [dict(item) for item in results]
+                job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
+                if episode is not None and job_id and getattr(self, "job_center", None) is not None:
+                    self.job_center.update(
+                        job_id,
+                        state="running",
+                        current=episode,
+                        total=total,
+                        message=t(message_key, episode=episode, total=total),
+                    )
+
+            def cancel_requested() -> bool:
                 cancel_event = getattr(self, "_planning_episode_cancel_event", None)
-                if cancel_event is not None and cancel_event.is_set():
+                return bool(cancel_event is not None and cancel_event.is_set())
+
+            for episode in range(1, total + 1):
+                if cancel_requested():
                     cancelled = True
                     break
                 with self._planning_episode_download_lock:
                     self._planning_episode_download_state["current"] = episode
                 if episode in local_episodes:
                     results.append({"episode": episode, "status": "local", "error": ""})
-                else:
-                    try:
-                        release = manager.search_and_add_best(
-                            media_id,
-                            episode=episode,
-                            batch=False,
-                            automatic=False,
+                    publish(episode)
+                    continue
+                self._set_planning_episode_phase("episodes", episode)
+                try:
+                    eligible = list(
+                        manager.release_candidates(media_id, episode=episode, batch=False, automatic=False)
+                    )
+                except Exception as exc:
+                    if not isinstance(exc, NoReleaseSourceError):
+                        self.logger.exception(
+                            "FAIL step=planning_episode.search media_id=%s episode=%s", media_id, episode
                         )
-                        results.append(
-                            {
-                                "episode": episode,
-                                "status": "added" if release is not None else "missing",
-                                "release": release.title if release is not None else "",
-                                "error": "",
-                            }
+                    results.append({"episode": episode, "status": "error", "error": str(exc)})
+                    failed = True
+                    publish(episode)
+                    break
+                if not eligible:
+                    self.logger.warning(
+                        "STOP step=planning_episode.search media_id=%s episode=%s reason=episode_not_found",
+                        media_id,
+                        episode,
+                    )
+                    results.append({"episode": episode, "status": "missing", "release": "", "error": ""})
+                    results.append(
+                        {
+                            "episode": None,
+                            "status": "error",
+                            "error": err("web.notAllEpisodesFound", episode=episode),
+                        }
+                    )
+                    failed = True
+                    publish(episode)
+                    break
+                found[episode] = eligible
+                results.append(
+                    {
+                        "episode": episode,
+                        "status": "found",
+                        "release": str(eligible[0].title or ""),
+                        "error": "",
+                    }
+                )
+                publish(episode)
+
+            if found and not failed and not cancelled:
+                ensure_space = getattr(manager, "_ensure_download_space", None)
+                try:
+                    if callable(ensure_space):
+                        ensure_space(sum(int(items[0].size_bytes or 0) for items in found.values()))
+                except NotEnoughDiskSpaceError as exc:
+                    results.append(
+                        {
+                            "episode": None,
+                            "status": "error",
+                            "error": err("web.episodesNoSpace", error=str(exc)),
+                        }
+                    )
+                    failed = True
+            if found and not failed and not cancelled:
+                before = self._planning_download_hashes(manager)
+                rows = {
+                    row["episode"]: index
+                    for index, row in enumerate(results)
+                    if row.get("episode") is not None
+                }
+                for episode, eligible in found.items():
+                    if cancel_requested():
+                        cancelled = True
+                        break
+                    self._set_planning_episode_phase("adding", episode)
+                    with self._planning_episode_download_lock:
+                        self._planning_episode_download_state["current"] = episode
+                    error = ""
+                    try:
+                        release = manager.add_release_candidates(
+                            media_id, eligible, episode=episode, batch=False
                         )
                     except Exception as exc:
                         self.logger.exception(
-                            "FAIL step=planning_episode.download media_id=%s episode=%s",
-                            media_id,
-                            episode,
+                            "FAIL step=planning_episode.download media_id=%s episode=%s", media_id, episode
                         )
-                        results.append({"episode": episode, "status": "error", "error": str(exc)})
-                with self._planning_episode_download_lock:
-                    self._planning_episode_download_state["episodes"] = [dict(item) for item in results]
-                job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
-                if job_id and getattr(self, "job_center", None) is not None:
-                    self.job_center.update(
-                        job_id,
-                        state="running",
-                        current=episode,
-                        total=total,
-                        message=t("web.episodeProgress", episode=episode, total=total),
+                        release, error = None, str(exc)
+                    if release is None:
+                        results[rows[episode]] = {
+                            "episode": episode,
+                            "status": "error",
+                            "release": "",
+                            "error": error,
+                        }
+                        results.append(
+                            {
+                                "episode": None,
+                                "status": "error",
+                                "error": err("web.episodeDidNotStart", episode=episode),
+                            }
+                        )
+                        failed = True
+                        publish(episode, "web.episodeStarting")
+                        break
+                    results[rows[episode]] = {
+                        "episode": episode,
+                        "status": "added",
+                        "release": str(release.title or ""),
+                        "error": "",
+                    }
+                    publish(episode, "web.episodeStarting")
+                if failed or cancelled:
+                    removed = self._planning_rollback(manager, media_id, before)
+                    self.logger.warning(
+                        "STOP step=planning_episode.download media_id=%s reason=%s removed=%s",
+                        media_id,
+                        "cancelled" if cancelled else "episode_did_not_start",
+                        removed,
                     )
-            status = "cancelled" if cancelled else "done"
+            if failed or cancelled:
+                # Nothing of this search stays: found and added episodes are "not downloaded".
+                results = [
+                    {**row, "status": "skipped"} if row.get("status") in {"found", "added"} else row
+                    for row in results
+                ]
+            status = "cancelled" if cancelled else "failed" if failed else "done"
         except Exception as exc:
             self.logger.exception("FAIL step=planning_episode.batch media_id=%s", media_id)
             results.append({"episode": None, "status": "error", "error": str(exc)})
@@ -19240,6 +22568,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         "running": False,
                         "current": total,
                         "episodes": [dict(item) for item in results],
+                        "phase": "done",
+                        "current_episode": None,
                         "finished_at": time.time(),
                     }
                 )
@@ -19248,7 +22578,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if status == "done":
                     self.job_center.finish(
                         job_id,
-                        message=t("web.episodeSearchComplete"),
+                        message=t("web.releaseSearchComplete" if single else "web.episodeSearchComplete"),
                         result={"media_id": media_id, "episodes": results},
                     )
                 elif status == "cancelled":
@@ -19280,8 +22610,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "total": total,
                 "current": 0,
                 "episodes": [],
+                "phase": "local",
+                "current_episode": None,
+                "phase_started_at": time.time(),
+                "local_episodes": [],
                 "started_at": time.time(),
                 "finished_at": 0.0,
+                # A movie or a one-episode title: one release for the whole title.
+                "single": bool(self._planning_single_file_title(anime) and total == 1),
+                "movie": str(anime.format or "").upper() == "MOVIE",
             }
             self._planning_episode_cancel_event = threading.Event()
             self._planning_episode_job_id = self.job_center.start(
@@ -19307,8 +22644,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         payload["episodes"] = [
             dict(item) for item in self._planning_episode_download_state.get("episodes", [])
         ]
-        thread = self._planning_episode_download_thread
+        payload["local_episodes"] = [
+            int(item) for item in self._planning_episode_download_state.get("local_episodes", [])
+        ]
+        thread = getattr(self, "_planning_episode_download_thread", None)
         payload["running"] = bool(thread is not None and thread.is_alive())
+        started = float(payload.get("phase_started_at") or 0.0)
+        # Seconds the current step has run, so the window can show it without its own clock.
+        payload["step_elapsed"] = max(0.0, time.time() - started) if payload["running"] and started else 0.0
         return payload
 
 
@@ -19317,13 +22660,61 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
         return
 
 
+# Every page, script, cover and API GET of the window is under /k/<per-launch key>/.
+# Any local process or account could read 127.0.0.1:<port>/index.html (the
+# session token, the chat history) and then call the token-protected POSTs; the
+# Host check only stops web pages. A cookie would not hold: pywebview's private
+# mode clears the shared cookie store whenever another window opens.
+PAGE_KEY_PREFIX = "/k/"
+
+
+def asset_page_base(origin: str, page_key: str) -> str:
+    """The base URL the window's pages and assets are served under."""
+    return f"{origin.rstrip('/')}{PAGE_KEY_PREFIX}{page_key}"
+
+
 def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler]:
     if not getattr(api, "_http_session_token", None):
         api._http_session_token = secrets.token_urlsafe(32)
+    if not getattr(api, "_http_page_key", None):
+        api._http_page_key = secrets.token_urlsafe(24)
 
     class _AppAssetHandler(_QuietHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, directory=str(web_root), **kwargs)
+
+        def _without_page_key(self) -> str | None:
+            """The request path after ``/k/<key>``; None when the key is missing or wrong."""
+            path = urlparse(self.path).path
+            if not path.startswith(PAGE_KEY_PREFIX):
+                return None
+            key, slash, rest = path[len(PAGE_KEY_PREFIX) :].partition("/")
+            if not slash or not hmac.compare_digest(key.encode(), str(api._http_page_key).encode()):
+                return None
+            return "/" + rest
+
+        def _has_session_token(self) -> bool:
+            token = str(self.headers.get("X-Pudge-Token") or "")
+            return bool(token) and hmac.compare_digest(token.encode(), str(api._http_session_token).encode())
+
+        def _admit_read(self) -> str | None:
+            """The path a GET/HEAD may read (the page key stripped), or None after a 403."""
+            if self._from_this_app():
+                inner = self._without_page_key()
+                if inner is None and self._has_session_token():
+                    # The page's own fetch() calls send the session token instead.
+                    inner = urlparse(self.path).path
+                if inner is not None:
+                    query = urlparse(self.path).query
+                    self.path = inner + (f"?{query}" if query else "")
+                    return inner
+            self._send_json({"ok": False, "error": "forbidden"}, status=403)
+            return None
+
+        def list_directory(self, path: Any) -> None:
+            # No folder listings (the covers folder, the page folder).
+            self.send_error(404)
+            return None
 
         def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -19369,13 +22760,19 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             self.end_headers()
             self.wfile.write(body)
 
+        def do_HEAD(self) -> None:
+            if self._admit_read() is None:
+                return
+            super().do_HEAD()
+
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            # Every GET, not only manga pages: index.html carries the session
+            # token and chat history, and the API routes read library data.
+            path = self._admit_read()
+            if path is None:
+                return
             manga_page = re.fullmatch(r"/api/manga/page/(\d+)/(\d+)/([0-9a-f]{20})", path)
             manga_thumb = re.fullmatch(r"/api/manga/cover/([A-Za-z0-9-]+\.jpg)", path)
-            if (manga_page or manga_thumb) and not self._from_this_app():
-                self._send_json({"ok": False, "error": "forbidden"}, status=403)
-                return
             if manga_page:
                 try:
                     body, content_type = api.manga.page_asset(
@@ -19421,7 +22818,8 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             super().do_GET()
 
         def do_POST(self) -> None:
-            path = urlparse(self.path).path
+            # mpv's helpers post to the plain path; a page may post under its key.
+            path = self._without_page_key() or urlparse(self.path).path
             if path not in {"/api/torrents/enabled", "/api/mpv/explain", "/api/mpv/playback-save"}:
                 self._send_json({"ok": False, "error": "not_found"}, status=404)
                 return
@@ -19430,7 +22828,12 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             if (
                 self.headers.get("Host") != expected_origin.removeprefix("http://")
                 or self.headers.get("Origin", expected_origin) != expected_origin
-                or not hmac.compare_digest(token, api._http_session_token)
+                # Bytes: a header with a non-ASCII character made compare_digest raise on
+                # str (outside the try below), and the request got no answer at all.
+                or not hmac.compare_digest(
+                    token.encode("utf-8", "surrogatepass"),
+                    str(api._http_session_token).encode("utf-8", "surrogatepass"),
+                )
             ):
                 self._send_json({"ok": False, "error": "forbidden"}, status=403)
                 return
@@ -19472,26 +22875,46 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
     return _AppAssetHandler
 
 
+class _AssetServer(http.server.ThreadingHTTPServer):
+    """The window's page server.
+
+    The page asks for some 30 scripts at once while the app is still starting;
+    the default queue of 5 waiting connections is too short for that burst.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
+def _write_index_page(api: WebAppApi, source: Path, target: Path) -> None:
+    """index.html with this session's token and the UI preferences as they are now."""
+    target.write_text(
+        source.read_text(encoding="utf-8")
+        .replace("__APP_NAME__", APP_NAME)
+        .replace("__PUDGE_HTTP_TOKEN__", api._http_session_token)
+        .replace(
+            "__PUDGE_UI_BOOTSTRAP__",
+            json.dumps(api.ui_preferences(), ensure_ascii=True).replace("<", "\\u003c"),
+        ),
+        encoding="utf-8",
+    )
+
+
 def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer, str]:
+    """Start the window's page server; returns it and the page base URL (with the key)."""
     api._http_session_token = secrets.token_urlsafe(32)
+    api._http_page_key = secrets.token_urlsafe(24)
     web_root = api.config.paths.cache_dir / "web-ui"
-    web_root.mkdir(parents=True, exist_ok=True)
+    # index.html carries the session token: the folder is this user's only.
+    private_directory(web_root)
+    api._web_root = web_root
     source_dir = Path(__file__).resolve().parent / "web"
     for source in source_dir.iterdir():
         if not source.is_file():
             continue
         target = web_root / source.name
         if source.name == "index.html":
-            target.write_text(
-                source.read_text(encoding="utf-8")
-                .replace("__APP_NAME__", APP_NAME)
-                .replace("__PUDGE_HTTP_TOKEN__", api._http_session_token)
-                .replace(
-                    "__PUDGE_UI_BOOTSTRAP__",
-                    json.dumps(api.ui_preferences(), ensure_ascii=True).replace("<", "\\u003c"),
-                ),
-                encoding="utf-8",
-            )
+            _write_index_page(api, source, target)
         else:
             shutil.copy2(source, target)
     covers_link = web_root / "covers"
@@ -19505,11 +22928,13 @@ def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer
         covers_link.symlink_to(api.config.library.cover_cache_dir, target_is_directory=True)
 
     handler = _asset_handler_for_api(api, web_root)
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = _AssetServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
-    return server, f"http://{host}:{port}"
+    # mpv's helpers post to the origin (token-protected); pages live under the key.
+    api.asset_origin = f"http://{host}:{port}"
+    return server, asset_page_base(api.asset_origin, api._http_page_key)
 
 
 class _MacWindowLifecycle:
@@ -19525,10 +22950,14 @@ class _MacWindowLifecycle:
         self.logger = logger
         self.on_quit = on_quit
         self.quit_requested = False
+        # Low RAM mode: lets go of the hidden window's page and brings it back on reopen.
+        self.unloader: Any | None = None
 
     def request_quit(self, source: str = "macos") -> None:
         first_request = not self.quit_requested
         self.quit_requested = True
+        if self.unloader is not None:
+            self.unloader.close()
         self.logger.info("EVENT app.quit_requested source=%s", source)
         if first_request and callable(self.on_quit):
             try:
@@ -19545,6 +22974,9 @@ class _MacWindowLifecycle:
             self.logger.info("EVENT app.window_close action=hide")
         except Exception as exc:
             self.logger.warning("FALLBACK step=app.window_hide error=%r", str(exc))
+            return False
+        if self.unloader is not None:
+            self.unloader.hidden_now()
         return False
 
     def reopen(self) -> bool:
@@ -19565,6 +22997,8 @@ class _MacWindowLifecycle:
                     from PyObjCTools import AppHelper
 
                     AppHelper.callAfter(restore)
+            if self.unloader is not None:
+                self.unloader.shown_now()
             self.window.show()
             self.logger.info("EVENT app.window_reopen action=show")
             return True
@@ -19573,13 +23007,393 @@ class _MacWindowLifecycle:
             return False
 
 
-def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLifecycle) -> bool:
+class _SplitWindowLifecycle:
+    """The main window lives in a window process (pudge/window_process.py; both modes).
+
+    The same interface as ``_MacWindowLifecycle`` for the app delegate, the second-launch
+    focus and the update/uninstall quit. Closing the window hides it in the window process;
+    ``unloader`` (WindowPageUnloader with release/restore) ends that process a while later
+    when nothing needs the page, and reopening starts a new one.
+    """
+
+    def __init__(self, host: Any, logger: Any, on_quit: Any | None = None) -> None:
+        self.host = host
+        self.logger = logger
+        self.on_quit = on_quit
+        self.quit_requested = False
+        self.unloader: Any | None = None
+        # The window process is the regular app (Dock icon, menu bar, Cmd+Tab) while it runs;
+        # this process is an accessory meanwhile (an accessory never owns the menu bar, so the
+        # window's menus could not be this process's).
+        self.window_owns_app = False
+
+    def request_quit(self, source: str = "macos") -> None:
+        first_request = not self.quit_requested
+        self.quit_requested = True
+        if self.unloader is not None:
+            self.unloader.close()
+        self.logger.info("EVENT app.quit_requested source=%s", source)
+        if first_request:
+            # Off the Cocoa main thread (the app delegate asks from there): the window process
+            # also ends by itself when this process and its channel go.
+            threading.Thread(target=self._stop_window, name="pudge-window-stop", daemon=True).start()
+            if callable(self.on_quit):
+                try:
+                    self.on_quit(source)
+                except Exception as exc:
+                    self.logger.warning("FALLBACK step=app.background_quiet_on_quit error=%r", str(exc))
+
+    def _stop_window(self) -> None:
+        try:
+            self.host.stop("quit")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("FALLBACK step=window_process.stop error=%r", str(exc))
+
+    def handle_closing(self) -> bool:
+        """The hidden placeholder window closes only when Pudge quits."""
+        return bool(self.quit_requested)
+
+    def reopen(self) -> bool:
+        if self.quit_requested:
+            return False
+        try:
+            if self.unloader is not None:
+                self.unloader.shown_now()  # starts a window process when there is none
+            # Shows a running one; starts one when there is none or the last one is ending.
+            if self.host.running and not getattr(self.host, "stopping", False):
+                self.host.show()
+            else:
+                self.host.start()
+            self.logger.info("EVENT app.window_reopen action=window_process pid=%s", self.host.pid)
+            return True
+        except Exception as exc:
+            self.logger.warning("FALLBACK step=app.window_reopen error=%r", str(exc))
+            return False
+
+    def window_hidden(self) -> None:
+        self.logger.info("EVENT app.window_close action=hide process=window")
+        if self.unloader is not None:
+            self.unloader.hidden_now()
+
+    def window_shown(self) -> None:
+        if self.unloader is not None:
+            self.unloader.shown_now()
+
+    def window_gone(self, crashed: bool) -> None:
+        if self.unloader is not None:
+            self.unloader.page_gone()
+        # The Dock icon and the menu bar are this process's again.
+        self.window_owns_app = False
+        self.apply_app_policy()
+
+    def window_ready(self) -> None:
+        """The window process became a regular app: it owns the Dock icon and the menu bar now.
+
+        This process hands it the activation (macOS 14 refuses an app that takes it without
+        that) and becomes an accessory. Nothing is forwarded on this process's own activations
+        any more: that took the menu bar, alerts and companion windows away from the user."""
+        self.window_owns_app = True
+        _yield_activation_to(getattr(self.host, "pid", 0))
+        self.apply_app_policy()
+
+    def apply_app_policy(self) -> None:
+        """Regular without a window process, accessory while one runs (pywebview's Cocoa backend
+        makes the process regular again when it is imported: _LazyPywebview calls this then)."""
+        if self.quit_requested:
+            return  # quitting: no Dock icon coming back for a moment
+        _set_app_activation_policy(accessory=self.window_owns_app)
+
+
+_PLACEHOLDER_HTML = "<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>"
+
+
+class _LazyPywebview:
+    """Window process: pywebview (and WebKit) in the main process only once a companion window
+    (audiobook float, mpv assistant, Screen text) is opened.
+
+    Until then the main process runs a plain NSApplication loop: Dock icon, menu, app delegate,
+    no WKWebView, no WebContent/Networking/GPU helper processes. The first companion starts
+    pywebview on the main thread with a hidden empty placeholder as its first window: the app
+    is already running, so ``webview.start`` returns at once, and the placeholder keeps
+    pywebview from stopping the app when the last companion closes.
+    """
+
+    START_WAIT_SECONDS = 15.0
+
+    def __init__(self, webview: Any, api: "WebAppApi", lifecycle: Any, logger: Any) -> None:
+        self.webview = webview
+        self.api = api
+        self.lifecycle = lifecycle
+        self.logger = logger
+        self.placeholder: Any = None
+        self._lock = threading.Lock()
+        self._requested = False
+        self.ready = threading.Event()
+
+    def ensure(self) -> None:
+        if self.ready.is_set():
+            return
+        with self._lock:
+            first = not self._requested
+            self._requested = True
+        if threading.current_thread() is threading.main_thread():
+            if first:
+                self._start()
+            return
+        if first:
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(self._start)
+        if not self.ready.wait(self.START_WAIT_SECONDS):
+            self.logger.warning("WAIT step=app.pywebview_lazy_start")
+
+    def _start(self) -> None:
+        try:
+            from webview.platforms.cocoa import BrowserView
+
+            proxy = getattr(self.api, "_macos_app_delegate_proxy", None)
+            if proxy is not None:
+                BrowserView._shared_app_delegate = proxy  # pywebview keeps Pudge's delegate
+            self.placeholder = self.webview.create_window(
+                APP_NAME, html=_PLACEHOLDER_HTML, hidden=True, width=320, height=200
+            )
+            self.placeholder.events.closing += self.lifecycle.handle_closing
+            started = time.monotonic()
+            self.webview.start(gui="cocoa", debug=False)  # the app runs already: returns
+            self.logger.info(
+                "EVENT app.pywebview_lazy_start ms=%d", round((time.monotonic() - started) * 1000)
+            )
+            # Importing pywebview's Cocoa backend made this process a regular app again.
+            restore = getattr(self.lifecycle, "apply_app_policy", None)
+            if callable(restore):
+                restore()
+        except Exception:
+            self.logger.exception("FAIL step=app.pywebview_lazy_start")
+        finally:
+            self.ready.set()
+
+
+def _install_split_main_menu() -> bool:
+    """The menu bar of the main process with a window process (pywebview's default one is not there); the
+    window process shows the same one while its window is in front."""
+    from . import window_process
+
+    return window_process.install_main_menu(APP_NAME)
+
+
+def _set_app_activation_policy(*, accessory: bool) -> bool:
+    """The main process with a window process: an accessory while the window process is the app in front,
+    regular otherwise. On Cocoa's main thread."""
+    if sys.platform != "darwin" or os.environ.get("PUDGE_NO_DOCK_CHANGES"):
+        return False
+    try:
+        from AppKit import (
+            NSApplication,
+            NSApplicationActivationPolicyAccessory,
+            NSApplicationActivationPolicyRegular,
+        )
+
+        application = NSApplication.sharedApplication()
+        policy = NSApplicationActivationPolicyAccessory if accessory else NSApplicationActivationPolicyRegular
+        if threading.current_thread() is threading.main_thread():
+            application.setActivationPolicy_(policy)
+        else:
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(application.setActivationPolicy_, policy)
+        return True
+    except Exception:  # noqa: BLE001 - cosmetics
+        return False
+
+
+def _yield_activation_to(pid: int) -> bool:
+    """macOS 14+: let the window process take the activation from this one."""
+    if sys.platform != "darwin" or not pid:
+        return False
+    try:
+        from AppKit import NSApplication, NSRunningApplication
+
+        application = NSApplication.sharedApplication()
+        if not application.respondsToSelector_("yieldActivationToApplication:"):
+            return False
+        target = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
+        if target is None:
+            return False
+
+        def hand_over() -> None:
+            application.yieldActivationToApplication_(target)
+
+        if threading.current_thread() is threading.main_thread():
+            hand_over()
+        else:
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(hand_over)
+        return True
+    except Exception:  # noqa: BLE001 - cosmetics
+        return False
+
+
+def _run_cocoa_loop() -> None:
+    """NSApplication's loop without pywebview (it returns when Pudge quits or is stopped)."""
+    from AppKit import NSApplication
+    from PyObjCTools import AppHelper
+
+    application = NSApplication.sharedApplication()
+    AppHelper.installMachInterrupt()
+    if os.environ.get("PUDGE_LAUNCH_BACKGROUND") != "1":  # an installer relaunch stays behind
+        application.activateIgnoringOtherApps_(True)
+    application.run()
+
+
+def _start_window_at_launch(host: Any, lifecycle: Any, logger: Any, environ: Any = None) -> bool:
+    """Start the main window's process at launch (True), or not after a background launch.
+
+    An installer relaunch (``--pudge-background``) starts no window at all: a new window, even
+    one that is never activated, took the screen from a full-screen game. Pudge stays in the Dock
+    and the menu bar; the first reopen (Dock click, menu, a second launch) starts the window.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.pop("PUDGE_LAUNCH_BACKGROUND", "") == "1":
+        if lifecycle.unloader is not None:
+            lifecycle.unloader.page_gone()  # like a window let go: the next reopen starts one
+        logger.info("EVENT app.background_launch window=deferred")
+        return False
+    if lifecycle.unloader is not None:
+        lifecycle.unloader.loading()  # scripts for the page wait until it reports ready
+    host.start()
+    return True
+
+
+def _launch_with_window_process(api: "WebAppApi", webview: Any, server: Any, base_url: str) -> int:
+    """The main window in its own process (both modes); this one keeps everything else.
+
+    No WebKit here at all until a companion window opens (``_LazyPywebview``).
+    """
+    from . import window_process
+
+    page_url = f"{base_url}/index.html"
+    host = window_process.WindowProcessHost(
+        api,
+        page_url=lambda: page_url,
+        title=APP_NAME,
+        window_options={
+            "width": 1280,
+            "height": 820,
+            "min_size": [980, 660],
+            "resizable": True,
+            "text_select": True,
+            "background_color": "#0b1320",
+        },
+        logger=api.logger,
+    )
+    api._window_process = host
+    api.set_window(host.window)
+    lifecycle = _SplitWindowLifecycle(host, api.logger)
+    api._macos_window_lifecycle = lifecycle
+    api._page_unloader = lifecycle.unloader = low_ram.WindowPageUnloader(
+        host.window,
+        enabled=lambda: True,  # both modes: the window process ends a while after a close
+        # 5 minutes in normal mode, 30 s in Low RAM mode (read at every close).
+        delay=lambda: low_ram.window_unload_delay(api.config),
+        page_url=lambda: page_url,
+        blank_url=lambda: f"{base_url}/blank.html",
+        python_veto=api._low_ram_unload_veto,
+        before_reload=api._before_page_reload,
+        # Not waiting for the process (the unloader holds its lock meanwhile; a reopen on Cocoa's
+        # main thread would wait for a slow WebKit teardown): a reopen starts a new one at once.
+        release=lambda: host.release("closed"),
+        restore=host.start,
+        unloaded_report=api._log_memory_window_unloaded,
+        logger=api.logger,
+    )
+    lazy = _LazyPywebview(webview, api, lifecycle, api.logger)
+    api._lazy_pywebview = lazy
+    js_bridge.BEFORE_CREATE = lazy.ensure
+
+    def window_gone(crashed: bool) -> None:
+        lifecycle.window_gone(crashed)
+        try:
+            api.set_window_activity(False)
+        except Exception as exc:  # noqa: BLE001
+            api.logger.warning("FALLBACK step=window_process.activity error=%r", str(exc))
+        if crashed:
+            # Where memory is a minute after the window process went away by itself.
+            timer = threading.Timer(60.0, api._log_memory_window_unloaded)
+            timer.daemon = True
+            timer.start()
+
+    def terminate_app() -> None:
+        from AppKit import NSApplication
+        from PyObjCTools import AppHelper
+
+        AppHelper.callAfter(NSApplication.sharedApplication().terminate_, None)
+
+    host.on_hidden = lifecycle.window_hidden
+    host.on_shown = lifecycle.window_shown
+    host.on_ready = lifecycle.window_ready
+    host.on_gone = window_gone
+    host.on_quit = terminate_app
+    host.on_drop = api._import_drop_in_background
+    # Uninstall closes "the window" after asking to quit: here that ends the app.
+    host.window.after_destroy = lambda: lifecycle.quit_requested and terminate_app()
+    api.logger.info("EVENT app.window_created pid=%s uid=%s process=window", os.getpid(), host.window.uid)
+    _INSTANCE_LOCK.serve_focus_requests(lambda: _focus_main_window(api))
+
+    def on_started() -> None:
+        icon_set = _set_macos_runtime_identity()
+        api.logger.info("EVENT app.webview_started runtime_identity=%s window_process=true", icon_set)
+        api.start_global_shortcuts()
+        api.resume_torrents_after_update()
+        try:
+            _start_window_at_launch(host, lifecycle, api.logger)
+        except Exception:
+            api.logger.exception("FAIL step=window_process.start")
+        _request_notification_permission_after_launch(api)
+
+    try:
+        with timed_step(api.logger, "app.webview_lifetime"):
+            _install_split_main_menu()
+            _install_macos_app_delegate_proxy(api, lifecycle, standalone=True)
+            from PyObjCTools import AppHelper
+
+            # Like pywebview's start(func): func runs on its own thread once the loop runs.
+            AppHelper.callAfter(
+                lambda: threading.Thread(
+                    target=on_started, name="AnimeMPVNotificationPermission", daemon=True
+                ).start()
+            )
+            _run_cocoa_loop()
+    finally:
+        js_bridge.BEFORE_CREATE = None
+        try:
+            host.stop("app_exit")
+        except Exception:  # noqa: BLE001
+            pass
+        api.close()
+        api.logger.info("APP session_stop")
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+def _install_macos_app_delegate_proxy(
+    api: "WebAppApi", lifecycle: _MacWindowLifecycle, *, standalone: bool = False
+) -> bool:
+    """``standalone``: the main process of the window-process launch, before any pywebview window (no original
+    delegate, no BrowserView yet: _LazyPywebview hands the proxy to pywebview when it starts)."""
     if sys.platform != "darwin":
         return False
     try:
         from AppKit import NSApplication, NSTerminateLater, NSModalPanelRunLoopMode
         from Foundation import NSObject, YES, NSDefaultRunLoopMode
-        from webview.platforms.cocoa import BrowserView
+
+        if standalone:
+            from types import SimpleNamespace
+
+            BrowserView = SimpleNamespace(_shared_app_delegate=None)
+        else:
+            from webview.platforms.cocoa import BrowserView
 
         application = NSApplication.sharedApplication()
         proxy = getattr(api, "_macos_app_delegate_proxy", None)
@@ -19588,7 +23402,7 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
             application.setDelegate_(proxy)
             return True
         original_delegate = application.delegate()
-        if original_delegate is None:
+        if original_delegate is None and not standalone:
             api.logger.warning("FALLBACK step=app.macos_delegate reason=no_original_delegate")
             return False
 
@@ -19703,6 +23517,9 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
         return False
 
 
+_RUNTIME_ICON_IMAGE: tuple[str, Any, Any] | None = None
+
+
 def _set_macos_runtime_identity() -> bool:
     """Set the real Cocoa process identity used by Dock and Cmd+Tab.
 
@@ -19711,7 +23528,10 @@ def _set_macos_runtime_identity() -> bool:
     before and after pywebview creates NSApplication. The app bundle still
     supplies the icon and display name as a second source of truth.
     """
-    if sys.platform != "darwin":
+    global _RUNTIME_ICON_IMAGE
+    if sys.platform != "darwin" or os.environ.get("PUDGE_NO_DOCK_CHANGES"):
+        # PUDGE_NO_DOCK_CHANGES: the test suite (a plain Python process) never turns itself
+        # into a Dock app with Pudge's icon labelled "Python" (seen while an update ran).
         return False
     icon_path = Path(__file__).resolve().parent / "assets" / "app-icon.png"
     try:
@@ -19729,8 +23549,20 @@ def _set_macos_runtime_identity() -> bool:
 
         application = NSApplication.sharedApplication()
         application.setActivationPolicy_(NSApplicationActivationPolicyRegular)
-        if icon_path.is_file():
-            image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+        from .window_process import bundle_has_own_icon
+
+        if icon_path.is_file() and not bundle_has_own_icon():
+            # Run from Pudge.app the bundle's icon file is what the Dock, Cmd+Tab and Force Quit
+            # show without anything decoded here (an NSImage of the icon kept its CGImage
+            # copies, tens of MB, in this process for good). Plain Python: the PNG.
+            # One NSImage for the whole run: each call (3 per launch) used to load a new
+            # 1024 px copy (~4 MB of CG Image each once drawn).
+            # Reused only for the same file and the same NSImage class (AppKit), never an
+            # image of another AppKit (tests stand-ins after a real one, or the reverse).
+            cached_path, cached_class, image = _RUNTIME_ICON_IMAGE or ("", None, None)
+            if image is None or cached_path != str(icon_path) or cached_class is not NSImage:
+                image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+                _RUNTIME_ICON_IMAGE = (str(icon_path), NSImage, image) if image is not None else None
             if image is not None:
                 if threading.current_thread() is threading.main_thread():
                     application.setApplicationIconImage_(image)
@@ -19742,11 +23574,6 @@ def _set_macos_runtime_identity() -> bool:
     except Exception:
         configure_logging().exception("FAIL step=app.runtime_identity")
         return False
-
-
-def _set_macos_runtime_icon() -> bool:
-    # Backwards-compatible private alias used by older tests/installations.
-    return _set_macos_runtime_identity()
 
 
 def _request_notification_permission_after_launch(api: WebAppApi) -> None:
@@ -19770,7 +23597,11 @@ def _focus_main_window(api: "WebAppApi") -> None:
         lifecycle.reopen()
     elif getattr(api, "window", None) is not None:
         api.window.show()
-    if sys.platform == "darwin":
+    if isinstance(lifecycle, _SplitWindowLifecycle):
+        # The window process brings its window (and itself) forward; activating
+        # this accessory process would take the focus away from that window.
+        lifecycle.host.activate()
+    elif sys.platform == "darwin":
         try:
             from AppKit import NSApp
             from PyObjCTools import AppHelper
@@ -19805,12 +23636,31 @@ def launch_web_app(config_path: Path) -> int:
     except ImportError as exc:
         raise RuntimeError(err("setup.pywebviewMissing")) from exc
 
-    api = WebAppApi(config_path)
+    try:
+        api = WebAppApi(config_path)
+    except sqlite3.DatabaseError:
+        # A damaged library ended the launch before any window or Safe Mode
+        # existed: offer the local copies with a native alert, then start again.
+        from .damaged_library import library_damage, recover_damaged_library
+
+        database_path = load_config(config_path, resolve_secrets=False).library.database_path
+        damage = library_damage(database_path)
+        if not damage:
+            raise  # not a damaged file (a full disk, a lock): the error stands
+        if not recover_damaged_library(database_path, damage):
+            return 1
+        api = WebAppApi(config_path)
     _set_macos_runtime_identity()
     with timed_step(api.logger, "app.asset_server"):
         server, base_url = _start_asset_server(api)
     api.asset_base = base_url
     api.manga.asset_base = base_url
+    from . import window_process
+
+    if window_process.supported(api.config):
+        # The window runs in its own process (pudge/window_process.py); PUDGE_WINDOW_PROCESS=0
+        # keeps it here (the in-process window below).
+        return _launch_with_window_process(api, webview, server, base_url)
     window = js_bridge.create_window(
         webview,
         APP_NAME,
@@ -19839,6 +23689,19 @@ def launch_web_app(config_path: Path) -> int:
     if sys.platform == "darwin":
         lifecycle = _MacWindowLifecycle(window, api.logger)
         api._macos_window_lifecycle = lifecycle
+        api._page_unloader = lifecycle.unloader = low_ram.WindowPageUnloader(
+            window,
+            enabled=lambda: low_ram.enabled(api.config),
+            page_url=lambda: f"{base_url}/index.html",
+            blank_url=lambda: f"{base_url}/blank.html",
+            python_veto=api._low_ram_unload_veto,
+            before_reload=api._before_page_reload,
+            # The hidden window also lets go of the web view's layers (IOSurfaces) and logs
+            # where memory is a minute later.
+            parking=low_ram.CocoaWebViewParking(window, logger=api.logger),
+            unloaded_report=api._log_memory_window_unloaded,
+            logger=api.logger,
+        )
         window.events.closing += lifecycle.handle_closing
 
         def on_before_show() -> None:
@@ -19857,6 +23720,7 @@ def launch_web_app(config_path: Path) -> int:
         icon_set = _set_macos_runtime_identity()
         api.logger.info("EVENT app.webview_started runtime_identity=%s", icon_set)
         api.start_global_shortcuts()
+        api.resume_torrents_after_update()
 
         # Finder drop binding is intentionally deferred until the page fires
         # ``pywebviewready``. Binding DOM drag events here used to attach too

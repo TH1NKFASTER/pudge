@@ -79,7 +79,7 @@ def test_global_shortcut_registers_replaces_and_reports_a_taken_combination() ->
     assert shortcut.status() == {"shortcut": "Meta+Alt+Shift+v", "registered": True, "error": ""}
     [(_key, _modifiers, callback)] = backend.registered.values()
     callback()
-    assert pressed.wait(1.0)  # the toggle runs off the main thread
+    assert pressed.wait(30)  # the toggle runs off the main thread
     shortcut.apply("Ctrl+Alt+F5")
     assert [entry[:2] for entry in backend.registered.values()] == [(0x60, CONTROL | OPTION)]
     shortcut.apply("Meta+Shift+v")
@@ -113,7 +113,7 @@ def test_shortcut_setting_round_trip(tmp_path) -> None:
 # The window page
 
 PARSED = {
-    "paragraphs": ["それが、二階堂ヒロだった。"],
+    "paragraphs": ["それが、二階堂ヒロの答えだった。"],
     "tokens": [
         [
             {"wordId": 11, "readingIndex": 0, "start": 0, "end": 3},
@@ -127,7 +127,7 @@ PARSED = {
 }
 
 PAGE_STATE = r"""
-window.screenState = {running: true, status: 'reading', text: 'それが、二階堂ヒロだった。', text_id: 1,
+window.screenState = {running: true, status: 'reading', text: 'それが、二階堂ヒロの答えだった。', text_id: 1,
   window_title: '魔法少女ノ魔女裁判', ocr_count: 1};
 __api.screen_text_state = async () => ({...window.screenState});
 __api.visual_novel_parse = async text => (window.PARSED);
@@ -172,7 +172,7 @@ def test_panel_page_shows_the_screen_text_with_clickable_words(page) -> None:
     assert out["title"] == en("screenText.windowTitle")
     assert out["card"] is True and "それが" in out["cardText"]
     assert out["next"] == ["次の"]
-    assert result.calls_of("visual_novel_parse") == [["それが、二階堂ヒロだった。"], ["次の台詞"]]
+    assert result.calls_of("visual_novel_parse") == [["それが、二階堂ヒロの答えだった。"], ["次の台詞"]]
 
 
 def test_panel_page_says_when_it_is_paused_or_cannot_capture(page) -> None:

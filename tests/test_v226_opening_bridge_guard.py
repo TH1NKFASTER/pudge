@@ -123,7 +123,6 @@ def test_resolved_opening_bridge_does_not_retrigger_stt_audio_verification() -> 
             onset_f1=0.86,
             activity_f1=0.90,
             mean_error=0.4,
-            rank_delta=0.01,
             gap_fingerprint=0.8,
             edge_hint_distance=1.0,
         )
@@ -205,7 +204,6 @@ def _path_window(center: float, offset: float, score: float = 3.3) -> _WindowMat
         onset_f1=0.82,
         activity_f1=0.92,
         mean_error=0.35,
-        rank_delta=0.01,
         gap_fingerprint=0.82,
         edge_hint_distance=1.0,
     )

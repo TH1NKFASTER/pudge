@@ -56,10 +56,36 @@ def pairs_of(tokens: Iterable[Any]) -> list[Pair]:
     return result
 
 
+def _entry_count(value: Any) -> int:
+    """Rough size of a unit's words: entries in its lists ({"cues": [...]}, {"words": [...]})."""
+    if isinstance(value, list):
+        return max(1, len(value))
+    if isinstance(value, dict):
+        return max(1, sum(len(item) if isinstance(item, (list, dict)) else 1 for item in value.values()))
+    return 1
+
+
 class WordUnits:
+    # Decoded words of ready units, kept for the next Statistics query: at most this many
+    # words in all, and dropped after READY_IDLE_SECONDS without a query.
+    READY_MAX_WORDS = 300_000
+    READY_IDLE_SECONDS = 600.0
+
     def __init__(self, database: Any) -> None:
         self.database = database
         self._ready: dict[str, Any] = {}
+        self._ready_words = 0
+        self._ready_used_at = time.monotonic()
+
+    def release_idle(self, force: bool = False) -> int:
+        if not self._ready or not (
+            force or time.monotonic() - self._ready_used_at >= self.READY_IDLE_SECONDS
+        ):
+            return 0
+        dropped = len(self._ready)
+        self._ready = {}
+        self._ready_words = 0
+        return dropped
 
     # ------------------------------------------------------------------ store
     def lookup(self, keys: Iterable[str]) -> dict[str, tuple[str, Any]]:
@@ -67,9 +93,11 @@ class WordUnits:
         wanted = [key for key in dict.fromkeys(keys) if key]
         result: dict[str, tuple[str, Any]] = {}
         missing = []
+        self._ready_used_at = time.monotonic()
+        ready = self._ready
         for key in wanted:
-            if key in self._ready:
-                result[key] = (READY, self._ready[key])
+            if key in ready:
+                result[key] = (READY, ready[key])
             else:
                 missing.append(key)
         with self.database.connect() as conn:
@@ -89,9 +117,12 @@ class WordUnits:
                         except (TypeError, ValueError):
                             status, words = PENDING, None
                         else:
-                            if len(self._ready) > 5000:
-                                self._ready.clear()
+                            size = _entry_count(words)
+                            if len(self._ready) > 5000 or self._ready_words + size > self.READY_MAX_WORDS:
+                                self._ready = {}
+                                self._ready_words = 0
                             self._ready[key] = words
+                            self._ready_words += size
                     result[key] = (status, words)
         return result
 
@@ -231,6 +262,7 @@ class WordUnits:
                 "SELECT DISTINCT e.kind,em.media_uuid,"
                 "json_extract(em.locator_end_json,'$.page_id') AS page_id,"
                 "json_extract(em.locator_end_json,'$.page_index') AS page_index,"
+                "json_extract(em.locator_end_json,'$.page_ids') AS page_ids,"
                 "json_extract(em.locator_end_json,'$.chapter_key') AS chapter_key "
                 "FROM consumption_events e JOIN consumption_event_media em ON em.event_id=e.event_id "
                 "WHERE e.kind IN ('manga','light_novel')"
@@ -241,6 +273,11 @@ class WordUnits:
             locator = {
                 name: row[name] for name in ("page_id", "page_index", "chapter_key") if row[name] is not None
             }
+            if row["page_ids"]:
+                try:
+                    locator["page_ids"] = json.loads(str(row["page_ids"]))
+                except ValueError:
+                    pass
             units.update(
                 segment_units(
                     {
@@ -266,6 +303,23 @@ def _locator_page(media: dict[str, Any]) -> tuple[str, int] | None:
     return page_id, index
 
 
+def _locator_pages(media: dict[str, Any]) -> list[tuple[str, int]]:
+    """The pages on screen: one, or both of two pages side by side (`page_ids`, the second
+    one is the page after `page_index`)."""
+    first = _locator_page(media)
+    if first is None:
+        return []
+    locator = media.get("locator_end") or media.get("locator_start") or {}
+    pair = locator.get("page_ids") if isinstance(locator, dict) else None
+    if (
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(isinstance(item, str) and item.strip() for item in pair)
+    ):
+        return [(str(pair[0]).strip(), first[1]), (str(pair[1]).strip(), first[1] + 1)]
+    return [first]
+
+
 def segment_units(segment: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
     kind = str(segment.get("kind") or "")
     units: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -276,8 +330,7 @@ def segment_units(segment: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any
         if kind == "anime":
             units[f"anime:{media_uuid}"] = ("anime", {"media_uuid": media_uuid})
         elif kind == "manga":
-            page = _locator_page(media)
-            if page is not None:
+            for page in _locator_pages(media):
                 units[f"manga:{media_uuid}:{page[0]}"] = (
                     "manga",
                     {"media_uuid": media_uuid, "page_id": page[0], "page_index": page[1]},

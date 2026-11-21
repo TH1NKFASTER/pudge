@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,10 @@ def test_finishing_an_earlier_volume_never_rolls_anilist_back(monkeypatch, tmp_p
 
     monkeypatch.setattr(service, "_connection", lambda: Connection(), raising=False)
     service.finish_volume(1)
+    # Sent in the background (the volume is finished locally first).
+    deadline = time.monotonic() + 5
+    while not sent and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert sent == [(5, "COMPLETED")]
 
 

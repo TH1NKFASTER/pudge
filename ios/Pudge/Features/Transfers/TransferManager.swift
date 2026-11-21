@@ -6,7 +6,14 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
     let store: LocalStore
     private var connection: MacConnection
     var onChange: (() -> Void)?
+    /// Only a transfer's received bytes changed (every 0.5 s while downloading): lighter than onChange.
+    var onProgress: (() -> Void)?
     private let stateLock = NSLock()
+    /// Restore's "paused" and a start's "running" of the same record, one after the other: a
+    /// start that began after restore checked the record could save "running" first and then
+    /// get restore's "paused" over it (a running download listed as paused). Always taken
+    /// before stateLock.
+    private let recordLock = NSLock()
     private var downloading = Set<String>()
     private var restored = false
     private var lastProgress: [String: Double] = [:]
@@ -29,8 +36,18 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
             guard let self else { return }
             self.stateLock.lock(); self.downloading = Set(tasks.compactMap(\.taskDescription)); self.restored = true; self.stateLock.unlock()
             let active = Set(tasks.compactMap(\.taskDescription))
-            for var record in (try? self.store.transfers()) ?? [] where record.status == "running" || record.status == "verifying" {
-                if !active.contains(record.id) { record.status = "paused"; try? self.store.saveTransfer(record) }
+            // "queued" too: saved just before its task started, an app ended in between left it
+            // queued with no task for good (Resume all skipped it, its space stayed reserved).
+            for listed in (try? self.store.transfers()) ?? [] where ["queued", "running", "verifying"].contains(listed.status) {
+                // Checked and saved with no start in between, from the record as it is now.
+                self.recordLock.lock()
+                // Not one started since the tasks were listed (its record says "running" by now).
+                self.stateLock.lock(); let started = self.downloading.contains(listed.id); self.stateLock.unlock()
+                if !active.contains(listed.id), !started, var record = (try? self.store.transfer(listed.id)) ?? nil,
+                   ["queued", "running", "verifying"].contains(record.status) {
+                    record.status = "paused"; try? self.store.saveTransfer(record)
+                }
+                self.recordLock.unlock()
             }
             self.notify()
         }
@@ -39,7 +56,17 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
         stateLock.lock(); connection = client; stateLock.unlock()
     }
     func cancelAll() { transfers.getAllTasks { tasks in tasks.forEach { $0.cancel() } } }
+    /// The Mac was disconnected or replaced: its downloads stop (kept as paused) and the background
+    /// session ends. Left valid, it kept this manager alive, and pairing the same Mac again opened
+    /// a second session with the same identifier (undefined in URLSession).
+    func invalidate() { transfers.invalidateAndCancel() }
     func notify() { DispatchQueue.main.async { [weak self] in self?.onChange?() } }
+    func notifyProgress() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let onProgress = self.onProgress { onProgress() } else { self.onChange?() }
+        }
+    }
     func download(_ book: AudioManifest) throws {
         try book.validate()
         let newParts = try book.resources.filter { part in
@@ -69,6 +96,8 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
         try start(record)
     }
     private func start(_ value: TransferRecord) throws {
+        // Held until the record says "running" (see recordLock).
+        recordLock.lock(); defer { recordLock.unlock() }
         stateLock.lock()
         guard restored else { stateLock.unlock(); throw PudgeError.invalid("Restoring background downloads; try again in a few seconds") }
         let client = connection
@@ -135,7 +164,8 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
             }
             var values = URLResourceValues(); values.isExcludedFromBackup = true
             try final.setResourceValues(values)
-            try store.markVerified(record.part, at: final)
+            // Verified just above (the same bytes): not hashed a second time.
+            try store.markVerified(record.part, at: final, hashed: record.part.sha256)
             record.status = "complete"; record.resumeData = nil; record.receivedBytes = record.part.sizeBytes; try store.saveTransfer(record)
         } catch {
             record.status = "failed"; record.message = error.localizedDescription; try? store.saveTransfer(record)
@@ -149,7 +179,9 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
             if let error, var record = try? store.transfers().first(where: { $0.id == id }) {
                 record.status = (error as NSError).code == NSURLErrorCancelled ? "paused" : "failed"
                 record.message = error.localizedDescription
-                record.resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+                // Pause saved its resume data already (cancel(byProducingResumeData:)): an error
+                // without any must not wipe it, or the next start downloads from 0.
+                if let data = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data { record.resumeData = data }
                 try? store.saveTransfer(record)
                 AppLog.write("transfer", record.part.fileName + " " + record.status + ": " + error.localizedDescription)
             }
@@ -164,9 +196,9 @@ final class TransferManager: PinnedDelegate, URLSessionDownloadDelegate, @unchec
         let previous = lastProgress[id] ?? 0
         if now - previous < 0.5 { stateLock.unlock(); return }
         lastProgress[id] = now; stateLock.unlock()
-        if var record = try? store.transfers().first(where: { $0.id == id }) {
+        if var record = try? store.transfer(id) {
             record.receivedBytes = max(0, min(record.part.sizeBytes, totalBytesWritten))
-            try? store.saveTransfer(record); notify()
+            try? store.saveTransfer(record); notifyProgress()
         }
     }
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

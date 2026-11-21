@@ -3,7 +3,13 @@ from __future__ import annotations
 import signal
 from types import SimpleNamespace
 
+import pytest
+
 import pudge.audiobooks as audiobooks
+from pudge.audiobooks import AudiobookService
+from pudge.database import Database
+
+pytestmark = pytest.mark.real_process_scan
 
 
 def test_legacy_whole_book_stt_workers_are_terminated_but_chunk_workers_survive(monkeypatch):
@@ -60,3 +66,22 @@ def test_cleanup_is_noop_when_ps_fails(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
     )
     assert audiobooks.terminate_legacy_audiobook_stt_workers() == []
+
+
+def test_audiobook_start_runs_both_scans(tmp_path, monkeypatch):
+    # The suite skips these scans at every other service start (conftest); here they run.
+    seen: list[str] = []
+    monkeypatch.setattr(
+        audiobooks, "terminate_legacy_audiobook_stt_workers", lambda **_kw: seen.append("stt") or [7]
+    )
+    monkeypatch.setattr(
+        audiobooks,
+        "terminate_orphaned_audiobook_players",
+        lambda cache_dir, **_kw: seen.append(f"mpv:{cache_dir}") or [8],
+    )
+    service = AudiobookService(
+        Database(tmp_path / "db.sqlite3"), ffprobe="ffprobe", ffmpeg="ffmpeg", mpv="mpv", cache_dir=tmp_path
+    )
+    assert seen == ["stt", f"mpv:{service.cache_dir}"]
+    assert service._legacy_stt_workers_terminated == [7] and service._orphan_players_terminated == [8]
+    service.close()

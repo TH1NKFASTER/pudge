@@ -13,8 +13,8 @@ from tests.test_fix_vn_card_picture import ADD, PAGE_API
 
 def test_the_word_is_marked_and_the_sentence_cut_around_it() -> None:
     assert (
-        jiten_marked_sentence("明日から袖を通すはずだったそれを眺め、", "眺め")
-        == "明日から袖を通すはずだったそれを**眺め**、"
+        jiten_marked_sentence("机の上に置いたままの古い手紙を眺め、", "眺め")
+        == "机の上に置いたままの古い手紙を**眺め**、"
     )
     long = "前" * 200 + "猫" + "後" * 200
     marked = jiten_marked_sentence(long, "猫")

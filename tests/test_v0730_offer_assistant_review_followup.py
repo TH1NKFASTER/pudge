@@ -33,26 +33,27 @@ def test_later_does_not_dismiss_unshown_or_unreleased_entries(tmp_path):
     assert discovery._state(5)["phase"] == "armed"
 
 
-def test_later_ui_waits_for_acknowledgement_and_retries_errors(page):
-    # "Later" closes the new-releases popup only once the backend has saved it; a failed save
-    # keeps the popup with an error and can be retried; acknowledged titles never come back.
+def test_not_interested_waits_for_acknowledgement_and_retries_errors(page):
+    # Review SCEN-8 changed this test: "Later" used to dismiss the offers for good. Now
+    # "Later" only closes the popup (no backend call; the same offer is not shown again this
+    # session), and the row's "Not interested" is the acknowledgement: the row goes only once
+    # the backend has saved it; a failed save keeps it with an error and can be retried.
     result = page.run(
         r"""
         const popup = () => ({open: $('plannedReleaseBackdrop').classList.contains('open') && __visible('#plannedReleaseBackdrop'),
                               titles: [...document.querySelectorAll('#plannedReleaseList strong')].map(n => n.innerText),
-                              later: __text('#plannedReleaseClose'), disabled: $('plannedReleaseClose').disabled});
+                              later: __text('#plannedReleaseClose'),
+                              disabled: !!document.querySelector('#plannedReleaseList [data-planned-release-dismiss]')?.disabled});
         const out = {shown: popup()};
-        await __click('#plannedReleaseClose');
-        out.saving = popup();
-        await __click('#plannedReleaseBackdrop');                 // a click beside the popup while saving
-        answers.shift()({ok: true}); await __flush();
+        await __click('#plannedReleaseClose');                    // Later
         out.closed = popup();
-        await __tick(60000);                                     // the next poll still lists 3
+        await __tick(60000);                                     // the next poll lists 3 and 4
         out.next = popup();
-        await __click('#plannedReleaseClose');
+        await __click('[data-planned-release-dismiss="4"]');
+        out.saving = popup();
         answers.shift()({ok: false}); await __flush();
-        out.failed = {...popup(), toast: __text('#toast'), error: t('error.generic', {error: PudgeI18n.t('ui.couldNotSaveLaterRetry')})};
-        await __click('#plannedReleaseClose');
+        out.failed = {...popup(), toast: __text('#toast'), error: t('error.generic', {error: PudgeI18n.t('ui.couldNotSaveNotInterested')})};
+        await __click('[data-planned-release-dismiss="4"]');
         answers.shift()({ok: true}); await __flush();
         out.retried = popup();
         out.later = PudgeI18n.t('ui.later');
@@ -69,7 +70,6 @@ def test_later_ui_waits_for_acknowledgement_and_retries_errors(page):
     out = result.value
     later = out["later"]
     assert out["shown"] == {"open": True, "titles": ["Synthetic release"], "later": later, "disabled": False}
-    assert out["saving"] == {**out["shown"], "disabled": True}
     assert out["closed"]["open"] is False
     assert out["next"] == {
         "open": True,
@@ -77,10 +77,12 @@ def test_later_ui_waits_for_acknowledgement_and_retries_errors(page):
         "later": later,
         "disabled": False,
     }
+    assert out["saving"] == {**out["next"], "disabled": True}
     assert out["failed"]["open"] is True and out["failed"]["disabled"] is False
+    assert out["failed"]["titles"] == ["New synthetic release"]
     assert out["failed"]["toast"] == out["failed"]["error"]
     assert out["retried"]["open"] is False
-    assert result.calls_of("dismiss_planned_release_offers") == [[[3]], [[4]], [[4]]]
+    assert result.calls_of("dismiss_planned_release_offers") == [[[4]], [[4]]]
 
 
 # Assistant panel geometry: the panel's box follows its inline position and size.

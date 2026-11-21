@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import zipfile
 from pathlib import Path
 
@@ -135,6 +136,10 @@ def test_anilist_open_and_finish_volume(tmp_path: Path, monkeypatch: pytest.Monk
     assert service.open_book(book["id"])["anilist_status"] == "CURRENT"
     finished = service.finish_volume(book["id"])
     assert finished["finished"] == 1
+    # AniList is told in the background (the volume is finished here at once).
+    deadline = time.monotonic() + 5
+    while (99, 2, "COMPLETED") not in saved and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert saved[-1] == (99, 2, "COMPLETED")
 
 

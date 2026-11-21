@@ -97,7 +97,10 @@ def test_iphone_reader_follows_the_mac_and_zooms_manga():
     read = source("ios/Pudge/UI/ReadScreen.swift")
     assert "func continueTarget" not in read and "func macCurrent<Item>" in read
     assert "ReaderAudioBar(player: player, following: follow, onFollow: returnToAudio)" in read
-    assert "abs(offset - (dragStart ?? offset)) > 24 { follow = false }" in read
+    assert "if follower.active, moved > 24 { follow = false }" in read
+    # iOS 17 (older iPads) has no scroll phases: a drag gesture stands in for onScrollPhaseChange.
+    assert "if #available(iOS 18.0, *) {\n            content.onScrollPhaseChange" in read
+    assert "DragGesture(minimumDistance: 8)" in read and "ended(abs(value.translation.height))" in read
     assert "guard follow, !dragging, let value else { return }" in read
     assert "struct ZoomableContainer<Content: View>: UIViewRepresentable" in read
     assert "ZoomableContainer(active: active, onTap:" in read

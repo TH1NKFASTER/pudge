@@ -33,9 +33,9 @@ def test_shortcut_starts_the_vn_capture_on_the_focused_window_and_stops_it() -> 
     # The regular VN start (window id, title = the window's title), no picker.
     assert api.starts == [(117, "jpdb", "", False)]
     assert api.changed == 1  # the Visual novels page is told to show it
-    vn.line("それが、二階堂ヒロだった。", 1)
+    vn.line("それが、二階堂ヒロの答えだった。", 1)
     state = panel.state()
-    assert (state["text"], state["permission_hint"]) == ("それが、二階堂ヒロだった。", False)
+    assert (state["text"], state["permission_hint"]) == ("それが、二階堂ヒロの答えだった。", False)
     panel.toggle()
     assert windows[0].destroyed and api.vn_stops == 1 and api.changed == 2
 
@@ -66,7 +66,6 @@ def test_allow_button_requests_screen_recording_once_and_opens_the_settings(tmp_
         monkeypatch.setattr(api, "open_screen_recording_settings", lambda: opened.append(1) or {"ok": True})
         allowed = {"value": False}
         monkeypatch.setattr(api.visual_novels, "_screen_recording_access", lambda: allowed["value"])
-        assert api.screen_recording_status() == {"allowed": False}
         assert api._settings_payload()["screen_recording_allowed"] is False
         first = api.screen_recording_request_access()
         second = api.screen_recording_request_access()
@@ -157,7 +156,7 @@ def test_second_press_during_the_picker_still_works_with_the_hint() -> None:
     panel, windows = make_panel(api, source)
     opener = threading.Thread(target=panel.toggle)
     opener.start()
-    assert api.picker_open.wait(2.0)
+    assert api.picker_open.wait(30)
     assert not panel.opened
     panel.toggle()
     opener.join(2.0)

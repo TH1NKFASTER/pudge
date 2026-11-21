@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from sources_support import configure_sources
+
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
 from pudge.web_app import WebAppApi
@@ -153,6 +155,7 @@ def test_download_group_and_planning_download_only_action_use_batch_search(tmp_p
     assert en("section.availableDownload") == "Available to download"
     assert ru("section.availableDownload") == "Можно скачать"
     api = make_api(tmp_path)
+    configure_sources(api.config)  # without a source the window shows a hint instead of searching
     api.manager.db.upsert_anime(
         LibraryAnime(
             media_id=42,
@@ -176,7 +179,7 @@ def test_download_group_and_planning_download_only_action_use_batch_search(tmp_p
             const out = {heading: section?.querySelector('h2').innerText, expected: t('section.availableDownload'),
                          titles: [...section.querySelectorAll('article')].map(el => el.dataset.title),
                          button: __text('[data-home-section="section.availableDownload"] button.download-card-button'),
-                         downloadAnime: t('action.downloadAnime')};
+                         downloadAnime: t('action.downloadNextEpisodes')};  // progress 2: a started title
             await __click('[data-home-section="section.availableDownload"] button.download-card-button');
             await __tick(10);
             out.modal = __text('#modalTitle');

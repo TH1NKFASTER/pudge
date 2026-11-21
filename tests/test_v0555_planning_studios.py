@@ -43,7 +43,6 @@ def test_relation_payload_contains_studio() -> None:
             "studios": {"nodes": [{"name": "Bones", "isAnimationStudio": True}]},
         },
         "PREQUEL",
-        include_children=False,
     )
     assert payload is not None
     assert payload["studio"] == "Bones"

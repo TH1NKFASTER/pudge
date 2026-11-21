@@ -68,10 +68,16 @@ function mp.register_event(name, fn)
     table.insert(events[name], fn)
 end
 function mp.register_script_message(name, fn) messages[name] = fn end
+local hooks = {}
+function mp.add_hook(name, _priority, fn)
+    hooks[name] = hooks[name] or {}
+    table.insert(hooks[name], fn)
+end
 function mp.get_time() return clock end
 function mp.add_timeout(seconds, fn) return new_timer(seconds, fn, false) end
 function mp.add_periodic_timer(seconds, fn) return new_timer(seconds, fn, true) end
 function mp.osd_message(text) record('osd', text) end
+function mp.enable_messages(level) record('enable_messages', level) end
 
 function mp.add_forced_key_binding(key, name, fn, opts)
     bindings[name or key] = {key = key, fn = fn, forced = true, opts = opts or {}}
@@ -101,6 +107,12 @@ function mp.commandv(...)
     elseif args[1] == 'script-message' then
         local handler = messages[args[2]]
         if handler then handler(select(3, unpack(args))) end
+    elseif args[1] == 'script-binding' then
+        -- "script/name": the mock keeps one binding table for all scripts.
+        local binding = bindings[(args[2] or ''):match('/(.+)$') or args[2]]
+        if binding then
+            if binding.opts and binding.opts.complex then binding.fn({event = 'press'}) else binding.fn() end
+        end
     end
     return true
 end
@@ -195,6 +207,12 @@ function sim.fire(name, fields)
     local event = {event = name}
     for key, value in pairs(fields or {}) do event[key] = value end
     for _, fn in ipairs(events[name] or {}) do fn(event) end
+end
+-- mpv runs a hook (on_unload: the file is still open) and waits for its handlers.
+function sim.hook(name)
+    for _, fn in ipairs(hooks[name] or {}) do
+        fn({defer = function() end, cont = function() end})
+    end
 end
 function sim.run_timers()
     for _, t in ipairs(timers) do

@@ -360,7 +360,7 @@ def test_playing_shows_progress_counts_the_episode_and_asks_for_the_final_rating
     )
 
 
-# The proxy fields of Settings: only Nyaa searches use them; one button fills in a local SOCKS proxy.
+# The proxy fields of Settings: only release searches use them; one button fills in a local SOCKS proxy.
 NYAA_SETTINGS = r"""
 setPage('settings'); await __tick(20);
 const block = $('presetNyaaSocks').closest('.setting-block');
@@ -376,8 +376,8 @@ return out;
 
 def test_settings_offer_a_local_socks_proxy_for_nyaa_and_save_notifications(page) -> None:
     # The hint is the effective text of the old duplicated 'help.nyaa' entry.
-    assert en("help.nyaa") == "Only Nyaa searches use the proxy selected here."
-    assert "только для поиска на Nyaa" in ru("help.nyaa")
+    assert en("help.nyaa") == "Only release searches use the proxy selected here."
+    assert "только для поиска релизов" in ru("help.nyaa")
     for lang in ("en", "ru"):
         result = page.run(
             NYAA_SETTINGS,
@@ -718,6 +718,7 @@ class _Cocoa:
     """Stand-ins for AppKit / Foundation / PyObjCTools that record what Pudge asks Cocoa to do."""
 
     def __init__(self, monkeypatch) -> None:
+        monkeypatch.delenv("PUDGE_NO_DOCK_CHANGES", raising=False)  # these stand-ins are the Dock here
         self.events: list[tuple] = []
         self.info: dict[str, str] = {}
         self.main_thread_queue: list = []
@@ -823,6 +824,8 @@ def test_launch_starts_pywebview_with_the_pudge_icon_and_renames_after_start(
 
     events: list = []
     monkeypatch.setattr(sys, "platform", "darwin")
+    # The in-process window (both modes use a window process unless PUDGE_WINDOW_PROCESS=0).
+    monkeypatch.setenv("PUDGE_WINDOW_PROCESS", "0")
     monkeypatch.setattr(web_app, "_INSTANCE_LOCK", None)
     monkeypatch.setattr(logging_utils, "set_log_rotation_owner", lambda owner: None)
     monkeypatch.setattr(web_app, "_set_macos_runtime_identity", lambda: events.append("identity") or True)
@@ -1536,10 +1539,6 @@ FIRST_START = {
 
 def test_first_start_opens_the_setup_guide_which_recommends_anilist_and_can_be_skipped(page) -> None:
     assert en("section.essential") == "Essential setup" and ru("section.essential") == "Основная настройка"
-    assert (
-        en("section.additional") == "Additional settings"
-        and ru("section.additional") == "Дополнительные настройки"
-    )
     assert en("onboarding.anilistTitle") == "Connect AniList (strongly advised)"
     for lang in ("en", "ru"):
         result = page.run(
@@ -1844,7 +1843,7 @@ queue.push(0.001, 0.5, 0.5);                        // score 1
 showScoreModal({media_id: 9, title: 'Show'}, false, null);
 const out = {title: __text('#modalTitle')};
 let shownAt = null;
-for (let ms = 10; ms <= 1500 && shownAt == null; ms += 10) { await __tick(10); if (ms === 500) out.spinning = look(); if (look().value) shownAt = ms; }
+for (let ms = 10; ms <= 2500 && shownAt == null; ms += 10) { await __tick(10); if (ms === 500) out.spinning = look(); if (look().value) shownAt = ms; }
 out.first = {...look(), shownAt};
 queue.push(0.001, 0.999, 0.5, 0.5);                 // score 1 again (not allowed), then 10
 await __click('#modalBody [data-action="reroll-score"]');
@@ -1879,8 +1878,9 @@ def test_score_wheel_spins_one_second_weighted_toward_the_middle(page) -> None:
             and out["spinning"]["reroll"] is True
             and out["spinning"]["value"] == ""
         )
-        # The result shows after one second (the spin starts on the next frame).
-        assert 1000 < out["first"]["shownAt"] <= 1050
+        # FINALE2: the first spin of a display shows its result after two seconds (it looked
+        # instant at one); Spin again below keeps one second.
+        assert 2000 < out["first"]["shownAt"] <= 2050
         assert out["first"] == {
             "value": "1",
             "use": False,
@@ -1894,60 +1894,6 @@ def test_score_wheel_spins_one_second_weighted_toward_the_middle(page) -> None:
         assert result.calls_of("set_anilist_score") == [[9, 10, None]]
         assert out["open"] is False and texts["saved"] in out["toasts"]
         assert out["counts"] == [10, 20, 40, 70, 100, 100, 70, 40, 20, 10]
-
-
-def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -> None:
-    api = make_api(tmp_path)
-    subtitle = tmp_path / "prepared subtitles.srt"
-    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
-    calls: list[list[str]] = []
-
-    patch_webapp_popen(monkeypatch, lambda command, *args, **kwargs: calls.append(command))
-
-    result = api.reveal_subtitle_file(str(subtitle))
-
-    assert result["ok"] is True
-    assert calls == [["open", "-R", str(subtitle.resolve())]]
-
-
-def test_library_row_names_the_external_subtitle_file_and_reveals_it(page) -> None:
-    # Which rows reveal what (and the reveal_subtitle_file calls): test_v0616_graph_subtitle_settings.py.
-    rows = [
-        {
-            "episode": 3,
-            "state": "ready",
-            "subtitle_source": "external",
-            "subtitle_path": "/s/Show - 03.ja.ass",
-            "subtitle_filename": "Show - 03.ja.ass",
-            "video_path": "/v/03.mkv",
-            "filename": "03.mkv",
-        },
-        {
-            "episode": 4,
-            "state": "ready",
-            "subtitle_source": "external",
-            "subtitle_path": "/s/04.srt",
-            "video_path": "/v/04.mkv",
-            "filename": "04.mkv",
-        },
-    ]
-    result = page.run(
-        """
-        const box = document.createElement('div');
-        box.innerHTML = ROWS.map(libraryEpisodeRow).join('');
-        document.body.appendChild(box);
-        const links = [...box.querySelectorAll('.library-subtitle')];
-        const out = {tooltips: links.map(link => link.getAttribute('title')), labels: links.map(link => link.innerText), expected: t('subtitle.external')};
-        links[0].click(); await __flush();
-        return out;
-        """.replace("ROWS", json.dumps(rows)),
-    )
-    out = result.value
-    assert out["tooltips"] == ["Show - 03.ja.ass", "/s/04.srt"]  # the file name, else the path
-    assert out["labels"] == [out["expected"], out["expected"]]
-    assert result.calls_of("reveal_subtitle_file") == [["/s/Show - 03.ja.ass"]]
-    # Shown as a link.
-    assert css_rules("index.html").get(".library-subtitle.external-link", "cursor") == "pointer"
 
 
 def test_save_settings_persists_notifications_toggle(tmp_path: Path) -> None:

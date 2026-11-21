@@ -135,7 +135,15 @@ def test_install_from_a_checkout_uses_the_lockfile_with_hashes(tmp_path):
         "--quiet",
     ]
     pip = first.calls("pip")
-    assert ["install", "--quiet", "--upgrade", "--require-hashes", "-r", requirements] in pip
+    assert [
+        "install",
+        "--quiet",
+        "--no-cache-dir",
+        "--upgrade",
+        "--require-hashes",
+        "-r",
+        requirements,
+    ] in pip
     # The terminal gets no exported requirements, i.e. no screens of package hashes.
     assert "sha256" not in first.output
     # Nothing is resolved from the wheel's own (unpinned) requirements.

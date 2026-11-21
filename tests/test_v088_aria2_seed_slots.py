@@ -51,6 +51,7 @@ def test_runtime_profile_forces_existing_sidecar_upgrade(tmp_path: Path, monkeyp
     monkeypatch.setattr(client, "_binary_path", lambda: "/opt/homebrew/bin/aria2c")
     monkeypatch.setattr(client, "_stop_unreachable_managed_sidecars", lambda: True)
     monkeypatch.setattr(client, "_rpc_raw", sidecar.call)
+    monkeypatch.setattr(client, "_rpc_is_own_sidecar", lambda: True)  # Pudge's own sidecar
     monkeypatch.setattr(
         aria2_module, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": sidecar.popen})
     )

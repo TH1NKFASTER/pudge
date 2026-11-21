@@ -60,6 +60,10 @@ struct StatsScreen: View {
                     Text("7 days").tag("7d"); Text("30 days").tag("30d"); Text("Year").tag("year"); Text("All").tag("all")
                 }.pickerStyle(.segmented)
                 if let error = media.statsError { Label(error, systemImage: "wifi.slash").font(.subheadline).foregroundStyle(.secondary) }
+                // A copy saved on this device is shown (the Mac did not answer yet, or is away).
+                if let saved = media.statsSavedAt, !media.loadingStats, media.stats != nil {
+                    Text("Saved " + saved.formatted(.relative(presentation: .named))).font(.caption).foregroundStyle(.secondary)
+                }
                 if let stats = media.stats {
                     Section {
                         HStack {
@@ -124,14 +128,20 @@ struct StatsScreen: View {
                             }
                         }
                     }
-                } else if media.loadingStats {
-                    ProgressView()
                 }
             }
             .scrollContentBackground(.hidden).background(PudgeTheme.background)
+            // Nothing to show yet: the indicator in the middle of the screen (it was a list row
+            // at the top left). With numbers shown, only a small one in the bar while they update.
+            .overlay { if media.stats == nil && media.loadingStats { ProgressView() } }
             .navigationTitle("Statistics")
-            .toolbar { ToolbarItem(placement: .primaryAction) { SettingsButton(model: media.app) } }
-            .refreshable { await media.refreshStats(period: period) }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if media.loadingStats && media.stats != nil { ProgressView().controlSize(.small) }
+                }
+                ToolbarItem(placement: .primaryAction) { SettingsButton(model: media.app) }
+            }
+            .refreshable { media.app.retryMacNow(); await media.refreshStats(period: period) }
             .task(id: period) { await media.refreshStats(period: period) }
         }
     }

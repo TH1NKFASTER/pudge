@@ -28,7 +28,8 @@ def _maintenance(tmp_path: Path, monkeypatch, run: str) -> dict:
     video = tmp_path / "Show - 03.mkv"
     video.write_bytes(b"video")
     manager.db.queue_subtitle_job(video, 7, 3, delay_seconds=6 * 3600)
-    cached = cfg.paths.cache_dir / "jimaku-api" / "search.json"
+    manager.db.set_state("subtitle_resolver_generation", "9")  # its one-time migration ran long ago
+    cached = cfg.paths.cache_dir / "jimaku-api" / ("0f" * 16 + ".json")
     cached.parent.mkdir(parents=True)
     cached.write_text("{}", encoding="utf-8")
     steps: list[str] = []
@@ -56,21 +57,27 @@ def _maintenance(tmp_path: Path, monkeypatch, run: str) -> dict:
         "subs": stats.get("subs"),
         "queued": stats.get("subtitle_check_queued"),
         "job": (job["state"], int(job["priority"]), float(job["next_check"]) <= time.time() + 1),
-        "jimaku_cache_kept": cached.exists(),
+        # Expired, not deleted: the old answer is the copy used when Jimaku does not respond.
+        "jimaku_cache_fresh": cached.exists() and cached.stat().st_mtime > 1,
     }
 
 
-def test_startup_uses_same_forced_subtitle_retry_pipeline_as_refresh(tmp_path: Path, monkeypatch) -> None:
-    # Startup used to leave delayed subtitle jobs alone while the background agent was on.
+def test_startup_runs_the_refresh_pipeline_without_forcing_subtitle_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Startup used to leave delayed subtitle jobs alone while the background agent was on;
+    # then it forced every job like a Refresh, past its backoff, on every launch.
     startup = _maintenance(tmp_path / "startup", monkeypatch, "run_startup_once")
     refresh = _maintenance(tmp_path / "refresh", monkeypatch, "run_interactive_refresh")
-    assert startup == refresh
-    # The delayed job is due now with the manual-refresh priority; Jimaku answers are fetched fresh.
-    assert startup["job"] == ("pending", 200, True) and startup["queued"] == 1
-    assert startup["jimaku_cache_kept"] is False
-    # New releases are searched first; subtitles are left to the foreground worker.
-    assert startup["steps"] == ["scan", "missing releases", "anilist"]
-    assert startup["subs"] == 0
+    # A launch keeps the delayed job's backoff and the Jimaku answers.
+    assert startup["job"] == ("pending", 0, False) and startup["queued"] == 0
+    assert startup["jimaku_cache_fresh"] is True
+    # Refresh is the explicit "check now": due with the manual-refresh priority, fetched fresh.
+    assert refresh["job"] == ("pending", 200, True) and refresh["queued"] == 1
+    assert refresh["jimaku_cache_fresh"] is False
+    # Both search new releases first and leave subtitles to the foreground worker.
+    assert startup["steps"] == refresh["steps"] == ["scan", "missing releases", "anilist"]
+    assert startup["subs"] == refresh["subs"] == 0
 
 
 SETTINGS = """

@@ -1,37 +1,44 @@
 from __future__ import annotations
 
+import bisect
 import hashlib
 import html
+import math
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 from collections import OrderedDict
+from collections.abc import Iterable
 from pathlib import Path
 
 from .i18n import err
+from .language import decode_subtitle_bytes, read_subtitle_file
+from .fsutil import atomic_write_text
 
 
-_TIME_RE = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})[,.](?P<ms>\d{1,3})")
-_TIMING_RE = re.compile(
-    r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*"
-    r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
-)
+# Hours may have more than two digits and a time may be negative (a file shifted before
+# 0 s): with ``\d{1,2}`` and no sign, "-00:00:01,000" read as +1 s and "100:00:01,000" lost
+# its first digit or the whole cue.
+_TIME_RE = re.compile(r"(?P<sign>-?)(?P<h>\d{1,4}):(?P<m>\d{2}):(?P<s>\d{2})[,.](?P<ms>\d{1,3})")
+_SRT_TIME = r"-?\d{1,4}:\d{2}:\d{2}[,.]\d{1,3}"
+_TIMING_RE = re.compile(rf"(?<![\d:])(?P<start>{_SRT_TIME})\s*-->\s*(?P<end>{_SRT_TIME})")
+# The last time ``srt_timestamp`` writes: what ``_TIME_RE`` reads back.
+_MAX_SRT_MILLISECONDS = 9999 * 3_600_000 + 59 * 60_000 + 59_999
 _ASS_OVERRIDE_RE = re.compile(r"\{[^{}]*\}")
 # Strip actual HTML tags, but do not eat Japanese dialogue merely wrapped in
-# ASCII angle brackets, such as ``<ずっと嫌いだった>``.
+# ASCII angle brackets, such as ``<いつも朝が苦手だった>``.
 _HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>", re.IGNORECASE)
-_RUBY_RP_RE = re.compile(r"<rp[^>]*>.*?</rp>", re.IGNORECASE | re.DOTALL)
-_RUBY_WITH_RB_RE = re.compile(
-    r"<ruby[^>]*>\s*<rb[^>]*>(.*?)</rb>.*?<rt[^>]*>.*?</rt>.*?</ruby>",
-    re.IGNORECASE | re.DOTALL,
+# HTML ruby: the reading (<rt>, and the <rp> brackets around it) is not spoken text, the
+# base is. Readings are removed one by one, so the base after a second reading stays
+# (<ruby>漢<rt>かん</rt>字<rt>じ</rt></ruby> read 漢 with one pattern per <ruby> element); an
+# <rt> may end at the next <rt>, at </ruby> or at the end of its line (HTML allows it).
+_RUBY_READING_RE = re.compile(
+    r"<rp(?:[.\s][^>]*)?>.*?</rp>|<rt(?:[.\s][^>]*)?>.*?(?:</rt>|(?=<rt[.\s>])|(?=</ruby>)|$)",
+    re.IGNORECASE | re.MULTILINE,
 )
-_RUBY_SIMPLE_RE = re.compile(
-    r"<ruby[^>]*>(.*?)<rt[^>]*>.*?</rt>.*?</ruby>",
-    re.IGNORECASE | re.DOTALL,
-)
+_RUBY_TAG_RE = re.compile(r"</?(?:ruby|rb|rtc|rt|rp)(?:[.\s][^>]*)?>", re.IGNORECASE)
 _KANA = r"ぁ-ゖァ-ヺーゝゞヽヾ"
 _KANJI = r"一-龯々〆ヵヶ"
 _FURIGANA_BASE = rf"([{_KANJI}][{_KANJI}{_KANA}・]*)"
@@ -61,25 +68,129 @@ _STRONG_SIMPLIFIED_CHINESE_HINTS = set(
 )
 
 
+# ``&`` and ``+`` separate languages in tags such as ``[CHS&JPN]``.
 _FILENAME_JAPANESE_MARKER_RE = re.compile(
-    r"(?i)(?:^|[\s._\-\[\(,])"
-    r"(?:ja(?:\[cc\])?|jp|jpn|japanese|日本語)"
-    r"(?:$|[\s._\-\[\]\),])"
+    r"(?i)(?:^|[\s._\-\[\(,&+])"
+    r"(?:ja(?:\[cc\])?|jp|jpn|japanese|日本語|jpsc|jptc|scjp|tcjp)"
+    r"(?:$|[\s._\-\[\]\),&+])"
+    # 简日双语 / 繁日雙語: Chinese + Japanese in one file.
+    r"|[简繁簡]日|中日[双雙]语|中日[双雙]語"
 )
 _FILENAME_CHINESE_MARKER_RE = re.compile(
-    r"(?i)(?:^|[\s._\-\[\(,])"
-    r"(?:chs|cht|chi|zho|zh(?:[-_](?:cn|tw|hans|hant))?|chinese|中文|简中|繁中|簡中)"
-    r"(?:$|[\s._\-\[\]\),])"
+    r"(?i)(?:^|[\s._\-\[\(,&+])"
+    r"(?:chs|cht|chi|zho|zh(?:[-_](?:cn|tw|hans|hant))?|chinese|中文|jpsc|jptc|scjp|tcjp)"
+    r"(?:$|[\s._\-\[\]\),&+])"
+    r"|简中|繁中|簡中|简体|繁体|簡體|繁體|[简繁簡]日|中日[双雙]语|中日[双雙]語|[双雙]语|[双雙]語"
 )
+# SC / TC / GB / BIG5 are also group names ("[SC-Raws]") or other words: they mark
+# Chinese only as a tag of their own in brackets ("[TC]", not GB alone, which is
+# also a size or a country) or beside another language tag ("[SC&JPN]").
+_FILENAME_BRACKET_GROUP_RE = re.compile(r"[\[\(]([^\[\]\(\)]*)[\]\)]")
+_FILENAME_TAG_SPLIT_RE = re.compile(r"[\s&+,_\-/.]+")
+_AMBIGUOUS_CHINESE_TAGS = frozenset({"sc", "tc", "gb", "big5"})
+_LANGUAGE_TAGS = frozenset(
+    {
+        "ja",
+        "jp",
+        "jpn",
+        "japanese",
+        "chs",
+        "cht",
+        "chi",
+        "zho",
+        "zh",
+        "chinese",
+        "en",
+        "eng",
+        "english",
+        "日本語",
+        "中文",
+    }
+)
+
+
+# Japanese + English in one file. Only a subtitle-language suffix right before the extension
+# is trusted ("03.jp-en.ass", ".en.ja.srt"): elsewhere "JPN, ENG" / "JPN.ENG" / "en-dub" name a
+# dual-audio release, not the subtitle text. A combined tag anywhere else counts only when the
+# lines confirm it (``bilingual_english_profile``).
+_JAPANESE_TAGS = frozenset({"ja", "jp", "jpn", "japanese"})
+_ENGLISH_TAGS = frozenset({"en", "eng", "english"})
+_FILENAME_JAPANESE_ENGLISH_SUFFIX_RE = re.compile(
+    r"(?i)[._\-](?:(?:ja|jp|jpn)[._\-+&](?:en|eng)|(?:en|eng)[._\-+&](?:ja|jp|jpn))\.(?:ass|ssa|srt|vtt)$"
+)
+_FILENAME_JAPANESE_ENGLISH_RE = re.compile(
+    r"(?i)(?:^|[\s._\-\[\(,&+])"
+    r"(?:(?:ja|jp|jpn|japanese)[\s._\-&+,]+(?:en|eng|english)"
+    r"|(?:en|eng|english)[\s._\-&+,]+(?:ja|jp|jpn|japanese))"
+    r"(?:$|[\s._\-\[\]\),&+])"
+)
+
+
+def _japanese_english_suffix(name: str) -> bool:
+    return bool(_FILENAME_JAPANESE_ENGLISH_SUFFIX_RE.search(name))
+
+
+def _japanese_english_tag_elsewhere(name: str) -> bool:
+    """A combined tag outside the suffix: a hint the lines must confirm."""
+    if _FILENAME_JAPANESE_ENGLISH_RE.search(name):
+        return True
+    for group in _FILENAME_BRACKET_GROUP_RE.findall(name):
+        tokens = {token for token in _FILENAME_TAG_SPLIT_RE.split(group.casefold()) if token}
+        if tokens & _JAPANESE_TAGS and tokens & _ENGLISH_TAGS:
+            return True
+    return False
+
+
+def _ambiguous_chinese_tag(name: str, *, japanese_marker: bool) -> bool:
+    for group in _FILENAME_BRACKET_GROUP_RE.findall(name):
+        tokens = {token for token in _FILENAME_TAG_SPLIT_RE.split(group.casefold()) if token}
+        ambiguous = tokens & _AMBIGUOUS_CHINESE_TAGS
+        if not ambiguous:
+            continue
+        if tokens & _LANGUAGE_TAGS:
+            return True
+        if tokens == ambiguous and not japanese_marker and ambiguous != {"gb"}:
+            return True
+    return False
+
+
+# Word edges are "not a letter or digit": ``\b`` takes "_" for a letter, so
+# "Show_01_AI_Translated.srt" and "Show_MTL_01.srt" were not seen.
+_MACHINE_TRANSLATED_NAME_RE = re.compile(
+    r"(?<![A-Za-z0-9])AI[\s_.-]*(?:translat[A-Za-z]*|TL)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])machine[\s_.-]*translat"
+    r"|(?<![A-Za-z0-9])MTL(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])translated[\s_.-]+from[\s_.-]+(?:english|eng|chinese|chs|cht)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])(?:google|deepl|chat[\s_.-]*gpt|gpt)[\s_.-]*(?:translat[A-Za-z]*|TL)(?![A-Za-z0-9])"
+    r"|機械翻訳|AI翻訳|自動翻訳",
+    re.IGNORECASE,
+)
+
+
+def subtitle_name_is_machine_translated(filename: str | Path) -> bool:
+    """True when a subtitle's name says it was machine-translated into Japanese.
+
+    "[Judas] Dorohedoro - S01E11 [JPN] (AI Translated From English).ass" is Japanese
+    text, times perfectly, and reads like a translation, not the episode's lines.
+    """
+    return bool(_MACHINE_TRANSLATED_NAME_RE.search(Path(str(filename)).name))
 
 
 def subtitle_filename_language_profile(filename: str | Path) -> dict[str, object]:
-    """Classify explicit Japanese/Chinese language markers in a subtitle name."""
+    """Classify explicit Japanese/Chinese/English language markers in a subtitle name."""
     name = Path(filename).name
     japanese = bool(_FILENAME_JAPANESE_MARKER_RE.search(name))
-    chinese = bool(_FILENAME_CHINESE_MARKER_RE.search(name))
+    chinese = bool(_FILENAME_CHINESE_MARKER_RE.search(name)) or _ambiguous_chinese_tag(
+        name, japanese_marker=japanese
+    )
+    english = bool(japanese and not chinese and _japanese_english_suffix(name))
+    english_hint = bool(japanese and not chinese and not english and _japanese_english_tag_elsewhere(name))
     if japanese and chinese:
         purity = "mixed_japanese_chinese"
+        priority = 0
+    elif english:
+        # The viewer would read English beside the Japanese: a fallback like JP+CN files.
+        purity = "mixed_japanese_english"
         priority = 0
     elif japanese:
         purity = "japanese_only"
@@ -95,6 +206,8 @@ def subtitle_filename_language_profile(filename: str | Path) -> dict[str, object
         "priority": priority,
         "japanese_marker": japanese,
         "chinese_marker": chinese,
+        "english_marker": english,
+        "english_tag_unconfirmed": english_hint,
     }
 
 
@@ -112,31 +225,37 @@ def format_preference_bonus(filename: str | Path, prefer_srt: bool = True) -> fl
     }.get(suffix, 0.0)
 
 
-def _timestamp_to_seconds(value: str) -> float:
+def _timestamp_to_seconds(value: str, *, signed: bool = False) -> float:
+    """Seconds of ``H:MM:SS,mmm``; a negative time only with ``signed`` (SRT), else invalid."""
     match = _TIME_RE.fullmatch(value.strip())
-    if not match:
+    if not match or (match.group("sign") and not signed):
         raise ValueError(err("subtitles.invalidTimestamp", value=value))
     milliseconds = match.group("ms").ljust(3, "0")[:3]
-    return (
+    seconds = (
         int(match.group("h")) * 3600
         + int(match.group("m")) * 60
         + int(match.group("s"))
         + int(milliseconds) / 1000.0
     )
+    return -seconds if match.group("sign") else seconds
 
 
-def _seconds_to_timestamp(value: float) -> str:
-    total_ms = max(0, int(round(value * 1000)))
+def srt_timestamp(value: float) -> str:
+    """``HH:MM:SS,mmm`` of a time in seconds (rounded to the millisecond, never negative,
+    never past what ``parse_srt`` reads back: 9999 hours)."""
+    total_ms = min(_MAX_SRT_MILLISECONDS, max(0, int(round(float(value) * 1000))))
     hours, remainder = divmod(total_ms, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     seconds, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
+_seconds_to_timestamp = srt_timestamp
+
+
 def _remove_embedded_furigana(value: str) -> str:
-    value = _RUBY_RP_RE.sub("", value)
-    value = _RUBY_WITH_RB_RE.sub(lambda match: match.group(1), value)
-    value = _RUBY_SIMPLE_RE.sub(lambda match: match.group(1), value)
+    if "<r" in value or "<R" in value:
+        value = _RUBY_TAG_RE.sub("", _RUBY_READING_RE.sub("", value))
     for pattern in _FURIGANA_PATTERNS:
         value = pattern.sub(r"\1", value)
     return value
@@ -147,7 +266,7 @@ def _remove_leading_speaker_labels(value: str) -> str:
 
     A standalone final cue such as ``（ドアが開く）`` is preserved. A label on
     its own line before dialogue, or a label directly followed by dialogue, is
-    removed: ``（南）赤石さん`` -> ``赤石さん``.
+    removed: ``（ミオ）青木さん`` -> ``青木さん``.
     """
     lines = value.splitlines()
     cleaned: list[str] = []
@@ -169,6 +288,42 @@ def _remove_leading_speaker_labels(value: str) -> str:
     return "\n".join(cleaned)
 
 
+_DRAWING_COMMANDS = frozenset("mnlbspc")
+_DRAWING_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+# A line that is only a release/encode credit (``BDRip.....Group``), never dialogue.
+_RELEASE_CREDIT_RE = re.compile(
+    r"(?i)(?<![a-z0-9])(?:bd-?rip|bdmv|web-?rip|web-?dl|dvd-?rip|hdtv-?rip|vcb-?studio|x26[45]|hevc|hi10p)"
+    r"(?![a-z0-9])|^\s*encod(?:ed|er|ing)\s*(?:by\b|:)"
+)
+
+
+def _is_ass_drawing_line(line: str) -> bool:
+    """``m 0 0 l 670 0 l 670 60 l 0 60``: ASS vector drawing commands shown as text."""
+    tokens = line.split()
+    if len(tokens) < 5 or tokens[0] != "m":
+        return False
+    commands = numbers = 0
+    for token in tokens:
+        if token in _DRAWING_COMMANDS:
+            commands += 1
+        elif _DRAWING_NUMBER_RE.fullmatch(token):
+            numbers += 1
+        else:
+            return False
+    return commands >= 2 and numbers >= 4
+
+
+def is_non_dialogue_line(line: str) -> bool:
+    """A subtitle line that is a vector drawing or a release credit, not dialogue."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("m ") and _is_ass_drawing_line(stripped):
+        return True
+    return not _JAPANESE_CHAR_RE.search(stripped) and bool(_RELEASE_CREDIT_RE.search(stripped))
+
+
 def plain_subtitle_text(value: str) -> str:
     """Normalize subtitle payload for stable plain-text rendering in mpv."""
     value = value.replace(r"\N", "\n").replace(r"\n", "\n").replace(r"\h", " ")
@@ -181,11 +336,38 @@ def plain_subtitle_text(value: str) -> str:
     value = value.replace("\ufeff", "")
     # Some Japanese broadcast captions contain a single corrupted Hangul glyph
     # immediately before otherwise valid Japanese text (for example
-    # ``모巨大生物``). Remove only that narrow artefact and leave legitimate
+    # ``모大きな船``). Remove only that narrow artefact and leave legitimate
     # Korean lines untouched.
     value = _STRAY_HANGUL_BEFORE_JAPANESE_RE.sub("", value)
     lines = [line.strip() for line in value.splitlines()]
-    return "\n".join(line for line in lines if line).strip()
+    return "\n".join(line for line in lines if line and not is_non_dialogue_line(line)).strip()
+
+
+def merge_layered_cues(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    """(cues, events merged): overlapping events with one visible text become one cue.
+
+    Karaoke and lyric-box layers draw the same line several times at once (glow,
+    border, highlight); as plain text each layer became its own stacked cue."""
+    open_by_text: dict[str, int] = {}
+    out: list[list[object]] = []
+    merged = 0
+    for start, end, text in sorted(cues, key=lambda cue: (float(cue[0]), float(cue[1]))):
+        visible = re.sub(r"\s+", "", re.sub(r"<[^>]*>|\{[^}]*\}", "", str(text or "")))
+        # A line, not a letter or a syllable of a sign (those are fragments, kept apart).
+        visible = visible if len(visible) >= 4 else ""
+        index = open_by_text.get(visible) if visible else None
+        if index is not None and float(start) < float(out[index][1]):
+            out[index][1] = max(float(out[index][1]), float(end))
+            merged += 1
+            continue
+        if visible:
+            open_by_text[visible] = len(out)
+        out.append([start, end, text])
+    if not merged:
+        return cues, 0
+    return [(row[0], row[1], row[2]) for row in out], merged  # type: ignore[misc]
 
 
 # Subtitle preparation parses the same few files dozens of times per episode.
@@ -197,7 +379,7 @@ _SRT_CUE_CACHE_LOCK = threading.Lock()
 
 
 def parse_srt(path: Path) -> list[tuple[float, float, str]]:
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    text = read_subtitle_file(path)
     with _SRT_CUE_CACHE_LOCK:
         cached = _SRT_CUE_CACHE.get(text)
         if cached is not None:
@@ -222,16 +404,30 @@ def _parse_srt_text(text: str) -> list[tuple[float, float, str]]:
         match = _TIMING_RE.search(lines[timing_index])
         if not match:
             continue
-        try:
-            start = _timestamp_to_seconds(match.group("start"))
-            end = _timestamp_to_seconds(match.group("end"))
-        except ValueError:
-            continue
-        if end <= start:
-            continue
-        payload = plain_subtitle_text("\n".join(lines[timing_index + 1 :]))
-        if payload:
-            cues.append((start, end, payload))
+        # A missing blank line merged the next cue into this block (and put its
+        # timing line on screen): every later timing line starts a new cue.
+        starts = [timing_index] + [
+            index for index in range(timing_index + 1, len(lines)) if _TIMING_RE.match(lines[index].strip())
+        ]
+        for position, line_index in enumerate(starts):
+            match = _TIMING_RE.search(lines[line_index])
+            stop = starts[position + 1] if position + 1 < len(starts) else len(lines)
+            # The next cue's bare number sits right before its timing line.
+            if stop < len(lines) and stop - 1 > line_index and lines[stop - 1].strip().isdigit():
+                stop -= 1
+            try:
+                start = _timestamp_to_seconds(match.group("start"), signed=True)
+                end = _timestamp_to_seconds(match.group("end"), signed=True)
+            except ValueError:
+                continue
+            # A line shifted before the start of the video begins there; one that also
+            # ends before it is not in the video.
+            start = max(0.0, start)
+            if end <= start:
+                continue
+            payload = plain_subtitle_text("\n".join(lines[line_index + 1 : stop]))
+            if payload:
+                cues.append((start, end, payload))
     return cues
 
 
@@ -261,12 +457,17 @@ def _parallel_han_cue_indices(
         ],
         key=lambda item: (item[1], item[2]),
     )
+    japanese_starts = [item[1] for item in japanese]
+    longest = max((item[2] - item[1] for item in japanese), default=0.0)
     paired: set[int] = set()
     for index, ((start, end, _text), kind) in enumerate(zip(cues, resolved_kinds)):
         if kind != "han_only":
             continue
         duration = max(end - start, 0.001)
-        for _japanese_index, japanese_start, japanese_end in japanese:
+        # Japanese cues that start this early end before ``start - tolerance``: the loop
+        # below skips them anyway (1 s of margin), so a long file is not scanned per cue.
+        first = bisect.bisect_left(japanese_starts, start - timestamp_tolerance - max(longest, 0.0) - 1.0)
+        for _japanese_index, japanese_start, japanese_end in japanese[first:]:
             if japanese_start > end + timestamp_tolerance:
                 break
             if japanese_end < start - timestamp_tolerance:
@@ -323,20 +524,99 @@ def bilingual_cjk_profile(
     }
 
 
-def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
+_LATIN_WORD_RE = re.compile(r"[A-Za-z']{2,}")
+# Words an English line nearly always has and romaji lyrics do not ("to", "no", "a", "de",
+# "he", "me", "so" are left out: they are romaji too).
+_ENGLISH_FUNCTION_WORDS = frozenset(
+    {
+        "the", "you", "is", "are", "was", "were", "what", "this", "that", "it's", "i'm", "don't",
+        "can't", "your", "we", "they", "she", "and", "of", "for", "with", "have", "not", "it",
+        "just", "but", "there", "here", "why", "how", "who", "will", "would", "be", "i",
+    }
+)  # fmt: skip
+_SONG_STYLE_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(?:op|ed|song|songs|kara|karaoke|lyric|lyrics|romaji|insert|kfx)(?:[^a-z]|$)"
+)
+_KARAOKE_TAG_RE = re.compile(r"(?i)\\k[fo]?\d")
+
+
+def _english_line(text: str) -> bool:
+    if _cue_script_kind(text) != "other":
+        return False
+    words = [word.casefold() for word in _LATIN_WORD_RE.findall(text)] + [
+        word.casefold() for word in re.findall(r"\b[Ii]\b", text)
+    ]
+    return len(words) >= 2 and any(word in _ENGLISH_FUNCTION_WORDS for word in words)
+
+
+def bilingual_english_profile(
+    cues: list[tuple[float, float, str]] | list[tuple[float, float, str, bool]],
+) -> dict[str, object]:
+    """Japanese and English lines shown together (a JP+EN fansub file under any name).
+
+    An English line has no kana or kanji, two Latin words and an English function word;
+    it is parallel when it shares at least half of its time with a Japanese line. Song
+    lines (``\\k`` karaoke, ``♪``, OP/ED/song/karaoke styles) never count: a short file of
+    40 Japanese lines and 20 romaji lyric lines is not bilingual. At least 40 parallel
+    English lines, and half as many as Japanese ones, are needed.
+    """
+    rows = [(cue[0], cue[1], cue[2], bool(cue[3]) if len(cue) > 3 else False) for cue in cues]
+    japanese = sorted(
+        (start, end) for start, end, text, _song in rows if _cue_script_kind(text) == "japanese"
+    )
+    english = [
+        (start, end)
+        for start, end, text, song in rows
+        if not song and "♪" not in text and end > start and _english_line(text)
+    ]
+    starts = [start for start, _end in japanese]
+    parallel = 0
+    for start, end in english:
+        position = bisect.bisect_right(starts, end)
+        for japanese_start, japanese_end in japanese[max(0, position - 8) : position]:
+            overlap = min(end, japanese_end) - max(start, japanese_start)
+            if overlap >= 0.5 * min(end - start, max(japanese_end - japanese_start, 0.001)):
+                parallel += 1
+                break
+    suspected = bool(len(japanese) >= 20 and parallel >= 40 and parallel >= 0.5 * len(japanese))
+    return {
+        "suspected_bilingual_english": suspected,
+        "japanese_cues": len(japanese),
+        "english_cues": len(english),
+        "parallel_english_cues": parallel,
+    }
+
+
+def english_lines_removed(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    """The cues without their English lines (``_english_line``; lines inside one cue too)."""
+    kept: list[tuple[float, float, str]] = []
+    removed = 0
+    for start, end, text in cues:
+        lines = [line for line in str(text).splitlines() if line.strip()]
+        japanese = [line for line in lines if not _english_line(line)]
+        removed += len(lines) - len(japanese)
+        if japanese:
+            kept.append((start, end, "\n".join(japanese)))
+    return kept, removed
+
+
+def _profile_cues(path: Path) -> list[tuple[float, float, str, bool]] | None:
+    """(start, end, plain text, song line) of a text subtitle; None when unreadable."""
     suffix = path.suffix.casefold()
     if suffix == ".srt":
         try:
-            return bilingual_cjk_profile(parse_srt(path))
+            return [(start, end, text, "♪" in text) for start, end, text in parse_srt(path)]
         except OSError:
-            return {"suspected_bilingual_cjk": False}
+            return None
     if suffix not in {".ass", ".ssa"}:
-        return {"suspected_bilingual_cjk": False}
+        return None
     try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        text = read_subtitle_file(path)
     except OSError:
-        return {"suspected_bilingual_cjk": False}
-    cues: list[tuple[float, float, str]] = []
+        return None
+    cues: list[tuple[float, float, str, bool]] = []
     for line in text.splitlines():
         if not line.casefold().startswith("dialogue:"):
             continue
@@ -349,9 +629,33 @@ def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
         except ValueError:
             continue
         payload = plain_subtitle_text(parts[9])
+        song = bool(
+            _KARAOKE_TAG_RE.search(parts[9])
+            or _SONG_STYLE_RE.search(parts[3])
+            or "karaoke" in parts[8].casefold()
+            or "♪" in payload
+        )
         if payload and end > start:
-            cues.append((start, end, payload))
-    return bilingual_cjk_profile(cues)
+            cues.append((start, end, payload, song))
+    return cues
+
+
+def subtitle_language_profiles(path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    """(bilingual CJK profile, bilingual English profile) from one read of the file."""
+    rows = _profile_cues(path)
+    if rows is None:
+        return {"suspected_bilingual_cjk": False}, {"suspected_bilingual_english": False}
+    return bilingual_cjk_profile([(start, end, text) for start, end, text, _song in rows]), (
+        bilingual_english_profile(rows)
+    )
+
+
+def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
+    return subtitle_language_profiles(path)[0]
+
+
+def subtitle_bilingual_english_profile(path: Path) -> dict[str, object]:
+    return subtitle_language_profiles(path)[1]
 
 
 def _filter_inline_chinese_lines(
@@ -365,7 +669,7 @@ def _filter_inline_chinese_lines(
     Chinese half. Keep short kanji-only Japanese fragments conservatively.
     """
     # A normal Japanese subtitle can legitimately contain a kanji-only line
-    # next to a kana-containing line (e.g. 出発前 / ルーデルドルフ閣下が…).  Do not
+    # next to a kana-containing line (e.g. 出発前 / 大佐殿が…).  Do not
     # infer "Chinese translation" from line length alone.  Traditional JP+CN
     # files without simplified-character hints are still detectable when this
     # mixed-line shape is a consistent file-wide pattern rather than an
@@ -575,25 +879,33 @@ def write_srt(
     normalized = _separate_touching_cues(
         cues, preserve_order=preserve_order, preserve_overlaps=preserve_overlaps
     )
-    for index, (start, end, text) in enumerate(normalized, start=1):
+    for start, end, text in normalized:
         payload = plain_subtitle_text(text)
         if not payload or end <= start:
             continue
-        blocks.append(f"{index}\n{_seconds_to_timestamp(start)} --> {_seconds_to_timestamp(end)}\n{payload}")
-    payload_text = "\n\n".join(blocks) + ("\n" if blocks else "")
-    # Write atomically: callers treat an existing output as a ready cache, so
-    # an interrupted write must never leave a truncated file at *path*.
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload_text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+        # Numbered as written: a left-out cue (no text after the cleanup) left a gap.
+        blocks.append(
+            f"{len(blocks) + 1}\n{_seconds_to_timestamp(start)} --> {_seconds_to_timestamp(end)}\n{payload}"
+        )
+    # Atomic: callers treat an existing output as a ready cache, so an interrupted
+    # write must never leave a truncated file at *path*. The usual file mode (the
+    # umask): the file can sit next to the video, where a media server running as
+    # another account reads it.
+    atomic_write_text(path, "\n\n".join(blocks) + ("\n" if blocks else ""))
+    return path
+
+
+def write_exact_srt(cues: Iterable[tuple[float, float, str]], path: Path) -> Path:
+    """Write cues exactly as given: no gap or overlap normalization, no text cleanup
+    (timing references, repaired alignments, OCR results). A cue without text or
+    without duration is left out; numbering counts every cue. Atomic, like write_srt."""
+    blocks = [
+        f"{index}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}"
+        for index, (start, end, text) in enumerate(cues, start=1)
+        if text and end > start
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "\n\n".join(blocks) + ("\n" if blocks else ""))
     return path
 
 
@@ -604,6 +916,77 @@ def _cached_srt_ready(path: Path) -> bool:
             return False
         return bool(parse_srt(path))
     except (OSError, ValueError):
+        return False
+
+
+def srt_has_non_dialogue_lines(subtitle: Path) -> bool:
+    """Whether an SRT shows a vector drawing or a release credit as text (prepared
+    before those were removed); False when unreadable."""
+    try:
+        text = read_subtitle_file(subtitle)
+    except OSError:
+        return False
+    for raw_line in text.splitlines():
+        line = _HTML_TAG_RE.sub("", _ASS_OVERRIDE_RE.sub("", raw_line)).strip()
+        if not line or "-->" in line or line.isdigit():
+            continue
+        if is_non_dialogue_line(line):
+            return True
+    return False
+
+
+def _without_non_dialogue_lines(subtitle: Path, output_dir: Path) -> Path | None:
+    """A copy of an already clean SRT without drawing/credit lines (timing kept
+    exactly; layered duplicates the drawing hid are merged); None when ``subtitle``
+    has none or nothing would be left."""
+    if not srt_has_non_dialogue_lines(subtitle):
+        return None
+    try:
+        stat = subtitle.stat()
+    except OSError:
+        return None
+    digest = hashlib.sha1(
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v16-nondialogue-v1".encode()
+    ).hexdigest()[:20]
+    output = output_dir / f"v16-{digest}.srt"
+    if _cached_srt_ready(output):
+        return output
+    cues, _merged = merge_layered_cues(parse_srt(subtitle))
+    if not cues:
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_exact_srt(cues, output)
+    return output
+
+
+def _playback_srt_output(subtitle: Path, output_dir: Path) -> Path:
+    """Where clean_srt_for_playback puts the cleaned copy of ``subtitle`` (named by its stat)."""
+    stat = subtitle.stat()
+    generation = "playback-srt-v16"
+    try:
+        subtitle.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        # Cleaned before as mojibake: a Shift-JIS/UTF-16 source gets a new key
+        # (UTF-8 keeps its key, which the library rebuilds for old OCR rows).
+        generation += "-decoded"
+    digest = hashlib.sha1(
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{generation}".encode()
+    ).hexdigest()[:20]
+    return output_dir / f"v16-{digest}.srt"
+
+
+def is_playback_copy_of(played: Path | str, source: Path | str, cache_dir: Path) -> bool:
+    """``played`` is ``source`` itself or its cleaned playback copy (clean_srt_for_playback)."""
+    try:
+        played_path = Path(played).expanduser().resolve()
+        source_path = Path(source).expanduser()
+        if played_path == source_path.resolve():
+            return True
+        if source_path.suffix.casefold() != ".srt" or not source_path.is_file():
+            return False
+        output_dir = (Path(cache_dir) / "playback-srt").expanduser()
+        return played_path == _playback_srt_output(source_path, output_dir).resolve()
+    except OSError:
         return False
 
 
@@ -623,19 +1006,21 @@ def clean_srt_for_playback(
     try:
         subtitle.resolve().relative_to(output_dir.resolve())
         if subtitle.name.startswith("v16-"):
+            stripped = _without_non_dialogue_lines(subtitle, output_dir)
+            if stripped is not None:
+                return stripped, {"reason": "non_dialogue_removed", "cleaned": True, "output": str(stripped)}
             return subtitle, {"reason": "already_clean", "cleaned": False}
     except ValueError:
         pass
 
-    stat = subtitle.stat()
-    digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v16".encode()
-    ).hexdigest()[:20]
+    output = _playback_srt_output(subtitle, output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v16-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if _cached_srt_ready(output):
+        stripped = _without_non_dialogue_lines(output, output_dir)
+        if stripped is not None:
+            return stripped, {"reason": "non_dialogue_removed", "cleaned": True, "output": str(stripped)}
         return output, {"reason": "cached", "cleaned": True, "output": str(output)}
     output.unlink(missing_ok=True)
 
@@ -646,6 +1031,9 @@ def clean_srt_for_playback(
     cues, bilingual_profile = _filter_parallel_chinese_cues(cues)
     if not cues:
         return subtitle, {"reason": "no_japanese_cues_after_bilingual_filter", "cleaned": False}
+    if srt_has_non_dialogue_lines(subtitle):
+        # The drawing hid a lyric that another layer shows too (box + text layers).
+        cues, _merged = merge_layered_cues(cues)
 
     conflict_count = sum(
         1
@@ -677,7 +1065,7 @@ def subtitle_has_genuine_overlaps(
         if suffix == ".srt":
             cues = parse_srt(subtitle)
         elif suffix in {".ass", ".ssa"}:
-            text = subtitle.read_text(encoding="utf-8-sig", errors="replace")
+            text = read_subtitle_file(subtitle)
             fields: list[str] = []
             in_events = False
             for raw_line in text.splitlines():
@@ -721,16 +1109,141 @@ def subtitle_has_genuine_overlaps(
     return False
 
 
+_ASS_DRAWING_TAG_RE = re.compile(r"\\p(\d+)", re.IGNORECASE)
+# Aegisub's karaoke templater (and Kara Effector) mark generated lines "fx".
+_ASS_FX_EFFECT_RE = re.compile(r"(?i)(?:^|[^a-z])fx(?:$|[^a-z])")
+
+
+def _strip_ass_drawings(raw_text: str) -> str:
+    """``raw_text`` without vector drawings (text between ``{\\p1}`` and ``{\\p0}``)."""
+    parts: list[str] = []
+    drawing = False
+    position = 0
+    for block in _ASS_OVERRIDE_RE.finditer(raw_text):
+        if not drawing:
+            parts.append(raw_text[position : block.start()])
+        modes = _ASS_DRAWING_TAG_RE.findall(block.group(0))
+        if modes:
+            drawing = int(modes[-1]) > 0
+        parts.append(_ASS_DRAWING_TAG_RE.sub("", block.group(0)))
+        position = block.end()
+    if not drawing:
+        parts.append(raw_text[position:])
+    return "".join(parts)
+
+
+# Styles/actors of staff rolls and release credits: never dialogue.
+_ASS_CREDIT_STYLE_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(?:credits?|staff|fansub|encoder?|encoded|logo|watermark)(?:[^a-z]|$)"
+)
+# Styles whose Latin-only lines in a Japanese file are romaji lyrics or sign/title text.
+_ASS_SIGN_STYLE_RE = re.compile(r"(?i)(?:^|[^a-z])(?:title|sign|signs)(?:[^a-z]|$)")
+
+
+def _sanitize_ass_events(text: str) -> tuple[str, dict[str, int]]:
+    """Drop karaoke-effect rows, vector drawings and credits from an ASS script.
+
+    A karaoke template emits one positioned event per syllable (Effect ``fx``);
+    converted to SRT every syllable became its own overlapping cue. Drawings
+    (``{\\p1}m 0 0 l 100 0 ...``) came through ffmpeg as subtitle text. Staff and
+    release-credit styles are not dialogue. In a Japanese script (most lines carry
+    kana or kanji) a Latin-only line in a song/karaoke/title/sign style or with
+    ``\\k`` timing is romaji or a sign, not Japanese dialogue. An event that ends at or
+    before its start is never shown: ffmpeg wrote one with End before Start as a cue
+    lasting until the next event (the geometry path always left it out).
+    """
+    fields: list[str] = []
+    section = ""
+    lines = text.splitlines()
+    # (line index, prefix, parts, row) of every Dialogue event
+    events: list[tuple[int, str, list[str], dict[str, str]]] = []
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line.casefold()
+        elif section == "[events]" and line.casefold().startswith("format:"):
+            fields = [part.strip().casefold() for part in line.split(":", 1)[1].split(",")]
+        elif section == "[events]" and fields and line.casefold().startswith("dialogue:"):
+            prefix, body = raw_line.split(":", 1)
+            parts = body.split(",", len(fields) - 1)
+            if len(parts) == len(fields):
+                events.append((index, prefix, parts, dict(zip(fields, parts))))
+    with_text = [plain_subtitle_text(_strip_ass_drawings(row.get("text", ""))) for *_rest, row in events]
+    nonempty = [payload for payload in with_text if payload]
+    japanese_script = len(nonempty) >= 5 and sum(
+        bool(_JAPANESE_CHAR_RE.search(payload)) for payload in nonempty
+    ) >= 0.5 * len(nonempty)
+    fx_removed = drawings_removed = credits_removed = romaji_removed = untimed_removed = 0
+    dropped: set[int] = set()
+    replaced: dict[int, str] = {}
+    for (index, prefix, parts, row), payload in zip(events, with_text):
+        raw_text = row.get("text", "")
+        try:
+            untimed = _timestamp_to_seconds(row.get("end", "")) <= _timestamp_to_seconds(row.get("start", ""))
+        except ValueError:
+            untimed = False  # an unreadable time is left to the converter, as before
+        if untimed:
+            untimed_removed += 1
+            dropped.add(index)
+            continue
+        if _ASS_FX_EFFECT_RE.search(row.get("effect", "")):
+            fx_removed += 1
+            dropped.add(index)
+            continue
+        if _ASS_CREDIT_STYLE_RE.search(row.get("style", "")) or _ASS_CREDIT_STYLE_RE.search(
+            row.get("name", "")
+        ):
+            credits_removed += 1
+            dropped.add(index)
+            continue
+        if (
+            japanese_script
+            and payload
+            and not _JAPANESE_CHAR_RE.search(payload)
+            and (
+                _SONG_STYLE_RE.search(row.get("style", ""))
+                or _ASS_SIGN_STYLE_RE.search(row.get("style", ""))
+                or _KARAOKE_TAG_RE.search(raw_text)
+            )
+        ):
+            romaji_removed += 1
+            dropped.add(index)
+            continue
+        if "text" in row and re.search(r"\\p[1-9]", raw_text, re.IGNORECASE):
+            drawings_removed += 1
+            if not payload:
+                dropped.add(index)
+                continue
+            parts = list(parts)
+            parts[fields.index("text")] = _strip_ass_drawings(raw_text)
+            replaced[index] = f"{prefix}:{','.join(parts)}"
+        elif not payload and _ASS_OVERRIDE_RE.sub("", raw_text).replace(r"\N", "").strip():
+            # Drawing commands whose ``{\\p1}`` an earlier converter removed, or a release credit.
+            drawings_removed += 1
+            dropped.add(index)
+    kept = [replaced.get(index, line) for index, line in enumerate(lines) if index not in dropped]
+    removed = {"fx_events_removed": fx_removed, "drawings_removed": drawings_removed}
+    if credits_removed:
+        removed["credits_removed"] = credits_removed
+    if romaji_removed:
+        removed["romaji_removed"] = romaji_removed
+    if untimed_removed:
+        removed["untimed_removed"] = untimed_removed
+    return "\n".join(kept) + "\n", removed
+
+
 def _ass_geometry_cues(
     source: Path,
+    sanitized: str | None = None,
 ) -> tuple[list[tuple[float, float, str]], dict[str, int]]:
     """Assemble positioned caption fragments before text/language cleanup.
 
     Ruby is only discarded when a smaller kana fragment sits above a matching
     kanji-containing base in the same interval. Small standalone dialogue and
     unpositioned events are retained. Moving/drawing events are not assembled.
+    ``sanitized``: ``_sanitize_ass_events`` of the file's text, when the caller has it.
     """
-    text = source.read_text(encoding="utf-8-sig", errors="replace")
+    text = sanitized if sanitized is not None else _sanitize_ass_events(read_subtitle_file(source))[0]
     fields: list[str] = []
     style_fields: list[str] = []
     styles: dict[str, dict[str, str]] = {}
@@ -781,9 +1294,12 @@ def _ass_geometry_cues(
 
         def number(name: str, default: float, style: dict[str, str] = style) -> float:
             try:
-                return float(style.get(name, default))
+                value = float(style.get(name, default))
             except (ValueError, TypeError):
                 return default
+            # "nan" or "inf" in a damaged style line: int(alignment) raised out of the whole
+            # conversion, and the file was no candidate at all.
+            return value if math.isfinite(value) else default
 
         def override(tag: str, default: float, raw_text: str = raw_text) -> float:
             matches = re.findall(r"\\" + tag + r"(-?\d+(?:\.\d+)?)", raw_text)
@@ -897,16 +1413,86 @@ def _ass_geometry_cues(
     }
 
 
-def _manual_ass_to_srt(source: Path, output: Path) -> bool:
-    cues, _geometry = _ass_geometry_cues(source)
+def _manual_ass_to_srt(
+    source: Path, output: Path, geometry_cues: list[tuple[float, float, str]] | None = None
+) -> bool:
+    """``geometry_cues``: ``_ass_geometry_cues(source)`` already parsed by the caller."""
+    cues = list(geometry_cues) if geometry_cues is not None else _ass_geometry_cues(source)[0]
     if not cues:
         return False
     cues, _bilingual_profile = _filter_parallel_chinese_cues(cues)
     if not cues:
         return False
+    cues, _layers_merged = merge_layered_cues(cues)
     cues, _parallel_merged = _merge_parallel_cues(cues)
     write_srt(cues, output, preserve_overlaps=True)
     return True
+
+
+_VTT_TIME = r"(?:(\d+):)?([0-5]?\d):([0-5]?\d)[.,](\d{1,3})"
+_VTT_TIMING_RE = re.compile(r"^\s*" + _VTT_TIME + r"\s+-->\s+" + _VTT_TIME + r"(?:\s+.*)?$")
+# Voice/class/language/ruby spans and inline timestamps: <v Name>, <c.yellow>, </c>, <00:01.000>.
+_VTT_TAG_RE = re.compile(r"</?(?:v|c|lang|ruby|rt|rp|b|i|u)(?:[.\s][^>]*)?>|<\d[\d:.]*>", re.IGNORECASE)
+# Furigana (<ruby>漢字<rt>かんじ</rt></ruby>) is a reading, not spoken text: with only the
+# tags removed the line read 漢字かんじ (wrong words in the popup, in sync and in read-along).
+_VTT_RUBY_READING_RE = _RUBY_READING_RE
+# Direction marks streaming services put before a line (&lrm;): never text.
+_VTT_DIRECTION_MARK_RE = re.compile(r"&(?:lrm|rlm);|[\u200e\u200f\u202a-\u202c]", re.IGNORECASE)
+
+
+def _vtt_text(line: str) -> str:
+    """One cue line without readings, tags and direction marks (``&amp;`` and the other
+    entities are read where every subtitle text is: ``plain_subtitle_text``)."""
+    return _VTT_DIRECTION_MARK_RE.sub("", _VTT_TAG_RE.sub("", _VTT_RUBY_READING_RE.sub("", line)))
+
+
+def _vtt_seconds(hours: str | None, minutes: str, seconds: str, millis: str) -> float:
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds) + int(millis.ljust(3, "0")) / 1000
+
+
+def parse_webvtt(text: str) -> list[tuple[float, float, str]]:
+    """Cues of a WebVTT file: the WEBVTT header, NOTE, STYLE and REGION blocks are skipped,
+    cue identifiers and settings (``line:``, ``align:`` …) dropped, voice/class tags removed;
+    timestamps with or without hours, with ``.`` (or ``,``) before the milliseconds."""
+    text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    cues: list[tuple[float, float, str]] = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        lines = block.strip("\n").split("\n")
+        # The timing line is the first one, or the second after a cue identifier.
+        index = next((i for i, line in enumerate(lines[:2]) if "-->" in line), None)
+        if index is None:
+            continue  # WEBVTT header, NOTE, STYLE, REGION
+        match = _VTT_TIMING_RE.match(lines[index])
+        if match is None:
+            continue
+        start = _vtt_seconds(*match.groups()[:4])
+        end = _vtt_seconds(*match.groups()[4:])
+        payload = "\n".join(
+            text for text in (_vtt_text(line).strip() for line in lines[index + 1 :]) if text
+        ).strip()
+        if payload and end > start:
+            cues.append((start, end, payload))
+    return cues
+
+
+def _webvtt_to_srt(subtitle: Path, cache_dir: Path, *, force: bool) -> tuple[Path, dict[str, object]]:
+    stat = subtitle.stat()
+    digest = hashlib.sha1(
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-webvtt-v2".encode()
+    ).hexdigest()[:20]
+    output = cache_dir / "converted" / f"vtt2-{digest}.srt"
+    if force:
+        output.unlink(missing_ok=True)
+    if _cached_srt_ready(output):
+        return output, {"reason": "cached", "converted": True, "output": str(output)}
+    cues = parse_webvtt(decode_subtitle_bytes(subtitle.read_bytes()))
+    if not cues:
+        return subtitle, {"reason": "conversion_failed", "converted": False, "method": "webvtt"}
+    write_srt(cues, output, preserve_overlaps=True)
+    if not _cached_srt_ready(output):
+        output.unlink(missing_ok=True)
+        return subtitle, {"reason": "conversion_failed", "converted": False, "method": "webvtt"}
+    return output, {"reason": "converted", "converted": True, "method": "webvtt", "output": str(output)}
 
 
 def convert_to_plain_srt(
@@ -917,31 +1503,42 @@ def convert_to_plain_srt(
     force: bool = False,
     verbose: bool = False,
 ) -> tuple[Path, dict[str, object]]:
-    """Convert ASS/SSA to styling-free SRT. Existing SRT is returned unchanged."""
+    """Convert ASS/SSA/WebVTT to styling-free SRT. Existing SRT is returned unchanged."""
     suffix = subtitle.suffix.casefold()
     if suffix == ".srt":
         return subtitle, {"reason": "already_srt", "converted": False}
+    if suffix == ".vtt":
+        # Counted as a text subtitle, but sent unconverted the sync engines refused it.
+        return _webvtt_to_srt(subtitle, cache_dir, force=force)
     if suffix not in {".ass", ".ssa"}:
         return subtitle, {"reason": "unsupported_format", "converted": False}
 
     stat = subtitle.stat()
+    # "-decoded": Shift-JIS/UTF-16 sources were converted to mojibake before.
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v9-geometry-layers".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v11-geometry-layers-decoded-nofx-nondialogue".encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "converted"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v19-{digest}.srt"
+    output = output_dir / f"v20-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if _cached_srt_ready(output):
         return output, {"reason": "cached", "converted": True, "output": str(output)}
     output.unlink(missing_ok=True)
 
+    # Read, decoded and cleaned once: the geometry parser and the copy ffmpeg converts
+    # both use this text (the file was read and cleaned a second time for ffmpeg).
+    raw = subtitle.read_bytes()
+    sanitized, removed = _sanitize_ass_events(decode_subtitle_bytes(raw))
     # FFmpeg's plain-text encoder drops layout before our language filter can
     # distinguish ruby/base fragments. Positioned captions use the ASS parser.
-    geometry_cues, geometry = _ass_geometry_cues(subtitle)
+    geometry_cues, geometry = _ass_geometry_cues(subtitle, sanitized)
+    # The Python fallback below converts these same events: parsed once, not again.
+    parsed_geometry_cues = list(geometry_cues)
     if geometry["positioned_events"] >= 2:
         geometry_cues, bilingual_profile = _filter_parallel_chinese_cues(geometry_cues)
+        geometry_cues, _layers_merged = merge_layered_cues(geometry_cues)
         geometry_cues, parallel_merged = _merge_parallel_cues(geometry_cues)
         if geometry_cues:
             write_srt(geometry_cues, output, preserve_overlaps=True)
@@ -966,16 +1563,36 @@ def convert_to_plain_srt(
         None if explicit_mixed_cjk else (shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path)
     )
     ffmpeg_error = ""
-    ffmpeg_output = output.with_name(f".{output.stem}.ffmpeg.srt")
+    # Names of this conversion only: two processes converting the same file (the window
+    # and the agent) overwrote and deleted each other's copies.
+    run = f"{os.getpid()}-{threading.get_ident()}"
+    ffmpeg_output = output.with_name(f".{output.stem}.{run}.ffmpeg.srt")
+    # ffmpeg drops every non-UTF-8 line ("missing -sub_charenc"), so a
+    # Shift-JIS/UTF-16 file goes in as a UTF-8 copy; karaoke-effect rows and
+    # drawings are removed from that copy as they are in the geometry path.
+    ffmpeg_input = output.with_name(f".{output.stem}.{run}.utf8{suffix}")
     if resolved:
         ffmpeg_output.unlink(missing_ok=True)
+        try:
+            try:
+                raw.decode("utf-8")
+                plain_utf8 = True
+            except UnicodeDecodeError:
+                plain_utf8 = False
+            if plain_utf8 and not any(removed.values()):
+                source_for_ffmpeg = subtitle
+            else:
+                ffmpeg_input.write_text(sanitized, encoding="utf-8")
+                source_for_ffmpeg = ffmpeg_input
+        except OSError:
+            source_for_ffmpeg = subtitle
         command = [
             resolved,
             "-y",
             "-loglevel",
             "error",
             "-i",
-            str(subtitle),
+            str(source_for_ffmpeg),
             str(ffmpeg_output),
         ]
         try:
@@ -996,6 +1613,7 @@ def convert_to_plain_srt(
                     if not cues:
                         output.unlink(missing_ok=True)
                     else:
+                        cues, _layers_merged = merge_layered_cues(cues)
                         cues, parallel_merged = _merge_parallel_cues(cues)
                         write_srt(cues, output, preserve_overlaps=True)
                         return output, {
@@ -1013,10 +1631,11 @@ def convert_to_plain_srt(
             ffmpeg_error = str(exc)
         finally:
             ffmpeg_output.unlink(missing_ok=True)
+            ffmpeg_input.unlink(missing_ok=True)
 
     output.unlink(missing_ok=True)
     try:
-        if _manual_ass_to_srt(subtitle, output):
+        if _manual_ass_to_srt(subtitle, output, parsed_geometry_cues):
             return output, {
                 "reason": "converted",
                 "converted": True,

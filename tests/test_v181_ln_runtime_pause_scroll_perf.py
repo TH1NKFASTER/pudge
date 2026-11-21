@@ -20,8 +20,8 @@ from t71g22_support import USER_SCROLL, ln_audio_pair
 
 def _old_cached_second_act_alignment() -> dict:
     text = (
-        "緩やかに下る坂も終わり、しばらくは土地の起伏といえば"
-        "申し訳程度の小さい丘、という実に進みやすい道だった。"
+        "緩やかな雨も夜に終わり、しばらくは辺りに見えるものは"
+        "見渡す限りの青い麦畑、そんな静かで単調な旅路だった。"
     )
     boundaries = _punctuation_boundaries(chapter_audio_text(text))
     assert {"offset": 11, "strength": 1} in boundaries
@@ -90,10 +90,10 @@ def test_old_alignment_cache_gets_the_books_punctuation_pauses(tmp_path: Path) -
     # the book's own text supplies the punctuation, so the highlight waits at the comma
     # during the narrator's pause (6858.66-6859.30) instead of crawling through it.
     text = (
-        "緩やかに下る坂も終わり、しばらくは土地の起伏といえば"
-        "申し訳程度の小さい丘、という実に進みやすい道だった。"
+        "緩やかな雨も夜に終わり、しばらくは辺りに見えるものは"
+        "見渡す限りの青い麦畑、そんな静かで単調な旅路だった。"
     )
-    _ln, audio, ln_id, audio_id = ln_audio_pair(tmp_path, ["小高い丘が延々と続く。", text], duration=7000.0)
+    _ln, audio, ln_id, audio_id = ln_audio_pair(tmp_path, ["白い砂浜が延々と続く。", text], duration=7000.0)
     cached = _old_cached_second_act_alignment()
     del cached["chapters"][0]["_runtime_punctuation_boundaries"]
     alignment_file = audio._alignment_path(ln_id, audio_id)

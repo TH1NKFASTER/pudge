@@ -65,6 +65,7 @@
       configure_jimaku: 's_jimaku',
       grant_folder_access: 's_watched_folders',
       enable_subtitle_ocr: 's_ocr_image_subtitles',
+      configure_sources: 's_src_release_search',
     };
     const target = document.getElementById(targets[actionCode] || 'settingsSearch');
     const block = target?.closest('.setting-block');

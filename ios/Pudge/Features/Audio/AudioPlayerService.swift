@@ -18,6 +18,8 @@ final class AudioPlayerService: ObservableObject {
     let store: LocalStore
     let deviceId: String
     var onCheckpoint: ((String) -> Void)?
+    /// The app's Bookmark action (PudgeModel.addBookmark), for the lock screen / Watch bookmark command.
+    var onBookmark: (() -> Void)?
     private(set) var sessionId = ""
     private var sequence: Int64 = 0
     private var baseRevision: Int64 = 0
@@ -36,7 +38,10 @@ final class AudioPlayerService: ObservableObject {
     private var handedOff = false
     private var confirmedPositionMs: Int64 = 0
     private var artwork: MPMediaItemArtwork?
-    private var artworkResource: String?
+    /// The cover the artwork was made of (its SHA-256: a new cover of the same book is another).
+    private var artworkKey: String?
+    /// The cover being decoded off the main thread (one at a time).
+    private var artworkLoading: String?
     private var lastNowPlaying = 0.0
     private var lastChapterTitle: String?
     init(store: LocalStore, deviceId: String) {
@@ -117,6 +122,17 @@ final class AudioPlayerService: ObservableObject {
         save(reason); nowPlaying()
     }
     func jump(_ seconds: Int64) { Task { try? await seek(positionMs + seconds * 1000) } }
+    /// Next chapter (lock screen, headphones, Watch): the next chapter's start; nothing on the last one.
+    func nextChapter() {
+        guard let book, let target = NowPlayingChapters.nextStart(positionMs: positionMs, chapters: book.chapters) else { return }
+        Task { try? await seek(target, reason: "chapter") }
+    }
+    /// Previous chapter: restarts the current chapter when more than 3 s of it is played, else the previous one.
+    func previousChapter() {
+        guard let book else { return }
+        let target = NowPlayingChapters.previousStart(positionMs: positionMs, chapters: book.chapters)
+        Task { try? await seek(target, reason: "chapter") }
+    }
     func pause(reason: String = "pause") {
         resumeAfterInterruption = false; player?.pause(); playing = false
         if seeking { generation += 1; player?.currentItem?.cancelPendingSeeks(); seeking = false }
@@ -156,7 +172,7 @@ final class AudioPlayerService: ObservableObject {
         if let book { for part in book.parts { try? store.setProtection(resourceId: part.resourceId, active: false) } }
         sleepDeadline = nil; sleepChapterEnd = nil; sleepRemaining = nil
         book = nil; playing = false
-        artwork = nil; artworkResource = nil; lastChapterTitle = nil
+        artwork = nil; artworkKey = nil; artworkLoading = nil; lastChapterTitle = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         // Release the audio session so the Dynamic Island / lock screen player disappears.
         if releaseSession { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
@@ -214,28 +230,56 @@ final class AudioPlayerService: ObservableObject {
         lastNowPlaying = ProcessInfo.processInfo.systemUptime
         let chapter = book.chapters.last(where: { $0.startMs <= positionMs })?.title
         lastChapterTitle = chapter
+        // The chapter's progress (the whole book without chapters); a scrub there is chapter time.
+        let shown = NowPlayingChapters.progress(positionMs: positionMs, durationMs: book.durationMs, chapters: book.chapters)
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: book.title,
             MPMediaItemPropertyArtist: chapter ?? "Pudge",
             MPMediaItemPropertyAlbumTitle: book.seriesTitle ?? book.title,
-            MPMediaItemPropertyPlaybackDuration: Double(book.durationMs) / 1000,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: Double(positionMs) / 1000,
+            MPMediaItemPropertyPlaybackDuration: Double(shown.durationMs) / 1000,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: Double(shown.elapsedMs) / 1000,
             MPNowPlayingInfoPropertyPlaybackRate: playing ? Double(rate) : 0.0,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: Double(rate),
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyChapterCount: shown.count,
         ]
+        if let number = shown.number { info[MPNowPlayingInfoPropertyChapterNumber] = number - 1 }
         if let art = currentArtwork(book) { info[MPMediaItemPropertyArtwork] = art }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        // Chapter buttons only for a book with chapters; the speed shown is the app's.
+        let commands = MPRemoteCommandCenter.shared()
+        let hasChapters = !book.chapters.isEmpty
+        commands.nextTrackCommand.isEnabled = hasChapters && NowPlayingChapters.nextStart(positionMs: positionMs, chapters: book.chapters) != nil
+        commands.previousTrackCommand.isEnabled = hasChapters
+        commands.changePlaybackRateCommand.isEnabled = true
     }
-    /// Lock screen / Dynamic Island artwork from the downloaded cover (built once per book).
+    /// Lock screen / Dynamic Island artwork from the downloaded cover, made once per cover (by
+    /// its SHA-256: the Mac's new cover of the same book replaced nothing when kept by resource)
+    /// and decoded off the main thread (a large cover stalled the player's tick). Until it is
+    /// ready Now Playing shows none; then it is set again.
     private func currentArtwork(_ book: AudioManifest) -> MPMediaItemArtwork? {
         guard let cover = book.cover else { return nil }
-        if artworkResource == cover.resourceId { return artwork }
-        artworkResource = cover.resourceId; artwork = nil
-        guard let local = try? store.resource(cover.resourceId), let image = UIImage(contentsOfFile: local.url.path) else { return nil }
-        artwork = Self.makeArtwork(image)
-        return artwork
+        if artworkKey == cover.sha256, let artwork { return artwork }
+        guard artworkLoading != cover.sha256 else { return nil }
+        // A cover not downloaded yet is tried again on the next update, not never.
+        guard let local = try? store.resource(cover.resourceId), local.state.verified, local.state.sha256 == cover.sha256 else { return nil }
+        let url = local.url, key = cover.sha256, asset = book.assetId
+        artworkLoading = key
+        Task {
+            let image = await Task.detached(priority: .utility) {
+                DownsampledImage.load(url, maxPixels: AudioPlayerService.artworkPixels)
+            }.value
+            guard self.artworkLoading == key else { return }
+            self.artworkLoading = nil
+            // Another book or another cover meanwhile: this one is not shown.
+            guard let image, self.book?.assetId == asset, self.book?.cover?.sha256 == key else { return }
+            self.artworkKey = key
+            self.artwork = Self.makeArtwork(image)
+            self.nowPlaying()
+        }
+        return nil
     }
+    nonisolated private static let artworkPixels = 1024
     /// MediaPlayer calls the artwork handler off the main thread: build it outside
     /// the main actor so the closure is not main-actor isolated.
     nonisolated private static func makeArtwork(_ image: UIImage) -> MPMediaItemArtwork {
@@ -246,19 +290,40 @@ final class AudioPlayerService: ObservableObject {
         commands.playCommand.addTarget { [weak self] _ in Task { @MainActor in self?.resume() }; return .success }
         commands.pauseCommand.addTarget { [weak self] _ in Task { @MainActor in self?.pause() }; return .success }
         commands.togglePlayPauseCommand.addTarget { [weak self] _ in Task { @MainActor in guard let self else { return }; if self.playing { self.pause() } else { self.resume() } }; return .success }
-        commands.skipForwardCommand.preferredIntervals = [15]; commands.skipBackwardCommand.preferredIntervals = [15]
-        // Audiobook controls: ±15 s on the lock screen / Dynamic Island, not track buttons.
+        // ±skip as the app's buttons (lock screen / Dynamic Island / Watch show these).
+        let skip = NowPlayingChapters.skipSeconds
+        commands.skipForwardCommand.preferredIntervals = [NSNumber(value: skip)]
+        commands.skipBackwardCommand.preferredIntervals = [NSNumber(value: skip)]
+        // Next / previous track are chapter jumps (headphones' double / triple press, Watch, CarPlay).
         commands.nextTrackCommand.isEnabled = false; commands.previousTrackCommand.isEnabled = false
-        commands.changePlaybackRateCommand.supportedPlaybackRates = [0.75, 1, 1.25, 1.5, 1.75, 2]
+        commands.nextTrackCommand.addTarget { [weak self] _ in Task { @MainActor in self?.nextChapter() }; return .success }
+        commands.previousTrackCommand.addTarget { [weak self] _ in Task { @MainActor in self?.previousChapter() }; return .success }
+        // The app's speeds (its speed menus); a change here is the app's speed (setRate), and back.
+        commands.changePlaybackRateCommand.supportedPlaybackRates = NowPlayingChapters.rates.map { NSNumber(value: $0) }
         commands.changePlaybackRateCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackRateCommandEvent else { return .commandFailed }
-            Task { @MainActor in self?.setRate(event.playbackRate) }; return .success
+            let rate = NowPlayingChapters.supportedRate(event.playbackRate)
+            Task { @MainActor in self?.setRate(rate) }; return .success
         }
-        commands.skipForwardCommand.addTarget { [weak self] _ in Task { @MainActor in self?.jump(15) }; return .success }
-        commands.skipBackwardCommand.addTarget { [weak self] _ in Task { @MainActor in self?.jump(-15) }; return .success }
+        // Bookmark: the player's Bookmark (PudgeModel.addBookmark through onBookmark).
+        commands.bookmarkCommand.isEnabled = true
+        commands.bookmarkCommand.localizedTitle = "Bookmark"
+        commands.bookmarkCommand.addTarget { [weak self] _ in
+            Task { @MainActor in guard let self, self.book != nil else { return }; self.onBookmark?() }; return .success
+        }
+        commands.skipForwardCommand.addTarget { [weak self] _ in Task { @MainActor in self?.jump(skip) }; return .success }
+        commands.skipBackwardCommand.addTarget { [weak self] _ in Task { @MainActor in self?.jump(-skip) }; return .success }
         commands.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            Task { @MainActor in try? await self?.seek(Int64(event.positionTime * 1000)) }; return .success
+            let seconds = event.positionTime
+            Task { @MainActor in
+                // Now Playing shows the chapter: the scrub is a place in it.
+                guard let self, let book = self.book else { return }
+                let target = NowPlayingChapters.scrubTarget(seconds: seconds, positionMs: self.positionMs,
+                                                            durationMs: book.durationMs, chapters: book.chapters)
+                try? await self.seek(target)
+            }
+            return .success
         }
         systemObservers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in

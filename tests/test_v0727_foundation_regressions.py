@@ -149,7 +149,7 @@ def test_vn_static_frame_commits_without_second_ocr(monkeypatch, tmp_path: Path)
     thread = threading.Thread(target=service._capture_loop, args=(stop_event, 1, 123), daemon=True)
     service._thread = thread
     thread.start()
-    deadline = time.monotonic() + 2.5
+    deadline = time.monotonic() + 30  # ends at the first transcript line
     state = service.state()
     while time.monotonic() < deadline and not state["transcript"]:
         time.sleep(0.05)

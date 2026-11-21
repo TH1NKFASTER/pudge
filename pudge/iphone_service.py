@@ -5,16 +5,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from . import audiobook_finish, read_along
 from .database import Database
+from .fsutil import atomic_write_bytes, temporary_sibling
 
 
 def now_ms() -> int:
@@ -63,15 +67,21 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     if not isinstance(parts, list) or not 1 <= len(parts) <= 10000:
         raise ValueError("Invalid audio parts")
     seen: set[str] = set()
+    resource_shas: dict[str, Any] = {}
     offset = 0
     for part in parts:
         if not isinstance(part, dict):
             raise ValueError("Invalid part")
-        for key in ("partId", "resourceId"):
-            part_id = identifier(part.get(key))
-            if key == "partId" and part_id in seen:
-                raise ValueError("Duplicate part")
-        seen.add(part["partId"])
+        part_id = identifier(part.get("partId"))
+        resource_id = identifier(part.get("resourceId"))
+        # Compared normalised (an uppercase copy of a part ID is the same part).
+        if part_id in seen:
+            raise ValueError("Duplicate part")
+        seen.add(part_id)
+        if resource_id in resource_shas and resource_shas[resource_id] != part.get("sha256"):
+            # One resource ID for two different files: refused here, not after the upload.
+            raise ValueError("Resource ID reused for different bytes")
+        resource_shas[resource_id] = part.get("sha256")
         if integer(part.get("offsetMs"), "offset") != offset:
             raise ValueError("Discontinuous timeline")
         offset += integer(part.get("durationMs"), "part duration", 1)
@@ -175,6 +185,7 @@ CREATE TABLE IF NOT EXISTS iphone_retention(resource TEXT NOT NULL,device TEXT N
 CREATE TABLE IF NOT EXISTS iphone_checkpoints(id TEXT PRIMARY KEY,device TEXT NOT NULL,body TEXT NOT NULL,receipt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS iphone_progress(asset TEXT PRIMARY KEY,revision INTEGER NOT NULL,selected TEXT,conflicts TEXT NOT NULL DEFAULT '[]',finished INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS iphone_bookmarks(id TEXT PRIMARY KEY,asset TEXT NOT NULL,edition TEXT NOT NULL,body TEXT NOT NULL,revision INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_iphone_bookmarks_asset ON iphone_bookmarks(asset);
 CREATE TABLE IF NOT EXISTS iphone_handoffs(id TEXT PRIMARY KEY,body TEXT NOT NULL,result TEXT);
 CREATE TABLE IF NOT EXISTS iphone_resolution_fences(asset TEXT PRIMARY KEY,revision INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS iphone_bookmark_links(id TEXT PRIMARY KEY,desktop_id INTEGER NOT NULL);
@@ -183,6 +194,7 @@ CREATE TABLE IF NOT EXISTS iphone_mac_starts(operation TEXT PRIMARY KEY,started 
 CREATE TABLE IF NOT EXISTS iphone_hashes(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS iphone_prepared(source TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,result TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS iphone_listen_marks(device TEXT NOT NULL,session TEXT NOT NULL,sequence INTEGER NOT NULL,position INTEGER NOT NULL,observed INTEGER NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(device,session));
+CREATE TABLE IF NOT EXISTS iphone_prepare_requests(asset TEXT PRIMARY KEY,requested INTEGER NOT NULL);
 """
 
 
@@ -215,6 +227,69 @@ def listening_interval(
     )
 
 
+# Longest merged run of periodic saves counted as listening (one phone session).
+_RUN_LIMIT_MS = 24 * 3600 * 1000
+
+
+def continuous_since(checkpoint: dict[str, Any], position_ms: int, observed_ms: int) -> dict[str, int] | None:
+    """Start of the uninterrupted playback a merged periodic checkpoint stands for.
+
+    A phone that saves while it cannot send keeps only the newest periodic checkpoint of a
+    session and names where the run began (`continuousSince`: observedAt, positionMs of the
+    first periodic save it replaced). None when absent or not plausible.
+    """
+    since = checkpoint.get("continuousSince")
+    if checkpoint.get("reason") != "periodic" or not isinstance(since, dict):
+        return None
+    try:
+        start = integer(since.get("observedAt"), "run start")
+        first = integer(since.get("positionMs"), "run position")
+    except ValueError:
+        return None
+    if not 0 < observed_ms - start <= _RUN_LIMIT_MS or not 0 <= first < position_ms:
+        return None
+    return {"observedAt": start, "positionMs": first}
+
+
+def run_interval(
+    run: dict[str, int], position_ms: int, observed_ms: int
+) -> tuple[float, float, float, float] | None:
+    """Listening of a merged run: counted when the position moved like playback (0.4-3.2x)."""
+    wall = (observed_ms - run["observedAt"]) / 1000.0
+    moved = (position_ms - run["positionMs"]) / 1000.0
+    if wall < 0.5 or moved <= 0 or moved < wall * 0.4 or moved > wall * 3.2 + 1.5:
+        return None
+    return (
+        run["observedAt"] / 1000.0,
+        observed_ms / 1000.0,
+        run["positionMs"] / 1000.0,
+        position_ms / 1000.0,
+    )
+
+
+# Longest interval the consumption ledger stores in one event (consumption.MAX_CHUNK_SECONDS).
+_LEDGER_CHUNK_SECONDS = 30.0
+
+
+def listening_chunks(
+    start: float, end: float, first: float, last: float, size: float = _LEDGER_CHUNK_SECONDS
+) -> list[tuple[float, float, float, float]]:
+    """Split one listening interval into consecutive pieces of at most `size` seconds of clock
+    time, the book position moving in proportion."""
+    span = end - start
+    if span <= size:
+        return [(start, end, first, last)]
+    count = int(math.ceil(span / size))
+    step = span / count
+    rate = (last - first) / span
+    pieces = []
+    for index in range(count):
+        a = start + index * step
+        b = end if index == count - 1 else start + (index + 1) * step
+        pieces.append((a, b, first + (a - start) * rate, first + (b - start) * rate))
+    return pieces
+
+
 class IPhoneService:
     def __init__(self, database: Database, root: Path, *, audiobooks: Any = None) -> None:
         self.db = database
@@ -226,7 +301,17 @@ class IPhoneService:
         self._catalog_lock = threading.Lock()
         self._catalog_worker: threading.Thread | None = None
         self._catalog_errors: list[dict[str, Any]] = []
-        self._transfer_locks: dict[str, threading.Lock] = {}
+        self._transfer_locks: dict[str, list[Any]] = {}
+        self._handoff_locks: dict[str, list[Any]] = {}
+        self._pruned_at = -1e9
+        # Verified resources ((id, sha) -> (path, size, mtime_ns)): AVPlayer's byte ranges of a
+        # streamed episode come many times a second, and each looked the file up and checked its
+        # hash in the database (two SQLite connections, milliseconds per range).
+        self._verified_resources: dict[tuple[str, str], tuple[str, int, int]] = {}
+        # Devices already known to find the Mac under any Bonjour name (saves a write per request).
+        self._finds_any_name: set[str] = set()
+        # Lazy catalogs (phones that prepare on request): books listed without a manifest yet.
+        self._catalog_pending: dict[str, dict[str, Any]] = {}
         # Mac sessions paused by a Mac -> iPhone handoff: their later saves
         # (Stop of the paused player) must never open a new branch.
         self.handed_off_sessions: set[tuple[str, str]] = set()
@@ -251,6 +336,12 @@ class IPhoneService:
                 handle.flush()
                 os.fsync(handle.fileno())
         self.secret = secret_path.read_bytes()
+        if not self.secret:
+            # Created but never written (power lost right after the create): nothing was ever
+            # made with it, so a new one is written instead of failing every start.
+            atomic_write_bytes(secret_path, secrets.token_bytes(32))
+            os.chmod(secret_path, 0o600)
+            self.secret = secret_path.read_bytes()
         if len(self.secret) != 32:
             raise ValueError("Invalid server identity")
         self.server_id = str(uuid.uuid5(uuid.NAMESPACE_URL, hashlib.sha256(self.secret).hexdigest()))
@@ -274,9 +365,153 @@ class IPhoneService:
                 ("iphone_invites", "token_hash", "TEXT"),
                 # NULL for invitations used before confirmation existed (approved then).
                 ("iphone_invites", "approval", "TEXT"),
+                # When the row was saved (Mac clock, ms): old receipts are pruned (prune_history).
+                ("iphone_checkpoints", "created", "INTEGER"),
+                ("iphone_bookmark_events", "created", "INTEGER"),
+                ("iphone_handoffs", "created", "INTEGER"),
+                # 1: the device's app finds the Mac under any Bonjour name (seen on its requests);
+                # NULL: not seen yet (an installed older build looks for the server ID).
+                ("iphone_devices", "finds_any_name", "INTEGER"),
             ):
                 if column not in {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            from .iphone_inventory import ensure_table
+
+            # What each device has downloaded (its own report), for the Mac's library icons.
+            ensure_table(conn)
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='iphone_downloads'"
+            ).fetchone():
+                # Copies a phone downloaded completely (their AAC copy on the Mac stays while the
+                # phone has it). Copies served before this was recorded count as downloaded.
+                conn.execute(
+                    "CREATE TABLE iphone_downloads(resource TEXT NOT NULL,device TEXT NOT NULL,"
+                    "at INTEGER NOT NULL,PRIMARY KEY(resource,device))"
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO iphone_downloads(resource,device,at) "
+                    "SELECT id,'legacy',? FROM iphone_resources",
+                    (now_ms(),),
+                )
+
+    # Receipts of checkpoints and bookmark edits are kept this long: a phone retrying a lost
+    # answer within it gets the same receipt. Every 5 s of listening saved one row, forever.
+    HISTORY_MS = 30 * 86_400_000
+    _PRUNE_EVERY = 3600.0
+
+    def prune_history(self, *, force: bool = False) -> dict[str, int]:
+        """Drop old checkpoint and bookmark receipts, listening marks and finished handoffs;
+        close handoffs nobody answered (at most hourly unless forced)."""
+        moment = time.monotonic()
+        if not force and moment - self._pruned_at < self._PRUNE_EVERY:
+            return {}
+        self._pruned_at = moment
+        now = now_ms()
+        cutoff = now - self.HISTORY_MS
+        removed: dict[str, int] = {}
+        with self.lock, self.db.connect() as conn:
+            for table in ("iphone_checkpoints", "iphone_bookmark_events", "iphone_handoffs"):
+                # Rows saved before the column existed get the time they are first seen here.
+                conn.execute(f"UPDATE {table} SET created=? WHERE created IS NULL", (now,))
+            removed["checkpoints"] = conn.execute(
+                "DELETE FROM iphone_checkpoints WHERE created<?", (cutoff,)
+            ).rowcount
+            removed["bookmark_events"] = conn.execute(
+                "DELETE FROM iphone_bookmark_events WHERE created<?", (cutoff,)
+            ).rowcount
+            # A handoff is answered within a minute; one still open after that never will be
+            # (every /commands poll rescanned the open ones).
+            stale = conn.execute(
+                "SELECT id FROM iphone_handoffs WHERE result IS NULL AND created<?",
+                (now - 2 * self._DEVICE_HANDOFF_MS,),
+            ).fetchall()
+            for row in stale:
+                conn.execute(
+                    "UPDATE iphone_handoffs SET result=? WHERE id=? AND result IS NULL",
+                    (encoded({"operationId": row["id"], "status": "source_unreachable"}), row["id"]),
+                )
+            removed["handoffs_closed"] = len(stale)
+            removed["handoffs"] = conn.execute(
+                "DELETE FROM iphone_handoffs WHERE result IS NOT NULL AND created<?",
+                (now - 7 * 86_400_000,),
+            ).rowcount
+            conn.execute(
+                "DELETE FROM iphone_mac_starts WHERE operation NOT IN (SELECT id FROM iphone_handoffs)"
+            )
+            # Listening marks are per playback session (phone clock).
+            removed["listen_marks"] = conn.execute(
+                "DELETE FROM iphone_listen_marks WHERE observed<?", (cutoff,)
+            ).rowcount
+            conn.execute("DELETE FROM iphone_prepare_requests WHERE requested<?", (now - 86_400_000,))
+        for operation in [key for key, start in self.device_handoffs.items() if now - start > 3600_000]:
+            self.device_handoffs.pop(operation, None)
+        return removed
+
+    @contextmanager
+    def _keyed_lock(self, table: dict[str, list[Any]], key: str):
+        """One lock per key while someone uses it; the entry goes with its last user (random
+        transfer or operation IDs of a looping phone no longer grow the dict for good)."""
+        with self.lock:
+            entry = table.get(key)
+            if entry is None:
+                entry = table[key] = [threading.Lock(), 0]
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self.lock:
+                entry[1] -= 1
+                if entry[1] <= 0 and table.get(key) is entry:
+                    del table[key]
+
+    def register_resource(self, conn: Any, resource: str, sha: str, size: int, path: Path | str) -> None:
+        """Where a resource's bytes are served from. The ID comes from the SHA-256, so the same
+        bytes at a new path (folder moved or renamed, a drive mounted as "/Volumes/X 1", a
+        rescanned book) move the row there; a stored copy that still verifies stays."""
+        self._verified_resources.pop((resource, sha), None)
+        row = conn.execute("SELECT sha,size,path FROM iphone_resources WHERE id=?", (resource,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO iphone_resources(id,sha,size,path) VALUES(?,?,?,?)",
+                (resource, sha, size, str(path)),
+            )
+            return
+        if row["sha"] != sha or (row["path"] == str(path) and row["size"] == size):
+            return
+        if self._stored_copy_verifies(conn, row):
+            return
+        conn.execute(
+            "UPDATE iphone_resources SET path=?,size=? WHERE id=? AND sha=?", (str(path), size, resource, sha)
+        )
+
+    @staticmethod
+    def _stored_copy_verifies(conn: Any, row: Any) -> bool:
+        """The stored path holds these bytes (by the hash cache; nothing is hashed here)."""
+        try:
+            stat = Path(row["path"]).stat()
+        except OSError:
+            return False
+        if stat.st_size != row["size"]:
+            return False
+        cached = conn.execute(
+            "SELECT size,mtime_ns,sha FROM iphone_hashes WHERE path=?", (str(row["path"]),)
+        ).fetchone()
+        return bool(
+            cached is not None
+            and cached["size"] == stat.st_size
+            and cached["mtime_ns"] == stat.st_mtime_ns
+            and cached["sha"] == row["sha"]
+        )
+
+    def record_download(self, device: str, resource: str) -> None:
+        """A phone received the whole resource: its prepared copy is kept (cache budget)."""
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO iphone_downloads(resource,device,at) VALUES(?,?,?) "
+                "ON CONFLICT(resource,device) DO UPDATE SET at=excluded.at",
+                (resource, device, now_ms()),
+            )
 
     def invite(self, base_url: str | list[str], certificate_sha256: str) -> dict[str, Any]:
         """A pairing invitation for the QR: valid 10 minutes, used by one device after the Mac allows it.
@@ -389,6 +624,8 @@ class IPhoneService:
 
     def approve_pairing(self, device: str) -> bool:
         """Allow on the Mac: the waiting device gets its token on its next request."""
+        from .iphone_inventory import forget
+
         device = identifier(device)
         with self.lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -399,11 +636,17 @@ class IPhoneService:
             if row is None:
                 return False
             conn.execute("UPDATE iphone_invites SET approval='approved' WHERE hash=?", (row["hash"],))
+            # A (re)paired device counts as an older build until one of its requests says otherwise.
             conn.execute(
-                "INSERT INTO iphone_devices(id,name,token_hash,revoked,paired_at) VALUES(?,?,?,0,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,token_hash=excluded.token_hash,revoked=0,paired_at=excluded.paired_at",
+                "INSERT INTO iphone_devices(id,name,token_hash,revoked,paired_at) VALUES(?,?,?,0,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,token_hash=excluded.token_hash,revoked=0,paired_at=excluded.paired_at,finds_any_name=NULL",
                 (device, row["name"] or "iPhone", row["token_hash"], now_ms()),
             )
+            # A re-paired device (same id) shows nothing until it reports again.
+            forget(conn, device)
         self.revoked_now.discard(device)
+        self._finds_any_name.discard(device)
+        # Its name may have changed: the library icons are drawn again.
+        self._library_devices_changed()
         return True
 
     def deny_pairing(self, device: str) -> None:
@@ -432,6 +675,25 @@ class IPhoneService:
     def still_authorized(self, device: str) -> bool:
         return device not in self.revoked_now
 
+    def note_new_discovery(self, device: str) -> None:
+        """This device's app finds the Mac under any Bonjour name (from its requests)."""
+        if device in self._finds_any_name or device == "mac":
+            return
+        with self.db.connect() as conn:
+            conn.execute("UPDATE iphone_devices SET finds_any_name=1 WHERE id=?", (device,))
+        self._finds_any_name.add(device)
+
+    def bonjour_needs(self) -> dict[str, bool]:
+        """Which Bonjour advertisements the paired devices need: ``private`` (a name per network,
+        for apps that find the Mac under any name) and ``legacy`` (named by the server ID, for
+        installed older builds, which accept only that name)."""
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT finds_any_name FROM iphone_devices WHERE revoked=0").fetchall()
+        return {
+            "private": any(row[0] == 1 for row in rows),
+            "legacy": any(row[0] != 1 for row in rows),
+        }
+
     def devices(self) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             return [
@@ -440,13 +702,36 @@ class IPhoneService:
             ]
 
     def revoke(self, device: str) -> None:
+        from .iphone_inventory import forget
+
         with self.db.connect() as conn:
             conn.execute("UPDATE iphone_devices SET revoked=1 WHERE id=?", (device,))
+            # Its downloads are no longer shown on the Mac's cards.
+            forget(conn, str(device))
         self.revoked_now.add(str(device))
+        self._library_devices_changed()
         server = self.http_server
         if server is not None:
             # Downloads and uploads in progress stop now, not when they finish.
             server.close_requests(str(device))
+
+    def record_inventory(self, device: str, payload: Any) -> dict[str, Any]:
+        """The device's downloaded items (POST /api/v2/inventory), in place of its last report."""
+        from .iphone_inventory import record
+
+        receipt = record(self.db, device, payload)
+        if receipt.pop("changed", False):
+            self._library_devices_changed()
+        return receipt
+
+    def _library_devices_changed(self) -> None:
+        """The window redraws the downloaded-on-device icons (UiPush topic "devices")."""
+        push = getattr(self.api, "_push_ui", None)
+        if callable(push):
+            try:
+                push("devices", {"at": now_ms()})
+            except Exception:  # noqa: BLE001 - an icon refresh never fails a phone request
+                pass
 
     def register_manifest(self, manifest: dict[str, Any], *, book_id: int | None = None) -> None:
         validate_manifest(manifest)
@@ -508,6 +793,8 @@ class IPhoneService:
         integer(offset, "offset")
         if not 1 <= len(data) <= 4 * 1024 * 1024:
             raise ValueError("Invalid chunk size")
+        # Checked before a lock exists for it: an unknown transfer ID never gets one.
+        transfer = self._archive(device, transfer)["id"]
         # Disk writes/fsync of one transfer must not stall the Mac player,
         # whose position saves take the service lock.
         with self._transfer_lock(transfer):
@@ -535,11 +822,11 @@ class IPhoneService:
                 os.fsync(handle.fileno())
             return {"offset": offset + len(data)}
 
-    def _transfer_lock(self, transfer: str) -> threading.Lock:
-        with self.lock:
-            return self._transfer_locks.setdefault(str(transfer), threading.Lock())
+    def _transfer_lock(self, transfer: str):
+        return self._keyed_lock(self._transfer_locks, str(transfer))
 
     def commit_archive(self, device: str, transfer: str) -> dict[str, Any]:
+        transfer = self._archive(device, transfer)["id"]
         with self._transfer_lock(transfer):
             archive = self._archive(device, transfer)
             if archive["receipt"] is not None:
@@ -565,9 +852,11 @@ class IPhoneService:
         self, device: str, transfer: str, manifest: dict[str, Any], ready: list
     ) -> dict[str, Any]:
         with self.lock:
+            moved = []
             for part, stage, final in ready:
                 if not final.exists():
                     os.replace(stage, final)
+                    moved.append((part, stage, final))
                 with final.open("rb") as handle:
                     os.fsync(handle.fileno())
             self._sync_directory(self.root / "objects")
@@ -580,6 +869,17 @@ class IPhoneService:
             }
             with self.db.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                for part, stage, final in moved:
+                    # commit_archive hashed these bytes at the staging path; the moved file keeps
+                    # their size and time. Without this verify_archive (offload) hashed the whole
+                    # part (gigabytes) again under the service lock.
+                    stat = final.stat()
+                    conn.execute(
+                        "INSERT INTO iphone_hashes(path,size,mtime_ns,sha) VALUES(?,?,?,?) "
+                        "ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,sha=excluded.sha",
+                        (str(final), stat.st_size, stat.st_mtime_ns, part["sha256"]),
+                    )
+                    conn.execute("DELETE FROM iphone_hashes WHERE path=?", (str(stage),))
                 for part, _, final in ready:
                     old = conn.execute(
                         "SELECT sha,size FROM iphone_resources WHERE id=?", (part["resourceId"],)
@@ -664,13 +964,30 @@ class IPhoneService:
 
     def resource(self, resource: str, sha: str) -> Path:
         identifier(resource)
+        key = (resource, sha)
+        known = self._verified_resources.get(key)
+        if known is not None:
+            try:
+                stat = os.stat(known[0])
+            except OSError:
+                stat = None
+            # The same size and modification time: the bytes checked before (as file_sha256).
+            if stat is not None and (stat.st_size, stat.st_mtime_ns) == known[1:]:
+                return Path(known[0])
+            self._verified_resources.pop(key, None)
         with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM iphone_resources WHERE id=?", (resource,)).fetchone()
         if row is None or row["sha"] != sha:
             raise ValueError("Resource revision unavailable")
         path = Path(row["path"])
-        if not path.is_file() or path.stat().st_size != row["size"] or self.file_sha256(path) != sha:
+        if not path.is_file() or path.stat().st_size != row["size"]:
             raise ValueError("Resource changed or missing")
+        stat = path.stat()
+        if self.file_sha256(path) != sha:
+            raise ValueError("Resource changed or missing")
+        if len(self._verified_resources) >= 256:
+            self._verified_resources.clear()
+        self._verified_resources[key] = (str(path), stat.st_size, stat.st_mtime_ns)
         return path
 
     def file_sha256(self, path: Path) -> str:
@@ -733,23 +1050,26 @@ class IPhoneService:
 
     def verify_archive(self, device: str, resource: str, edition: str) -> dict[str, Any]:
         identifier(edition)
-        with self.lock, self.db.connect() as conn:
+        with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM iphone_resources WHERE id=?", (resource,)).fetchone()
             versions = conn.execute(
                 "SELECT manifest FROM iphone_versions WHERE edition=?", (edition,)
             ).fetchall()
-            part = next(
-                (
-                    p
-                    for v in versions
-                    for p in resources(json.loads(v["manifest"]))
-                    if p["resourceId"] == resource
-                ),
-                None,
-            )
-            if row is None or part is None:
-                raise ValueError("No verified archive for this edition")
-            self.resource(resource, part["sha256"])
+        part = next(
+            (
+                p
+                for v in versions
+                for p in resources(json.loads(v["manifest"]))
+                if p["resourceId"] == resource
+            ),
+            None,
+        )
+        if row is None or part is None:
+            raise ValueError("No verified archive for this edition")
+        # The bytes are checked (hashed when not known yet: gigabytes) outside the service
+        # lock, as in commit_archive: the Mac player's position saves and every phone sync take it.
+        self.resource(resource, part["sha256"])
+        with self.lock, self.db.connect() as conn:
             retention = conn.execute(
                 "SELECT receipt FROM iphone_retention WHERE resource=? AND device=? AND edition=?",
                 (resource, device, edition),
@@ -825,6 +1145,37 @@ class IPhoneService:
             self._record_listening(device, item)
         return receipt
 
+    def backfill_listening_runs(self) -> int:
+        """Re-count phone listening refused before long runs were split (statistics stayed flat
+        after offline listening). Idempotent: the ledger ignores event ids it already holds."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.device, c.body, a.book_id FROM iphone_checkpoints c "
+                "JOIN iphone_assets a ON a.id = json_extract(c.body, '$.assetId') "
+                "WHERE c.device != 'mac' AND a.book_id IS NOT NULL "
+                "AND json_extract(c.body, '$.reason') = 'periodic' "
+                "AND json_extract(c.body, '$.continuousSince') IS NOT NULL "
+                "AND COALESCE(json_extract(c.receipt, '$.status'), '') != 'rejected'"
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                checkpoint = json.loads(row["body"])
+                position = int(checkpoint["positionMs"])
+                observed = int(checkpoint["observedAt"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            run = continuous_since(checkpoint, position, observed)
+            interval = run_interval(run, position, observed) if run is not None else None
+            if interval is None or interval[1] - interval[0] <= _LEDGER_CHUNK_SECONDS:
+                continue  # short runs were stored the first time
+            self._record_listening(
+                str(row["device"]),
+                {"book_id": int(row["book_id"]), "interval": interval, "checkpoint": str(row["id"]) + ":run"},
+            )
+            count += 1
+        return count
+
     def device_name(self, device: str) -> str:
         with self.db.connect() as conn:
             row = conn.execute("SELECT name FROM iphone_devices WHERE id=?", (device,)).fetchone()
@@ -841,24 +1192,30 @@ class IPhoneService:
             if media is None:
                 return
             start, end, first, last = item["interval"]
-            ledger.record_device_interval(
-                device_id=device,
-                device_name=self.device_name(device),
-                event_id="iphone-audio:" + item["checkpoint"],
-                kind="audiobook",
-                media_ref=media,
-                start_utc=start,
-                end_utc=end,
-                active_seconds=end - start,
-                locator_start={"position_seconds": first},
-                locator_end={"position_seconds": last},
-                payload={
-                    "speed": round((last - first) / max(0.001, end - start), 3),
-                    "seek_or_discontinuity": False,
-                },
-                measurement_method="iphone_audiobook_checkpoints",
-                activity_group_id=ledger.audiobook_activity_group(book_id),
-            )
+            name = self.device_name(device)
+            group = ledger.audiobook_activity_group(book_id)
+            speed = round((last - first) / max(0.001, end - start), 3)
+            # The ledger takes intervals of at most MAX_CHUNK_SECONDS; a merged run of saves
+            # the phone kept while offline spans minutes or hours and was refused whole.
+            for index, (chunk_start, chunk_end, chunk_first, chunk_last) in enumerate(
+                listening_chunks(start, end, first, last)
+            ):
+                key = item["checkpoint"] if index == 0 else f"{item['checkpoint']}:{index}"
+                ledger.record_device_interval(
+                    device_id=device,
+                    device_name=name,
+                    event_id="iphone-audio:" + key,
+                    kind="audiobook",
+                    media_ref=media,
+                    start_utc=chunk_start,
+                    end_utc=chunk_end,
+                    active_seconds=chunk_end - chunk_start,
+                    locator_start={"position_seconds": chunk_first},
+                    locator_end={"position_seconds": chunk_last},
+                    payload={"speed": speed, "seek_or_discontinuity": False},
+                    measurement_method="iphone_audiobook_checkpoints",
+                    activity_group_id=group,
+                )
         except Exception as exc:  # noqa: BLE001 - statistics never block the position receipt
             logger = getattr(self.api, "logger", None)
             if logger is not None:
@@ -871,13 +1228,25 @@ class IPhoneService:
         body = encoded(checkpoint)
         with self.lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            current_revision_row = conn.execute(
+                "SELECT revision FROM iphone_progress WHERE asset=?", (str(checkpoint.get("assetId")),)
+            ).fetchone()
+            current_revision = int(current_revision_row["revision"]) if current_revision_row else 0
             previous = conn.execute("SELECT * FROM iphone_checkpoints WHERE id=?", (event,)).fetchone()
             if previous:
-                if previous["device"] != device or previous["body"] != body:
+                if previous["device"] != device:
+                    # Saved and sent under this phone's earlier device ID (restored from a backup
+                    # or moved to a new iPhone, then paired again): final, nothing is stored. A
+                    # 409 here stopped every later sync of that phone for good.
+                    return {
+                        "checkpointId": event,
+                        "revision": current_revision,
+                        "status": "rejected",
+                        "reason": "device_changed",
+                    }
+                if previous["body"] != body:
                     raise ValueError("Checkpoint ID reused")
                 return json.loads(previous["receipt"])
-            if checkpoint.get("deviceId") != device:
-                raise ValueError("Checkpoint belongs to another device")
 
             def rejected(code: str, revision: int = 0) -> dict[str, Any]:
                 # A well-formed but stale event (book removed, new edition, Mac
@@ -885,11 +1254,14 @@ class IPhoneService:
                 # make the phone retry it forever and block every later sync.
                 receipt = {"checkpointId": event, "revision": revision, "status": "rejected", "reason": code}
                 conn.execute(
-                    "INSERT INTO iphone_checkpoints(id,device,body,receipt) VALUES(?,?,?,?)",
-                    (event, device, body, encoded(receipt)),
+                    "INSERT INTO iphone_checkpoints(id,device,body,receipt,created) VALUES(?,?,?,?,?)",
+                    (event, device, body, encoded(receipt), now_ms()),
                 )
                 return receipt
 
+            if checkpoint.get("deviceId") != device:
+                # Queued under an earlier device ID of this phone (see above).
+                return rejected("device_changed", current_revision)
             manifest_row = conn.execute(
                 "SELECT * FROM iphone_assets WHERE id=?", (checkpoint.get("assetId"),)
             ).fetchone()
@@ -897,10 +1269,6 @@ class IPhoneService:
                 identifier(checkpoint.get("assetId"))
                 return rejected("unknown_asset")
             manifest = json.loads(manifest_row["manifest"])
-            current_revision_row = conn.execute(
-                "SELECT revision FROM iphone_progress WHERE asset=?", (manifest["assetId"],)
-            ).fetchone()
-            current_revision = int(current_revision_row["revision"]) if current_revision_row else 0
             if (
                 checkpoint.get("editionId") != manifest["editionId"]
                 or checkpoint.get("timelineRevision") != manifest["timelineRevision"]
@@ -942,15 +1310,32 @@ class IPhoneService:
                     "SELECT * FROM iphone_listen_marks WHERE device=? AND session=?", (device, session)
                 ).fetchone()
                 if mark is None or sequence > int(mark["sequence"]):
-                    interval = listening_interval(mark, position, observed) if mark is not None else None
-                    if interval is not None:
-                        listened.append(
-                            {
-                                "book_id": int(manifest_row["book_id"]),
-                                "interval": interval,
-                                "checkpoint": event,
-                            }
+                    run = continuous_since(checkpoint, position, observed)
+                    if run is not None:
+                        # Periodic saves the phone merged while they waited to be sent: the
+                        # step into the run as usual, then the run itself.
+                        first = (
+                            listening_interval(mark, run["positionMs"], run["observedAt"])
+                            if mark is not None
+                            else None
                         )
+                        steps = [(first, event), (run_interval(run, position, observed), event + ":run")]
+                    else:
+                        steps = [
+                            (
+                                listening_interval(mark, position, observed) if mark is not None else None,
+                                event,
+                            )
+                        ]
+                    for interval, key in steps:
+                        if interval is not None:
+                            listened.append(
+                                {
+                                    "book_id": int(manifest_row["book_id"]),
+                                    "interval": interval,
+                                    "checkpoint": key,
+                                }
+                            )
                     conn.execute(
                         "INSERT INTO iphone_listen_marks(device,session,sequence,position,observed,reason) VALUES(?,?,?,?,?,?) "
                         "ON CONFLICT(device,session) DO UPDATE SET sequence=excluded.sequence,position=excluded.position,"
@@ -1000,12 +1385,12 @@ class IPhoneService:
                 # Mac clock receive time: "still playing there?" must not depend
                 # on the phone's clock.
                 selected = {**checkpoint, "receivedAt": now_ms()}
-                # Finished is set by "finish" and cleared only by an explicit "unfinish"
-                # (Mark unfinished); "reset" (Start over) moves the place and keeps it.
-                if reason == "finish":
-                    finished = True
-                elif reason == "unfinish":
-                    finished = False
+                # Finished is set by "finish" or a place at the end (audiobook_finish, the
+                # Mac player's rule) and cleared only by an explicit "unfinish" (Mark
+                # unfinished); "reset" (Start over) moves the place and keeps it.
+                finished = audiobook_finish.finished_after_save(
+                    finished, position / 1000, manifest["durationMs"] / 1000, str(reason)
+                )
             else:
                 status = "conflict"
                 # One candidate per listening session: a long parallel session
@@ -1020,8 +1405,8 @@ class IPhoneService:
                 conflicts.append({**checkpoint, "receivedAt": now_ms()})
             receipt = {"checkpointId": event, "revision": revision, "status": status}
             conn.execute(
-                "INSERT INTO iphone_checkpoints(id,device,body,receipt) VALUES(?,?,?,?)",
-                (event, device, body, encoded(receipt)),
+                "INSERT INTO iphone_checkpoints(id,device,body,receipt,created) VALUES(?,?,?,?,?)",
+                (event, device, body, encoded(receipt), now_ms()),
             )
             conn.execute(
                 "INSERT INTO iphone_progress(asset,revision,selected,conflicts,finished) VALUES(?,?,?,?,?) ON CONFLICT(asset) DO UPDATE SET revision=excluded.revision,selected=excluded.selected,conflicts=excluded.conflicts,finished=excluded.finished",
@@ -1054,6 +1439,14 @@ class IPhoneService:
             if selected is None or selected["editionId"] != current["editionId"]:
                 raise ValueError("Invalid resolution")
             revision = row["revision"] + 1
+            # The same rule as an accepted checkpoint: choosing a "finish" candidate used to
+            # leave the book unfinished (and an "unfinish" one finished).
+            finished = audiobook_finish.finished_after_save(
+                bool(row["finished"]),
+                int(selected.get("positionMs") or 0) / 1000,
+                int(current.get("durationMs") or 0) / 1000,
+                str(selected.get("reason") or ""),
+            )
             if selected["deviceId"] == "mac":
                 state = self.mac_sessions.get((asset, selected["playbackSessionId"]))
                 if state is not None:
@@ -1063,14 +1456,14 @@ class IPhoneService:
                 (asset, revision),
             )
             conn.execute(
-                "UPDATE iphone_progress SET revision=?,selected=?,conflicts=? WHERE asset=?",
-                (revision, encoded(selected), "[]", asset),
+                "UPDATE iphone_progress SET revision=?,selected=?,conflicts=?,finished=? WHERE asset=?",
+                (revision, encoded(selected), "[]", int(finished), asset),
             )
             book = conn.execute("SELECT book_id FROM iphone_assets WHERE id=?", (asset,)).fetchone()
             if book and book["book_id"] is not None:
                 conn.execute(
-                    "UPDATE audiobooks SET position=?,updated_at=? WHERE id=?",
-                    (selected["positionMs"] / 1000, time.time(), book["book_id"]),
+                    "UPDATE audiobooks SET position=?,finished=?,updated_at=? WHERE id=?",
+                    (selected["positionMs"] / 1000, int(finished), time.time(), book["book_id"]),
                 )
             return {"revision": revision, "status": "accepted"}
 
@@ -1103,11 +1496,6 @@ class IPhoneService:
             for device, choice in sorted(newest.items(), key=lambda pair: rank(pair[1]), reverse=True)
         ]
 
-    def phone_position_choice(self, progress: dict[str, Any] | None) -> dict[str, Any] | None:
-        """The newest iPhone/iPad candidate while a book's positions conflict."""
-        choices = self.phone_position_choices(progress)
-        return choices[0] if choices else None
-
     def use_phone_position(self, book_id: int, checkpoint_id: str, expected_revision: int) -> float:
         """Resolve a conflict on the Mac in favour of the phone; returns the chosen position."""
         asset = self.asset_for_book(int(book_id))
@@ -1115,44 +1503,157 @@ class IPhoneService:
             raise ValueError("Audiobook is not shared with the iPhone")
         result = self.resolve_progress(asset, int(expected_revision), str(checkpoint_id))
         # A Mac player that keeps playing follows the choice instead of reopening the conflict.
-        for (session_asset, _session), state in self.mac_sessions.items():
+        # (A snapshot: the player and the catalog walk add sessions on their own threads.)
+        for (session_asset, _session), state in list(self.mac_sessions.items()):
             if session_asset == asset:
                 state["base"] = result["revision"]
         return self.progress(asset)["selected"]["positionMs"] / 1000
 
-    def catalog(self) -> dict[str, Any]:
+    def catalog(self, *, lazy: bool = False) -> dict[str, Any]:
+        """Manifests for the phone. ``lazy``: books still to be prepared on request are listed
+        under ``pending`` (title and size only) instead of with a manifest whose copy is gone."""
         with self.db.connect() as conn:
-            items = [json.loads(r["manifest"]) for r in conn.execute("SELECT manifest FROM iphone_assets")]
-        return {"protocolMajor": 2, "serverId": self.server_id, "items": items}
+            # Ordered: the same library gives the same answer (its hash is the catalog's ETag).
+            items = [
+                json.loads(r["manifest"])
+                for r in conn.execute("SELECT manifest FROM iphone_assets ORDER BY id")
+            ]
+        if not lazy:
+            return {"protocolMajor": 2, "serverId": self.server_id, "items": items}
+        pending = dict(self._catalog_pending)
+        return {
+            "protocolMajor": 2,
+            "serverId": self.server_id,
+            "items": [item for item in items if item["assetId"] not in pending],
+            "pending": [pending[key] for key in sorted(pending)],
+        }
 
-    def refresh_catalog(self, wait_seconds: float = 10.0) -> dict[str, Any]:
+    def refresh_catalog(self, wait_seconds: float = 10.0, *, lazy: bool = False) -> dict[str, Any]:
         """Refresh manifests in the background; wait briefly for quick results.
 
         Hashing a new library or converting an incompatible codec can take
         minutes. The phone's catalog request must not hang on it: what is ready
         within ``wait_seconds`` is returned, the rest appears on a later refresh.
+
+        ``lazy`` (phones that prepare on request): only books whose copies are already
+        prepared get a manifest; the others wait for ``prepare_asset`` (hashing a whole
+        library and converting every FLAC/Opus book took hours and gigabytes for books
+        never downloaded).
         """
+        self.prune_history()
         with self._catalog_lock:
             worker = self._catalog_worker
             if worker is None or not worker.is_alive():
                 worker = threading.Thread(
-                    target=self._refresh_catalog_worker, name="pudge-iphone-catalog", daemon=True
+                    target=self._refresh_catalog_worker,
+                    args=(lazy,),
+                    name="pudge-iphone-catalog",
+                    daemon=True,
                 )
                 self._catalog_worker = worker
                 worker.start()
         worker.join(timeout=max(0.0, float(wait_seconds)))
         return {"errors": list(self._catalog_errors), "preparing": worker.is_alive()}
 
-    def _refresh_catalog_worker(self) -> None:
+    def prepare_asset(self, asset: Any, wait_seconds: float = 20.0) -> dict[str, Any]:
+        """The phone wants to download a book of a lazy catalog: prepare it first (it comes
+        before every other book). Ready → its manifest; otherwise "preparing" (ask again)."""
+        asset = identifier(asset)
+        with self.db.connect() as conn:
+            known = conn.execute("SELECT 1 FROM iphone_assets WHERE id=?", (asset,)).fetchone()
+        if known is None and asset not in self._catalog_pending:
+            raise KeyError("Unknown asset")
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO iphone_prepare_requests(asset,requested) VALUES(?,?) "
+                "ON CONFLICT(asset) DO UPDATE SET requested=excluded.requested",
+                (asset, now_ms()),
+            )
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        # A walk already running when the request came may not see it; the next one does.
+        for walk in range(2):
+            self.refresh_catalog(wait_seconds=max(0.0, deadline - time.monotonic()), lazy=True)
+            with self.db.connect() as conn:
+                waiting = conn.execute(
+                    "SELECT 1 FROM iphone_prepare_requests WHERE asset=?", (asset,)
+                ).fetchone()
+                if waiting is not None and walk == 1 and time.monotonic() < deadline:
+                    # Two full walks did not take it: not a book of this Mac's library (an
+                    # edition archived from a phone), which needs no preparation.
+                    conn.execute("DELETE FROM iphone_prepare_requests WHERE asset=?", (asset,))
+                    waiting = None
+            if waiting is None or time.monotonic() >= deadline:
+                break
+        if waiting is not None:
+            return {"status": "preparing"}
+        failed = next((item for item in self._catalog_errors if item.get("assetId") == asset), None)
+        if failed is not None:
+            return {"status": "failed", "error": failed.get("error") or "Preparation failed"}
+        if asset not in self._catalog_pending:
+            try:
+                return {"status": "ready", "manifest": self.manifest(asset)}
+            except KeyError:
+                pass
+        return {"status": "preparing"}
+
+    def _refresh_catalog_worker(self, lazy: bool = False) -> None:
         try:
-            self._catalog_errors = self._refresh_catalog_now()["errors"]
+            self._catalog_errors = self._refresh_catalog_now(lazy=lazy)["errors"]
         except Exception as exc:  # A failed scan must never break the HTTP server.
             self._catalog_errors = [{"title": "*", "error": type(exc).__name__}]
 
-    def _refresh_catalog_now(self) -> dict[str, Any]:
+    def _cached_prepared_audio(self, source: Path) -> dict[str, Any] | None:
+        """The prepared copy of a source when it is current (nothing hashed or converted)."""
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
         with self.db.connect() as conn:
-            books = [dict(r) for r in conn.execute("SELECT * FROM audiobooks ORDER BY id")]
+            row = conn.execute(
+                "SELECT size,mtime_ns,result FROM iphone_prepared WHERE source=?", (str(source),)
+            ).fetchone()
+        if row is None or row["size"] != stat.st_size or row["mtime_ns"] != stat.st_mtime_ns:
+            return None
+        cached = json.loads(row["result"])
+        target = Path(cached["path"])
+        try:
+            if not target.is_file() or target.stat().st_size != cached["sizeBytes"]:
+                return None
+        except OSError:
+            return None
+        return {**cached, "path": target}
+
+    def _refresh_catalog_now(self, *, lazy: bool = False) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            # Newest first: a book added today no longer waits for every older one.
+            books = [dict(r) for r in conn.execute("SELECT * FROM audiobooks ORDER BY id DESC")]
+            requested = {
+                str(r["asset"])
+                for r in conn.execute("SELECT asset FROM iphone_prepare_requests ORDER BY requested")
+            }
+            assets = {
+                int(r["book_id"]): str(r["id"])
+                for r in conn.execute("SELECT id,book_id FROM iphone_assets WHERE book_id IS NOT NULL")
+            }
+
+        def asset_of(book: dict[str, Any]) -> str:
+            return assets.get(int(book["id"])) or str(
+                uuid.uuid5(uuid.UUID(self.server_id), "audiobook:" + str(book["id"]))
+            )
+
+        def ready(book: dict[str, Any]) -> bool:
+            with self.db.connect() as conn:
+                paths = [
+                    str(r["path"])
+                    for r in conn.execute("SELECT path FROM audiobook_files WHERE book_id=?", (book["id"],))
+                ] or [str(book["path"])]
+            return all(self._cached_prepared_audio(Path(path)) is not None for path in paths)
+
+        # What a phone asked for first, then what is already prepared (fast), then the rest.
+        cheap = {int(book["id"]) for book in books if ready(book)}
+        books.sort(key=lambda book: (asset_of(book) not in requested, int(book["id"]) not in cheap))
         errors = []
+        pending: dict[str, dict[str, Any]] = {}
         for book in books:
             try:
                 with self.db.connect() as conn:
@@ -1182,6 +1683,22 @@ class IPhoneService:
                     if existing
                     else str(uuid.uuid5(uuid.UUID(self.server_id), "audiobook:" + str(book["id"])))
                 )
+                if lazy and int(book["id"]) not in cheap and asset not in requested:
+                    entry: dict[str, Any] = {
+                        "assetId": asset,
+                        "title": str(book["title"] or "")[:1024] or "Audiobook",
+                        "needsPreparation": True,
+                    }
+                    if float(book.get("duration") or 0) > 0:
+                        entry["durationMs"] = round(float(book["duration"]) * 1000)
+                    entry.update(self._series_info(book["id"]))
+                    # Its cover too (made once, then a cached file): the phone shows the book with
+                    # its picture, in its series, before anyone asks the Mac to prepare it.
+                    cover = self._book_cover(book["id"], Path(files[0]["path"]))
+                    if cover is not None:
+                        entry["cover"] = cover
+                    pending[asset] = entry
+                    continue
                 prepared = [self._prepared_audio(Path(f["path"])) for f in files]
                 edition = str(
                     uuid.uuid5(
@@ -1207,10 +1724,7 @@ class IPhoneService:
                     )
                     offset += p["canonicalDurationMs"]
                     with self.db.connect() as conn:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO iphone_resources(id,sha,size,path) VALUES(?,?,?,?)",
-                            (resource, p["sha256"], p["sizeBytes"], str(p["path"])),
-                        )
+                        self.register_resource(conn, resource, p["sha256"], p["sizeBytes"], p["path"])
                 manifest = {
                     "protocolMajor": 2,
                     "assetId": asset,
@@ -1246,8 +1760,17 @@ class IPhoneService:
                 session = getattr(self.audiobooks, "_playback_sessions", {}).get(book["id"])
                 if session and (asset, session) not in self.mac_sessions:
                     self.begin_mac_session(asset, session)
-            except (ValueError, OSError, subprocess.SubprocessError) as exc:
-                errors.append({"title": book["title"], "error": type(exc).__name__})
+            except Exception as exc:  # noqa: BLE001 - one book (an old row, an odd file) never ends the walk
+                # A KeyError/TypeError used to end the walk: every later book stayed
+                # "preparing" for the phone and its prepare request was never cleared.
+                errors.append(
+                    {"title": book["title"], "error": type(exc).__name__, "assetId": asset_of(book)}
+                )
+            finally:
+                if asset_of(book) in requested:
+                    with self.db.connect() as conn:
+                        conn.execute("DELETE FROM iphone_prepare_requests WHERE asset=?", (asset_of(book),))
+        self._catalog_pending = pending
         self._forget_deleted_mac_books()
         return {"errors": errors}
 
@@ -1291,7 +1814,7 @@ class IPhoneService:
             source_sha = self.file_sha256(source)
             target = self.root / "objects" / f"cover-{source_sha}-w{self._COVER_MAX_WIDTH}.jpg"
             if not target.is_file() or target.stat().st_size <= 0:
-                temporary = target.with_name(target.name + ".tmp.jpg")
+                temporary = temporary_sibling(target, ".tmp.jpg")
                 ffmpeg = getattr(self.audiobooks, "ffmpeg", "ffmpeg")
                 try:
                     subprocess.run(
@@ -1326,10 +1849,7 @@ class IPhoneService:
             return None
         cover_id = str(uuid.uuid5(uuid.UUID(self.server_id), "cover:" + sha))
         with self.db.connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO iphone_resources(id,sha,size,path) VALUES(?,?,?,?)",
-                (cover_id, sha, size, str(target)),
-            )
+            self.register_resource(conn, cover_id, sha, size, target)
         return {"resourceId": cover_id, "sha256": sha, "sizeBytes": size, "fileName": "cover.jpg"}
 
     def _book_details(self, book_id: int) -> dict[str, Any]:
@@ -1382,7 +1902,7 @@ class IPhoneService:
                     (int(book_id),),
                 ).fetchone()
             if link is None:
-                return None
+                return self._anime_read_along(int(book_id))
             ln_id = int(link["ln_book_id"])
             path = Path(audio._alignment_path(ln_id, int(book_id)))
             if not path.is_file():
@@ -1420,9 +1940,7 @@ class IPhoneService:
             sha = hashlib.sha256(data).hexdigest()
             target = self.root / "objects" / f"readalong-{sha}.json"
             if not target.is_file():
-                temporary = target.with_name(target.name + ".tmp")
-                temporary.write_bytes(data)
-                os.replace(temporary, target)
+                atomic_write_bytes(target, data)
             resource = str(uuid.uuid5(uuid.UUID(self.server_id), "readalong:" + sha))
             result = {
                 "resourceId": resource,
@@ -1431,10 +1949,7 @@ class IPhoneService:
                 "fileName": "readalong.json",
             }
             with self.db.connect() as conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO iphone_resources(id,sha,size,path) VALUES(?,?,?,?)",
-                    (resource, sha, len(data), str(target)),
-                )
+                self.register_resource(conn, resource, sha, len(data), target)
                 conn.execute(
                     "INSERT INTO iphone_prepared(source,size,mtime_ns,result) VALUES(?,?,?,?) "
                     "ON CONFLICT(source) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,result=excluded.result",
@@ -1444,141 +1959,73 @@ class IPhoneService:
         except Exception:  # noqa: BLE001 - read-along is optional; audio never depends on it
             return None
 
-    _SENTENCE_END = frozenset("。！？!?…")
-    _SENTENCE_CLOSE = frozenset("」』）)】〉》\"'")
+    def _anime_read_along(self, book_id: int) -> dict[str, Any] | None:
+        """An audiobook made from anime episodes: their prepared subtitles as read-along text."""
+        from .anime_audiobooks import read_along_document, read_along_signature
+
+        try:
+            # The catalog asks for every book on every sync: the document is built (and
+            # hashed) again only when an episode's text, the chapters or the title changed.
+            signature = read_along_signature(self.db, int(book_id))
+            if signature is None:
+                return None
+            key = f"readalong-anime:{int(book_id)}"
+            with self.db.connect() as conn:
+                row = conn.execute("SELECT result FROM iphone_prepared WHERE source=?", (key,)).fetchone()
+            if row is not None:
+                cached = json.loads(row["result"])
+                if cached.get("signature") == signature:
+                    if not cached.get("resourceId"):
+                        return None  # no text, as before
+                    target = Path(cached["path"])
+                    if target.is_file() and target.stat().st_size == cached["sizeBytes"]:
+                        return {k: cached[k] for k in ("resourceId", "sha256", "sizeBytes", "fileName")}
+            document = read_along_document(self.db, int(book_id))
+            data = (
+                json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                if document
+                else b""
+            )
+            if not data or len(data) > 50 * 1024 * 1024:
+                with self.db.connect() as conn:
+                    conn.execute(
+                        "INSERT INTO iphone_prepared(source,size,mtime_ns,result) VALUES(?,0,0,?) "
+                        "ON CONFLICT(source) DO UPDATE SET size=0,mtime_ns=0,result=excluded.result",
+                        (key, encoded({"signature": signature})),
+                    )
+                return None
+            sha = hashlib.sha256(data).hexdigest()
+            target = self.root / "objects" / f"readalong-{sha}.json"
+            if not target.is_file():
+                atomic_write_bytes(target, data)
+            resource = str(uuid.uuid5(uuid.UUID(self.server_id), "readalong:" + sha))
+            result = {
+                "resourceId": resource,
+                "sha256": sha,
+                "sizeBytes": len(data),
+                "fileName": "readalong.json",
+            }
+            with self.db.connect() as conn:
+                self.register_resource(conn, resource, sha, len(data), target)
+                conn.execute(
+                    "INSERT INTO iphone_prepared(source,size,mtime_ns,result) VALUES(?,?,0,?) "
+                    "ON CONFLICT(source) DO UPDATE SET size=excluded.size,mtime_ns=0,result=excluded.result",
+                    (key, len(data), encoded({**result, "path": str(target), "signature": signature})),
+                )
+            return result
+        except Exception:  # noqa: BLE001 - read-along is optional; audio never depends on it
+            return None
+
+    _SENTENCE_END = read_along.SENTENCE_END
+    _SENTENCE_CLOSE = read_along.SENTENCE_CLOSE
 
     def _read_along_document(self, ln_id: int, alignment: dict[str, Any]) -> dict[str, Any]:
-        from .reading_audio_alignment import (
-            _IMAGE_PARAGRAPH_RE,
-            _runtime_audio_position_index,
-            normalize_reading_text,
-        )
-        from .iphone_media import compact_tokens, utf16_to_index
-
-        with self.db.connect() as conn:
-            texts = {
-                int(r["chapter_index"]): (str(r["title"]), str(r["text"]))
-                for r in conn.execute(
-                    "SELECT chapter_index,title,text FROM ln_chapters WHERE book_id=?", (int(ln_id),)
-                )
-            }
-            try:
-                hashes = {
-                    int(r["chapter_index"]): str(r["text_hash"])
-                    for r in conn.execute(
-                        "SELECT chapter_index,text_hash FROM ln_chapters WHERE book_id=?", (int(ln_id),)
-                    )
-                }
-            except Exception:  # noqa: BLE001 - older schema without hashes: sentences only
-                hashes = {}
-            title_row = conn.execute("SELECT title FROM ln_books WHERE id=?", (int(ln_id),)).fetchone()
         reader = getattr(getattr(self, "api", None), "light_novels", None)
-        chapters = []
-        for row in _runtime_audio_position_index(alignment).get("chapters") or []:
-            chapter = row["chapter"]
-            index = int(chapter.get("chapter_index") or 0)
-            if index not in texts:
-                continue
-            title, text = texts[index]
-            parsed = None
-            if reader is not None and index in hashes:
-                try:
-                    parsed = reader._cached_parse(hashes[index], provider="jiten")
-                except Exception:  # noqa: BLE001 - words are optional
-                    parsed = None
-            groups = (parsed or {}).get("tokens") or []
-            vocabulary = (parsed or {}).get("vocabulary") or []
-            sentences = []
-            cursor = 0
-            paragraph = 0
-            parse_index = -1
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                parse_index += 1
-                if _IMAGE_PARAGRAPH_RE.fullmatch(line):
-                    continue
-                group = (
-                    compact_tokens(groups[parse_index], vocabulary, line) if parse_index < len(groups) else []
-                )
-                to_python = utf16_to_index(line)
-                to_utf16 = [0]
-                for character in line:
-                    to_utf16.append(to_utf16[-1] + (2 if ord(character) > 0xFFFF else 1))
-                # Normalized offset of each word start, counted like the Mac reader (gaps + words).
-                starts, running, previous = [], cursor, 0
-                for token in group:
-                    at = to_python[min(token[0], len(to_python) - 1)]
-                    running += len(normalize_reading_text(line[previous:at])) if at > previous else 0
-                    previous = max(previous, at)
-                    starts.append(running)
-                begin = 0
-                for piece in self._split_sentences(line):
-                    length = len(normalize_reading_text(piece))
-                    item = {"p": paragraph, "text": piece, "start": cursor, "end": cursor + length}
-                    low, high = to_utf16[begin], to_utf16[begin + len(piece)]
-                    words = [
-                        [token[0] - low, min(token[1], high) - low, start, token[2], token[3]]
-                        for token, start in zip(group, starts)
-                        if low <= token[0] < high
-                    ]
-                    if words:
-                        item["w"] = words
-                    sentences.append(item)
-                    cursor += length
-                    begin += len(piece)
-                paragraph += 1
-            anchors = []
-            for anchor in row["anchors"]:
-                point = [
-                    max(0, round(float(anchor["time"]) * 1000)),
-                    max(0, int(round(float(anchor["offset"])))),
-                ]
-                if anchors and (point[0] < anchors[-1][0] or point[1] < anchors[-1][1]):
-                    continue  # the phone interpolates on a monotonic clock
-                if anchors and point[0] - anchors[-1][0] < 400 and point[1] - anchors[-1][1] < 4:
-                    continue
-                anchors.append(point)
-            if not sentences or len(anchors) < 2:
-                continue
-            chapters.append(
-                {
-                    "index": index,
-                    "title": title,
-                    "startMs": round(float(row["start"]) * 1000),
-                    "endMs": round(float(row["end"]) * 1000),
-                    "sentences": sentences,
-                    "anchors": anchors,
-                }
-            )
-        return {"schema": 1, "title": str(title_row["title"]) if title_row else "", "chapters": chapters}
+        return read_along.light_novel_document(self.db, reader, int(ln_id), alignment)
 
     @classmethod
     def _split_sentences(cls, line: str) -> list[str]:
-        pieces, current = [], ""
-        for index, character in enumerate(line):
-            current += character
-            following = line[index + 1] if index + 1 < len(line) else ""
-            if (
-                character in cls._SENTENCE_END
-                and following not in cls._SENTENCE_END
-                and following not in cls._SENTENCE_CLOSE
-            ):
-                pieces.append(current)
-                current = ""
-            elif (
-                character in cls._SENTENCE_CLOSE
-                and current
-                and len(current) > 1
-                and current[-2] in cls._SENTENCE_END
-                and following not in cls._SENTENCE_CLOSE
-            ):
-                pieces.append(current)
-                current = ""
-        if current:
-            pieces.append(current)
-        return pieces
+        return read_along.split_sentences(line)
 
     def _cover_source(self, book_id: int, first_file: Path) -> Path | None:
         audio = self.audiobooks
@@ -1599,12 +2046,18 @@ class IPhoneService:
                     return paths[1]
         return None
 
+    REMOTE_COVER_RETRY_SECONDS = 3600.0
+
     def _remote_cover(self, url: str) -> Path | None:
         folder = self.root / "cover-sources"
         folder.mkdir(exist_ok=True, mode=0o700)
         target = folder / hashlib.sha256(url.encode("utf-8")).hexdigest()
         if target.is_file() and target.stat().st_size > 0:
             return target
+        failures = self.__dict__.setdefault("_remote_cover_failures", {})
+        if time.monotonic() - failures.get(url, float("-inf")) < self.REMOTE_COVER_RETRY_SECONDS:
+            # An offline Mac waited 15 s per book on every catalog walk: tried again later.
+            return None
         try:
             import httpx
 
@@ -1612,12 +2065,11 @@ class IPhoneService:
             response.raise_for_status()
             data = response.content
         except Exception:  # noqa: BLE001 - offline Mac: no cover, catalog still works
+            failures[url] = time.monotonic()
             return None
         if not 0 < len(data) <= 10 * 1024 * 1024:
             return None
-        temporary = target.with_name(target.name + ".tmp")
-        temporary.write_bytes(data)
-        os.replace(temporary, target)
+        atomic_write_bytes(target, data)
         return target
 
     def bookmarks(self, asset: str) -> dict[str, Any]:
@@ -1630,6 +2082,36 @@ class IPhoneService:
                 for r in conn.execute("SELECT body FROM iphone_bookmarks WHERE asset=?", (asset,))
             ]
         return {"items": values}
+
+    STATE_BATCH_LIMIT = 1000
+
+    def sync_state(self, assets: Any, since: Any = None) -> dict[str, Any]:
+        """Progress and bookmarks of several books in one answer (the phone asked for each book
+        twice on every 15 s sync, ~20 requests a second for a large library).
+
+        ``revision`` identifies the answer; when the phone sends the one it has (``since``)
+        and nothing changed, the items are left out (``unchanged``).
+        """
+        if not isinstance(assets, list) or len(assets) > self.STATE_BATCH_LIMIT:
+            raise ValueError("Invalid asset list")
+        wanted = list(dict.fromkeys(identifier(asset) for asset in assets))
+        marks: dict[str, list[dict[str, Any]]] = {}
+        # One lock for all books (the Mac player's position saves take it too).
+        with self.lock, self.db.connect() as conn:
+            for asset in wanted:
+                self._sync_desktop_bookmarks(conn, asset)
+                marks[asset] = [
+                    json.loads(r["body"])
+                    for r in conn.execute("SELECT body FROM iphone_bookmarks WHERE asset=?", (asset,))
+                ]
+        items = [
+            {"assetId": asset, "progress": self.progress_view(asset), "bookmarks": marks[asset]}
+            for asset in wanted
+        ]
+        revision = hashlib.sha256(encoded(items).encode()).hexdigest()[:32]
+        if since == revision:
+            return {"revision": revision, "unchanged": True, "items": []}
+        return {"revision": revision, "unchanged": False, "items": items}
 
     def _sync_desktop_bookmarks(self, conn: Any, asset: str) -> None:
         row = conn.execute("SELECT book_id,manifest FROM iphone_assets WHERE id=?", (asset,)).fetchone()
@@ -1690,8 +2172,14 @@ class IPhoneService:
                 "INSERT OR REPLACE INTO iphone_bookmark_links(id,desktop_id) VALUES(?,?)", (key, desktop_id)
             )
             conn.execute(
-                "INSERT INTO iphone_bookmark_events(id,device,body,receipt) VALUES(?,?,?,?)",
-                (event, "mac", encoded(body), encoded({"eventId": event, "revision": revision + 1})),
+                "INSERT INTO iphone_bookmark_events(id,device,body,receipt,created) VALUES(?,?,?,?,?)",
+                (
+                    event,
+                    "mac",
+                    encoded(body),
+                    encoded({"eventId": event, "revision": revision + 1}),
+                    now_ms(),
+                ),
             )
 
     def record_bookmark(self, device: str, bookmark: dict[str, Any]) -> dict[str, Any]:
@@ -1702,15 +2190,19 @@ class IPhoneService:
             conn.execute("BEGIN IMMEDIATE")
             old_event = conn.execute("SELECT * FROM iphone_bookmark_events WHERE id=?", (event,)).fetchone()
             if old_event:
-                if old_event["device"] != device or old_event["body"] != body:
+                if old_event["device"] != device:
+                    # Sent before under this phone's earlier device ID (set up again, as for
+                    # checkpoints): a final receipt, nothing stored; an error stopped its queue.
+                    return {"eventId": event, "revision": 0, "status": "rejected", "reason": "device_changed"}
+                if old_event["body"] != body:
                     raise ValueError("Bookmark event reused")
                 return json.loads(old_event["receipt"])
 
             def rejected(code: str, revision: int = 0) -> dict[str, Any]:
                 receipt = {"eventId": event, "revision": revision, "status": "rejected", "reason": code}
                 conn.execute(
-                    "INSERT INTO iphone_bookmark_events(id,device,body,receipt) VALUES(?,?,?,?)",
-                    (event, device, body, encoded(receipt)),
+                    "INSERT INTO iphone_bookmark_events(id,device,body,receipt,created) VALUES(?,?,?,?,?)",
+                    (event, device, body, encoded(receipt), now_ms()),
                 )
                 return receipt
 
@@ -1747,8 +2239,8 @@ class IPhoneService:
             )
             receipt = {"eventId": event, "revision": revision + 1}
             conn.execute(
-                "INSERT INTO iphone_bookmark_events(id,device,body,receipt) VALUES(?,?,?,?)",
-                (event, device, body, encoded(receipt)),
+                "INSERT INTO iphone_bookmark_events(id,device,body,receipt,created) VALUES(?,?,?,?,?)",
+                (event, device, body, encoded(receipt), now_ms()),
             )
             if row["book_id"] is not None:
                 link = conn.execute(
@@ -1830,8 +2322,8 @@ class IPhoneService:
                 }
                 with self.lock, self.db.connect() as conn:
                     conn.execute(
-                        "INSERT OR IGNORE INTO iphone_handoffs(id,body,result) VALUES(?,?,?)",
-                        (operation, encoded({**request, "targetDeviceId": "mac"}), encoded(result)),
+                        "INSERT OR IGNORE INTO iphone_handoffs(id,body,result,created) VALUES(?,?,?,?)",
+                        (operation, encoded({**request, "targetDeviceId": "mac"}), encoded(result), now_ms()),
                     )
                 return result
         return self.handoff("mac", request)
@@ -1995,9 +2487,12 @@ class IPhoneService:
                     row = conn.execute(
                         "SELECT position,finished,updated_at FROM audiobooks WHERE id=?", (book_id,)
                     ).fetchone()
+                # Compared on the Mac clock (receivedAt): observedAt is the phone's clock, so a
+                # phone running ahead hid the Mac's own newer listening.
+                seen = int(selected.get("receivedAt") or selected.get("observedAt") or 0)
                 if (
                     row is not None
-                    and float(row["updated_at"] or 0) * 1000 > selected["observedAt"]
+                    and float(row["updated_at"] or 0) * 1000 > seen
                     and abs(float(row["position"] or 0) * 1000 - selected["positionMs"]) > 2000
                 ):
                     # The Mac played while this service was not attached (iPhone
@@ -2011,6 +2506,12 @@ class IPhoneService:
 
     def handoff(self, device: str, request: dict[str, Any]) -> dict[str, Any]:
         operation = identifier(request.get("operationId"))
+        # Copies of one request (the phone retries while the Mac still pauses) run one after
+        # the other: a copy started meanwhile used to answer from a half-done handoff.
+        with self._keyed_lock(self._handoff_locks, operation):
+            return self._handoff(device, request, operation)
+
+    def _handoff(self, device: str, request: dict[str, Any], operation: str) -> dict[str, Any]:
         asset = identifier(request.get("assetId"))
         expected = integer(request.get("expectedRevision"), "revision")
         body = encoded({**request, "targetDeviceId": device})
@@ -2029,7 +2530,9 @@ class IPhoneService:
                     )
                     return result
             else:
-                conn.execute("INSERT INTO iphone_handoffs(id,body) VALUES(?,?)", (operation, body))
+                conn.execute(
+                    "INSERT INTO iphone_handoffs(id,body,created) VALUES(?,?,?)", (operation, body, now_ms())
+                )
         progress = self.progress(asset)
         deterministic = str(uuid.uuid5(uuid.UUID(operation), "final-checkpoint"))
         with self.db.connect() as conn:
@@ -2144,8 +2647,19 @@ class IPhoneService:
                                         "positionMs": value,
                                         "revision": receipt["revision"],
                                     }
+        # An answer saved meanwhile (the phone's acknowledgement) stays final: an unconditional
+        # save overwrote "source_paused" with "revision_conflict".
         with self.db.connect() as conn:
-            conn.execute("UPDATE iphone_handoffs SET result=? WHERE id=?", (encoded(result), operation))
+            saved = conn.execute(
+                "UPDATE iphone_handoffs SET result=? WHERE id=? AND result IS NULL",
+                (encoded(result), operation),
+            ).rowcount
+            if not saved:
+                stored = conn.execute(
+                    "SELECT result FROM iphone_handoffs WHERE id=?", (operation,)
+                ).fetchone()
+                if stored is not None and stored["result"]:
+                    return json.loads(stored["result"])
         return result
 
     _DEVICE_HANDOFF_MS = 60000

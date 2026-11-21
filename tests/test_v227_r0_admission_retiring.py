@@ -49,7 +49,7 @@ def test_debug_fresh_coalesces_same_video_and_queues_distinct_videos(tmp_path: P
                 process_calls.append(video)
             if video == one:
                 first_inside.set()
-                assert release_first.wait(2)
+                assert release_first.wait(30)
             else:
                 second_inside.set()
         return 1
@@ -66,7 +66,7 @@ def test_debug_fresh_coalesces_same_video_and_queues_distinct_videos(tmp_path: P
 
     first = WebAppApi.debug_reselect_subtitles(fake, str(one))
     assert first["ok"] is True
-    assert first_inside.wait(1)
+    assert first_inside.wait(30)
 
     duplicate = WebAppApi.debug_reselect_subtitles(fake, str(one))
     assert duplicate["already_running"] is True
@@ -78,7 +78,7 @@ def test_debug_fresh_coalesces_same_video_and_queues_distinct_videos(tmp_path: P
     assert not second_inside.is_set()
 
     release_first.set()
-    assert second_inside.wait(1)
+    assert second_inside.wait(30)
     assert supervisor.shutdown(timeout=2) == []
 
     assert force_calls == [one, two]
@@ -108,7 +108,7 @@ def test_debug_fresh_worker_failure_releases_priority_request(tmp_path: Path) ->
 
     result = WebAppApi.debug_reselect_subtitles(fake, str(tmp_path / "failure.mkv"))
     assert result["ok"] is True
-    assert entered.wait(1)
+    assert entered.wait(30)
     assert supervisor.shutdown(timeout=2) == []
     assert scheduler._priority_requests == []
     assert not scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND)
@@ -129,7 +129,7 @@ def test_supervisor_tracks_retiring_cooperative_task_until_actual_finish() -> No
         old_worker,
         pass_cancel_event=True,
     )
-    assert old_entered.wait(1)
+    assert old_entered.wait(30)
 
     replacement = supervisor.start_with_admission(
         "same-name",
@@ -149,9 +149,9 @@ def test_supervisor_tracks_retiring_cooperative_task_until_actual_finish() -> No
     )
 
     release_old.set()
-    old.thread.join(1)
+    old.thread.join(30)
     assert not old.running
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 30  # ends as soon as it retired
     while time.monotonic() < deadline and any(row["retiring"] for row in supervisor.status()):
         time.sleep(0.01)
     assert not any(row["retiring"] for row in supervisor.status())

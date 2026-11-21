@@ -30,7 +30,7 @@ def test_ln_close_waits_for_transaction_before_restore_can_replace_file(tmp_path
             conn.execute("CREATE TABLE restore_barrier_test(value INTEGER)")
             conn.execute("INSERT INTO restore_barrier_test VALUES(7)")
             entered.set()
-            assert release.wait(2)
+            assert release.wait(30)
 
     def close():
         try:
@@ -43,7 +43,7 @@ def test_ln_close_waits_for_transaction_before_restore_can_replace_file(tmp_path
     worker = threading.Thread(target=writer)
     closer = threading.Thread(target=close)
     worker.start()
-    assert entered.wait(1)
+    assert entered.wait(30)
     closer.start()
     try:
         assert not finished.wait(0.05), "Database replacement must wait for its active writer"
@@ -63,12 +63,12 @@ def test_late_dictionary_fetch_cannot_write_after_repository_is_closed(tmp_path)
 
     def fetch():
         entered.set()
-        assert release.wait(2)
+        assert release.wait(30)
         return {"wordId": 7, "readingIndex": 0, "reading": "なな", "dictionary_complete": True}
 
     try:
         repository.resolve("account", {"wordId": 7}, fetch)
-        assert entered.wait(1)
+        assert entered.wait(30)
         getattr(repository, "close", lambda **kwargs: None)(timeout=1)
         release.set()
         repository.pool.shutdown()

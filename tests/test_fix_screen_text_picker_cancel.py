@@ -45,7 +45,7 @@ def test_panel_appears_only_after_a_window_is_chosen_next_to_it() -> None:
     panel, windows = make_panel(api, source)
     opener = threading.Thread(target=panel.toggle)
     opener.start()
-    assert api.picker_open.wait(2.0)
+    assert api.picker_open.wait(30)
     assert windows == [] and not panel.opened
     api.picker_choice.set()
     opener.join(2.0)

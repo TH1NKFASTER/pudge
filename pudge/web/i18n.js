@@ -129,6 +129,9 @@
     let body = value.slice(prefix.length);
     // Python's KeyError quotes its message.
     if (body.length >= 2 && body[0] === body[body.length - 1] && (body[0] === "'" || body[0] === '"')) body = body.slice(1, -1);
+    // The templates' lazy wildcards backtrack badly on long near-matches (a
+    // few KB froze the window for a minute): long texts are shown as they are.
+    if (body.length > 500) return value;
     for (const pattern of errorPatterns) {
       const match = pattern.regex.exec(body);
       if (!match) continue;

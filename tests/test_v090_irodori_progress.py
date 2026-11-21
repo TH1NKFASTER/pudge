@@ -51,7 +51,7 @@ def test_duplicate_irodori_click_returns_existing_job(
 
     monkeypatch.setattr(api, "_irodori_tts_worker", worker)
     first = api.generate_light_novel_tts(int(book["id"]))
-    assert entered.wait(timeout=2)
+    assert entered.wait(timeout=30)
     second = api.generate_light_novel_tts(int(book["id"]))
     assert first["started"] is True
     assert second["started"] is False

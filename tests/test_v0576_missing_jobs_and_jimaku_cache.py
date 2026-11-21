@@ -69,7 +69,7 @@ def test_manual_refresh_recreates_missing_job_from_waiting_library_row(tmp_path:
     assert job["episode"] == 6
 
 
-def test_manual_refresh_recovers_processing_job_before_lease_expires(tmp_path: Path, monkeypatch) -> None:
+def test_manual_refresh_recovers_processing_job_once_its_lease_expired(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
     stub_regular_maintenance(monkeypatch, manager)
     video = manager.config.library.root_dir / "Mushoku Tensei III - 06.mkv"
@@ -96,8 +96,16 @@ def test_manual_refresh_recovers_processing_job_before_lease_expires(tmp_path: P
         return observed["due"]
 
     monkeypatch.setattr(manager, "process_subtitle_jobs", process)
+    # A live lease: the agent (which runs subtitle jobs without the maintenance lock)
+    # may be preparing it right now. Taking it over prepared the episode twice.
     manager.run_once(force_subtitle_retry=True)
+    assert observed["due"] == 0
+    assert manager.db.subtitle_jobs()[0]["state"] == "processing"
 
+    # Its worker was killed: once the lease ran out, Refresh takes the job back.
+    with manager.db.connect() as conn:
+        conn.execute("UPDATE subtitle_jobs SET lease_until=?", (time.time() - 1,))
+    manager.run_once(force_subtitle_retry=True)
     assert observed["due"] == 1
     assert manager.db.subtitle_jobs()[0]["state"] == "pending"
 

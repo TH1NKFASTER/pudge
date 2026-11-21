@@ -96,7 +96,7 @@ def test_a_refused_personal_key_is_not_reported_as_a_trial_problem(tmp_path, mon
 
 def test_the_ended_trial_is_one_notice_per_trial(tmp_path, monkeypatch):
     _config(tmp_path, monkeypatch, now=1000.0)
-    expired = _config(tmp_path, monkeypatch, now=1000.0 + 49 * 3600)
+    expired = _config(tmp_path, monkeypatch, now=1000.0 + (7 * 24 + 1) * 3600)  # the 7-day trial is over
     assert not expired.jimaku.trial_active and expired.jimaku.api_key == ""
     problem = jimaku_key_problem(expired)
     assert (problem["kind"], problem["seen"]) == ("trial_expired", False)

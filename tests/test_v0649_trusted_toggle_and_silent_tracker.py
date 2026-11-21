@@ -26,8 +26,8 @@ def _manager(tmp_path: Path) -> AnimeManager:
 def _strong_untrusted() -> NyaaRelease:
     return NyaaRelease(
         title="[AnoZu] Bleach S17E43 REPACK 1080p WEB-DL",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="a" * 40,
         size_text="1006.8 MiB",
         size_bytes=1007 * 1024 * 1024,

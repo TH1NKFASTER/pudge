@@ -142,9 +142,15 @@ def test_release_uses_locked_hashed_dependencies(tmp_path: Path) -> None:
     # resolves them (with uv.lock it exports them: test_fix_locked_dev_installs.py).
     release = release_history()
     requirements = str(release.projects["9.8.6"] / "release-requirements.txt")
-    assert ["install", "--quiet", "--upgrade", "--require-hashes", "-r", requirements] in release.steps[
-        "install"
-    ].result.calls("pip")
+    assert [
+        "install",
+        "--quiet",
+        "--no-cache-dir",
+        "--upgrade",
+        "--require-hashes",
+        "-r",
+        requirements,
+    ] in release.steps["install"].result.calls("pip")
     development = source_history().steps["install"].result.calls("pip")
     assert not [call for call in development if "-r" in call]
     assert [call for call in development if call[-1].endswith(".whl[sync]")]

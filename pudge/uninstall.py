@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .branding import (
     APP_AGENT_CLI,
@@ -221,14 +222,25 @@ def render_uninstall_script(plan: UninstallPlan, *, parent_pid: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def launch_uninstaller(plan: UninstallPlan, *, parent_pid: int | None = None) -> Path:
+def launch_uninstaller(
+    plan: UninstallPlan,
+    *,
+    parent_pid: int | None = None,
+    on_started: Callable[[int], None] | None = None,
+) -> Path:
+    """Start the detached cleanup script; ``on_started`` gets its pid.
+
+    The script is a child of the app until the app exits: the app's quit
+    cleanup must leave that pid alone (it used to kill the script while it
+    waited, so nothing was removed).
+    """
     descriptor, raw_path = tempfile.mkstemp(prefix=f"{APP_SLUG}-uninstall-", suffix=".zsh")
     script_path = Path(raw_path)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(render_uninstall_script(plan, parent_pid=parent_pid or os.getpid()))
         script_path.chmod(0o700)
-        subprocess.Popen(
+        process = subprocess.Popen(
             ["/bin/zsh", str(script_path)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -238,4 +250,7 @@ def launch_uninstaller(plan: UninstallPlan, *, parent_pid: int | None = None) ->
     except Exception:
         script_path.unlink(missing_ok=True)
         raise
+    pid = int(getattr(process, "pid", 0) or 0)
+    if pid and on_started is not None:
+        on_started(pid)
     return script_path

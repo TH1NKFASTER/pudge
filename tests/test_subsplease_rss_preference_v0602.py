@@ -57,6 +57,7 @@ def _manager() -> AnimeManager:
     manager.logger = logging.getLogger("test-subsplease-preference")
     manager.log = lambda message: None
     manager._storage_can_accept = lambda size_bytes: True
+    manager._redownload_blocked = lambda media_id, episode: False
     return manager
 
 
@@ -75,7 +76,9 @@ def test_preferred_subsplease_skips_nyaa_when_rss_has_suitable_release(monkeypat
     monkeypatch.setattr("pudge.manager.search_subsplease_ranked", rss)
     monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
-    releases = _manager().search_releases(135865, episode=5)
+    # Automatic searches only: Find episode (manual) always asks Nyaa too
+    # (tests/test_fix_manual_search_asks_nyaa.py).
+    releases = _manager().search_releases(135865, episode=5, automatic=True)
 
     assert calls == ["rss"]
     assert releases == [rss_release]
@@ -141,7 +144,7 @@ def test_default_order_uses_subsplease_first_and_skips_nyaa_when_rss_is_suitable
     monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     manager = _manager()
-    releases = manager.search_releases(135865, episode=5)
+    releases = manager.search_releases(135865, episode=5, automatic=True)  # manual asks Nyaa too
 
     assert calls == ["rss"]
     assert releases[0].category_id == "subsplease-rss"

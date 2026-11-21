@@ -153,8 +153,16 @@ def watched_by_anilist_progress(
         except (TypeError, ValueError):
             return False
         return local_episode >= 1 and local_episode <= watched_through
+    return single_unit_title(media_format, total_episodes)
+
+
+def single_unit_title(media_format: str | None, episodes: int | None) -> bool:
+    """A title that is one file: a movie, or a one-episode OVA, special or ONA.
+
+    Its download or file without an episode number is episode 1.
+    """
     try:
-        single_entry = int(total_episodes or 0) == 1
+        single_entry = int(episodes or 0) == 1
     except (TypeError, ValueError):
         single_entry = False
     return single_entry or str(media_format or "").upper() == "MOVIE"

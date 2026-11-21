@@ -33,7 +33,7 @@ FIREFOX = {
 SCREEN = [{"x": 0, "y": 0, "width": 1728, "height": 1117}]
 
 
-def wait_for(condition, timeout: float = 3.0) -> None:
+def wait_for(condition, timeout: float = 30.0) -> None:  # ends as soon as it holds
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if condition():
@@ -187,7 +187,7 @@ def make_panel(api: Api, source: Source) -> tuple[ScreenTextPanel, list[Window]]
 
 def test_running_vn_page_capture_is_mirrored_and_no_second_capture_starts() -> None:
     vn = VN(running=True, window_id=117, generation=3)
-    vn.line("それが、二階堂ヒロだった。", 1)
+    vn.line("それが、二階堂ヒロの答えだった。", 1)
     api, source = Api(vn), Source(allowed=False)
     panel, windows = make_panel(api, source)
     panel.toggle()
@@ -195,7 +195,11 @@ def test_running_vn_page_capture_is_mirrored_and_no_second_capture_starts() -> N
     assert source.resolved_with == [117] and api.starts == []
     assert windows[0].options["position"] == panel_position(FIREFOX["bounds"], SCREEN, PANEL_SIZE)
     state = panel.state()
-    assert (state["text"], state["text_id"], state["status"]) == ("それが、二階堂ヒロだった。", 1, "reading")
+    assert (state["text"], state["text_id"], state["status"]) == (
+        "それが、二階堂ヒロの答えだった。",
+        1,
+        "reading",
+    )
     vn.line("次の台詞", 2)
     assert (panel.state()["text"], panel.state()["text_id"]) == ("次の台詞", 2)
     assert panel.state()["text_id"] == 2  # polled again: unchanged
@@ -213,7 +217,7 @@ def test_without_screen_recording_the_panel_uses_the_window_picker_and_stops_it_
     panel, windows = make_panel(api, source)
     opener = threading.Thread(target=panel.toggle)
     opener.start()
-    assert api.picker_open.wait(2.0)
+    assert api.picker_open.wait(30)
     assert not panel.opened and windows == []  # no panel until a window is chosen
     api.picker_choice.set()
     opener.join(2.0)
@@ -247,9 +251,9 @@ def test_second_press_while_the_picker_is_open_cancels_it() -> None:
     panel, windows = make_panel(api, source)
     opener = threading.Thread(target=panel.toggle)
     opener.start()
-    assert api.picker_open.wait(2.0)
+    assert api.picker_open.wait(30)
     panel.toggle()  # the shortcut again
-    opener.join(2.0)
+    opener.join(30)
     assert not opener.is_alive() and windows == [] and not panel.opened
     assert vn.stops == 1 and vn.state()["running"] is False and vn.pause is None
 

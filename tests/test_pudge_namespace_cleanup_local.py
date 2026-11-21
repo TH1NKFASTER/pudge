@@ -17,6 +17,7 @@ from pudge.branding import (
     LEGACY_BUNDLE_IDS,
 )
 from source_policy import source
+from repository_files import in_repository
 
 ROOT = Path(__file__).parents[1]
 
@@ -29,7 +30,7 @@ def test_pudge_is_the_active_internal_identity() -> None:
     assert APP_AGENT_CLI == "pudge-agent"
     assert APP_ENV_PREFIX == "PUDGE"
     assert (ROOT / "pudge").is_dir()
-    assert not (ROOT / ("anime" + "_mpv")).exists()
+    assert not in_repository("anime" + "_mpv")
 
 
 def test_legacy_brand_is_retained_only_for_migration() -> None:

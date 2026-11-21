@@ -45,6 +45,25 @@ __api.start_manga_ocr_book = async id => window.MANGA.status(id);
 __api.stop_manga_ocr_book = async () => ({ok: true});
 __api.manga_nearby_mokuro = async () => ({available: false});
 __api.manga_set_position = async (id, index) => ({ok: true, id, position: index});
+// The two-page table the Mac serves (pudge/manga_spreads.py): cover alone, then pairs; a wide
+// page alone and pairs again after it; MANGA.shift[id] puts the page after the cover alone too.
+window.MANGA.wide = {}; window.MANGA.shift = {};
+window.MANGA.table = (count, wide, shift) => {
+  if (count <= 0) return [];
+  const out = [[0]]; let i = 1;
+  if (shift && i < count) out.push([i++]);
+  while (i < count) {
+    if (!wide.includes(i) && i + 1 < count && !wide.includes(i + 1)) { out.push([i, i + 1]); i += 2; }
+    else out.push([i++]);
+  }
+  return out;
+};
+__api.manga_spreads = async id => {
+  const count = Number((window.MANGA.books.find(book => book.id === id) || {}).page_count || 6);
+  const wide = window.MANGA.wide[id] || [], shift = Boolean(window.MANGA.shift[id]);
+  return {wide, shift, aspect: 1.5, spreads: window.MANGA.table(count, wide, shift)};
+};
+__api.manga_set_pair_shift = async (id, shift) => { window.MANGA.shift[id] = Boolean(shift); return __api.manga_spreads(id); };
 __api.manga_mark_read = async (id, index) => ({id, read_pages: index + 1});
 __api.toggle_fullscreen = async () => ({ok: true});
 // Jiten words of the test texts: 猫 (new), 犬 (known).

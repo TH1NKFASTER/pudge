@@ -259,26 +259,6 @@ def test_csv_export_uses_same_filtered_scope(tmp_path: Path) -> None:
     assert rows[0]["title"] == "Manga"
 
 
-def test_daily_rollup_rebuild_persists_real_event_count(tmp_path: Path) -> None:
-    db = Database(tmp_path / "db.sqlite3")
-    ledger = ConsumptionLedger(db)
-    stats = ConsumptionStatistics(db)
-    base = 1_700_000_000.0
-    media = ledger.ensure_media(kind="manga", title="Manga", aliases=[("stable", "rollup")])
-    _event(ledger, media_uuid=media.media_uuid, kind="manga", start=base, end=base + 10)
-    _event(ledger, media_uuid=media.media_uuid, kind="manga", start=base + 20, end=base + 30)
-
-    rebuilt = stats.rebuild_daily_rollups()
-    assert rebuilt["days"] >= 1
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT total_seconds,event_count FROM consumption_daily_rollups WHERE total_seconds > 0"
-        ).fetchall()
-    assert len(rows) == 1
-    assert float(rows[0]["total_seconds"]) == pytest.approx(20.0)
-    assert int(rows[0]["event_count"]) == 2
-
-
 def test_csv_export_is_not_truncated_at_ui_page_limit(tmp_path: Path) -> None:
     db = Database(tmp_path / "db.sqlite3")
     stats = ConsumptionStatistics(db)
@@ -335,9 +315,11 @@ def _statistics_payload(tmp_path: Path, scope: dict[str, object]) -> dict[str, o
 
 
 def test_statistics_page_follows_the_computer_time_zone_without_a_selector(page, tmp_path: Path) -> None:
-    # Reports use this computer's zone automatically; the old "report timezone" selector is gone.
+    # Reports use this computer's zone automatically; the old "report timezone" selector is gone,
+    # and the page no longer prints a footnote about it (or about native coverage).
     assert not has_text("report timezone") and not has_text("Report timezone")
-    assert "follows this computer automatically" in en("stats.timezoneNote", zone="UTC")
+    assert not has_text("follows this computer automatically")
+    assert not has_text("Native coverage is recorded")
     payload = _statistics_payload(tmp_path, {"period": "30d"})
     zone = payload["timezone"]["label"]
     for lang in ("en", "ru"):
@@ -346,7 +328,7 @@ def test_statistics_page_follows_the_computer_time_zone_without_a_selector(page,
             await __click('.nav button[data-page="statistics"]'); await __tick(50);
             return {visible: __visible('#statistics'), text: __text('#statisticsContent'),
                     controls: [...document.querySelectorAll('#statisticsContent select, #statisticsContent input')].map(el => el.id),
-                    note: PudgeI18n.t('stats.timezoneNote', {zone: ZONE}), total: __text('#statsBody .stats-card strong'),
+                    note: __text('#statsBody .stats-note'), total: __text('#statsBody .stats-card strong'),
                     twoMinutes: PudgeI18n.t('stats.durationMinutesSeconds', {minutes: 2, seconds: 0})};
             """.replace("ZONE", json.dumps(zone)),
             lang=lang,
@@ -356,7 +338,7 @@ def test_statistics_page_follows_the_computer_time_zone_without_a_selector(page,
         assert out["visible"] is True
         [[scope, limit, offset]] = result.calls_of("consumption_statistics_query")
         assert (scope["period"], scope["kind"], limit, offset) == ("30d", "all", 200, 0)
-        assert out["note"] in out["text"] and zone in out["note"]
+        assert out["note"] in ("", None) and zone not in out["text"]
         assert out["controls"] == [
             "statsKind",
             "statsMedia",

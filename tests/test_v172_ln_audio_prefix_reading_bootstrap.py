@@ -41,7 +41,7 @@ class _Response:
                 ]
             ],
             "vocabulary": [
-                {"wordId": 1, "readingIndex": 1, "reading": "小[こ]高[だか]い丘[おか]"},
+                {"wordId": 1, "readingIndex": 1, "reading": "白[しろ]い砂[すな]浜[はま]"},
                 {"wordId": 2, "readingIndex": 1, "reading": "が"},
                 {"wordId": 3, "readingIndex": 1, "reading": "延[えん]々[えん]と"},
                 {"wordId": 4, "readingIndex": 1, "reading": "続[つづ]く"},
@@ -77,20 +77,20 @@ def test_precision_alignment_bootstraps_readings_when_full_reader_cache_is_absen
         return _Response()
 
     monkeypatch.setattr("pudge.audiobooks.httpx.post", post)
-    text = "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
+    text = "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。"
     digest = "a" * 64
     hints, metadata = service._ensure_chapter_start_reading_hints(180, 0, text, digest)
 
     assert metadata["source"] == "jiten_prefix_api"
     assert metadata["hint_count"] >= 4
     assert hints[:4] == [
-        {"offset_start": 0, "offset_end": 4, "surface": "小高い丘", "reading": "こだかいおか"},
+        {"offset_start": 0, "offset_end": 4, "surface": "白い砂浜", "reading": "しろいすなはま"},
         {"offset_start": 4, "offset_end": 5, "surface": "が", "reading": "が"},
         {"offset_start": 5, "offset_end": 8, "surface": "延々と", "reading": "えんえんと"},
         {"offset_start": 8, "offset_end": 10, "surface": "続く", "reading": "つづく"},
     ]
     assert len(calls) == 1
-    assert calls[0][1]["json"]["text"][0].startswith("小高い丘")
+    assert calls[0][1]["json"]["text"][0].startswith("白い砂浜")
     # The cache file the service wrote keeps the readings but never the Jiten API key.
     output_cache = service._chapter_start_reading_cache_path(digest)
     assert "secret-test-key" not in json.dumps(
@@ -101,7 +101,7 @@ def test_precision_alignment_bootstraps_readings_when_full_reader_cache_is_absen
 def test_bootstrapped_prefix_readings_are_cached_without_second_jiten_request(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path)
     monkeypatch.setattr("pudge.audiobooks.httpx.post", lambda *args, **kwargs: _Response())
-    text = "小高い丘が延々と続く。"
+    text = "白い砂浜が延々と続く。"
     digest = "b" * 64
     first, first_meta = service._ensure_chapter_start_reading_hints(180, 0, text, digest)
     assert first and first_meta["source"] == "jiten_prefix_api"

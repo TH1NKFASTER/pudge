@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from . import audio_timeline
 from .subtitle_formats import parse_srt, write_srt
 
 PART_A_TAIL = 240.0
@@ -58,18 +59,44 @@ def work_dir_for(video: Path, cache_dir: Path) -> Path:
     return cache_dir / "double-episodes" / key
 
 
-def cut_audio_part(ffmpeg: str, video: Path, start: float, end: float | None, output: Path) -> Path:
-    """Cut [start, end) of the first audio track (mono 16 kHz FLAC) plus subtitle tracks."""
+def cut_audio_part(
+    ffmpeg: str,
+    video: Path,
+    start: float,
+    end: float | None,
+    output: Path,
+    *,
+    ffprobe: str | None = None,
+) -> Path:
+    """Cut [start, end) of the first audio track (mono 16 kHz FLAC) plus subtitle tracks.
+
+    A part's time 0 is playback time ``start`` of the video (audio_timeline). When the
+    audio track starts after the file start, the copied part would start at that
+    track's first packet (or an earlier subtitle) instead; its audio is then decoded
+    from the file start with that silence in front, cut, and timed from 0.
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
+    delay = audio_timeline.audio_delay(video, ffprobe or audio_timeline.ffprobe_beside(ffmpeg), position=0)
     base = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    subtitles = "0:s?"
+    if delay:
+        length = f":duration={max(1.0, end - start):.3f}" if end is not None else ""
+        audio_filter = (
+            f"{audio_timeline.delay_filter(delay)},asetpts=N/SR/TB,"
+            f"atrim=start={max(0.0, start):.3f}{length},asetpts=PTS-STARTPTS"
+        )
+        base += ["-i", str(video)]
+        subtitles = "1:s?"  # the same file again, cut like the old part (subtitle tracks only)
     if start > 0:
         base += ["-ss", f"{start:.3f}"]
     base += ["-i", str(video)]
     if end is not None:
         base += ["-t", f"{max(1.0, end - start):.3f}"]
     audio = ["-map", "0:a:0", "-c:a", "flac", "-ac", "1", "-ar", "16000"]
+    if delay:
+        audio[2:2] = ["-af", audio_filter]
     attempts = (
-        base + audio + ["-map", "0:s?", "-c:s", "copy", str(output)],
+        base + audio + ["-map", subtitles, "-c:s", "copy", str(output)],
         base + audio + ["-sn", str(output)],  # a subtitle codec Matroska cannot hold
     )
     error = ""

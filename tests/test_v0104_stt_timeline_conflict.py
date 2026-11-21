@@ -1,4 +1,5 @@
 from pudge.syncing import _prefer_embedded_timeline_over_conflicting_speech
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def _strong_timeline():
@@ -110,8 +111,7 @@ def test_upgrade_requeues_only_recorded_stt_timeline_clock_conflict(tmp_path: Pa
     assert manager._requeue_stt_timeline_clock_conflicts() == 1
     repaired = manager.db.episode_by_path(video)
     assert repaired is not None
-    assert repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert manager.db.get_state("subtitle_stt_timeline_conflict_generation", "") == "2"
     assert manager._requeue_stt_timeline_clock_conflicts() == 0
 

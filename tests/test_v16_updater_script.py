@@ -56,7 +56,7 @@ def run_update_scenario(tmp_path, monkeypatch, *, source_exits):
             patch.setattr("pudge.updater.subprocess.Popen", lambda *a, **k: order.append("spawn"))
             updater._launch_script(project, [])
         assert order == ["clean", "spawn", "quit"]
-        script = tmp_path / "run-pudge-update.zsh"
+        script = updater.update_root / "run-pudge-update.zsh"
         # macOS tools as zsh functions (the portable runner of t71g00_support); the 30-second
         # wait for the old app's exit passes at once.
         standins = f"/usr/bin/open() {{ '{opener}' \"$@\"; }}\n/usr/bin/ditto() {{ '{copier}' \"$@\"; }}\n/bin/sleep() {{ :; }}\n"

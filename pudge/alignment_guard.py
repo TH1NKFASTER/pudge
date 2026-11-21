@@ -32,12 +32,20 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from .subtitle_formats import parse_srt
+from .subtitle_formats import parse_srt, write_exact_srt
 
 GUARD_VERSION = "alignment-guard-2"
 _MUSIC_ONLY_RE = re.compile(r"^[\s♪♫♬♩〜～~・…\-‐―─()（）]*$")
-_CLAMP_EPSILON = 0.05
+# Pudge's own writer never starts a line before 0.1 s (write_srt), so a block pushed
+# before the start of the video piles up there, not at 0.0 s: with 0.05 s neither the
+# clamped-start count nor the standalone check ever saw a file Pudge wrote itself.
+_CLAMP_EPSILON = 0.105
 _OVERLAP_EPSILON = 0.05
+# Subtitle writers lengthen very short lines to about this (write_srt: 0.3 s).
+_MIN_DISPLAY_SECONDS = 0.35
+# A final file this many lines shorter than its source pairs lines in order (_match).
+_ORDERED_MATCH_DROPPED_CUES = 20
+_ORDERED_MATCH_DROPPED_FRACTION = 0.1
 
 
 def _sha(path: Path) -> str:
@@ -76,6 +84,19 @@ def _match(
     """Index pairs raw→final: by position when texts agree, else a text walk."""
     if len(raw) == len(final) and all(_norm(a[2]) == _norm(b[2]) for a, b in zip(raw, final)):
         return [(i, i) for i in range(len(raw))]
+    if len(raw) - len(final) >= max(_ORDERED_MATCH_DROPPED_CUES, _ORDERED_MATCH_DROPPED_FRACTION * len(raw)):
+        # Whole scenes dropped (a cut broadcast): the nearest-index walk pairs a repeated
+        # short line with a copy hundreds of lines away; the order-keeping match does not.
+        import difflib
+
+        matcher = difflib.SequenceMatcher(
+            None, [_norm(cue[2]) for cue in raw], [_norm(cue[2]) for cue in final], autojunk=False
+        )
+        return [
+            (block.a + offset, block.b + offset)
+            for block in matcher.get_matching_blocks()
+            for offset in range(block.size)
+        ]
     pairs: list[tuple[int, int]] = []
     by_text: dict[str, list[int]] = {}
     for index, cue in enumerate(final):
@@ -101,26 +122,42 @@ def _overlaps(cues: list[tuple[float, float, str]]) -> set[tuple[str, str]]:
     return result
 
 
+def _new_overlaps(
+    raw: list[tuple[float, float, str]],
+    final: list[tuple[float, float, str]],
+    pairs: list[tuple[int, int]],
+) -> int:
+    """Neighbouring lines that overlap in the final file but did not in the raw one.
+
+    Lines are told apart by their place in the raw file, not by their text: with sets of
+    text pairs a repeated "はい" made overlaps appear and vanish. A line the writer only
+    lengthened to the minimum display time keeps its raw length here: Seirei Gensouki E11
+    (Netflix [cc], 0.08 s lines) was rejected for 20 "new overlaps" on a constant -1.0 s
+    map, and the raw file was shown 1 s off. Lines lengthened further still count.
+    """
+    placed = []
+    for i, j in pairs:
+        raw_length = max(0.0, raw[i][1] - raw[i][0])
+        final_length = max(0.0, final[j][1] - final[j][0])
+        if final_length <= max(raw_length + _OVERLAP_EPSILON, _MIN_DISPLAY_SECONDS):
+            final_length = min(final_length, raw_length)
+        placed.append((final[j][0], final[j][0] + final_length, i))
+    placed.sort()
+    count = 0
+    for (_start, end, left), (next_start, _next_end, right) in zip(placed, placed[1:]):
+        if next_start >= end - _OVERLAP_EPSILON:
+            continue
+        a, b = raw[left], raw[right]
+        if min(a[1], b[1]) - max(a[0], b[0]) > _OVERLAP_EPSILON:
+            continue  # they overlapped in the raw file already (parallel ASS lines)
+        count += 1
+    return count
+
+
 def _percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     position = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * fraction))))
     return ordered[position]
-
-
-def _write_exact_srt(cues: list[tuple[float, float, str]], path: Path) -> None:
-    def timestamp(seconds: float) -> str:
-        milliseconds = max(0, int(round(float(seconds) * 1000.0)))
-        hours, remainder = divmod(milliseconds, 3_600_000)
-        minutes, remainder = divmod(remainder, 60_000)
-        whole_seconds, millis = divmod(remainder, 1000)
-        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{millis:03d}"
-
-    blocks = [
-        f"{index}\n{timestamp(start)} --> {timestamp(end)}\n{text}"
-        for index, (start, end, text) in enumerate(cues, start=1)
-        if text and end > start
-    ]
-    path.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
 
 
 def stabilize_music_marker_pairs(
@@ -128,6 +165,7 @@ def stabilize_music_marker_pairs(
     final: Path,
     *,
     cache_dir: Path | None = None,
+    destination: Path | None = None,
 ) -> dict[str, Any]:
     """Keep the two boundaries of one music block on one supported clock.
 
@@ -137,6 +175,8 @@ def stabilize_music_marker_pairs(
     spoken cue supports that split, shortening/lengthening the song by many seconds.
     When that happens, use the nearby *dialogue* clock for both markers. A music
     block whose two boundaries already share the same shift is left untouched.
+
+    The repaired track is written to ``destination`` (default: ``final`` itself).
     """
     try:
         raw_cues = _load(Path(raw), cache_dir)
@@ -233,8 +273,14 @@ def stabilize_music_marker_pairs(
 
     if not repairs:
         return {"applied": False, "reason": "no_inconsistent_music_marker_pair"}
-    _write_exact_srt(repaired, Path(final))
-    return {"applied": True, "reason": "music_marker_pair_clock_stabilized", "repairs": repairs}
+    target = Path(destination) if destination is not None else Path(final)
+    write_exact_srt(repaired, target)
+    return {
+        "applied": True,
+        "reason": "music_marker_pair_clock_stabilized",
+        "repairs": repairs,
+        "output": str(target),
+    }
 
 
 def validate_alignment_output(
@@ -287,8 +333,7 @@ def validate_alignment_output(
 
     new_clamped = sum(1 for i, j in speech if raw_cues[i][0] > 1.0 and final_cues[j][0] <= _CLAMP_EPSILON)
     raw_overlaps = _overlaps([raw_cues[i] for i, _ in speech])
-    final_overlaps = _overlaps([final_cues[j] for _, j in speech])
-    new_overlaps = len(final_overlaps - raw_overlaps)
+    new_overlaps = _new_overlaps(raw_cues, final_cues, speech)
     ordered = sorted(speech, key=lambda pair: pair[0])
     inversions = 0
     for (i0, j0), (i1, j1) in zip(ordered, ordered[1:]):
@@ -316,6 +361,18 @@ def validate_alignment_output(
             current = 1
     runs.append(current)
     scattered = sum(length for length in runs if length < 3) / n
+    # Clock changes between the stable runs (3+ cues on one shift). The lines a piecewise
+    # map squeezes between two clocks (content one side has and the other lacks) ramp
+    # across in steps of a few seconds; every step counted as a jump made one cut look
+    # like a destroyed map (Konosuba E6 on a TV capture with commercials: three clocks,
+    # 22 squeezed lines, 12 "jumps"). Short runs stay measured by ``scattered``.
+    stable_levels: list[float] = []
+    position = 0
+    for length in runs:
+        if length >= 3:
+            stable_levels.append(statistics.median(shifts[position : position + length]))
+        position += length
+    stable_jumps = sum(1 for a, b in zip(stable_levels, stable_levels[1:]) if abs(b - a) > 2.0)
     far = sum(1 for value in shifts if abs(value - median) > 30.0) / n
     diagnostics.update(
         {
@@ -330,6 +387,7 @@ def validate_alignment_output(
             "shift_min": round(min(shifts), 3),
             "shift_max": round(max(shifts), 3),
             "shift_jumps": jumps,
+            "stable_shift_jumps": stable_jumps,
             "shift_runs": len(runs),
             "scattered_fraction": round(scattered, 4),
             "far_from_median_fraction": round(far, 4),
@@ -345,7 +403,7 @@ def validate_alignment_output(
         reasons.append("order_inversions")
     if collapsed >= 5 and collapsed > raw_max_same_start + 2:
         reasons.append("collapsed_lines")
-    if spread > 30.0 and (jumps > max(6, int(0.03 * n)) or scattered > 0.10):
+    if spread > 30.0 and (stable_jumps > max(6, int(0.03 * n)) or scattered > 0.10):
         reasons.append("scattered_time_map")
     if reasons:
         return {**base, "status": "rejected", "reason": ",".join(reasons), "diagnostics": diagnostics}

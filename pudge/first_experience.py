@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from typing import Any
 
 import httpx
 from .i18n import err
+from .fsutil import atomic_write_text
 
 JITEN_MPV_INSTALLER_COMMIT = "90e407cc5dd963d5e36babf2a1e2ea4db2b07e6c"
 JITEN_MPV_INSTALLER_URL = (
@@ -45,8 +47,33 @@ def _brew_path() -> str:
     return ""
 
 
+def _homebrew_tool(name: str) -> str:
+    """A tool in Homebrew's bin folder: an app opened from the Dock has no Homebrew on PATH."""
+    for folder in ("/opt/homebrew/bin", "/usr/local/bin"):
+        candidate = Path(folder) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def find_tool(name: str, configured: str) -> str:
+    """The configured tool, else the one on PATH, else Homebrew's ("" when none is installed)."""
+    return _command_path(configured) or _command_path(name) or _homebrew_tool(name)
+
+
+def replacement_tool(name: str, configured: str) -> str:
+    """An installed tool to use when the configured value does not resolve ("" otherwise).
+
+    install.sh no longer installs mpv, so the config can keep its default "mpv" (or a
+    Homebrew path from before an uninstall) while mpv is later installed in Terminal.
+    """
+    if _command_path(configured):
+        return ""
+    return _command_path(name) or _homebrew_tool(name)
+
+
 def _tool_status(name: str, configured: str, version_arg: str) -> dict[str, Any]:
-    path = _command_path(configured) or _command_path(name)
+    path = find_tool(name, configured)
     version = ""
     if path:
         try:
@@ -121,9 +148,7 @@ def _write_jiten_installed_version(version: str) -> None:
     program_dir, _script_path, _config_path = _jiten_paths()
     program_dir.mkdir(parents=True, exist_ok=True)
     marker = program_dir / JITEN_MPV_VERSION_MARKER
-    temporary = marker.with_suffix(".tmp")
-    temporary.write_text(normalized + "\n", encoding="utf-8")
-    os.replace(temporary, marker)
+    atomic_write_text(marker, normalized + "\n")
 
 
 def _latest_jiten_release() -> tuple[str, str]:
@@ -215,7 +240,9 @@ def _looks_like_jpdb_script(path: Path, scripts_root: Path) -> bool:
     try:
         # The official installer may leave a generic main.lua/client.lua name.
         # Inspect only a bounded text prefix; credentials are never extracted.
-        source = path.read_text(encoding="utf-8", errors="ignore")[:256_000]
+        # Only that prefix is read (every Home build asks, and a bundled .js can be MBs).
+        with path.open(encoding="utf-8", errors="ignore") as handle:
+            source = handle.read(256_000)
     except OSError:
         return False
     return "jpdb" in source.casefold()
@@ -229,7 +256,8 @@ def _jpdb_installations() -> list[dict[str, Path]]:
         if not scripts_root.is_dir():
             continue
         try:
-            entries = list(scripts_root.rglob("*"))[:5000]
+            # The walk stops at the cap instead of listing the whole tree first.
+            entries = list(itertools.islice(scripts_root.rglob("*"), 5000))
         except OSError:
             continue
         lua_files = [
@@ -274,8 +302,10 @@ def _jpdb_installations() -> list[dict[str, Path]]:
     return found
 
 
-def _jpdb_paths() -> tuple[Path, Path, Path]:
-    installations = _jpdb_installations()
+def _jpdb_paths(installations: list[dict[str, Path]] | None = None) -> tuple[Path, Path, Path]:
+    """``installations``: what ``_jpdb_installations`` found, when the caller has it already."""
+    if installations is None:
+        installations = _jpdb_installations()
     if installations:
         selected = max(
             installations,
@@ -309,8 +339,10 @@ def mpv_study_status(
 ) -> dict[str, Any]:
     program_dir, script_path, config_path = _jiten_paths()
     jiten_installed = script_path.is_file() and program_dir.is_dir()
-    jpdb_dir, jpdb_script, jpdb_server = _jpdb_paths()
+    # One walk of the mpv script folders (every Home build asks): it was walked, and every
+    # script read, twice.
     variants = _jpdb_installations()
+    jpdb_dir, jpdb_script, jpdb_server = _jpdb_paths(variants)
     jpdb_server_ready = jpdb_server.is_file() and (os.name == "nt" or os.access(jpdb_server, os.X_OK))
     # Lua-only forks may talk directly to jpdb. The official plugin additionally
     # ships an executable server, which is verified when present.
@@ -383,9 +415,14 @@ def dependency_status(
     }
 
 
-def install_media_tools(*, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str, Any]:
+def install_media_tools(
+    *, mpv: str = "mpv", ffmpeg: str = "ffmpeg", include_mpv: bool = True
+) -> dict[str, Any]:
+    # mpv (about 1 GB with Homebrew's dependencies) is installed only when asked for:
+    # "Install missing" in the guide used to pull it in for manga/LN-only users too.
+    wanted = ("mpv", "ffmpeg") if include_mpv else ("ffmpeg",)
     before = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
-    missing = [name for name in ("mpv", "ffmpeg") if not before[name]["installed"]]
+    missing = [name for name in wanted if not before[name]["installed"]]
     if missing:
         brew = _brew_path()
         if not brew:
@@ -404,9 +441,27 @@ def install_media_tools(*, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str
             detail = (completed.stderr or completed.stdout or err("setup.homebrewFailed")).strip()
             raise FirstExperienceError(detail[-2000:])
     after = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
-    if not after["mpv"]["installed"] or not after["ffmpeg"]["installed"]:
+    if not all(after[name]["installed"] for name in wanted):
         raise FirstExperienceError(err("setup.mediaToolsMissing"))
     return after
+
+
+def _write_private_json(config_path: Path, payload: dict[str, Any]) -> None:
+    """Atomically replace a plugin config holding an API key, 0600 from creation.
+
+    The temp file used to be written 0644 and chmod-ed afterwards, so the key
+    was briefly readable by other users of the Mac.
+    """
+    fd, raw_temporary = tempfile.mkstemp(
+        prefix=f".{config_path.name}.", suffix=".tmp", dir=config_path.parent
+    )
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, config_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_jiten_api_key(api_key: str) -> None:
@@ -424,13 +479,26 @@ def _write_jiten_api_key(api_key: str) -> None:
         except (OSError, json.JSONDecodeError):
             pass
     payload["api_key"] = value
-    temporary = config_path.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, config_path)
+    _write_private_json(config_path, payload)
+
+
+def forget_jiten_api_key(previous_key: str) -> bool:
+    """The Jiten key was cleared in Pudge: remove JitenMPV's copy if it is that key.
+
+    A key the user gave JitenMPV itself (a different one) stays."""
+    previous = str(previous_key or "").strip()
+    if not previous:
+        return False
+    _program_dir, _script_path, config_path = _jiten_paths()
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(loaded, dict) or str(loaded.get("api_key") or "").strip() != previous:
+        return False
+    loaded.pop("api_key", None)
+    _write_private_json(config_path, loaded)
+    return True
 
 
 def _write_jpdb_api_token(api_token: str) -> None:
@@ -456,13 +524,7 @@ def _write_jpdb_api_token(api_token: str) -> None:
     payload.setdefault("serverPort", 9726)
     payload.setdefault("cookiePath", "./jpdb-cookie.txt")
     payload.setdefault("debug", False)
-    temporary = config_path.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, config_path)
+    _write_private_json(config_path, payload)
 
 
 def configure_mpv_study_keys(*, jiten_api_key: str = "", jpdb_api_token: str = "") -> None:

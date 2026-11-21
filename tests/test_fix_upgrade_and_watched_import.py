@@ -28,7 +28,7 @@ def _release(info_hash: str, score: float) -> NyaaRelease:
     return NyaaRelease(
         title=f"[Group] Upgrade Show - 05 [1080p] [{info_hash[:8]}]",
         link="",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text="1.4 GiB",
         size_bytes=1400 * 1024 * 1024,

@@ -22,8 +22,8 @@ ANIME = LibraryAnime(
 def release(name: str, score: float, info_hash: str) -> NyaaRelease:
     return NyaaRelease(
         title=name,
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text="10 GiB",
         size_bytes=10 * 1024**3,

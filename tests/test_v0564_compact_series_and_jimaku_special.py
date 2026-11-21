@@ -86,7 +86,7 @@ def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Pat
             + """
             return {cards: document.querySelectorAll('.ready-sequence-card').length, series: card.title, rows: rows(),
                     lead: card.querySelector('.ready-sequence-meta strong').innerText, text: card.innerText,
-                    orderLabels: ['label.watchSequence', 'label.releaseOrder', 'label.anilistOrder'].map(key => t(key))};
+                    orderLabels: ['Watch order', 'Release order', 'AniList relation order', 'Порядок просмотра', 'Порядок выхода', 'Связи AniList']};
             """,
             lang=lang,
             state=state,

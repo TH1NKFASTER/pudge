@@ -69,6 +69,14 @@ PATH_TOOLS = {
 ROOT_TOOLS = {
     "/usr/bin/ditto": (
         'record ditto "$@"\n'
+        # MACSIM_DITTO_FAILS_AFTER=N: a folder copy stops after N entries like ditto on a full disk.
+        'if [ -n "${MACSIM_DITTO_FAILS_AFTER:-}" ] && [ -d "$1" ]; then\n'
+        '  mkdir -p "$2"; n=0\n'
+        '  for f in "$1"/* "$1"/.[!.]*; do [ -e "$f" ] || continue; n=$((n+1))\n'
+        '    if [ "$n" -gt "$MACSIM_DITTO_FAILS_AFTER" ]; then echo "ditto: $2: No space left on device" >&2; exit 1; fi\n'
+        '    cp -pR "$f" "$2/"; done\n'
+        "  exit 0\n"
+        "fi\n"
         'if [ -d "$1" ]; then mkdir -p "$2" && cp -pR "$1/." "$2/"; else mkdir -p "$(dirname "$2")" && cp -p "$1" "$2"; fi\n'
     ),
     "/usr/bin/clang": (
@@ -209,11 +217,20 @@ def _uninstall(site: Path, info: Path) -> None:
                 pass
 
 
-def _install_wheel(site: Path, wheel: Path, *, force: bool) -> None:
+def _install_wheel(site: Path, wheel: Path, *, force: bool, root: str = "") -> None:
+    """`pip install WHEEL`; with `--root ROOT --ignore-installed` (root given) the files go to
+    ROOT + site and the installed distribution is neither consulted nor removed."""
     import zipfile
 
     version = wheel.name.split("-")[1]
-    installed = sorted(site.glob("pudge-*.dist-info"))
+    # Whether the installed package could be imported while pip ran (its __init__.py).
+    _record("pip-saw-installed-package", str((site / "pudge" / "__init__.py").is_file()))
+    if root:
+        site = Path(root + str(site))
+        site.mkdir(parents=True, exist_ok=True)
+        installed = []
+    else:
+        installed = sorted(site.glob("pudge-*.dist-info"))
     if installed and not force and installed[0].name == f"pudge-{version}.dist-info":
         print(f"Requirement already satisfied: pudge=={version}")
         return
@@ -248,14 +265,44 @@ def fake_pip(venv: Path, args: list[str]) -> int:
     if args[:1] == ["install"]:
         options = args[1:]
         if "-r" in options:
+            if os.environ.get("MACSIM_FAIL_PIP_REQUIREMENTS") == "1":
+                print("error: stand-in network failure", file=sys.stderr)
+                return 1
             return 0
-        for target in (arg for arg in options if not arg.startswith("-")):
+        root = options[options.index("--root") + 1] if "--root" in options else ""
+        if root:
+            assert "--ignore-installed" in options, "pip --root without --ignore-installed"
+        for target in (arg for arg in options if not arg.startswith("-") and arg != root):
             path = target.split("[", 1)[0]
             if path.endswith(".whl"):
-                _install_wheel(site, Path(path), force="--force-reinstall" in options)
+                _install_wheel(site, Path(path), force="--force-reinstall" in options, root=root)
             elif target.startswith("manga-ocr"):
                 (site / "manga_ocr").mkdir(exist_ok=True)
                 (site / "manga_ocr" / "__init__.py").write_text("", encoding="utf-8")
+    if args[:1] == ["uninstall"]:
+        # The named distributions (PEP 503 names): their recorded files and dist-info.
+        import re
+        import shutil
+
+        def canonical(name: str) -> str:
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        names = {canonical(arg) for arg in args[1:] if not arg.startswith("-")}
+        for info in sorted(site.glob("*.dist-info")):
+            metadata = (
+                (info / "METADATA").read_text(encoding="utf-8") if (info / "METADATA").is_file() else ""
+            )
+            name = next((line[6:].strip() for line in metadata.splitlines() if line.startswith("Name: ")), "")
+            if canonical(name) not in names:
+                continue
+            record = info / "RECORD"
+            for line in record.read_text(encoding="utf-8").splitlines() if record.is_file() else []:
+                target = site / line.split(",", 1)[0]
+                if target.is_file():
+                    target.unlink()
+                    if target.parent != site and not any(target.parent.iterdir()):
+                        target.parent.rmdir()
+            shutil.rmtree(info, ignore_errors=True)
     return 0
 
 
@@ -426,7 +473,6 @@ class MacSim:
             "ffmpeg/bin/ffmpeg",
             "ffmpeg/bin/ffprobe",
             "alass/bin/alass-cli",
-            "sevenzip/bin/7zz",
             "aria2/bin/aria2c",
         ):
             _write_tool(self.prefix / tool, "exit 0\n")
@@ -473,6 +519,11 @@ class MacSim:
 
     @property
     def agent_plist(self) -> Path:
+        # Outside ~/Library/LaunchAgents: the window bootstraps it by path (only while open).
+        return self.data / "launchd/com.pudge.agent.plist"
+
+    @property
+    def legacy_agent_plist(self) -> Path:
         return self.home / "Library/LaunchAgents/com.pudge.agent.plist"
 
     @property
@@ -644,8 +695,8 @@ class History:
 @functools.cache
 def release_history() -> History:
     """A release user's history: a fresh install of 9.8.6 (an old-brand app and agent are still
-    there), three failed attempts to update to 9.8.7, a successful in-app update to a patched
-    9.8.7 (same version number, changed files)."""
+    there), three failed attempts to update to 9.8.7 (each puts 9.8.6 back), an update to
+    9.8.7, a successful in-app update to a patched 9.8.7 (same version number, changed files)."""
     sim = MacSim(_workspace("release"))
     (sim.home / "Applications/Anime MPV.app/Contents").mkdir(parents=True)
     legacy_agent = sim.home / "Library/LaunchAgents/com.anime-mpv.agent.plist"
@@ -675,6 +726,8 @@ def release_history() -> History:
     blocker.mkdir()
     steps["after_swap_fails"] = _step(sim, projects["9.8.7"])
     blocker.rmdir()
+    # That failed install put the 9.8.6 runtime back; 9.8.7 is installed by an update.
+    steps["reinstall"] = _step(sim, projects["9.8.7"], "--update")
     # The in-app updater installs a patched build while Pudge is still running.
     steps["update"] = _step(
         sim, projects["9.8.7-patched"], "--update", env={"MACSIM_RUNNING_BUNDLES": "com.pudge.app"}
@@ -814,8 +867,16 @@ class ReleaseBuild:
             }
 
 
-def build_release(base: Path, *, env: dict[str, str] | None = None, readme: str = "") -> ReleaseBuild:
-    """Runs build_release.sh in a small Pudge project (version 9.8.7) under `base`."""
+def build_release(
+    base: Path,
+    *,
+    env: dict[str, str] | None = None,
+    readme: str = "",
+    git: bool = False,
+    untracked: dict[str, str] | None = None,
+) -> ReleaseBuild:
+    """Runs build_release.sh in a small Pudge project (version 9.8.7) under `base`: a plain
+    folder, or (``git``) a git checkout of it; ``untracked`` files are added afterwards."""
     project, tools, log = base / "project", base / "bin", base / "calls.log"
     (project / "pudge/assets").mkdir(parents=True)
     (project / "pudge/__pycache__").mkdir()
@@ -845,6 +906,12 @@ def build_release(base: Path, *, env: dict[str, str] | None = None, readme: str 
         " and [the release workflow](.github/workflows/release.yml).\n",
     }
     for relative, text in files.items():
+        (project / relative).write_text(text, encoding="utf-8")
+    if git:
+        for command in (["init", "-q"], ["add", "-A"]):
+            subprocess.run(["git", "-C", str(project), *command], check=True, capture_output=True)
+    for relative, text in (untracked or {}).items():
+        (project / relative).parent.mkdir(parents=True, exist_ok=True)
         (project / relative).write_text(text, encoding="utf-8")
     for name, body in RELEASE_TOOLS.items():
         _write_tool(tools / name, body)

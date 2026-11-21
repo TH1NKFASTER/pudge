@@ -16,7 +16,7 @@ from tests.test_fix_screen_text_permission import FIREFOX, SCREEN, VN, Api, Sour
 from tests.test_patch_e_ui import make_api
 
 PARSED = {
-    "paragraphs": ["それが、二階堂ヒロだった。"],
+    "paragraphs": ["それが、二階堂ヒロの答えだった。"],
     "tokens": [
         [
             {"wordId": 11, "readingIndex": 0, "start": 0, "end": 3},
@@ -35,7 +35,7 @@ LLM = {
     "llm_model": "local",
 }
 BEFORE = r"""
-window.screenState = {running: true, status: 'reading', text: 'それが、二階堂ヒロだった。', text_id: 1,
+window.screenState = {running: true, status: 'reading', text: 'それが、二階堂ヒロの答えだった。', text_id: 1,
   window_title: 'Game', ocr_count: 1};
 __api.screen_text_state = async () => ({...window.screenState});
 __api.visual_novel_parse = async () => window.PARSED;
@@ -157,7 +157,7 @@ def test_selecting_offers_translate_and_explain_together_and_explains(page) -> N
     out = result.value
     assert out["translate"] is True and out["explain"] is True
     assert "It was Hiro Nikaido." in out["explained"]
-    assert result.calls_of("analyze_grammar")[0][0] == "それが、二階堂ヒロだった。"
+    assert result.calls_of("analyze_grammar")[0][0] == "それが、二階堂ヒロの答えだった。"
 
 
 # Popups fit the small window

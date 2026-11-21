@@ -145,7 +145,8 @@ def test_amount_chips_have_no_repeats_and_types_not_done_are_left_out(page) -> N
             "en",
             (
                 ["Anime: 1h 5m", "Light novel: 15m 0s", "Manga: 10m 0s"],
-                ["Anime: 1h 0m", "Light novel: 746 characters", "Manga: 46 pages"],
+                # No second anime time: the legend already has it (2026-10-15).
+                ["Light novel: 746 characters", "Manga: 46 pages"],
             ),
         ),
         ("ru", (None, None)),
@@ -160,7 +161,9 @@ def test_amount_chips_have_no_repeats_and_types_not_done_are_left_out(page) -> N
             lang=lang,
         )
         legend, amounts = out
-        assert len(legend) == 3 and len(amounts) == 3  # no Visual novel (0 s), no Audiobook (0), no "—"
+        assert (
+            len(legend) == 3 and len(amounts) == 2
+        )  # no Visual novel (0 s), no Audiobook (0), no "—", no anime time
         assert not any("repeat" in text or "повтор" in text for text in legend + amounts)
         if expected[0]:
             assert (legend, amounts) == expected

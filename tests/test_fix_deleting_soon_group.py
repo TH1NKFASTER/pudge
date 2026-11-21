@@ -167,7 +167,7 @@ def test_home_shows_deleting_soon_with_keep(page) -> None:
     pending = {
         "media_id": 9,
         "title": "Two Heroes",
-        "delete_at": 1790900000,
+        "delete_at": 1790856000 + 7200,  # the page clock + 2 h: the page counts from delete_at
         "delete_remaining_seconds": 7200,
     }
     kept = {"media_id": 8, "title": "Old Drop", "delete_at": None}

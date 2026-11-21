@@ -14,8 +14,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .branding import APP_NAME, BACKUP_APP_ID, APP_SLUG
+from .database_storage import vacuum_into
+from .fsutil import remove_stale_temporaries
 from .i18n import err
+from .sources import FILE_NAME as SOURCES_FILE_NAME, SourcesError, parse_sources
 from .restore_guard import DatabaseInUse, exclusive_database
+from .url_credentials import mask_url_password, restore_url_password, same_address_apart_from_password
 
 
 BACKUP_FORMAT = 2
@@ -30,7 +34,11 @@ _CONFIG_SECRET_KEYS = {
     ("qbittorrent", "api_key"),
     ("nyaa", "proxy_url"),
 }
-_DATABASE_SECRET_KEYS = {"jiten_api_key", "jpdb_api_token"}
+# ln_settings rows that hold a credential (normally empty: the Keychain has them).
+_DATABASE_SECRET_KEYS = {"jiten_api_key", "jpdb_api_token", "irodori_tts_api_key"}
+_SECRET_PLACEHOLDERS = ",".join("?" * len(_DATABASE_SECRET_KEYS))
+# An ln_settings address whose user:password@ part is a credential too.
+_DATABASE_URL_KEYS = ("irodori_tts_url",)
 
 
 def _config_secret_values(text: str) -> dict[tuple[str, str], str]:
@@ -89,6 +97,12 @@ def _merge_config_secrets(restored: str, current: str) -> str:
     return "\n".join(lines) + ("\n" if restored.endswith("\n") else "")
 
 
+def _url_without_password(address: str) -> str:
+    """``scheme://user@host`` for ``scheme://user:password@host`` (other addresses unchanged)."""
+    masked = mask_url_password(address)
+    return address if masked == address else restore_url_password(masked, "")
+
+
 def _read_database_secrets(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
@@ -100,12 +114,21 @@ def _read_database_secrets(path: Path) -> dict[str, str]:
             if not exists:
                 return {}
             rows = conn.execute(
-                "SELECT key,value FROM ln_settings WHERE key IN (?,?)",
+                f"SELECT key,value FROM ln_settings WHERE key IN ({_SECRET_PLACEHOLDERS})",
                 tuple(sorted(_DATABASE_SECRET_KEYS)),
+            ).fetchall()
+            url_rows = conn.execute(
+                f"SELECT key,value FROM ln_settings WHERE key IN ({','.join('?' * len(_DATABASE_URL_KEYS))})",
+                _DATABASE_URL_KEYS,
             ).fetchall()
     except sqlite3.Error:
         return {}
-    return {str(key): str(value) for key, value in rows if str(value)}
+    secrets = {str(key): str(value) for key, value in rows if str(value)}
+    # An address with a password (stripped from backups) is kept for the merge below.
+    secrets.update(
+        {str(key): str(value) for key, value in url_rows if _url_without_password(str(value)) != str(value)}
+    )
+    return secrets
 
 
 def _sqlite_snapshot(source: Path, target: Path) -> None:
@@ -116,8 +139,13 @@ def _sqlite_snapshot(source: Path, target: Path) -> None:
 
 # Local copies of the library beside the database: one before every restore
 # (so a restore can be undone) and one a day. ``pre-v<N>`` copies are made by
-# schema migrations (Database._backup_before_migration).
-SNAPSHOT_KEEP = {"pre-restore": 3, "daily": 7}
+# schema migrations (Database._backup_before_migration). Seven daily copies of
+# a ~1 GB library used to take 7 GB; three cover a bad day or a weekend.
+SNAPSHOT_KEEP = {"pre-restore": 3, "daily": 3}
+# One-off copies (before a schema update, before an identity repair, a damaged
+# library put aside by a restore) used to stay forever, ~1 GB each.
+ONE_OFF_COPY_MAX_AGE_SECONDS = 14 * 86400
+_ONE_OFF_NAME = re.compile(r"^(?:pre-v\d+|identity-repair-\d+|damaged-\d{8}-\d{6})\.backup(?:-wal|-shm)?$")
 # How long a restore waits for mpv helper processes to finish a database write.
 RESTORE_LOCK_TIMEOUT = 10.0
 _SNAPSHOT_NAME = re.compile(r"^(?:(pre-restore|daily)-(\d{8}-\d{6})(?:-(\d+))?|pre-v\d+)$")
@@ -171,8 +199,30 @@ def list_database_snapshots(database_path: Path) -> list[dict[str, Any]]:
     return [item for _created, _counter, item in found]
 
 
+def _file_contains_any(path: Path, values: list[str], *, chunk_size: int = 4 * 1024 * 1024) -> bool:
+    """One of ``values`` (UTF-8) is in the file or its -wal (read in chunks)."""
+    needles = [value.encode("utf-8") for value in values if value]
+    if not needles:
+        return False
+    overlap = max(len(needle) for needle in needles) - 1
+    for candidate in (path, Path(str(path) + "-wal")):
+        if not candidate.is_file():
+            continue
+        tail = b""
+        with candidate.open("rb") as handle:
+            while chunk := handle.read(chunk_size):
+                window = tail + chunk
+                if any(needle in window for needle in needles):
+                    return True
+                tail = window[-overlap:] if overlap > 0 else b""
+    return False
+
+
 def _check_database_file(path: Path) -> None:
-    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)) as conn:
+    # The path is escaped: a folder named with "?" or "#" used to check (and
+    # create) a different empty file, and "%41" made every check fail.
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
         row = conn.execute("PRAGMA quick_check").fetchone()
     if row is None or str(row[0]).casefold() != "ok":
         raise ValueError(err("backup.integrityFailed"))
@@ -181,7 +231,7 @@ def _check_database_file(path: Path) -> None:
 def make_database_snapshot(
     database_path: Path, kind: str, *, now: float | None = None, prune: bool = True
 ) -> Path:
-    """A checked copy of the live database (SQLite backup API), then rotation of that kind."""
+    """A checked copy of the live database (VACUUM INTO), then rotation of that kind."""
     database_path = Path(database_path).expanduser()
     if kind not in SNAPSHOT_KEEP:
         raise ValueError(f"unknown snapshot kind {kind!r}")
@@ -202,11 +252,10 @@ def make_database_snapshot(
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
         with closing(sqlite3.connect(database_path, timeout=10)) as source:
-            with closing(sqlite3.connect(temporary)) as destination:
-                # One step: a single read transaction, so the copy is consistent
-                # while WAL writers go on.
-                source.backup(destination)
-                destination.execute("PRAGMA journal_mode=DELETE")
+            # One read transaction, so the copy is consistent while WAL writers
+            # go on. The backup API used to copy the free pages too (a 90 MB
+            # library made 950 MB copies).
+            vacuum_into(source, temporary)
         _check_database_file(temporary)
         os.chmod(temporary, 0o600)
         os.replace(temporary, target)
@@ -220,13 +269,9 @@ def make_database_snapshot(
 def _prune_snapshots(database_path: Path, kind: str, *, keep_path: Path | None = None) -> list[str]:
     same_kind = [item for item in list_database_snapshots(database_path) if item["kind"] == kind]
     removed: list[str] = []
-    # Copies interrupted by a quit or crash.
-    try:
-        for leftover in database_path.parent.glob(f".{database_path.name}.{kind}-*.tmp"):
-            if leftover.stat().st_mtime < time.time() - 3600:
-                leftover.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # Copies interrupted by a quit or crash: daily and pre-restore snapshots, and the
+    # pre-migration copy the database makes (each a full copy of the library).
+    remove_stale_temporaries(database_path.parent, f".{database_path.name}.*.tmp")
     for item in same_kind[SNAPSHOT_KEEP[kind] :]:
         if keep_path is not None and Path(item["path"]) == keep_path:
             continue
@@ -235,6 +280,42 @@ def _prune_snapshots(database_path: Path, kind: str, *, keep_path: Path | None =
             removed.append(item["path"])
         except OSError:
             continue
+    return removed
+
+
+def prune_one_off_copies(database_path: Path, *, now: float | None = None) -> list[str]:
+    """Delete one-off copies (pre-v<N>, identity-repair, damaged) older than 14 days.
+
+    A copy goes only once a newer daily or pre-restore copy exists, so the
+    library is never left without any copy beside it.
+    """
+    database_path = Path(database_path).expanduser()
+    current = time.time() if now is None else float(now)
+    newest_regular = max(
+        (
+            item["created_at"]
+            for item in list_database_snapshots(database_path)
+            if item["kind"] in SNAPSHOT_KEEP
+        ),
+        default=0.0,
+    )
+    prefix = database_path.name + "."
+    removed: list[str] = []
+    try:
+        candidates = list(database_path.parent.glob(database_path.name + ".*.backup*"))
+    except OSError:
+        return removed
+    for candidate in candidates:
+        if not candidate.name.startswith(prefix) or not _ONE_OFF_NAME.match(candidate.name[len(prefix) :]):
+            continue
+        try:
+            modified = candidate.stat().st_mtime
+            if modified >= current - ONE_OFF_COPY_MAX_AGE_SECONDS or newest_regular <= modified:
+                continue
+            candidate.unlink()
+        except OSError:
+            continue
+        removed.append(str(candidate))
     return removed
 
 
@@ -306,6 +387,25 @@ def _merge_iphone_access(staged_db: Path, live_db: Path) -> None:
         conn.commit()
 
 
+def _forget_iphone_identity(staged_db: Path) -> None:
+    """A backup set up as another Mac: its iPhone protocol data (paired devices, book and file
+    IDs made from the other Mac's identity, positions and receipts) stays behind. With the same
+    server ID on both Macs, a phone sent a watched mark for episode N of one Mac to the other's
+    episode N. Library positions themselves (audiobooks, episodes) are kept."""
+    with closing(sqlite3.connect(staged_db)) as conn:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'iphone\\_%' ESCAPE '\\'"
+            )
+        ]
+        for table in tables:
+            conn.execute(f'DELETE FROM "{table}"')
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='state'").fetchone():
+            conn.execute("DELETE FROM state WHERE key='iphone_restored_at'")
+        conn.commit()
+
+
 def _copy_live_iphone_access(conn: sqlite3.Connection) -> None:
     for table in ("iphone_devices", "iphone_invites"):
         live_sql = conn.execute(
@@ -361,7 +461,8 @@ def create_backup(
 
         cached_files: list[dict[str, str]] = []
         redacted_secret_count = 0
-        with sqlite3.connect(db_copy) as conn:
+        removed_secrets: list[str] = []
+        with closing(sqlite3.connect(db_copy)) as conn:
             conn.row_factory = sqlite3.Row
             try:
                 rows = conn.execute(
@@ -374,18 +475,45 @@ def create_backup(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
                 ).fetchone()
                 if exists:
+                    keys = tuple(sorted(_DATABASE_SECRET_KEYS))
+                    removed_secrets = [
+                        str(row[0])
+                        for row in conn.execute(
+                            f"SELECT value FROM ln_settings WHERE key IN ({_SECRET_PLACEHOLDERS}) AND value<>''",
+                            keys,
+                        ).fetchall()
+                    ]
                     cursor = conn.execute(
-                        "UPDATE ln_settings SET value='' WHERE key IN (?,?) AND value<>''",
-                        tuple(sorted(_DATABASE_SECRET_KEYS)),
+                        f"UPDATE ln_settings SET value='' WHERE key IN ({_SECRET_PLACEHOLDERS}) AND value<>''",
+                        keys,
                     )
                     redacted_secret_count += int(cursor.rowcount or 0)
+                    for url_key in _DATABASE_URL_KEYS:
+                        row = conn.execute("SELECT value FROM ln_settings WHERE key=?", (url_key,)).fetchone()
+                        address = str(row[0] or "") if row else ""
+                        without_password = _url_without_password(address)
+                        if without_password != address:
+                            removed_secrets.append(address)
+                            conn.execute(
+                                "UPDATE ln_settings SET value=? WHERE key=?", (without_password, url_key)
+                            )
+                            redacted_secret_count += 1
                     conn.commit()
-                    # Rebuild pages so removed tokens cannot survive in SQLite
-                    # freelist space inside the supposedly sanitized archive.
-                    conn.execute("VACUUM")
-                    conn.execute("PRAGMA journal_mode=DELETE")
-            except sqlite3.Error:
-                pass
+                    # The copy is in WAL mode: the UPDATE is only in the -wal file until
+                    # a checkpoint moves it into the archived main file.
+                    mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+                    if mode is None or str(mode[0]).casefold() != "delete":
+                        raise sqlite3.OperationalError("the redacted copy kept its WAL journal")
+                    if removed_secrets:
+                        # Rebuild pages so removed tokens cannot survive in SQLite
+                        # freelist space inside the supposedly sanitized archive.
+                        conn.execute("VACUUM")
+            except sqlite3.Error as exc:
+                # A failed redaction used to be ignored and the archive still held the keys.
+                raise RuntimeError(err("backup.redactionFailed", error=str(exc))) from exc
+        # Byte check of the archived file; very short values could match unrelated data.
+        if _file_contains_any(db_copy, [value for value in removed_secrets if len(value) >= 12]):
+            raise RuntimeError(err("backup.redactionFailed", error="a removed key is still in the copy"))
         durable_subtitle_dir = database_path.parent / "prepared-subtitles"
         for index, row in enumerate(rows, start=1):
             original = Path(str(row["subtitle_path"])).expanduser()
@@ -426,22 +554,45 @@ def create_backup(
             "cache_dir": str(cache_dir),
             "cached_files": cached_files,
             "includes_media": False,
-            "secrets_included": False,
+            # API keys are redacted, but the iPhone identity (server secret and
+            # TLS private key) is carried on purpose so a restored Mac stays
+            # paired; the manifest used to claim no secrets at all.
+            "secrets_included": bool(identity_files),
             "redacted_secret_count": redacted_secret_count,
             "iphone_identity": [path.name for path in identity_files],
         }
-        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-            if config_path.exists():
-                redacted_config, config_secret_count = _redact_config(config_path.read_text(encoding="utf-8"))
-                redacted_secret_count += config_secret_count
-                manifest["redacted_secret_count"] = redacted_secret_count
-                archive.writestr("config.toml", redacted_config)
-            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            archive.write(db_copy, "library.sqlite3")
-            for item in cached_files:
-                archive.write(Path(item["original"]), item["archive"])
-            for path in identity_files:
-                archive.write(path, f"iphone/{path.name}")
+        # Written 0600 (it holds the TLS private key) and renamed into place,
+        # so it is never world-readable, not even while being written. A backup cut
+        # off by a quit or crash left its hidden temporary beside the output.
+        remove_stale_temporaries(output.parent, f".{output.name}.*.tmp")
+        remove_stale_temporaries(output.parent, f".{APP_SLUG}-backup-*.zip.*.tmp")
+        fd, raw_partial = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=str(output.parent))
+        partial = Path(raw_partial)
+        try:
+            with (
+                os.fdopen(fd, "wb") as stream,
+                zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive,
+            ):
+                if config_path.exists():
+                    redacted_config, config_secret_count = _redact_config(
+                        config_path.read_text(encoding="utf-8")
+                    )
+                    redacted_secret_count += config_secret_count
+                    manifest["redacted_secret_count"] = redacted_secret_count
+                    archive.writestr("config.toml", redacted_config)
+                # Release sources (Settings → Sources) used to be part of config.toml.
+                sources_file = config_path.with_name(SOURCES_FILE_NAME)
+                if sources_file.is_file():
+                    archive.write(sources_file, SOURCES_FILE_NAME)
+                archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                archive.write(db_copy, "library.sqlite3")
+                for item in cached_files:
+                    archive.write(Path(item["original"]), item["archive"])
+                for path in identity_files:
+                    archive.write(path, f"iphone/{path.name}")
+            os.replace(partial, output)
+        finally:
+            partial.unlink(missing_ok=True)
     return {
         "path": str(output),
         "cached_files": len(cached_files),
@@ -611,6 +762,20 @@ def _validate_staged_config(staged_config: Path, *, database_path: Path, cache_d
         raise ValueError(err("backup.otherCache"))
 
 
+def _cached_member_name(member: str) -> str:
+    """The file name a cached subtitle of the archive is restored under (a plain name)."""
+    name = member.replace("\\", "/").rsplit("/", 1)[-1]
+    if (
+        name in {"", ".", ".."}
+        or name != Path(member).name
+        or any(ord(character) < 32 for character in name)
+        or len(name.encode("utf-8")) > 255
+        or any(part == ".." for part in member.replace("\\", "/").split("/"))
+    ):
+        raise ValueError(err("backup.invalidArchiveMember"))
+    return name
+
+
 def restore_backup(
     *,
     archive_path: Path,
@@ -618,6 +783,7 @@ def restore_backup(
     database_path: Path,
     cache_dir: Path,
     post_commit: Callable[[], None] | None = None,
+    iphone_identity: str = "replace",
 ) -> dict[str, Any]:
     """Validate completely in staging, then replace live files with rollback.
 
@@ -625,7 +791,14 @@ def restore_backup(
     function enters its commit phase.  The function itself guarantees that an
     invalid archive never touches live files and that a commit failure restores
     the previous database/config/cached subtitle set.
+
+    ``iphone_identity``: "replace" (this Mac takes the backed-up Mac's place: its iPhone
+    identity and pairings come back) or "new" (the backup sets up another Mac while the
+    first one stays in use: this Mac keeps its own identity and the backup's iPhone data is
+    left out, so phones never mistake one Mac for the other; they pair with it anew).
     """
+    if iphone_identity not in {"replace", "new"}:
+        raise ValueError("Invalid iPhone identity choice")
 
     archive_path = archive_path.expanduser()
     config_path = config_path.expanduser()
@@ -657,8 +830,31 @@ def restore_backup(
             if "config.toml" in names:
                 with archive.open("config.toml") as source, restored_config.open("wb") as destination:
                     shutil.copyfileobj(source, destination)
+            staged_sources: Path | None = None
+            if SOURCES_FILE_NAME in names:
+                try:
+                    sources = parse_sources(archive.read(SOURCES_FILE_NAME))
+                except SourcesError:
+                    sources = None  # a broken sources file is not worth failing the restore
+                if sources is not None:
+                    staged_sources = tmp / SOURCES_FILE_NAME
+                    staged_sources.write_text(
+                        json.dumps(sources.to_dict(), indent=2) + "\n", encoding="utf-8"
+                    )
 
-            for index, item in enumerate(manifest.get("cached_files", []), start=1):
+            cached_items = manifest.get("cached_files", [])
+            if not isinstance(cached_items, list):
+                raise ValueError(err("backup.notBackup", app=APP_NAME))
+            # Every name is checked before the first file is staged: the file name of a
+            # crafted member ("prepared-subtitles/..", "x/.", a name with a backslash or
+            # a NUL) would point the restored subtitle at a folder or outside its folder.
+            for item in cached_items:
+                if not isinstance(item, dict):
+                    continue
+                member = str(item.get("archive") or "")
+                if member and member in names and str(item.get("original") or ""):
+                    _cached_member_name(member)
+            for index, item in enumerate(cached_items, start=1):
                 if not isinstance(item, dict):
                     continue
                 member = str(item.get("archive") or "")
@@ -666,11 +862,12 @@ def restore_backup(
                 if not member or member not in names or not original:
                     continue
                 storage = str(item.get("storage") or "")
+                member_name = _cached_member_name(member)
                 if storage == "durable" or member.startswith("prepared-subtitles/"):
-                    target = database_path.parent / "prepared-subtitles" / Path(member).name
+                    target = database_path.parent / "prepared-subtitles" / member_name
                 else:
-                    target = cache_dir / "restored-subtitles" / Path(member).name
-                staged = staged_cached_dir / f"{index:04d}-{Path(member).name}"
+                    target = cache_dir / "restored-subtitles" / member_name
+                staged = staged_cached_dir / f"{index:04d}-{member_name}"
                 with archive.open(member) as source, staged.open("wb") as destination:
                     shutil.copyfileobj(source, destination)
                 staged_cached.append((original, staged, target))
@@ -678,7 +875,12 @@ def restore_backup(
 
             staged_identity: list[tuple[Path, Path, int | None]] = []
             identity_dir = database_path.parent / "iphone"
-            for name in manifest.get("iphone_identity", []) if backup_format >= 2 else []:
+            restored_names = (
+                manifest.get("iphone_identity", [])
+                if backup_format >= 2 and iphone_identity == "replace"
+                else []
+            )
+            for name in restored_names:
                 name = str(name)
                 member = f"iphone/{name}"
                 if not _IPHONE_IDENTITY_NAME.match(name) or member not in names:
@@ -705,6 +907,8 @@ def restore_backup(
                 )
             conn.commit()
         _keep_database_secrets(restored_db, existing_database_secrets)
+        if iphone_identity == "new":
+            _forget_iphone_identity(restored_db)
         _merge_iphone_access(restored_db, database_path)
         with closing(sqlite3.connect(restored_db)) as conn:
             final_integrity = conn.execute("PRAGMA integrity_check").fetchone()
@@ -732,6 +936,8 @@ def restore_backup(
         files: list[tuple[Path, Path, int | None]] = []
         if staged_config is not None:
             files.append((staged_config, config_path, 0o600))
+        if staged_sources is not None:
+            files.append((staged_sources, config_path.with_name(SOURCES_FILE_NAME), 0o600))
         files.extend((staged, target, None) for _original, staged, target in staged_cached)
         if staged_identity:
             identity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -748,6 +954,7 @@ def restore_backup(
         "path": str(archive_path),
         "restored_cached_files": len(restored_paths),
         "restored_iphone_identity": len(staged_identity),
+        "iphone_identity": iphone_identity,
         "undo_snapshot": str(undo) if undo is not None else "",
         "restart_required": True,
     }
@@ -763,6 +970,13 @@ def _keep_database_secrets(staged_db: Path, secrets: dict[str, str]) -> None:
         ).fetchone():
             return
         for key, value in secrets.items():
+            if key in _DATABASE_URL_KEYS:
+                # The restored address keeps this Mac's password only when it is the same
+                # address apart from the password (backups strip it); another one stays as is.
+                row = conn.execute("SELECT value FROM ln_settings WHERE key=?", (key,)).fetchone()
+                restored = str(row[0] or "") if row else ""
+                if not restored or not same_address_apart_from_password(restored, value):
+                    continue
             conn.execute(
                 "INSERT INTO ln_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
@@ -819,6 +1033,11 @@ def _commit_restore(
                     Path(str(database_path) + suffix).unlink(missing_ok=True)
                 _atomic_copy(restored_db, database_path)
                 for staged, target, mode in files:
+                    if mode is not None:
+                        # copy2 carries this mode onto the file renamed into
+                        # place; a staged 0644 left a secret world-readable
+                        # until the chmod after the rename.
+                        os.chmod(staged, mode)
                     _atomic_copy(staged, target)
                     if mode is not None:
                         target.chmod(mode)
@@ -831,6 +1050,8 @@ def _commit_restore(
                     if saved is None:
                         target.unlink(missing_ok=True)
                     else:
+                        if mode is not None:
+                            os.chmod(saved, mode)
                         _atomic_copy(saved, target)
                         if mode is not None:
                             target.chmod(mode)

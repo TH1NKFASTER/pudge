@@ -395,14 +395,16 @@ def test_background_pass_releases_lease_on_error(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(intro_skipper, "analyze_title", boom)
     scheduler = FakeScheduler()
-    with pytest.raises(RuntimeError):
-        run_background_pass(
-            db=_fake_db(tmp_path, files),
-            cache_dir=tmp_path / "c",
-            ffmpeg="f",
-            ffprobe="p",
-            scheduler=scheduler,
-        )
+    # A title that raises is logged and left for a day (REVIEW mod-intro #3: it used to end
+    # every pass before the titles after it); the lease is released all the same.
+    result = run_background_pass(
+        db=_fake_db(tmp_path, files),
+        cache_dir=tmp_path / "c",
+        ffmpeg="f",
+        ffprobe="p",
+        scheduler=scheduler,
+    )
+    assert result["status"] == "idle"
     assert scheduler.released == 1
 
 

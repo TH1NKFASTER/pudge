@@ -76,6 +76,10 @@ def test_v160_manifest_recovers_opaque_direct_release_after_restart(tmp_path: Pa
         selected=[{"name": "release-root/audio-0001.m4b"}],
         collection=False,
     )
+    # Not before the torrent client finished it: full-size files prove nothing (pieces arrive out of order).
+    api._audiobook_torrent_client = lambda: (_ for _ in ()).throw(RuntimeError("no client"))
+    assert api._recoverable_light_novel_audiobook_paths(book, destination) == []
+    api._mark_ln_audiobook_selection_complete(destination)
 
     assert api._recoverable_light_novel_audiobook_paths(book, destination) == [opaque.resolve()]
 
@@ -108,7 +112,7 @@ def test_recovered_multifile_volume_never_imports_neighbor_audio(tmp_path: Path)
 
     assert result == {"id": 12}
     root, files, kwargs = calls[0]
-    assert root == destination / ".pudge-volume-import"
+    assert root.parent == destination / ".pudge-volume-import"
     assert len(files) == 2
     assert neighbor.resolve() not in {path.resolve() for path in files}
     assert {path.stat().st_ino for path in files} == {selected_a.stat().st_ino, selected_b.stat().st_ino}

@@ -17,6 +17,10 @@ function torrentUiLabel(state,lang){
   const language=lang?(String(lang).toLowerCase().startsWith('ru')?'ru':'en'):undefined;
   return PudgeI18n.t(keys[state]||keys.unknown,{},language);
 }
+// An observed Off does not wear off: the backends stay stopped until the next On, which
+// sends a new status. Requiring a reading under 15 s old made every card say "Shutdown not
+// confirmed" between two checks (they come every 30-120 s while Torrents are off).
+function torrentOffConfirmed(live){return !!live&&live.enabled===false&&live.transition==='off_confirmed';}
 function torrentTrafficFresh(live,enabled,now=Date.now()/1000){
   const observed=Number(live?.updated_at||0);
   return !!live&&live.stale===false&&live.enabled===enabled&&observed>0&&now>=observed&&now-observed<15;

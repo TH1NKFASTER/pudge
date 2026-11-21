@@ -37,16 +37,16 @@ def test_ass_is_converted_to_plain_srt_without_styles(tmp_path):
 def test_plain_subtitle_text_removes_isolated_hangul_prefix_before_japanese():
     from pudge.subtitle_formats import plain_subtitle_text
 
-    assert plain_subtitle_text("모巨大生物が出現しました") == "巨大生物が出現しました"
+    assert plain_subtitle_text("모大きな船が見えました") == "大きな船が見えました"
     assert plain_subtitle_text("한국어 자막") == "한국어 자막"
 
 
 def test_plain_subtitle_text_removes_angle_wrappers_and_speaker_labels():
     from pudge.subtitle_formats import plain_subtitle_text
 
-    source = "＜（黒絵）\nずっと　自分が嫌いだった＞"
-    assert plain_subtitle_text(source) == "ずっと　自分が嫌いだった"
-    assert plain_subtitle_text("（南）赤石さん") == "赤石さん"
+    source = "＜（ハナ）\nいつも　朝が苦手だった＞"
+    assert plain_subtitle_text(source) == "いつも　朝が苦手だった"
+    assert plain_subtitle_text("（ミオ）青木さん") == "青木さん"
 
 
 def test_plain_subtitle_text_preserves_standalone_stage_direction():
@@ -67,8 +67,8 @@ def test_clean_srt_for_playback_creates_clean_copy(tmp_path):
     from pudge.subtitle_formats import clean_srt_for_playback
 
     text = (
-        "1\n00:00:34,301 --> 00:00:37,804\n＜（黒絵）\nずっと　自分が嫌いだった＞\n\n"
-        "2\n00:00:48,315 --> 00:00:50,317\n（南）赤石さん\n"
+        "1\n00:00:34,301 --> 00:00:37,804\n＜（ハナ）\nいつも　朝が苦手だった＞\n\n"
+        "2\n00:00:48,315 --> 00:00:50,317\n（ミオ）青木さん\n"
     )
     original = tmp_path / "episode.srt"
     original.write_text(text, encoding="utf-8")
@@ -81,10 +81,10 @@ def test_clean_srt_for_playback_creates_clean_copy(tmp_path):
     text = output.read_text(encoding="utf-8")
     assert "＜" not in text
     assert "＞" not in text
-    assert "（黒絵）" not in text
-    assert "（南）" not in text
-    assert "ずっと　自分が嫌いだった" in text
-    assert "赤石さん" in text
+    assert "（ハナ）" not in text
+    assert "（ミオ）" not in text
+    assert "いつも　朝が苦手だった" in text
+    assert "青木さん" in text
 
 
 def test_write_srt_separates_exactly_touching_cues(tmp_path):
@@ -93,8 +93,8 @@ def test_write_srt_separates_exactly_touching_cues(tmp_path):
     output = tmp_path / "touching.srt"
     write_srt(
         [
-            (37.804, 42.476, "醜くて\nひねくれてて　全然かわいくない"),
-            (42.476, 47.080, "恋なんて恐怖でしかない\nそう思ってたのに"),
+            (37.804, 42.476, "眠くて\nお腹もすいて　全然動けない"),
+            (42.476, 47.080, "傘なら玄関に置いてある\n早く取ってきてね"),
         ],
         output,
     )

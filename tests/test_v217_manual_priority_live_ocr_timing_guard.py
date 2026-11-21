@@ -64,13 +64,13 @@ def test_user_waiter_gets_heavy_slot_before_background_reacquire(tmp_path: Path)
 
     thread = threading.Thread(target=user, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30  # ends as soon as the user work waits
     while time.monotonic() < deadline and not scheduler.should_yield_to_higher_priority(
         WorkPriority.BACKGROUND
     ):
         time.sleep(0.01)
     background.release()
-    assert acquired.wait(2)
+    assert acquired.wait(30)
     # A background retry must not jump ahead while the manual request/lease lives.
     assert (
         scheduler.acquire_heavy(

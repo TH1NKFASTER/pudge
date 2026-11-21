@@ -137,9 +137,12 @@ def test_downloaded_episodes_open_without_waiting_for_an_absent_mac() -> None:
         in start
     )
     assert "guard await media.app.reachMac() else {" in start
-    episodes = _swift(MEDIA, "func refreshEpisodes(", "await sendVideoPositions()")
-    assert "guard await app.reachMac() else { episodesError = Self.episodesOffline; return }" in episodes
-    refresh = _swift(MODEL, "func refresh() async {", "let catalog =")
+    episodes = _swift(MEDIA, "private func loadEpisodes(", "await sendVideoPositions()")
+    assert (
+        "guard await app.reachMac() else { if episodesError != Self.episodesOffline { episodesError = Self.episodesOffline }; return }"
+        in episodes
+    )
+    refresh = _swift(MODEL, "private func refreshOnce() async {", "let catalog =")
     assert "guard await reachMac() else { reloadLocal(); return }" in refresh
     model = _swift(MODEL)
     assert "if macAvailable && !oldValue && macChecked { reconnected() }" in model
@@ -163,25 +166,30 @@ def test_light_novels_and_manga_download_and_open_without_the_mac() -> None:
         "try FileIntegrity.verify(partial, sha256: sha, sizeBytes: size) try ReadingPackage.unpack(partial, into: target)"
         in download
     )
-    assert "if var saved = savedChapter(book, index: index) {" in media
+    assert "if var saved = await savedChapter(book, index: index) {" in media
     assert (
-        "if let local = localReadingImage(path), let image = UIImage(contentsOfFile: local.path) {" in media
+        "if let local, let image = DownsampledImage.load(local, maxPixels: limit) { return image }" in media
     )
     assert 'let file = readingURL("manga", book).appendingPathComponent("text-\\(page).json")' in media
-    assert "if let saved = savedParse(text) { return saved }" in media
+    assert "if let saved = await savedParse(text) { return saved }" in media
     # Without the Mac the lists show the downloaded volumes; positions read here wait for the Mac.
     reading = _swift(MEDIA, "func refreshReading(", "func refreshEpisodes(")
     assert "novels = savedNovelItems(); manga = savedMangaItems()" in reading
     assert "await sendReadingPositions()" in reading
     assert "record.chapter = chapter; record.offset = offset; record.positionDirty = true" in media
-    # Every volume has a download button in its reader and a long-press menu in the lists.
+    # Every volume has a download button in its reader and a ⋯ / long-press menu on its card
+    # in the library grids (LibraryCard shows `actions` in both).
     read = _swift(READ)
     assert 'ReadingDownloadButton(media: media, kind: "ln", id: bookId, title: title)' in read
     assert 'ReadingDownloadButton(media: media, kind: "manga", id: book.id, title: book.title)' in read
-    assert (
-        '.contextMenu { ReadingDownloadMenu(media: media, kind: "ln", id: book.id, title: book.title) }'
-        in read
-    )
+    novel_card = _swift(READ, "struct NovelCard: View", "struct NovelShelfCard: View")
+    assert "} actions: { Button(action: open)" in novel_card
+    assert 'ReadingDownloadMenu(media: media, kind: "ln", id: book.id, title: book.title)' in novel_card
+    manga_card = _swift(READ, "struct MangaCard: View", "struct MangaShelfCard: View")
+    assert 'ReadingDownloadMenu(media: media, kind: "manga", id: book.id, title: book.title)' in manga_card
+    assert "if media.needsOCR(book) { GetOCRMenuItem(media: media, book: book) }" in manga_card
+    grid = _swift("ios/Pudge/UI/LibraryGrid.swift")
+    assert "card.contextMenu { actions() }" in grid and "Menu { actions() } label:" in grid
     assert "let start = media.startPosition(bookId, value)" in read
     assert "ReadingDownloadsScreen(media: model.media)" in _swift("ios/Pudge/UI/SettingsScreen.swift")
 
@@ -486,7 +494,9 @@ def test_pairing_shows_the_code_and_waits_for_allow_on_the_mac() -> None:
 def test_pairing_tries_every_mac_address_of_the_invitation_in_order() -> None:
     reach = _swift(MODEL, "private func reachableMac(", "func disconnect()")
     assert "for address in payload.candidates {" in reach
-    assert "if await client.answers() { return mac }" in reach
+    # Each probe connection is closed (its URLSessions held their delegates until invalidated).
+    assert "let answered = await client.answers()" in reach
+    assert reach.index("client.close()") < reach.index("if answered { return mac }")
     parse = _swift(
         "ios/Pudge/Networking/MacConnection.swift", "var candidates: [String] {", "struct PairedMac"
     )
@@ -516,7 +526,7 @@ def test_start_over_asks_first_and_mark_unfinished_is_separate() -> None:
     assert "isPresented: $startOverConfirmation" in dialog
     assert 'model.player.save("reset")' in dialog
     assert book.count('save("reset")') == 1  # only behind the confirmation
-    at = book.index("state.finished {")
+    at = book.index("if model.isFinished(book) {")
     finished = book[at : book.index("Section {", at)]
     assert 'if model.macSupports("progress-unfinish") {' in finished
     assert 'Button("Mark unfinished") { model.markUnfinished(book) }' in finished

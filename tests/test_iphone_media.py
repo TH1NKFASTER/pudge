@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import subprocess
 import zipfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from pudge.database import Database
+from pudge.light_novels import LightNovelSetupRequired
 from pudge.iphone_media import MediaError, compact_tokens, prepare_video, streak, utf16_to_index
 from test_iphone_audio_repository import allowed
 from media_tools import requires_ffmpeg
@@ -308,12 +310,15 @@ def test_media_routes_over_https(service, tmp_path):
         consumption_statistics_query=lambda scope, limit, offset: {
             "summary": {"total_seconds": 100, "active_days": 1, "sessions": 2},
             "breakdown": {"anime": 100},
-            "days": [{"day": "2026-10-05", "seconds": 100, "breakdown": {"anime": 100}}],
+            "days": [
+                {"day": time.strftime("%Y-%m-%d"), "seconds": 100, "breakdown": {"anime": 100}}
+            ],  # streak: today
             "works": [{"title": "Show", "kind": "anime", "seconds": 100}],
         },
         manga=SimpleNamespace(_book=lambda book: {"path": str(archive)}, _pages=lambda path: ["001.jpg"]),
+        # The real missing-token error (setup required: final, 422 with its reason).
         study_parse_text=lambda text: (_ for _ in ()).throw(
-            RuntimeError("Jiten API token is not configured")
+            LightNovelSetupRequired("Jiten API token is not configured")
         ),
     )
     server, thread, pin = start_iphone_server(service, host="127.0.0.1", port=0)
@@ -481,7 +486,9 @@ def test_paragraph_flags_and_furigana_follow_the_mac_reader_settings():
         3,
         3,
     ]  # known: mature, no furigana/mark; new and young: both
-    assert [(row[5] >> 3) & 15 for row in view["tokens"]] == [6, 1, 2]  # JitenMPV mastered, new, young (+1)
+    # JitenMPV mature, new, young (+1): "known" is mature there too, as in the Mac reader below
+    # (it was Mastered, which the JitenMPV themes dim, while the Mac showed it green).
+    assert [(row[5] >> 3) & 15 for row in view["tokens"]] == [3, 1, 2]
     # Bits 7-10: the Mac reader's word state (WORD_STATES index + 1): "known" is Jiten's
     # mature, a word without a card is unknown (0), young.
     assert [row[5] >> 7 for row in view["tokens"]] == [4, 0, 3]
@@ -706,15 +713,16 @@ def test_jitenmpv_look_reads_the_theme_or_custom_colours(tmp_path):
 
     assert subtitle_look(tmp_path / "missing.json")["source"] == "default"
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({"Theme": "Underline", "FontSize": 52}), encoding="utf-8")
+    # JitenMPV's config.json is snake_case (PascalCase fallback: tests/test_fix_ios3_jitenmpv_look.py).
+    config.write_text(json.dumps({"theme": "Underline", "font_size": 52}), encoding="utf-8")
     look = subtitle_look(config)
     assert look["source"] == "jiten-mpv" and look["fontSize"] == 52
     assert look["states"][0]["underlineColor"] == "#a566ef" and "underline" not in look["states"][2]
     config.write_text(
         json.dumps(
             {
-                "Theme": "Custom",
-                "CustomThemeColors": {
+                "theme": "Custom",
+                "custom_theme_colors": {
                     "Young": {
                         "text_color": "#123456",
                         "outline_color": "#000000",
@@ -825,3 +833,37 @@ def test_light_novels_carry_series_and_franchise_grouping(service):
         and items[1]["progress"] == 0.4
     )
     assert items[2]["progress"] == 1.0 and items[2]["volume"] == 1
+
+
+def test_anime_groups_say_whether_the_title_is_ongoing(service, tmp_path):
+    with service.db.connect() as conn:
+        for media, title in [(11, "Airing"), (12, "Finished"), (13, "MacNew"), (14, "Unknown")]:
+            conn.execute(
+                "INSERT INTO anime(media_id,title,status,progress,episodes,updated_at) VALUES(?,?,'CURRENT',0,12,0)",
+                (media, title),
+            )
+            video = tmp_path / f"{media}.mkv"
+            video.write_bytes(b"x")
+            subtitle = tmp_path / f"{media}.srt"
+            subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nx\n", encoding="utf-8")
+            conn.execute(
+                "INSERT INTO episodes(media_id,title,episode,video_path,subtitle_path,state,updated_at) VALUES(?,?,1,?,?,'ready',0)",
+                (media, "Ep 1", str(video), str(subtitle)),
+            )
+    library = [
+        SimpleNamespace(media_id=11, title="Airing", progress=0, episodes=12, media_status="RELEASING"),
+        SimpleNamespace(media_id=12, title="Finished", progress=0, episodes=12, media_status="FINISHED"),
+        SimpleNamespace(media_id=13, title="MacNew", progress=0, episodes=12, media_status="FINISHED"),
+    ]
+    home = {"new_ready": [{"media_id": 13}], "completed_ready": [{"media_id": 12}]}
+    service.api = _api(
+        manager=SimpleNamespace(
+            db=SimpleNamespace(anime_list=lambda: library, personal_release_schedule=lambda media: False)
+        ),
+        _personal_schedule_snapshot=lambda anime: {"enabled": False},
+        get_state_fast=lambda: {"home": home},
+    )
+    groups = {g["title"]: g["airing"] for g in service.media.anime()["items"]}
+    # Airing on AniList or under the Mac's New episodes ready: New episodes ready on the phone;
+    # a finished title: Completed & ready.
+    assert groups == {"Airing": True, "Finished": False, "MacNew": True, "Unknown": False}

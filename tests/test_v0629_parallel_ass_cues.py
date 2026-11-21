@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pudge.subtitle_formats import convert_to_plain_srt, parse_srt
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def test_broadcast_ass_parallel_lines_keep_shared_timing(tmp_path: Path) -> None:
@@ -13,12 +14,12 @@ Title: Grand Blue regression
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:49.08,0:00:51.58,Default,,0,0,0,,{\\pos(552,407)}そうなのか？
-Dialogue: 0,0:00:49.08,0:00:51.58,Default,,0,0,0,,{\\pos(172,497)}まったく➡
-Dialogue: 0,0:00:51.58,0:00:54.09,Default,,0,0,0,,{\\pos(172,437)}何を急に
-Dialogue: 0,0:00:51.58,0:00:54.09,Default,,0,0,0,,{\\pos(192,497)}変なこと言いだしてんだか。
-Dialogue: 0,0:00:54.09,0:00:56.26,Default,,0,0,0,,飲み過ぎじゃないの？
-Dialogue: 0,0:00:54.09,0:00:56.26,Default,,0,0,0,,だから➡
+Dialogue: 0,0:00:49.08,0:00:51.58,Default,,0,0,0,,{\\pos(552,407)}本当なのか？
+Dialogue: 0,0:00:49.08,0:00:51.58,Default,,0,0,0,,{\\pos(172,497)}それなら➡
+Dialogue: 0,0:00:51.58,0:00:54.09,Default,,0,0,0,,{\\pos(172,437)}どうして急に
+Dialogue: 0,0:00:51.58,0:00:54.09,Default,,0,0,0,,{\\pos(192,497)}窓なんか開けてるんだか。
+Dialogue: 0,0:00:54.09,0:00:56.26,Default,,0,0,0,,寒すぎじゃないの？
+Dialogue: 0,0:00:54.09,0:00:56.26,Default,,0,0,0,,だって➡
 """,
         encoding="utf-8",
     )
@@ -34,9 +35,9 @@ Dialogue: 0,0:00:54.09,0:00:56.26,Default,,0,0,0,,だから➡
     assert len(cues) == 3
     assert cues[0][0] == 49.08
     assert cues[0][1] == 51.48  # 100 ms safety gap before the next cue.
-    assert cues[0][2] == "そうなのか？\nまったく➡"
-    assert cues[1][2] == "何を急に\n変なこと言いだしてんだか。"
-    assert cues[2][2] == "飲み過ぎじゃないの？\nだから➡"
+    assert cues[0][2] == "本当なのか？\nそれなら➡"
+    assert cues[1][2] == "どうして急に\n窓なんか開けてるんだか。"
+    assert cues[2][2] == "寒すぎじゃないの？\nだって➡"
     assert all(end - start > 2.0 for start, end, _text in cues)
 
 
@@ -119,8 +120,7 @@ def test_generation_eight_requeues_only_old_playback_srt(tmp_path: Path) -> None
         )
 
     assert manager._requeue_legacy_generated_subtitles() == 1
-    playback = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv")
-    alass = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
-    assert playback is not None and playback.subtitle_path is None
-    assert alass is not None and alass.subtitle_path is not None
+    # The old playback copy is kept while it is prepared again; the ALASS output is not touched.
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 05.mkv")
+    assert_not_prepared_again(manager, cfg.library.root_dir / "Anime - 06.mkv")
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"

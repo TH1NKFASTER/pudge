@@ -1,7 +1,7 @@
 'use strict';
 
 // The Jimaku key notice: the key stopped working (Jimaku refuses the shared trial key or your
-// own key, or the 48 hours of the trial ended). It says what happened and why Jimaku subtitles
+// own key, or the 7 days of the trial ended). It says what happened and why Jimaku subtitles
 // are unavailable, and takes a personal key: Save checks it with Jimaku first and says whether it
 // worked. It opens by itself once per trial or refused personal key when nothing else is open
 // (the backend remembers it was shown); Settings → Jimaku API opens it again. Closing it changes

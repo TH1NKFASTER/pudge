@@ -300,7 +300,8 @@ def test_download_final_sequel_reports_missing_torrent_without_status_change() -
     assert result["ok"] is False
     assert result["reason"] == "no_release"
     assert db.get_anime(2).status == ""
-    assert api.manager.calls == [(2, None, False)]
+    # The whole title (an episode-less single search sent no Nyaa query).
+    assert api.manager.calls == [(2, None, True)]
 
 
 def test_score_modal_offers_the_sequel_actions_and_opens_it_on_anilist(page) -> None:

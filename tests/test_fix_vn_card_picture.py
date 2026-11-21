@@ -47,10 +47,10 @@ def fresh_service() -> VisualNovelService:
 def test_each_line_keeps_the_frame_it_was_first_read_from() -> None:
     service = fresh_service()
     partial = read(service, game_frame("red"), "それが")  # half-typed
-    first = read(service, game_frame("blue"), "それが、二階堂ヒロだった。")
+    first = read(service, game_frame("blue"), "それが、二階堂ヒロの答えだった。")
     assert first != partial
     # The same line read again later (another frame) keeps its first frame.
-    assert read(service, game_frame("green"), "それが、二階堂ヒロだった。", commit=True) == first
+    assert read(service, game_frame("green"), "それが、二階堂ヒロの答えだった。", commit=True) == first
     [row] = service.state()["transcript"]
     assert row["frame_id"] == first
     jpeg = service.frame_jpeg(first)
@@ -96,7 +96,7 @@ def test_adding_a_word_from_a_vn_line_attaches_its_game_picture(tmp_path) -> Non
                 "word_id": 7,
                 "reading_index": 0,
                 "deck_id": "12",
-                "sentence": "それが、二階堂ヒロだった。",
+                "sentence": "それが、二階堂ヒロの答えだった。",
                 "media_context": {"kind": "vn", "frame_id": frame_id},
             }
         )
@@ -157,7 +157,7 @@ def test_jiten_add_uploads_the_game_picture_as_card_media(tmp_path) -> None:
             7,
             0,
             deck_id="12",
-            sentence="それが、二階堂ヒロだった。" * 20,
+            sentence="それが、二階堂ヒロの答えだった。" * 20,
             surface="二階堂ヒロ",
             media_image=b"JPEG",
             media_filename="pudge-vn-frame-3.jpg",

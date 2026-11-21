@@ -14,6 +14,7 @@ from pudge.config import load_config, write_config
 from pudge.database import Database
 from pudge.manga import MangaService
 from test_skip_segments_playback import _launch
+from desktop_isolation import patch_webapp_popen
 from test_web_app import make_api
 from tests.css_support import css_rules
 from tests.i18n_support import en, has_text
@@ -117,7 +118,12 @@ def test_removed_mpv_anilist_open_and_correct_shortcuts_are_gone(tmp_path: Path,
         before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
     )
     assert sorted(result.value) == [
+        "s_shortcut_mpv_auto_pause",
         "s_shortcut_mpv_explain",
+        "s_shortcut_mpv_next_line",
+        "s_shortcut_mpv_previous_line",
+        "s_shortcut_mpv_replay_line",
+        "s_shortcut_mpv_reset_carried_delay",
         "s_shortcut_mpv_skip",
         "s_shortcut_mpv_translate",
         "s_shortcut_mpv_watched",
@@ -125,8 +131,13 @@ def test_removed_mpv_anilist_open_and_correct_shortcuts_are_gone(tmp_path: Path,
     ]
     [[saved]] = result.calls_of("save_settings")
     assert sorted(key for key in saved if key.startswith("shortcut_")) == [
+        "shortcut_mpv_auto_pause",
         "shortcut_mpv_explain_subtitle",
         "shortcut_mpv_mark_watched",
+        "shortcut_mpv_next_line",
+        "shortcut_mpv_previous_line",
+        "shortcut_mpv_replay_line",
+        "shortcut_mpv_reset_carried_delay",
         "shortcut_mpv_skip_segment",
         "shortcut_mpv_translate_subtitle",
         "shortcut_screen_text",
@@ -147,8 +158,13 @@ def test_removed_mpv_anilist_open_and_correct_shortcuts_are_gone(tmp_path: Path,
     # Playback passes mpv only the remaining shortcuts.
     _command, env, _ = _launch(tmp_path / "play", monkeypatch, exclusive=False, segments=False)
     assert sorted(key for key in env if key.startswith("PUDGE_SHORTCUT_")) == [
+        "PUDGE_SHORTCUT_AUTO_PAUSE",
         "PUDGE_SHORTCUT_EXPLAIN_SUBTITLE",
         "PUDGE_SHORTCUT_MARK_WATCHED",
+        "PUDGE_SHORTCUT_NEXT_LINE",
+        "PUDGE_SHORTCUT_PREVIOUS_LINE",
+        "PUDGE_SHORTCUT_REPLAY_LINE",
+        "PUDGE_SHORTCUT_RESET_CARRIED_DELAY",
         "PUDGE_SHORTCUT_SKIP_SEGMENT",
         "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE",
     ]
@@ -250,7 +266,9 @@ def test_window_api_reveals_the_audiobook_and_restores_a_deleted_bookmark(
     book_id = int(book["id"])
     opened: list[list[str]] = []
     monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", lambda command, *a, **k: opened.append(command))
+    # Only web_app's Popen: subprocess.Popen itself is process-wide, and the api's audiobook
+    # cover thread (ffmpeg) ran inside this test on a busy Mac and was counted as a reveal.
+    patch_webapp_popen(monkeypatch, lambda command, *a, **k: opened.append(command))
     assert api.audiobook_reveal_source(book_id) == {"ok": True, "path": str(source.resolve())}
     assert opened == [["open", "-R", str(source.resolve())]]  # selected in Finder
 

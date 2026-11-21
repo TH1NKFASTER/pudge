@@ -17,6 +17,7 @@ from pudge.light_novels import LightNovelService
 from pudge.manager import AnimeManager, _subtitle_retry_is_network_error, _subtitle_retry_is_rate_limit, err
 from pudge.providers.jimaku import JimakuClient, JimakuError
 from t71g19_support import LN_PAIRED, OPEN
+from repository_files import in_repository
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -286,4 +287,4 @@ def test_v0673_resync_jobs_wait_while_regular_subtitle_work_runs(tmp_path: Path)
 
 
 def test_v0673_llm_handoff_note_is_not_shipped() -> None:
-    assert not (ROOT / "docs" / "LLM_HANDOFF.md").exists()
+    assert not in_repository("docs/LLM_HANDOFF.md")

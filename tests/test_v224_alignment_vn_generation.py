@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-import pudge.audiobooks as audiobooks_module
 import pudge.visual_novels as vn_module
 from pudge.audiobooks import AudiobookService
 from pudge.config import AppConfig
@@ -60,73 +58,14 @@ def _paired_audio(tmp_path: Path) -> tuple[AudiobookService, int, int]:
     return audio, ln_id, audio_id
 
 
-def _wait_until(predicate, timeout: float = 2.0) -> None:
+def _wait_until(predicate, timeout: float = 60.0) -> None:
+    # Ends as soon as the condition holds; the far bound only stops a hang (a busy Mac).
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(0.01)
     raise AssertionError("condition did not become true")
-
-
-def test_alignment_reprocess_generation_blocks_late_old_publish(monkeypatch, tmp_path: Path) -> None:
-    audio, ln_id, audio_id = _paired_audio(tmp_path)
-    first_started = threading.Event()
-    release_first = threading.Event()
-    calls = 0
-    calls_lock = threading.Lock()
-
-    monkeypatch.setattr(
-        audio,
-        "_load_transcript",
-        lambda _audio_id: {"segments": [{"start": 0.0, "end": 2.0, "text": "狼と商人"}]},
-    )
-    monkeypatch.setattr(audio, "_load_or_analyze_activity", lambda *_args, **_kwargs: ([], "test"))
-    monkeypatch.setattr(audio, "_cached_chapter_start_reading_hints", lambda _ln_id: {})
-    monkeypatch.setattr(audio, "_alignment_chapter_needs_precision", lambda _row: False)
-    monkeypatch.setattr(audio, "_transcript_fingerprint", lambda _audio_id: "transcript")
-    monkeypatch.setattr(
-        audiobooks_module,
-        "build_alignment_report",
-        lambda alignment, _chapters: {"summary": {"coverage": 1.0}, "marker": alignment["marker"]},
-    )
-
-    def fake_align(*_args, **_kwargs):
-        nonlocal calls
-        with calls_lock:
-            calls += 1
-            call = calls
-        if call == 1:
-            first_started.set()
-            assert release_first.wait(2.0)
-        return {
-            "schema": "reading-audio-v3",
-            "chapters": [],
-            "confidence": 0.9 if call == 2 else 0.1,
-            "anchor_count": 0,
-            "marker": "new" if call == 2 else "old",
-        }
-
-    # The alignment itself runs in a child process; the test replaces that step.
-    monkeypatch.setattr(audio, "_align_reading_audio", fake_align)
-
-    audio.prepare_alignment(ln_id)
-    assert first_started.wait(1.0)
-    second = audio.reprocess_alignment(ln_id)
-    assert int(second["generation"]) >= 2
-
-    output = audio._alignment_path(ln_id, audio_id)
-    _wait_until(lambda: output.is_file())
-    assert json.loads(output.read_text(encoding="utf-8"))["marker"] == "new"
-
-    release_first.set()
-    _wait_until(
-        lambda: not any(name.startswith("reading-audio-align-") for name in audio.active_worker_names())
-    )
-    assert json.loads(output.read_text(encoding="utf-8"))["marker"] == "new"
-    status = audio.alignment_status(ln_id)
-    assert status["ready"] is True
-    assert float(status["confidence"]) == 0.9
 
 
 def test_alignment_relink_cancels_old_generation(tmp_path: Path) -> None:

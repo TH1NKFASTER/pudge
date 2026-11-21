@@ -202,7 +202,8 @@ def test_waiting_card_opens_why_not_ready_and_offers_watching_without_subtitles(
             const out = {title: __text('#modalTitle'), buttons: [...document.querySelectorAll('#modalBody button')].map(b => [b.dataset.action, b.textContent]),
                          expected: {title: `${t('action.whyNotReady')} — Show`, buttons: [
                            ['watch-diagnostic-without-subs', t('action.watchWithoutJpSubs')], ['retry-diagnostic', t('action.retryPreparation')],
-                           ['choose-diagnostic-subtitle', t('action.chooseSubtitle')], ['find-diagnostic-release', t('action.findEpisode')]]}};
+                           ['choose-diagnostic-subtitle', t('action.chooseSubtitle')],
+                           ['choose-diagnostic-subtitle-as-is', t('action.useSubtitleAsIs')], ['find-diagnostic-release', t('action.findEpisode')]]}};
             await __click('[data-action="watch-diagnostic-without-subs"]'); await __tick(20);
             out.closed = !$('modalBackdrop').classList.contains('open');
             await open();

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -33,8 +34,9 @@ def probe_container_edit_points(video: Path, ffprobe_path: str = "ffprobe") -> l
         payload = json.loads(completed.stdout or "{}") if completed.returncode == 0 else {}
     except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
         return []
+    chapters = payload.get("chapters") if isinstance(payload, dict) else None
     points: list[dict[str, object]] = []
-    for chapter in payload.get("chapters", []):
+    for chapter in chapters if isinstance(chapters, list) else []:
         if not isinstance(chapter, dict):
             continue
         tags = chapter.get("tags") if isinstance(chapter.get("tags"), dict) else {}
@@ -44,7 +46,7 @@ def probe_container_edit_points(video: Path, ffprobe_path: str = "ffprobe") -> l
                 seconds = float(chapter.get(key))
             except (TypeError, ValueError):
                 continue
-            if seconds <= 0:
+            if not math.isfinite(seconds) or seconds <= 0:
                 continue
             points.append({"time": round(seconds, 3), "kind": kind, "title": title})
     unique: dict[int, dict[str, object]] = {}

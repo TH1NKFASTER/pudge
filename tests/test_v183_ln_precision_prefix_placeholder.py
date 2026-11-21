@@ -19,16 +19,16 @@ from pudge.reading_audio_alignment import (
 from t71g23_support import paired_book, write_alignment
 
 SECOND_ACT = (
-    "緩やかに下る坂も終わり、しばらくは土地の起伏といえば申し訳程度の小さい丘、という実に進みやすい道だった。"
+    "緩やかな雨も夜に終わり、しばらくは辺りに見えるものは見渡す限りの青い麦畑、そんな静かで単調な旅路だった。"
 )
 SECOND_ACT_HINTS = [
     {"offset_start": 0, "offset_end": 3, "surface": "緩やか", "reading": "ゆるやか"},
     {"offset_start": 8, "offset_end": 11, "surface": "終わり", "reading": "おわり"},
     {"offset_start": 11, "offset_end": 15, "surface": "しばらく", "reading": "しばらく"},
     {"offset_start": 15, "offset_end": 16, "surface": "は", "reading": "は"},
-    {"offset_start": 16, "offset_end": 18, "surface": "土地", "reading": "とち"},
-    {"offset_start": 18, "offset_end": 19, "surface": "の", "reading": "の"},
-    {"offset_start": 19, "offset_end": 21, "surface": "起伏", "reading": "きふく"},
+    {"offset_start": 16, "offset_end": 18, "surface": "辺り", "reading": "あたり"},
+    {"offset_start": 18, "offset_end": 19, "surface": "に", "reading": "に"},
+    {"offset_start": 19, "offset_end": 21, "surface": "見え", "reading": "みえ"},
 ]
 
 
@@ -41,19 +41,19 @@ def _second_act_with_precision_words() -> dict:
         {
             "start": 6856.20,
             "end": 6860.80,
-            "text": "緩やかに下る坂も終わりしばらくは土地の起伏",
+            "text": "緩やかな雨も夜に終わりしばらくは辺りに見え",
             "words": [
                 {"start": 6856.20, "end": 6856.80, "word": "ゆるやか"},
-                {"start": 6856.82, "end": 6857.10, "word": "に"},
-                {"start": 6857.12, "end": 6857.45, "word": "くだる"},
-                {"start": 6857.47, "end": 6857.72, "word": "さか"},
-                {"start": 6857.74, "end": 6857.86, "word": "も"},
+                {"start": 6856.82, "end": 6857.10, "word": "な"},
+                {"start": 6857.12, "end": 6857.45, "word": "あめ"},
+                {"start": 6857.47, "end": 6857.72, "word": "も"},
+                {"start": 6857.74, "end": 6857.86, "word": "よるに"},
                 {"start": 6858.18, "end": 6858.66, "word": "おわり"},
                 {"start": 6859.30, "end": 6860.04, "word": "しばらく"},
                 {"start": 6860.05, "end": 6860.16, "word": "は"},
-                {"start": 6860.17, "end": 6860.47, "word": "とち"},
-                {"start": 6860.48, "end": 6860.57, "word": "の"},
-                {"start": 6860.58, "end": 6860.80, "word": "きふく"},
+                {"start": 6860.17, "end": 6860.47, "word": "あたり"},
+                {"start": 6860.48, "end": 6860.57, "word": "に"},
+                {"start": 6860.58, "end": 6860.80, "word": "みえ"},
             ],
         }
     ]

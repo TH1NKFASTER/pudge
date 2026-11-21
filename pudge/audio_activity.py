@@ -179,6 +179,10 @@ def analyze_audio_activity(
         "-vn",
         "-sn",
         "-dn",
+        # Raw PCM keeps no timestamps: a gap inside the track would collapse and
+        # every region after it be early by the gap (audio_timeline).
+        "-af",
+        "aresample=async=1",
         "-ac",
         "1",
         "-ar",

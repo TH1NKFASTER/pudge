@@ -13,9 +13,9 @@ function relationNode(item,current=false){
   const listStatus=String(item.list_status||'').toUpperCase();
   const progress=Number(item.progress||0),episodes=Number(item.episodes||0);
   const watched=!!item.watched||['COMPLETED','REPEATING'].includes(listStatus)||!!(episodes&&progress>=episodes);
-  const coverUrl=listCoverUrl(item.cover_url||item.cover||'');
+  const coverUrl=listCoverUrl(pudgeSafeMediaUrl(item.cover_url||item.cover));
   const coverBody=coverUrl
-    ?`<img class="relation-node-cover" src="${escapeHtml(coverUrl)}" draggable="false" alt="">`
+    ?`<img class="relation-node-cover" src="${escapeHtml(coverUrl)}" draggable="false" alt="" loading="lazy" decoding="async">`
     :`<span class="relation-node-cover placeholder">${t('label.cover')}</span>`;
   const coverHtml=`<button type="button" class="relation-cover-action" data-action="url" data-url="${escapeHtml(url)}" aria-label="AniList">${coverBody}</button>`;
   return `<div class="relation-node ${current?'current':''} ${watched?'watched':''}" data-relation-node="1" data-media-id="${item.media_id}" data-title="${escapeHtml(item.title||'')}" data-site-url="${escapeHtml(url)}" data-list-status="${escapeHtml(listStatus)}" data-watched="${watched?'1':'0'}" data-media-status="${escapeHtml(item.media_status||'')}" data-cover-url="${escapeHtml(coverUrl)}" data-year="${escapeHtml(item.season_year??'')}" data-episodes="${escapeHtml(item.episodes??'')}" data-studio="${escapeHtml(item.studio||'')}">${coverHtml}<span class="relation-node-copy"><span class="relation-node-title">${escapeHtml(item.title)}</span>${meta?`<span class="relation-node-meta">${meta}</span>`:''}</span></div>`;
@@ -206,7 +206,7 @@ function fullRelationGraphDiagram(graph){
     }
   }
   const nodeHtml=nodes.map(item=>{const id=Number(item.media_id),pos=positions.get(id);if(!pos||collapsedAlternativeIds.has(id))return '';return `<div class="full-relation-node ${backboneSet.has(id)?'backbone':'branch'}" style="left:${Math.round(pos.x)}px;top:${Math.round(pos.y)}px">${relationNode(item,id===rootId)}</div>`;}).join('');
-  const alternativeHtml=[...alternativeGroups.entries()].map(([anchor,ids])=>{const pos=positions.get(anchor);if(!pos)return '';const movies=ids.map(id=>byId.get(id)).filter(Boolean).sort((a,b)=>relationDateNumber(a)-relationDateNumber(b)||Number(a.media_id)-Number(b.media_id));const covers=movies.map(item=>{const cover=item.cover_url||item.cover||'',url=item.site_url||`https://anilist.co/anime/${item.media_id}`,title=escapeHtml(item.title||'');const body=cover?`<img src="${escapeHtml(cover)}" draggable="false" alt="">`:`<span class="full-relation-alt-placeholder"></span>`;return `<button type="button" class="full-relation-alt" data-action="url" data-url="${escapeHtml(url)}" data-relation-node="1" data-relation-alternative="1" data-media-id="${item.media_id}" data-title="${title}" data-cover-url="${escapeHtml(cover)}" data-year="${escapeHtml(item.season_year??'')}" data-episodes="${escapeHtml(item.episodes??'')}" data-studio="${escapeHtml(item.studio||'')}" title="${title}">${body}</button>`;}).join('');return `<div class="full-relation-alternatives" style="left:${Math.round(pos.x)}px;top:${Math.round(pos.y-52)}px"><span class="full-relation-alternatives-label">${escapeHtml(relationTypeLabel('ALTERNATIVE'))}</span><div class="full-relation-alternatives-list">${covers}</div></div>`;}).join('');
+  const alternativeHtml=[...alternativeGroups.entries()].map(([anchor,ids])=>{const pos=positions.get(anchor);if(!pos)return '';const movies=ids.map(id=>byId.get(id)).filter(Boolean).sort((a,b)=>relationDateNumber(a)-relationDateNumber(b)||Number(a.media_id)-Number(b.media_id));const covers=movies.map(item=>{const cover=pudgeSafeMediaUrl(item.cover_url||item.cover),url=item.site_url||`https://anilist.co/anime/${item.media_id}`,title=escapeHtml(item.title||'');const body=cover?`<img src="${escapeHtml(cover)}" draggable="false" alt="">`:`<span class="full-relation-alt-placeholder"></span>`;return `<button type="button" class="full-relation-alt" data-action="url" data-url="${escapeHtml(url)}" data-relation-node="1" data-relation-alternative="1" data-media-id="${item.media_id}" data-title="${title}" data-cover-url="${escapeHtml(cover)}" data-year="${escapeHtml(item.season_year??'')}" data-episodes="${escapeHtml(item.episodes??'')}" data-studio="${escapeHtml(item.studio||'')}" title="${title}">${body}</button>`;}).join('');return `<div class="full-relation-alternatives" style="left:${Math.round(pos.x)}px;top:${Math.round(pos.y-52)}px"><span class="full-relation-alternatives-label">${escapeHtml(relationTypeLabel('ALTERNATIVE'))}</span><div class="full-relation-alternatives-list">${covers}</div></div>`;}).join('');
   const notes=[];if(graph.partial)notes.push(t('label.partialRelatedGraph'));if(graph.truncated)notes.push(t('uiA.relation.truncated'));
   return `${notes.length?`<div class="full-relation-note">${notes.join(' ')}</div>`:''}<div class="full-relation-viewport" data-graph-width="${width}" data-graph-height="${height}"><div class="full-relation-canvas" style="width:${width}px;height:${height}px"><svg class="full-relation-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true"><defs><marker id="fullRelationArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7898c7"></path></marker></defs>${edgePaths.join('')}${edgeLabels.join('')}</svg>${nodeHtml}${alternativeHtml}</div></div>`;
 }
@@ -352,13 +352,48 @@ function queueAllPlanningJiten(){
 function literaturePlannedCard(a){
   const isNovel=a.media_kind==='novel';const type=isNovel?t('uiA.lightNovel'):t('planned.typeManga');
   const progress=isNovel?tn('uiA.planned.volumeProgress',a.volumes??'?',{progress:Number(a.progress_volumes||0)}):tn('uiA.planned.chapterProgress',a.chapters??'?',{progress:Number(a.progress||0)});
-  const coverHtml=a.cover?`<div class="list-cover cover-shell"><img src="${escapeHtml(a.cover)}" draggable="false" alt=""></div>`:`<div class="list-cover cover-shell"><div class="cover-placeholder">${t('label.cover')}</div></div>`;
+  const coverUrl=pudgeSafeMediaUrl(a.cover),coverHtml=coverUrl?`<div class="list-cover cover-shell"><img src="${escapeHtml(coverUrl)}" draggable="false" alt="" loading="lazy" decoding="async"></div>`:`<div class="list-cover cover-shell"><div class="cover-placeholder">${t('label.cover')}</div></div>`;
   return `<article class="anime-card planned-literature" data-media-id="${a.media_id}" data-literature="${a.media_kind}" data-action="url" data-url="${escapeHtml(a.site_url||'')}" data-title="${escapeHtml(a.title||'')}"><div class="stripe"></div>${coverHtml}<div class="anime-copy"><div class="anime-title" data-full-title="${escapeHtml(a.title||'')}" title="${escapeHtml(a.title||'')}">${escapeHtml(a.title||'')}</div><div class="meta"><strong>${type}</strong> • ${escapeHtml(progress)}${a.media_status?` • ${escapeHtml(mediaStatusLabel(a.media_status))}`:''}</div>${planningJitenShell(a)}</div></article>`;
 }
 // Planning is rebuilt only while it is the visible page; hidden, it is marked
 // dirty and rebuilt when opened (its cards held MBs of detached DOM).
 function buildPlannedOnce(){if(ui.page!=='planned'){ui.plannedDirty=true;ui.plannedVisibleCount=plannedItems().length;return;}ui.plannedDirty=false;buildPlannedNow();}
-function buildPlannedNow(){const container=$('plannedContent');if(plannedJitenObserver){plannedJitenObserver.disconnect();plannedJitenObserver=null;}container.innerHTML='';ui.plannedNodes.clear();for(const a of plannedItems()){const wrap=document.createElement('div');wrap.innerHTML=a.media_kind==='anime'?animeCard(a,true):literaturePlannedCard(a);const node=wrap.firstElementChild;ui.plannedNodes.set(plannedKey(a),node);container.appendChild(node);observePlanningJiten(a,node);}applyPlanned();}
+// Planning holds a card (cover, relation covers, Jiten chips) for every planned title. Left
+// for PLANNED_RELEASE_MS, its cards go (the page is hidden: the DOM and decoded covers only
+// cost WebContent memory) and are built again, like on the first visit, when it is opened.
+const PLANNED_RELEASE_MS=5*60*1000;
+function schedulePlannedRelease(){if(ui.plannedReleaseTimer)clearTimeout(ui.plannedReleaseTimer);ui.plannedReleaseTimer=setTimeout(releaseHiddenPlanned,window.PudgeLowRam?.enabled?.()?window.PudgeLowRam.TAB_RELEASE_MS:PLANNED_RELEASE_MS);}
+function cancelPlannedRelease(){if(ui.plannedReleaseTimer)clearTimeout(ui.plannedReleaseTimer);ui.plannedReleaseTimer=null;}
+function releaseHiddenPlanned(){
+  ui.plannedReleaseTimer=null;
+  if(ui.page==='planned'||!ui.plannedNodes.size)return;
+  for(const node of ui.plannedNodes.values()){const region=node.querySelector?.('[data-planned-jiten]');if(region)plannedJitenObserver?.unobserve(region);node.remove();}
+  ui.plannedNodes.clear();ui.plannedDirty=true;
+}
+// Every state change (a push, a poll, an episode search adding a torrent) rebuilt all
+// cards: container.innerHTML='' and a new cover <img> per card, so Planning blinked
+// with "Cover" placeholders. Now a card whose markup is unchanged stays as it is; a
+// changed card is replaced, keeping its cover, relation row and Jiten chips when
+// those parts are the same.
+const PLANNED_KEPT_PARTS=['.cover-shell','.relation-diagram','[data-planned-jiten]'];
+function plannedCardParts(node){return PLANNED_KEPT_PARTS.map(selector=>node.querySelector(selector)?.outerHTML??null);}
+function buildPlannedNow(){
+  const container=$('plannedContent'),previous=new Map(ui.plannedNodes);ui.plannedNodes.clear();
+  for(const a of plannedItems()){
+    const key=plannedKey(a),html=a.media_kind==='anime'?animeCard(a,true):literaturePlannedCard(a),old=previous.get(key);
+    previous.delete(key);
+    if(old&&old._plannedHtml===html&&old.parentNode===container){ui.plannedNodes.set(key,old);continue;}
+    const wrap=document.createElement('div');wrap.innerHTML=html;const node=wrap.firstElementChild;node._plannedHtml=html;node._plannedParts=plannedCardParts(node);
+    let jitenKept=false;
+    if(old?._plannedParts)PLANNED_KEPT_PARTS.forEach((selector,index)=>{const fresh=node.querySelector(selector),kept=old.querySelector(selector);if(fresh&&kept&&node._plannedParts[index]===old._plannedParts[index]){fresh.replaceWith(kept);if(selector==='[data-planned-jiten]')jitenKept=true;}});
+    ui.plannedNodes.set(key,node);
+    if(old?.parentNode===container)old.replaceWith(node);else{old?.remove();container.appendChild(node);}
+    if(!jitenKept)observePlanningJiten(a,node);
+  }
+  for(const node of previous.values()){const region=node.querySelector?.('[data-planned-jiten]');if(region)plannedJitenObserver?.unobserve(region);node.remove();}
+  syncPlanningDownloadButtons();
+  applyPlanned();
+}
 function applyPlanned(){
   const filter=$('plannedFilter').value,sort=$('plannedSort').value,typeFilter=$('plannedTypeFilter')?.value||'all';
   const difficultyFilter=$('plannedDifficultyFilter')?.value||'all',lengthFilter=$('plannedLengthFilter')?.value||'all',knownFilter=$('plannedKnownFilter')?.value||'all';
@@ -386,9 +421,10 @@ function applyPlanned(){
   else items.sort((a,b)=>String(a.title).localeCompare(String(b.title),ui.lang));
   ui.plannedVisibleCount=items.length;
   const fragment=document.createDocumentFragment(),visible=new Set(items.map(plannedKey));
-  for(const [id,node] of ui.plannedNodes)node.hidden=!visible.has(id);
-  for(const a of items){const node=ui.plannedNodes.get(plannedKey(a));if(node)fragment.appendChild(node);}
-  $('plannedContent').appendChild(fragment);
+  for(const [id,node] of ui.plannedNodes){const hidden=!visible.has(id);if(node.hidden!==hidden)node.hidden=hidden;}
+  // Cards already in this order stay put: moving every card on each state change was part of the flicker.
+  const wanted=items.map(a=>ui.plannedNodes.get(plannedKey(a))).filter(Boolean),wantedSet=new Set(wanted),shownNow=[...$('plannedContent').children].filter(node=>!node.hidden&&wantedSet.has(node));
+  if(shownNow.length!==wanted.length||shownNow.some((node,index)=>node!==wanted[index])){for(const node of wanted)fragment.appendChild(node);$('plannedContent').appendChild(fragment);}
   // Empty states: nothing planned at all, or nothing left after the filters.
   {const container=$('plannedContent');let empty=container.querySelector(':scope > .planned-empty');
    const total=ui.plannedNodes.size;
@@ -410,25 +446,163 @@ function plannedSuggestionFacts(row){
   if(row.studio)facts.push(String(row.studio));
   return facts.join(' · ');
 }
+// A suggestion's cover: the list-size copy (AniList's "large" is ~460 px for a ~90 px box),
+// loaded lazily at a fixed size; without a usable address no <img> (src="" asks the page itself).
+function plannedSuggestionCover(row){const source=listCoverUrl(pudgeSafeMediaUrl(row?.cover));return source?`<img src="${escapeHtml(source)}" alt="" loading="lazy" decoding="async" fetchpriority="low" width="42" height="58">`:'<span class="planned-suggestion-cover-placeholder" aria-hidden="true"></span>';}
 function renderPlannedSuggestions(rows,query){
   const root=plannedSuggestionsRoot(),existing=new Set(plannedItems().map(plannedKey)),type=$('plannedTypeFilter')?.value||'all';
   const visible=(rows||[]).filter(row=>!existing.has(plannedKey(row))&&(type==='all'||row.media_kind===type));
-  root.innerHTML=visible.length?`<h2>${PudgeI18n.t('ui.anilistSuggestions')} <span>${escapeHtml(query)}</span></h2><div class="planned-suggestion-grid">${visible.map(row=>{const facts=plannedSuggestionFacts(row),score=anilistScoreChip(row.mean_score,'percent'),genres=(row.genres||[]).join(' · '),description=String(row.description||'').trim();return `<article data-action="url" data-url="${escapeHtml(row.site_url||'')}" tabindex="0" title="${PudgeI18n.t('ui.openOnAnilist')}"><img src="${escapeHtml(row.cover||'')}" alt="" loading="lazy"><div class="planned-suggestion-main"><strong>${escapeHtml(row.title||'')}</strong>${row.native_title&&row.native_title!==row.title?`<span>${escapeHtml(row.native_title)}</span>`:''}<span>${escapeHtml(row.format||row.media_kind||'')}${score?` · ${score}`:''}${facts?` · ${escapeHtml(facts)}`:''}</span></div><button data-planning-suggestion="${Number(row.media_id)}" data-media-kind="${escapeHtml(row.media_kind||'anime')}">${PudgeI18n.t('ui.add')}</button><div class="planned-suggestion-info"><strong>${escapeHtml(row.title||'')}</strong>${score}${facts?`<span>${escapeHtml(facts)}</span>`:''}${row.media_status?`<span>${escapeHtml(mediaStatusLabel(row.media_status))}</span>`:''}${genres?`<span>${escapeHtml(genres)}</span>`:''}${description?`<p>${escapeHtml(description)}</p>`:''}</div></article>`;}).join('')}</div>`:'';
+  root.innerHTML=visible.length?`<h2>${PudgeI18n.t('ui.anilistSuggestions')} <span>${escapeHtml(query)}</span></h2><div class="planned-suggestion-grid">${visible.map(row=>{const facts=plannedSuggestionFacts(row),score=anilistScoreChip(row.mean_score,'percent'),genres=(row.genres||[]).join(' · '),description=String(row.description||'').trim();return `<article data-action="url" data-url="${escapeHtml(row.site_url||'')}" tabindex="0" title="${PudgeI18n.t('ui.openOnAnilist')}">${plannedSuggestionCover(row)}<div class="planned-suggestion-main"><strong>${escapeHtml(row.title||'')}</strong>${row.native_title&&row.native_title!==row.title?`<span>${escapeHtml(row.native_title)}</span>`:''}<span>${escapeHtml(row.format||row.media_kind||'')}${score?` · ${score}`:''}${facts?` · ${escapeHtml(facts)}`:''}</span></div><button data-planning-suggestion="${Number(row.media_id)}" data-media-kind="${escapeHtml(row.media_kind||'anime')}">${PudgeI18n.t('ui.add')}</button><div class="planned-suggestion-info"><strong>${escapeHtml(row.title||'')}</strong>${score}${facts?`<span>${escapeHtml(facts)}</span>`:''}${row.media_status?`<span>${escapeHtml(mediaStatusLabel(row.media_status))}</span>`:''}${genres?`<span>${escapeHtml(genres)}</span>`:''}${description?`<p>${escapeHtml(description)}</p>`:''}</div></article>`;}).join('')}</div>`:'';
 }
 function schedulePlannedSuggestions(){
   if(plannedSuggestionTimer)clearTimeout(plannedSuggestionTimer);const query=String($('plannedSearch')?.value||'').trim(),token=++plannedSuggestionToken;
   if(query.length<3){renderPlannedSuggestions([],query);return;}
   plannedSuggestionTimer=setTimeout(async()=>{try{const rows=await pywebview.api.planning_search_anilist(query);if(token===plannedSuggestionToken)renderPlannedSuggestions(rows,query);}catch(e){console.error(e);}},350);
 }
-function planningReleasedEpisodeCountForAnime(anime={}){const finished=String(anime.media_status||'').toUpperCase()==='FINISHED',total=Math.max(0,Number(anime.episodes||0)),released=Math.max(0,Number(anime.released_episodes||0)),beforeNext=Math.max(0,Number(anime.next_airing_episode||1)-1);return Math.floor(finished?(total||released):Math.max(released,beforeNext,Number(anime.progress||0)));}
+// A movie or a one-episode title: Planning downloads one release for all of it
+// (as WebAppApi._planning_single_file_title), with its own button label.
+function planningSingleFileTitle(anime={}){return String(anime.format||'').toUpperCase()==='MOVIE'||Number(anime.episodes)===1;}
+function planningReleasedEpisodeCountForAnime(anime={}){const finished=String(anime.media_status||'').toUpperCase()==='FINISHED',total=Math.max(0,Number(anime.episodes||0)),released=Math.max(0,Number(anime.released_episodes||0)),beforeNext=Math.max(0,Number(anime.next_airing_episode||1)-1);let count=Math.floor(finished?(total||released):Math.max(released,beforeNext,Number(anime.progress||0)));if(finished&&!count&&String(anime.format||'').toUpperCase()==='MOVIE')count=1;return planningSingleFileTitle(anime)?Math.min(count,1):count;}
+function planningDownloadButtonLabel(single){return single?PudgeI18n.t('ui.autoDownloadSingle'):PudgeI18n.t('ui.autoDownloadEpisodes');}
 function planningReleasedEpisodeCount(mediaId){return planningReleasedEpisodeCountForAnime(animeFromId(mediaId)||{});}
 function planningEpisodeFallback(context){if(!context.batch||context.episodeCount<1)return '';return `<div class="planning-episode-fallback"><strong>${PudgeI18n.t('ui.noSuitableSeriesPack')}</strong><span class="subtle">${PudgeI18n.t('ui.chooseAReleaseForEach')}</span><div class="setting-inline-actions"><button data-action="planning-episodes-manual">${PudgeI18n.t('ui.chooseSeparateEpisodes')}</button><button class="primary" data-action="planning-episodes-auto">${PudgeI18n.t('ui.downloadReleasedAutomatically')}</button></div></div>`;}
 function planningEpisodeContextFromRelease(){const release=ui.releaseContext;if(!release||release.episodeCount<1)return null;if(ui.planningEpisodeContext?.mediaId===release.mediaId&&ui.planningEpisodeContext?.total===release.episodeCount)return ui.planningEpisodeContext;ui.planningEpisodeContext={mediaId:release.mediaId,total:release.episodeCount,title:animeFromId(release.mediaId)?.title||'',states:new Map(),running:false,current:0,added:0};return ui.planningEpisodeContext;}
-function planningEpisodeStatusLabel(state){return state==='added'?(PudgeI18n.t('ui.added')):state==='local'?(PudgeI18n.t('ui.alreadyLocal')):state==='missing'?(PudgeI18n.t('ui.notFound')):state==='error'?(PudgeI18n.t('ui.error')):'';}
-function renderPlanningEpisodeChooser(context){if(!context)return;ui.planningEpisodeContext=context;$('modalTitle').textContent=`${PudgeI18n.t('ui.separateEpisodes')}${context.title?` — ${context.title}`:''}`;const episodes=Array.from({length:context.total},(_,index)=>index+1),rows=episodes.map(episode=>{const state=context.states.get(episode)||'',status=planningEpisodeStatusLabel(state);return `<button class="${escapeHtml(state)}" data-action="planning-episode-release" data-episode="${episode}" ${state==='local'?'disabled':''}><span>${PudgeI18n.t('table.episode')} ${episode}</span><small>${status}</small></button>`;}).join('');$('modalBody').innerHTML=`<div class="planning-episode-toolbar"><button class="primary" data-action="planning-episodes-auto">${PudgeI18n.t('ui.downloadReleasedAutomatically')}</button></div><div class="planning-episode-grid">${rows}</div>`;}
+function planningEpisodeStatusLabel(state){return state==='added'?(PudgeI18n.t('ui.added')):state==='local'?(PudgeI18n.t('ui.alreadyLocal')):state==='missing'?(PudgeI18n.t('ui.notFound')):state==='error'?(PudgeI18n.t('ui.error')):state==='found'?PudgeI18n.t('planned.searchEpisodeFound'):state==='skipped'?PudgeI18n.t('planned.searchEpisodeSkipped'):state==='searching'?PudgeI18n.t('planned.searchEpisodeSearching'):state==='pending'?PudgeI18n.t('planned.searchEpisodePending'):'';}
+function renderPlanningEpisodeChooser(context){if(!context)return;ui.planningEpisodeContext=context;$('modalTitle').textContent=`${PudgeI18n.t('ui.separateEpisodes')}${context.title?` — ${context.title}`:''}`;const episodes=Array.from({length:context.total},(_,index)=>index+1),rows=episodes.map(episode=>{const state=context.states.get(episode)||'',status=planningEpisodeStatusLabel(state);const copies=window.PudgeDeviceCopies?.slot?.('episode',[`${Number(context.mediaId)}:${episode}`],'row')||'';return `<button class="${escapeHtml(state)}" data-action="planning-episode-release" data-episode="${episode}" ${state==='local'?'disabled':''}><span>${PudgeI18n.t('table.episode')} ${episode}${copies}</span><small>${status}</small></button>`;}).join('');$('modalBody').innerHTML=`<div class="planning-episode-toolbar"><button class="primary" data-action="planning-episodes-auto">${PudgeI18n.t('ui.downloadReleasedAutomatically')}</button></div><div class="planning-episode-grid">${rows}</div>`;}
 async function preparePlanningEpisodeChooser(context){if(!context)return;$('modalTitle').textContent=PudgeI18n.t('ui.checkingLocalEpisodes');$('modalBody').innerHTML='<div class="empty"><span class="spinner"></span></div>';const preview=await pywebview.api.planning_episode_download_preview(context.mediaId);context.total=Number(preview.total||context.total);context.title=preview.title||context.title;for(const episode of preview.local_episodes||[])context.states.set(Number(episode),'local');renderPlanningEpisodeChooser(context);}
 function planningEpisodeJobSummary(job){const rows=job.episodes||[],counts={added:0,local:0,missing:0,error:0};for(const row of rows)counts[row.status]=(counts[row.status]||0)+1;return PudgeI18n.t('ui.addedAlreadyLocalNotFound',{added:counts.added,local:counts.local,missing:counts.missing,error:counts.error});}
-function renderPlanningEpisodeJob(job,finished=false){ui.planningEpisodeJobVisible=true;$('modalBackdrop').hidden=false;$('modalBackdrop').classList.remove('watch-order-open');$('modalBackdrop').classList.add('open');$('modalTitle').textContent=`${finished?(PudgeI18n.t('ui.searchComplete')):(PudgeI18n.t('ui.searchingReleasedEpisodes'))}${job.title?` — ${job.title}`:''}`;if(!finished){$('modalBody').innerHTML=`<div class="planning-episode-progress"><strong>${PudgeI18n.t('ui.checkingLocalFilesAndSearching')} ${Number(job.current||0)} / ${Number(job.total||0)}</strong><progress max="${Math.max(1,Number(job.total||1))}" value="${Number(job.current||0)}"></progress><span class="subtle">${PudgeI18n.t('ui.youCanCloseThisWindow')}</span></div>`;return;}const rows=(job.episodes||[]).map(row=>`<div class="planning-episode-result ${escapeHtml(row.status||'')}"><span>${row.episode==null?(PudgeI18n.t('ui.generalError')):`${PudgeI18n.t('table.episode')} ${Number(row.episode)}`}</span><small>${planningEpisodeStatusLabel(row.status)}</small>${row.error?`<em>${escapeHtml((window.PudgeUiLanguage?.message(row.error) ?? String(row.error)))}</em>`:row.release?`<em>${escapeHtml(row.release)}</em>`:''}</div>`).join('');$('modalBody').innerHTML=`<p>${escapeHtml(planningEpisodeJobSummary(job))}</p><div class="planning-episode-results">${rows}</div>`;}
-async function pollPlanningEpisodeDownload(){ui.planningEpisodeJobPollTimer=null;let job;try{job=await pywebview.api.planning_episode_download_status();}catch(error){console.error(error);ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,2500);return;}ui.planningEpisodeJob=job;if(job.running){if(ui.planningEpisodeJobVisible)renderPlanningEpisodeJob(job,false);ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,900);return;}const finishedAt=Number(job.finished_at||0);if(finishedAt&&finishedAt!==ui.planningEpisodeJobFinishedAt){ui.planningEpisodeJobFinishedAt=finishedAt;ui.state=await pywebview.api.get_state();renderDataPages();renderPlanningEpisodeJob(job,true);if((job.episodes||[]).some(row=>row.status==='added')&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,1000);}}
-async function startPlanningEpisodeDownload(context){if(!context)return;const job=await pywebview.api.start_planning_episode_download(Number(context.mediaId));ui.planningEpisodeJob=job;renderPlanningEpisodeJob(job,false);if(!ui.planningEpisodeJobPollTimer)ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,500);}
-async function resumePlanningEpisodeDownload(){try{const job=await pywebview.api.planning_episode_download_status();ui.planningEpisodeJob=job;if(job.running&&!ui.planningEpisodeJobPollTimer)ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,500);}catch(error){console.error(error);}}
+// The search dialog (audit: it showed one static line for minutes and was rebuilt
+// on every 900 ms poll). It is built once and then updated in place: a step line,
+// a bar that moves with finished episodes, and one row per episode.
+// "found": searched, started only when every episode was found; "skipped": not downloaded then.
+const PLANNING_EPISODE_DONE=new Set(['added','local','missing','error','found','skipped']);
+function planningEpisodeJobRoot(){const root=$('modalBody')?.firstElementChild;return root?.classList?.contains('planning-episode-job')?root:null;}
+// True while the open dialog shows the search. Another dialog that took the modal
+// over (a release list, a score prompt) is left alone from then on.
+function planningEpisodeJobShown(){if(!ui.planningEpisodeJobVisible)return false;const shown=!!($('modalBackdrop')?.classList.contains('open')&&planningEpisodeJobRoot());if(!shown)ui.planningEpisodeJobVisible=false;return shown;}
+function planningEpisodeJobRows(job,finished){
+  const total=Math.max(0,Number(job?.total||0)),local=new Set((job?.local_episodes||[]).map(Number)),byEpisode=new Map(),general=[];
+  for(const row of job?.episodes||[]){if(row?.episode==null)general.push(row);else byEpisode.set(Number(row.episode),row);}
+  const current=job?.phase==='episodes'?Number(job.current_episode||0):0,detail=row=>row?.error?(window.PudgeUiLanguage?.message(row.error)??String(row.error)):String(row?.release||'');
+  const rows=[];
+  for(let episode=1;episode<=total;episode++){
+    const row=byEpisode.get(episode);
+    const status=row?.status||(local.has(episode)?'local':!finished&&episode===current?'searching':'pending');
+    // The finished view lists what the search reported, as before; rows it never reached stay out.
+    rows.push({key:String(episode),episode,status,detail:detail(row),shown:!finished||!!row});
+  }
+  general.forEach((row,index)=>rows.push({key:`general-${index}`,episode:null,status:row.status||'error',detail:detail(row),shown:true}));
+  return rows;
+}
+function planningEpisodeJobDone(rows){return rows.filter(row=>row.episode!=null&&PLANNING_EPISODE_DONE.has(row.status)).length;}
+function planningEpisodeStepText(job){
+  const total=Number(job?.total||0),episode=Number(job?.current_episode||0);
+  const single=!!job?.single;
+  const step=single&&job?.phase==='episodes'?PudgeI18n.t('planned.searchStepSingle'):single&&job?.phase==='adding'?PudgeI18n.t('planned.searchStepSingleAdding'):job?.phase==='episodes'&&episode?PudgeI18n.t('planned.searchStepEpisode',{episode,total}):job?.phase==='adding'&&episode?PudgeI18n.t('planned.searchStepAdding',{episode,total}):job?.phase==='batch'?PudgeI18n.t('planned.searchStepBatch'):job?.phase==='batch_retry'?PudgeI18n.t('planned.searchStepBatchRetry'):PudgeI18n.t('planned.searchStepLocal');
+  const seconds=Math.floor(Number(job?.step_elapsed||0));
+  return seconds>=1?`${step} · ${PudgeI18n.t('planned.searchStepElapsed',{seconds})}`:step;
+}
+function setPlanningText(node,text){if(node&&node.textContent!==text)node.textContent=text;}
+function updatePlanningEpisodeJobView(root,job,finished){
+  const rows=planningEpisodeJobRows(job,finished),total=Math.max(0,Number(job?.total||0));
+  const progress=root.querySelector('[data-job-progress]'),bar=root.querySelector('progress'),meter=root.querySelector('[data-job-meter]'),summary=root.querySelector('[data-job-summary]');
+  progress.hidden=finished;summary.hidden=!finished;
+  setPlanningText(root.querySelector('[data-job-step]'),finished?'':planningEpisodeStepText(job));
+  if(Number(bar.max)!==Math.max(1,total))bar.max=Math.max(1,total);
+  const done=Math.min(total,planningEpisodeJobDone(rows));if(Number(bar.value)!==done)bar.value=done;
+  meter.classList.toggle('busy',!finished);
+  setPlanningText(summary,finished?planningEpisodeJobSummary(job):'');
+  const list=root.querySelector('[data-job-results]'),existing=new Map([...list.children].map(node=>[node.dataset.episodeRow,node])),keep=new Set();
+  for(const row of rows){
+    let node=existing.get(row.key);
+    if(!node){node=document.createElement('div');node.dataset.episodeRow=row.key;node.innerHTML='<span></span><small></small><em hidden></em>';list.appendChild(node);}
+    keep.add(row.key);
+    const className=`planning-episode-result ${row.status}`;if(node.className!==className)node.className=className;
+    if(node.hidden===row.shown)node.hidden=!row.shown;
+    const [label,status,detail]=node.children;
+    setPlanningText(label,row.episode==null?PudgeI18n.t('ui.generalError'):job?.single?PudgeI18n.t(job.movie?'planned.searchSingleMovie':'planned.searchSingleRelease'):`${PudgeI18n.t('table.episode')} ${row.episode}`);
+    setPlanningText(status,planningEpisodeStatusLabel(row.status));
+    setPlanningText(detail,row.detail);if(detail.hidden===!!row.detail)detail.hidden=!row.detail;
+  }
+  for(const [key,node] of existing)if(!keep.has(key))node.remove();
+}
+function renderPlanningEpisodeJob(job,finished=false){
+  const backdrop=$('modalBackdrop');
+  // Open the dialog and build its body only when it does not show the search yet.
+  let root=planningEpisodeJobShown()?planningEpisodeJobRoot():null;
+  if(!root){
+    backdrop.hidden=false;backdrop.classList.remove('watch-order-open');backdrop.classList.add('open');
+    $('modalBody').innerHTML=`<div class="planning-episode-job"><div class="planning-episode-progress" data-job-progress><strong data-job-step></strong><div class="planning-episode-meter" data-job-meter><progress max="1" value="0"></progress></div><span class="subtle">${PudgeI18n.t('ui.youCanCloseThisWindow')}</span></div><p data-job-summary hidden></p><div class="planning-episode-results" data-job-results></div></div>`;
+    root=planningEpisodeJobRoot();
+  }
+  ui.planningEpisodeJobVisible=true;
+  setPlanningText($('modalTitle'),`${finished?(PudgeI18n.t('ui.searchComplete')):job.single?PudgeI18n.t('ui.searchingRelease'):(PudgeI18n.t('ui.searchingReleasedEpisodes'))}${job.title?` — ${job.title}`:''}`);
+  updatePlanningEpisodeJobView(root,job,finished);
+  // The result is seen now: the sidebar line has nothing more to say about it.
+  if(finished)ui.planningEpisodeStatusResultAt=0;
+  renderPlanningEpisodeStatusLine();
+}
+// The sidebar line under "Open folder" (#statusTask, next to #status): the search
+// while its dialog is closed, then its result for STATUS_CLEAR_MS. Separate from
+// setStatus(), so neither overwrites the other's text.
+function planningShortTitle(title){const text=String(title||'').trim();if(text.length<=18)return text;let cut=text.slice(0,17);const space=cut.lastIndexOf(' ');if(space>=8)cut=cut.slice(0,space);return `${cut.trimEnd()}…`;}
+function renderPlanningEpisodeStatusLine(){
+  const line=$('statusTask');if(!line)return;
+  const job=ui.planningEpisodeJob,title=planningShortTitle(job?.title),total=Number(job?.total||0);
+  let text='',failed=false;
+  if(job&&!planningEpisodeJobShown()){
+    if(job.running&&job.single)text=PudgeI18n.t('planned.searchSingleStatusRunning',{title});
+    else if(job.running){const rows=planningEpisodeJobRows(job,false),episode=job.phase==='episodes'?Number(job.current_episode||0):0;text=PudgeI18n.t('planned.searchStatusRunning',{title,done:episode||planningEpisodeJobDone(rows),total});}
+    else if(ui.planningEpisodeStatusResultAt&&Number(job.finished_at||0)===ui.planningEpisodeStatusResultAt){
+      const counts={added:0,missing:0,error:0};for(const row of job.episodes||[])counts[row.status]=(counts[row.status]||0)+1;
+      failed=job.status==='failed'||(!counts.added&&counts.error>0);
+      if(job.single)text=PudgeI18n.t(failed?'planned.searchSingleStatusFailed':counts.added?'planned.searchSingleStatusAdded':'planned.searchSingleStatusDone',{title});
+      else text=failed?PudgeI18n.t('planned.searchStatusFailed',{title}):PudgeI18n.t('planned.searchStatusDone',{title,added:counts.added,missing:counts.missing});
+    }
+  }
+  setPlanningText(line,text);
+  const tooltip=text&&job?.title?String(job.title):'';if(line.title!==tooltip)line.title=tooltip;
+  if(line.hidden===!!text)line.hidden=!text;
+  line.classList.toggle('error',failed);
+}
+function showPlanningEpisodeResultLine(job){
+  ui.planningEpisodeStatusResultAt=Number(job?.finished_at||0);
+  if(ui.planningEpisodeStatusTimer)clearTimeout(ui.planningEpisodeStatusTimer);
+  ui.planningEpisodeStatusTimer=setTimeout(()=>{ui.planningEpisodeStatusTimer=null;ui.planningEpisodeStatusResultAt=0;renderPlanningEpisodeStatusLine();},STATUS_CLEAR_MS);
+}
+// Only one episode search runs at a time (start_planning_episode_download answers with
+// the running one), yet every card's button looked ready. While it runs the other
+// cards' buttons are grey with a tooltip naming it (aria-disabled: WebKit shows no
+// tooltip on a disabled button) and its own card's button says "Searching…" and opens
+// the live dialog. Updated in place: the cards are not rebuilt for this.
+function planningRunningSearchId(){const job=ui.planningEpisodeJob;return job?.running?Number(job.media_id||0):0;}
+function syncPlanningDownloadButtons(){
+  const job=ui.planningEpisodeJob,running=planningRunningSearchId();
+  for(const button of document.querySelectorAll('#plannedContent .planned-card-download')){
+    const own=!!running&&Number(button.dataset.id)===running,blocked=!!running&&!own;
+    setPlanningText(button,own?PudgeI18n.t('planned.searchEpisodeSearching'):planningDownloadButtonLabel(button.dataset.single==='1'));
+    button.classList.toggle('is-unavailable',blocked);button.classList.toggle('is-searching',own);
+    const state=blocked?'true':'false';if(button.getAttribute('aria-disabled')!==state)button.setAttribute('aria-disabled',state);
+    const tip=blocked?PudgeI18n.t('planned.searchBusyTooltip',{title:String(job?.title||'')}):'';
+    if((button.dataset.tooltip||'')!==tip){if(tip)button.dataset.tooltip=tip;else delete button.dataset.tooltip;}
+  }
+}
+function openPlanningEpisodeJob(){const job=ui.planningEpisodeJob;if(!job)return;renderPlanningEpisodeJob(job,!job.running&&Number(job.finished_at||0)>0);}
+async function pollPlanningEpisodeDownload(){
+  ui.planningEpisodeJobPollTimer=null;let job;
+  try{job=await pywebview.api.planning_episode_download_status();}catch(error){console.error(error);ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,2500);return;}
+  ui.planningEpisodeJob=job;syncPlanningDownloadButtons();
+  if(job.running){if(planningEpisodeJobShown())renderPlanningEpisodeJob(job,false);else renderPlanningEpisodeStatusLine();ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,900);return;}
+  const finishedAt=Number(job.finished_at||0);
+  if(!finishedAt||finishedAt===ui.planningEpisodeJobFinishedAt){renderPlanningEpisodeStatusLine();return;}
+  ui.planningEpisodeJobFinishedAt=finishedAt;
+  // Finished while the dialog was closed: the result goes to the sidebar line
+  // (a click opens it) instead of popping the dialog over whatever is open now.
+  if(planningEpisodeJobShown())renderPlanningEpisodeJob(job,true);
+  else{showPlanningEpisodeResultLine(job);renderPlanningEpisodeStatusLine();}
+  // The new state redraws only the Planning cards that changed (buildPlannedNow).
+  ui.state=await pywebview.api.get_state();renderDataPages();
+  if((job.episodes||[]).some(row=>row.status==='added')&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,1000);
+}
+async function startPlanningEpisodeDownload(context){if(!context)return;const job=await pywebview.api.start_planning_episode_download(Number(context.mediaId));ui.planningEpisodeJob=job;syncPlanningDownloadButtons();ui.planningEpisodeStatusResultAt=0;renderPlanningEpisodeJob(job,false);if(!ui.planningEpisodeJobPollTimer)ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,500);}
+async function resumePlanningEpisodeDownload(){try{const job=await pywebview.api.planning_episode_download_status();ui.planningEpisodeJob=job;syncPlanningDownloadButtons();renderPlanningEpisodeStatusLine();if(job.running&&!ui.planningEpisodeJobPollTimer)ui.planningEpisodeJobPollTimer=setTimeout(pollPlanningEpisodeDownload,500);}catch(error){console.error(error);}}

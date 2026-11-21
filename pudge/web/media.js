@@ -8,6 +8,11 @@
   let audioState = {books: []};
   let audioImportBusy = '';
   let audioPollTimer = null;
+  const schedulePoll = (callback, visibleMs, hiddenMs = 15000) => {
+    if (typeof window.pudgeSchedulePoll === 'function') return window.pudgeSchedulePoll(callback, visibleMs, hiddenMs);
+    const timer = setTimeout(callback, document.hidden ? Math.max(visibleMs, hiddenMs) : visibleMs);
+    return {cancel: () => clearTimeout(timer)};
+  };
   let audioControlMutation = 0;
   let audioControlEngagedUntil = 0;
   let activeAudioBookId = null;
@@ -35,6 +40,21 @@
     emitAudioSelection();
   };
 
+  // A finished audiobook offers to mark its linked light novel finished; "Not now" hides the
+  // offer for that audiobook (this Mac only).
+  const LN_FINISH_OFFER_KEY='pudge.audiobook.lnFinishOfferDismissed';
+  const dismissedLnFinishOffers = () => {
+    try{const value=JSON.parse(localStorage.getItem(LN_FINISH_OFFER_KEY)||'[]');return new Set(Array.isArray(value)?value.map(Number):[]);}catch(_error){return new Set();}
+  };
+  const dismissLnFinishOffer = bookId => {
+    const ids=dismissedLnFinishOffers();ids.add(Number(bookId));
+    try{localStorage.setItem(LN_FINISH_OFFER_KEY,JSON.stringify([...ids].slice(-500)));}catch(_error){}
+  };
+  const linkedNovelToFinish = book => {
+    const novel=book?.linked_light_novel;
+    if(!book?.finished||!novel||novel.finished||!Number(novel.id))return null;
+    return dismissedLnFinishOffers().has(Number(book.id))?null:novel;
+  };
   const savedAudioSpeed = bookId => {
     const key=`pudge.audiobook.speed.${Number(bookId)}`;
     const value=Number(localStorage.getItem(key)||1);
@@ -53,6 +73,29 @@
     return hours > 0
       ? `${hours}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`
       : `${minutes}:${String(seconds).padStart(2,'0')}`;
+  };
+  // Fields a poll changes while a book is transcribing or playing: everything else the
+  // page shows is in this signature. Equal signature: the cards are patched in place
+  // (FE-5: one transcription rebuilt all cards and 2,400 chapter buttons every 1.4 s).
+  const audioStructureSignature = () => JSON.stringify((audioState?.books || []).map(book => {
+    const transcription = book.transcription && typeof book.transcription === 'object'
+      ? {...book.transcription, progress_percent: undefined, queue_position: undefined, queue_size: undefined}
+      : book.transcription;
+    return {...book, position: undefined, current_chapter: undefined, transcription};
+  }));
+  let audioRenderedSignature = '';
+  const updateAudioPreparationFields = () => {
+    for (const book of audioState.books || []) {
+      const card = document.querySelector(`.audiobook-card[data-audiobook-id="${Number(book.id)}"]`);
+      const node = card?.querySelector('.audiobook-preparation');
+      const html = audioPreparation(book.transcription || {});
+      if (!node || !html) {
+        if (Boolean(node) !== Boolean(html)) return false;
+        continue;
+      }
+      if (node.outerHTML !== html) node.outerHTML = html;
+    }
+    return true;
   };
   const updateAudioLiveFields = () => {
     for(const book of audioState.books||[]){
@@ -176,6 +219,7 @@
   const renderAudio = () => {
     const root = $('audiobooksContent');
     if (!root) return;
+    audioRenderedSignature = audioStructureSignature();
     const openChapterBooks=new Set(
       [...root.querySelectorAll('.audiobook-chapters[open][data-book-id]')]
         .map(node=>Number(node.dataset.bookId))
@@ -229,7 +273,13 @@
       const selected=audioSelection.has(Number(book.id));
       const volume=Number(book.volume||0);
       const displayTitle=grouped&&volume>0?(PudgeI18n.t('ui.volume',{volume:volume})):String(book.title||'');
-      return `<article class="audiobook-card ${book.playing?'playing':''} ${selected?'selected':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong title="${esc(String(book.title||''))}">${esc(displayTitle)}</strong>${book.metadata_pending?`<span class="audiobook-metadata-pending">${PudgeI18n.t('media.metadata')}</span>`:''}${book.tts_generated?`<span class="audiobook-tts-badge" title="${PudgeI18n.t('media.ttsGenerated')}" aria-label="${PudgeI18n.t('media.ttsGenerated')}">🤖</span>`:''}${book.playing?`<span class="audiobook-live"><i></i>${PudgeI18n.t('media.playing')}</span>`:''}</div><span data-audio-live-summary="${Number(book.id)}">${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${PudgeI18n.t('media.timeLeft',{time:formatAudioTime(remaining)})}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${PudgeI18n.tn('media.fileCount',Number(book.file_count||0))}`:''}${syncConflict?` · ${syncConflict}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${PudgeI18n.t('media.position')}"><span class="audiobook-chapter-hover" aria-hidden="true"></span>${phoneMarker}</div></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}${handoffControl}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">${PudgeI18n.t('sidebar.seekBackShort')}</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">${PudgeI18n.t('sidebar.seekForwardShort')}</button><button data-media-action="bookmark-audio" data-id="${book.id}">${PudgeI18n.t('media.bookmark')}</button><label class="audiobook-speed"><span>${PudgeI18n.t('media.speed')}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${PudgeI18n.t('media.sleep')}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option>${[15,30,45,60].map(minutes=>`<option value="${minutes}">${PudgeI18n.t('library.durationMinutes',{minutes})}</option>`).join('')}<option value="chapter">${PudgeI18n.t('media.endOfChapter')}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(PudgeI18n.t('media.markUnfinished')):(PudgeI18n.t('media.finish'))}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${PudgeI18n.t('media.remove')}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${PudgeI18n.t('media.chapters')}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${PudgeI18n.t('media.show')}</span><span class="audiobook-chapters-close">${PudgeI18n.t('media.hide')}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`;
+      // Downloaded on a paired iPhone/iPad (device_copies.js): beside the title.
+      const copies=window.PudgeDeviceCopies?.slot?.('audiobook',[book.id],grouped?'row':'info')||'';
+      const finishedBadge=book.finished?`<span class="audiobook-finished-badge" title="${esc(PudgeI18n.t('media.finishedBadge'))}"><b aria-hidden="true">✓</b>${PudgeI18n.t('media.finishedBadge')}</span>`:'';
+      const novelToFinish=linkedNovelToFinish(book);
+      const novelTitle=novelToFinish?String(novelToFinish.title||'')+(Number(novelToFinish.volume||0)>0&&!/\d/.test(String(novelToFinish.title||''))?` · ${PudgeI18n.t('ui.volume',{volume:Number(novelToFinish.volume)})}`:''):'';
+      const novelOffer=novelToFinish?`<div class="audiobook-ln-finish-offer"><span>${esc(PudgeI18n.t('media.linkedNovelNotFinished',{title:novelTitle}))}</span><button class="primary" data-media-action="finish-linked-ln" data-id="${Number(book.id)}" data-ln-id="${Number(novelToFinish.id)}">${PudgeI18n.t('media.markLinkedNovelFinished')}</button><button data-media-action="dismiss-linked-ln" data-id="${Number(book.id)}">${PudgeI18n.t('media.notNow')}</button></div>`:'';
+      return `<article class="audiobook-card ${book.playing?'playing':''} ${selected?'selected':''} ${book.finished?'finished':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong title="${esc(String(book.title||''))}">${esc(displayTitle)}</strong>${finishedBadge}${copies}${book.metadata_pending?`<span class="audiobook-metadata-pending">${PudgeI18n.t('media.metadata')}</span>`:''}${book.tts_generated?`<span class="audiobook-tts-badge" title="${PudgeI18n.t('media.ttsGenerated')}" aria-label="${PudgeI18n.t('media.ttsGenerated')}">🤖</span>`:''}${book.playing?`<span class="audiobook-live"><i></i>${PudgeI18n.t('media.playing')}</span>`:''}</div><span data-audio-live-summary="${Number(book.id)}">${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${PudgeI18n.t('media.timeLeft',{time:formatAudioTime(remaining)})}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${PudgeI18n.tn('media.fileCount',Number(book.file_count||0))}`:''}${syncConflict?` · ${syncConflict}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${PudgeI18n.t('media.position')}"><span class="audiobook-chapter-hover" aria-hidden="true"></span>${phoneMarker}</div>${novelOffer}</div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}${handoffControl}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">${PudgeI18n.t('sidebar.seekBackShort')}</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">${PudgeI18n.t('sidebar.seekForwardShort')}</button><button data-media-action="bookmark-audio" data-id="${book.id}">${PudgeI18n.t('media.bookmark')}</button><label class="audiobook-speed"><span>${PudgeI18n.t('media.speed')}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${PudgeI18n.t('media.sleep')}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option>${[15,30,45,60].map(minutes=>`<option value="${minutes}">${PudgeI18n.t('library.durationMinutes',{minutes})}</option>`).join('')}<option value="chapter">${PudgeI18n.t('media.endOfChapter')}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(PudgeI18n.t('media.markUnfinished')):(PudgeI18n.t('media.finish'))}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${PudgeI18n.t('media.remove')}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${PudgeI18n.t('media.chapters')}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${PudgeI18n.t('media.show')}</span><span class="audiobook-chapters-close">${PudgeI18n.t('media.hide')}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`;
     };
     const groups=[];
     for(const book of booksForRender){
@@ -248,7 +298,8 @@
       const ids=group.books.map(book=>Number(book.id)).filter(Number.isFinite);
       const selectedInSeries=ids.filter(id=>audioSelection.has(id)).length;
       const selectionClass=ids.length&&selectedInSeries===ids.length?'series-selected':selectedInSeries?'series-partial':'';
-      return `<section class="audiobook-series-card ${selectionClass}" data-audiobook-series="${esc(group.seriesKey)}"><div class="audiobook-series-card-head"><div><strong>${esc(title)}</strong><span>${PudgeI18n.tn('media.volumeCount',group.books.length)}</span></div><span>${esc(meta)}</span></div><div class="audiobook-series-scroll" data-series-key="${esc(group.seriesKey)}" data-first-unfinished-id="${Number(target?.id||0)}">${group.books.map(book=>renderBookCard(book,true)).join('')}</div></section>`;
+      const copies=window.PudgeDeviceCopies?.slot?.('audiobook',ids,'info')||'';
+      return `<section class="audiobook-series-card ${selectionClass}" data-audiobook-series="${esc(group.seriesKey)}"><div class="audiobook-series-card-head"><div><strong>${esc(title)}</strong>${copies}<span>${PudgeI18n.tn('media.volumeCount',group.books.length)}</span></div><span>${esc(meta)}</span></div><div class="audiobook-series-scroll" data-series-key="${esc(group.seriesKey)}" data-first-unfinished-id="${Number(target?.id||0)}">${group.books.map(book=>renderBookCard(book,true)).join('')}</div></section>`;
     }).join('');
     root.innerHTML = `<button id="audiobookImport" hidden ${audioImportBusy?'disabled':''}>${PudgeI18n.t('media.import')}</button>${audioImportBusy?`<div class="audiobook-import-status"><span class="audiobook-pulse"></span>${PudgeI18n.t('media.readingAudiobookMetadata')}</div>`:''}<div class="audiobook-list">${libraryHtml}</div>${books.length?'':`<div class="empty">${PudgeI18n.t('media.singleAudioFilesAndFolders')}</div>`}`;
     [...root.querySelectorAll('.audiobook-controls')].forEach(controls=>{const card=controls.closest('.audiobook-card');const book=audiobookById(Number(card?.dataset.audiobookId));if(!book)return;const before=controls.querySelector('.danger-action');if(book.cover_url&&card){card.classList.add('has-cover');const cover=document.createElement(book.anilist_id?'button':'div');cover.className='audiobook-cover';cover.dataset.audioCoverId=String(book.id);if(book.anilist_id){cover.dataset.mediaAction='open-audio-cover';cover.dataset.url=String(book.anilist_site_url||`https://anilist.co/manga/${book.anilist_id}`);cover.title='AniList';}cover.innerHTML=`<img src="${esc(book.cover_url)}" alt="">`;card.prepend(cover);}const identity=document.createElement('button');identity.dataset.mediaAction='identify-audio';identity.dataset.id=String(book.id);identity.dataset.title=String(book.title||'');identity.textContent=book.anilist_id?(PudgeI18n.t('ui.changeAnilist')):'AniList';controls.insertBefore(identity,before);});
@@ -311,10 +362,12 @@
     const cardsDrawn=drawnIds.size===(audioState.books||[]).length&&(audioState.books||[]).every(book=>drawnIds.has(Number(book.id)));
     if(audioControlMutation===0&&!focusedAudioControl&&!controlEngaged){
       if(livePlayback&&cardsDrawn)updateAudioLiveFields();
+      else if(cardsDrawn&&audioRenderedSignature&&audioStructureSignature()===audioRenderedSignature&&updateAudioPreparationFields())updateAudioLiveFields();
       else if(!openAudioMenu)renderAudio();
     }
     window.updateCount?.();
-    if (audioPollTimer) clearTimeout(audioPollTimer);
+    if (audioPollTimer) audioPollTimer.cancel();
+    audioPollTimer = null;
     const active=document.querySelector('.nav button[data-page="audiobooks"]')?.classList.contains('active');
     const playing=(audioState.books||[]).some(book=>book.playing);
     const transcribing=(audioState.books||[]).some(book=>String(book.transcription?.status||'')==='transcribing');
@@ -326,7 +379,8 @@
       // every 1.2 s forever. Poll active work quickly, but a passive queue only
       // needs occasional position updates.
       const delay=document.documentElement.classList.contains('energy-saving')?5000:playing?1000:transcribing?1400:covers?2200:5000;
-      audioPollTimer=setTimeout(()=>void loadAudio({playbackOnly:playing&&!transcribing&&!covers&&!queued}),delay);
+      // Hidden window: every 15 s, at once when it comes back (FE-5).
+      audioPollTimer=schedulePoll(()=>{audioPollTimer=null;void loadAudio({playbackOnly:playing&&!transcribing&&!covers&&!queued});},delay);
     }
   };
 
@@ -613,7 +667,7 @@
       if(type==='identify'&&book){await window.showMediaIdentity?.('audiobook',Number(book.id),book.title||'');return;}
       if(type==='find-ln'&&book){await showAudioLnSearch(Number(book.id));return;}
       if(type==='edit-metadata'&&book){const saved=await window.PudgeLibraryMetadata?.edit('audiobook',book);if(saved){await loadAudio();window.toast?.(PudgeI18n.t('ui.volumeAndSeriesSaved'));}return;}
-      if(type==='reveal'&&book){await pywebview.api.audiobook_reveal_source(Number(book.id));return;}
+      if(type==='reveal'&&book){const result=await pywebview.api.audiobook_reveal_source(Number(book.id));if(result?.ok===false)window.toast?.(result.error?PudgeI18n.message(String(result.error)):PudgeI18n.t('ui.revealFailed'));return;}
       if(type==='delete'&&book){if(!await pudgeConfirm(PudgeI18n.t('media.removeThisAudiobookFromPudge'),{danger:true}))return;const result=await pywebview.api.audiobook_delete(Number(book.id));applyAudioActionResult(result);counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();return;}
       if(type==='rename-bookmark'&&bookmarkId!=null){showAudioBookmarkRename(bookmarkId);return;}
       if(type==='delete-bookmark'&&bookmarkId!=null){await deleteAudioBookmark(Number(bookmarkId));return;}
@@ -721,6 +775,21 @@
     if (type === 'finish-audio') {
       if(action.dataset.finished!=='1'&&!await pudgeConfirm(PudgeI18n.t('media.markThisAudiobookUnfinishedThe')))return;
       const result=await pywebview.api.audiobook_mark_finished(Number(action.dataset.id),action.dataset.finished==='1');applyAudioActionResult(result);renderAudio();
+    }
+    if (type === 'finish-linked-ln') {
+      const lnId=Number(action.dataset.lnId);
+      action.disabled=true;
+      try{await pywebview.api.light_novel_set_finished(lnId,true);}
+      catch(error){action.disabled=false;window.toast?.(PudgeI18n.message(String(error?.message||error)));return;}
+      for(const item of audioState.books||[]){if(Number(item.linked_light_novel?.id)===lnId)item.linked_light_novel={...item.linked_light_novel,finished:true};}
+      renderAudio();
+      window.toast?.(PudgeI18n.t('media.linkedNovelMarkedFinished'));
+      void window.loadLightNovels?.(true);
+      return;
+    }
+    if (type === 'dismiss-linked-ln') {
+      dismissLnFinishOffer(Number(action.dataset.id));renderAudio();
+      return;
     }
     if (type === 'stop-audio') {
       await stopAudiobook(Number(action.dataset.id));

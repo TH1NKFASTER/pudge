@@ -73,6 +73,14 @@ QR Code generator library by Project Nayuki
 (https://www.nayuki.io/page/qr-code-generator-library), MIT License,
 Copyright (c) Project Nayuki. The full license text is kept in the file header.
 
+## MLX Whisper (mlx-examples)
+
+`pudge/whisper_mlx/` (Japanese speech recognition in the STT worker) is the Whisper
+example of Apple's mlx-examples (<https://github.com/ml-explore/mlx-examples>,
+mlx-whisper 0.4.3), a port of OpenAI Whisper (<https://github.com/openai/whisper>).
+MIT License, Copyright © 2023 Apple Inc.; the full text is in
+`pudge/whisper_mlx/LICENSE`. The first line of each file names Pudge's changes.
+
 ## Optional external applications
 
 Pudge does not bundle mpv, FFmpeg, JitenMPV, or jpdb-mpv-plugin binaries. During

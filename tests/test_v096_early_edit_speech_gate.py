@@ -21,7 +21,6 @@ def _row(center: float, offset: float) -> _WindowMatch:
         onset_f1=0.85,
         activity_f1=0.85,
         mean_error=0.2,
-        rank_delta=0.01,
         gap_fingerprint=0.9,
         edge_hint_distance=None,
     )

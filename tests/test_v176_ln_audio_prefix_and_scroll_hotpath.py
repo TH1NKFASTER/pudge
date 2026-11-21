@@ -23,7 +23,7 @@ from t71g22_support import USER_SCROLL
 
 def test_unpunctuated_real_opening_prefix_is_never_silently_skipped() -> None:
     story = (
-        "小高い丘が延々と続き岩ばかりが目立ち草も木も少ない道を荷馬車が進んでいた。"
+        "白い砂浜が延々と続き貝殻ばかりが光り人も舟も少ない道を荷馬車が進んでいた。"
         "旅人は遠くの町を目指してゆっくりと坂を下っていった。"
     ) * 8
     # The first trustworthy STT phrase begins at offset 10.  There is no strong
@@ -65,8 +65,8 @@ def test_unpunctuated_real_opening_prefix_is_never_silently_skipped() -> None:
 
 def test_character_level_spoken_chapter_title_plateau_is_zero_width() -> None:
     story = (
-        "緩やかに下る坂も終わりしばらくは土地の起伏といえば申し訳程度の小さい丘という実に進みやすい道だった。"
-        "昨晩の酒の余韻がまだ抜けきらないロレンスにはちょうどよい道といえた。"
+        "緩やかな雨も夜に終わりしばらくは辺りに見えるものは見渡す限りの青い麦畑そんな静かで単調な旅路だった。"
+        "朝からの疲れがまだ抜けていない商人のカイにはありがたい休息となった。"
     ) * 8
     # Real clocks can split the false 第X幕 advance into one-character anchors.
     # v175 inspected only the first seven anchors and therefore never reached

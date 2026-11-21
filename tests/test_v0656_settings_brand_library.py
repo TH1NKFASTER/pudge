@@ -13,6 +13,7 @@ from pudge.library import scan_library
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 from tests.i18n_support import has_text
+from repository_files import in_repository
 
 ROOT = Path(__file__).parents[1]
 
@@ -49,6 +50,11 @@ def test_mpv_shortcuts_are_recorded_by_pressing_them(page) -> None:
             "s_shortcut_mpv_translate",
             "s_shortcut_mpv_explain",
             "s_shortcut_mpv_skip",
+            "s_shortcut_mpv_replay_line",
+            "s_shortcut_mpv_previous_line",
+            "s_shortcut_mpv_next_line",
+            "s_shortcut_mpv_auto_pause",
+            "s_shortcut_mpv_reset_carried_delay",
             "s_shortcut_screen_text",
         ]
         [[saved]] = result.calls_of("save_settings")
@@ -247,5 +253,5 @@ def test_branding_has_one_source_and_no_rename_script() -> None:
     # The installer, the release build and the window all follow pudge/brand.env (see
     # test_install_script.py, test_release_bundle_v066.py and the window test above).
     assert (APP_NAME, APP_SLUG, APP_BUNDLE_ID) == ("pudge", "pudge", "com.pudge.app")
-    assert not (ROOT / "rename_brand.py").exists()
+    assert not in_repository("rename_brand.py")
     assert (ROOT / "pudge" / "legacy_install.py").is_file()

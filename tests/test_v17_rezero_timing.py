@@ -20,6 +20,7 @@ from pudge.subtitles.timeline_alignment import (
 )
 from pudge.subtitles.validation import quality_from_result
 from pudge.syncing import _optimize_subtitle_unguarded, subtitle_quality_accepted
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def timing():
@@ -44,9 +45,9 @@ def test_real_episode_clock_switches_in_opening_gap_and_stays_through_final_dial
     assert len(cues) == len(data["source"])
     assert all(a[0] <= b[0] for a, b in itertools.pairwise(cues))
     assert all(end > start for start, end, _text in cues)
-    anchors = {text: start for start, _end, text in cues if text in {"ＥＭＭ！", "ＥＭＴ！"}}
-    assert abs(anchors["ＥＭＭ！"] - 289.97) <= 0.35
-    assert abs(anchors["ＥＭＴ！"] - 322.84) <= 0.35
+    anchors = {text: start for start, _end, text in cues if text in {"ＫＬＭ！", "ＫＬＰ！"}}
+    assert abs(anchors["ＫＬＭ！"] - 289.97) <= 0.35
+    assert abs(anchors["ＫＬＰ！"] - 322.84) <= 0.35
     final_source_index = next(i for i, cue in enumerate(data["source"]) if cue[0] == 2319.18)
     assert cues[final_source_index][0] == pytest.approx(2277.43, abs=0.001)
     # Held-out reference error remains visible; this must not get grade A.
@@ -60,26 +61,26 @@ def test_real_episode_clock_switches_in_opening_gap_and_stays_through_final_dial
     "change", ["none", "single", "repeated", "wrong_time", "reversed", "lowercase", "embedded"]
 )
 def test_shared_acronyms_require_two_unique_ordered_consistent_identities(change):
-    source = [(332.03, 334.03, "ＥＭＭ！"), (364.73, 366.73, "ＥＭＴ！")]
-    reference = [(289.97, 291.50, "E-M-M!"), (322.84, 324.42, "E-M-T!")]
+    source = [(332.03, 334.03, "ＫＬＭ！"), (364.73, 366.73, "ＫＬＰ！")]
+    reference = [(289.97, 291.50, "K-L-M!"), (322.84, 324.42, "K-L-P!")]
     if change == "single":
         reference.pop()
     elif change == "repeated":
-        source.append((370.0, 372.0, "ＥＭＭ！"))
+        source.append((370.0, 372.0, "ＫＬＭ！"))
     elif change == "wrong_time":
-        reference[1] = (328.84, 330.42, "E-M-T!")
+        reference[1] = (328.84, 330.42, "K-L-P!")
     elif change == "reversed":
-        reference = [(322.84, 324.42, "E-M-M!"), (289.97, 291.50, "E-M-T!")]
+        reference = [(322.84, 324.42, "K-L-M!"), (289.97, 291.50, "K-L-P!")]
     elif change == "lowercase":
-        reference[0] = (289.97, 291.50, "e-m-m!")
+        reference[0] = (289.97, 291.50, "k-l-m!")
     elif change == "embedded":
-        source[0] = (332.03, 334.03, "説明 ＥＭＭ！")
+        source[0] = (332.03, 334.03, "説明 ＫＬＭ！")
     evidence = _shared_opening_text_anchors(source, reference, 304.4, -31.5, -41.75)
     assert evidence["supported"] == (change == "none")
 
 
 def window(center, offset):
-    return _WindowMatch(center, offset, 3.0, 8, 8, 8, 1.0, 1.0, 0.95, 0.2, 0.0, 0.0, None)
+    return _WindowMatch(center, offset, 3.0, 8, 8, 8, 1.0, 1.0, 0.95, 0.2, 0.0, None)
 
 
 def test_text_proof_does_not_clear_unrelated_early_audio_risk():
@@ -196,8 +197,7 @@ def test_upgrade_requeues_only_old_weak_opening_signature_once(tmp_path):
         details={"alignment": alignment},
     )
     assert manager._requeue_shared_opening_timeline_upgrade() == 1
-    row = manager.db.episode_by_path(video)
-    assert row.subtitle_path is None and row.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert video.is_file() and video.stat().st_size == len(b"video") and subtitle.exists()  # nothing deleted
     assert manager._requeue_shared_opening_timeline_upgrade() == 0
     manager.db.upsert_episode(

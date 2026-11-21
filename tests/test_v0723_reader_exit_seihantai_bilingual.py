@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pudge.audiobooks import AudiobookService
 from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.library import scan_library
@@ -13,18 +12,6 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime
 from pudge.subtitle_formats import clean_srt_for_playback
 from t71g21_support import READER, paired
-
-
-def test_explicit_stop_of_a_read_together_book_stops_its_audiobook() -> None:
-    service = object.__new__(AudiobookService)
-    calls: list[int] = []
-    service.link_for_light_novel = lambda _ln, include_alignment=False: {"book": {"id": 75}}  # type: ignore[method-assign]
-    service.stop = lambda book_id: calls.append(int(book_id)) or {"ok": True, "stopped": True}  # type: ignore[method-assign]
-
-    result = service.stop_for_light_novel(6)
-
-    assert result == {"ok": True, "stopped": True, "audiobook_id": 75}
-    assert calls == [75]
 
 
 STOPS = ("light_novel_stop_paired", "audiobook_stop", "audiobook_set_paused")

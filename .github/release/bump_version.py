@@ -18,6 +18,18 @@ def replace_once(path: Path, pattern: str, replacement: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def replace_ios_version(version: str) -> None:
+    """The iPhone/iPad app shows Pudge's version (MARKETING_VERSION of every app configuration)."""
+    path = ROOT / "ios" / "Pudge.xcodeproj" / "project.pbxproj"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    updated, count = re.subn(r'("MARKETING_VERSION" = )"[^"]*";', rf'\g<1>"{version}";', text)
+    if count == 0:
+        raise SystemExit(f"Expected a MARKETING_VERSION in {path}")
+    path.write_text(updated, encoding="utf-8")
+
+
 def ensure_changelog_entry(version: str) -> None:
     path = ROOT / "CHANGELOG.md"
     text = path.read_text(encoding="utf-8")
@@ -53,6 +65,8 @@ def main() -> int:
         r'^version\s*=\s*"[^"]+"',
         f'version = "{args.version}"',
     )
+
+    replace_ios_version(args.version)
 
     readme = ROOT / "README.md"
     text = readme.read_text(encoding="utf-8")

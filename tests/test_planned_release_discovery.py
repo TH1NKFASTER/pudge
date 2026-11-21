@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from pudge.manager_models import LibraryAnime, NyaaRelease
-from pudge.planned_release_discovery import PlannedReleaseDiscovery
+from pudge.planned_release_discovery import _SEARCH_REVISION, PlannedReleaseDiscovery
 
 
 class DB:
@@ -326,7 +326,7 @@ def test_unchanged_episode_aliases_keep_backoff(tmp_path):
             "next_check": current + 2 * 60 * 60,
             "attempts": 4,
             "search_aliases": [2, 192],
-            "search_revision": 5,
+            "search_revision": _SEARCH_REVISION,
         },
     )
     mgr._release_episode_context_from_graph = Mock(return_value=((2, 192), ()))
@@ -373,7 +373,7 @@ def test_search_transport_revision_resets_failed_backoff_even_when_aliases_uncha
     assert result == {"armed": 0, "searched": 1, "found": 1}
     state = json.loads(mgr.db.get_state(svc._key(anime.media_id)))
     assert state["phase"] == "found"
-    assert state["search_revision"] == 5
+    assert state["search_revision"] == _SEARCH_REVISION
     assert state["search_aliases"] == [2, 192]
     mgr.search_releases.assert_called_once_with(
         anime.media_id,

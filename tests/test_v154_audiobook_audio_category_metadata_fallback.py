@@ -117,6 +117,7 @@ def test_qbt_metadata_inspection_does_not_modify_existing_torrent(monkeypatch, t
     qbt = object.__new__(QBittorrentClient)
     qbt.login = lambda: None
     qbt._torrent_by_hash = lambda value: {"hash": value}
+    qbt._lookup_torrent = lambda value: {"hash": value}
     qbt.files = lambda value: [{"index": 0, "name": "existing/book.m4b", "size": 123}]
     deleted: list[str] = []
     qbt.delete = lambda value, **kwargs: deleted.append(value)

@@ -114,7 +114,7 @@ def test_analyze_audio_activity_kills_hung_decoder_after_timeout(tmp_path: Path)
 
 
 def test_write_srt_is_atomic_when_replace_fails(tmp_path: Path, monkeypatch) -> None:
-    from pudge import subtitle_formats
+    from pudge import fsutil, subtitle_formats
 
     output_srt = tmp_path / "out.srt"
     output_srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nold\n", encoding="utf-8")
@@ -122,7 +122,7 @@ def test_write_srt_is_atomic_when_replace_fails(tmp_path: Path, monkeypatch) -> 
     def boom(_src, _dst):
         raise OSError("disk full")
 
-    monkeypatch.setattr(subtitle_formats.os, "replace", boom)
+    monkeypatch.setattr(fsutil.os, "replace", boom)
     with pytest.raises(OSError):
         subtitle_formats.write_srt([(1.0, 2.0, "new")], output_srt)
     assert "old" in output_srt.read_text(encoding="utf-8")
@@ -248,6 +248,9 @@ class _FakeClient:
     def delete(self, torrent_hash, delete_files=False):
         self.deleted.append(torrent_hash)
 
+    def torrent_status(self, torrent_hash):
+        return None if torrent_hash in self.deleted else {"progress": 1.0}
+
     def close(self):
         pass
 
@@ -282,6 +285,8 @@ def test_enforce_disk_limit_skips_identity_repair_protected_file(
     )
     monkeypatch.setattr(manager, "downloads_enabled", lambda: True)
     monkeypatch.setattr(manager, "qbt_client", lambda: _FakeClient(deleted))
+    # The disk limit removes the torrent from the client that holds it.
+    monkeypatch.setattr(manager, "torrent_clients", lambda: [("qbittorrent", _FakeClient(deleted))])
     monkeypatch.setattr(manager.db, "episode_count_for_torrent", lambda _h: 1)
 
     count = manager.enforce_disk_limit()

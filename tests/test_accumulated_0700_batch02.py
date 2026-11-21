@@ -178,8 +178,9 @@ def test_fresh_subtitle_selection_searches_and_syncs_from_scratch(tmp_path: Path
 
     monkeypatch.setattr("pudge.manager.subprocess.Popen", Process)
     assert manager.force_fresh_subtitle_selection(video)["ok"] is True
-    # The cached selection is gone and the episode is queued again ...
-    assert not cached.exists() and manager.db.episode_by_path(video).subtitle_path is None
+    # The episode is queued again; its subtitles stay playable until new ones are ready ...
+    assert cached.exists() and manager.db.episode_by_path(video).subtitle_path == cached
+    assert manager.db.subtitle_jobs()
     manager.process_subtitle_jobs(limit=1)
     # ... and is prepared with a full new search and a new sync.
     command = next(command for command in commands if "--media-id" in command)

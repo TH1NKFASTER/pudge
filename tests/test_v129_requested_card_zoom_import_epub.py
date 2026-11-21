@@ -218,7 +218,7 @@ def test_parent_audiobook_folder_imports_child_books_separately(tmp_path: Path, 
 
     targets = service.folder_import_targets(parent)
     assert targets == [first.resolve(), second.resolve()]
-    books = service.import_folder_collection(parent)
+    books = [service.import_folder(target) for target in targets]
     assert [book["title"] for book in books] == ["Book A", "Book B"]
     assert all(book["file_count"] == 1 for book in books)
 

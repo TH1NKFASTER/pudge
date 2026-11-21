@@ -10,12 +10,12 @@ const heading = block => (block.querySelector(':scope > h3, :scope > summary')?.
 const power = [...root.querySelectorAll('.setting-block')].find(block => heading(block) === t('settings.powerSaving'));
 const gate = [...root.querySelectorAll('.setting-block')].find(block => heading(block) === PudgeI18n.t('ui.reviewsBeforeContent'));
 const shown = () => ({power: power.checkVisibility(), gate: gate.checkVisibility()});
-const additional = t('section.additional');
+const additional = ['Additional settings', 'Дополнительные настройки'];  // the retired wrapper's title
 const out = {
   topLevel: [power.parentElement === panel, gate.parentElement === panel],
   gateCollapsible: gate.tagName === 'DETAILS',
   wrappers: [...root.querySelectorAll('#settingsPower, details.advanced-settings')].length,
-  additionalTitles: [...root.querySelectorAll('summary, h2, h3, .setting-divider-title')].filter(node => node.innerText.trim() === additional).length,
+  additionalTitles: [...root.querySelectorAll('summary, h2, h3, .setting-divider-title')].filter(node => additional.includes(node.innerText.trim())).length,
   essential: shown(),
 };
 await __click('.settings-categories [data-settings-category="advanced"]');

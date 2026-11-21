@@ -119,12 +119,19 @@
   };
 
   let livePollTimer = null;
+  let loadGeneration = 0;
   const stopLivePoll = () => { if (livePollTimer) clearTimeout(livePollTimer); livePollTimer = null; };
   const load = async (showLoading=true) => {
     if (!currentAnime?.media_id) return;
+    const generation = ++loadGeneration, anime = currentAnime;
     if (showLoading) { currentData = null; render(); }
-    try { currentData = await pywebview.api.anime_debug_snapshot(Number(currentAnime.media_id), currentEpisode); currentEpisode=currentData?.selected_episode??currentEpisode; }
-    catch (error) { currentData = {anime: currentAnime, summary:{diagnosis:{error:String(error?.message||error)}}}; }
+    let data;
+    try { data = await pywebview.api.anime_debug_snapshot(Number(anime.media_id), currentEpisode); }
+    catch (error) { data = {anime, summary:{diagnosis:{error:String(error?.message||error)}}}; }
+    // A slower answer for the anime (or episode) shown before must not replace
+    // this one: "Fresh subtitles" would then act on the other anime's video.
+    if (generation !== loadGeneration || currentAnime !== anime) return;
+    currentData = data; currentEpisode = data?.selected_episode ?? currentEpisode;
     render();
   };
   const pollFreshRun = async () => {
@@ -139,6 +146,7 @@
   };
 
   const open = async anime => {
+    stopLivePoll();
     currentAnime = anime; currentEpisode = null; activeTab = 'summary';
     ensure().classList.add('open');
     await load();

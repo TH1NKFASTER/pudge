@@ -114,7 +114,8 @@ def _run(manager, monkeypatch, releases, caplog) -> list[str]:
         "add_release",
         lambda _media_id, release, **_kwargs: added.append(release.info_hash) or True,
     )
-    manager.logger.addHandler(caplog.handler)
+    # Only for this test: caplog's handler is one object for the whole session.
+    monkeypatch.setattr(manager.logger, "handlers", [*manager.logger.handlers, caplog.handler])
     manager.logger.setLevel(logging.INFO)
     manager.auto_upgrade_downloaded()
     return added
@@ -213,8 +214,9 @@ def test_automatic_seadex_lookup_is_cache_only(tmp_path: Path, monkeypatch) -> N
 
 
 def test_release_card_shows_seadex_label_only_for_exact_match(page) -> None:
-    assert ru("release.seadexPreferred") == "Рекомендован SeaDex"
-    assert en("release.seadexPreferred") == "SeaDex recommended"
+    # The label names no site (Pudge ships with no recommendations source).
+    assert ru("release.seadexPreferred") == "Рекомендован"
+    assert en("release.seadexPreferred") == "Recommended"
     releases = [
         {"title": "Best", "reasons": ["seadex-exact", "seadex-preferred", "seadex-bonus=60"]},
         {"title": "Alt", "reasons": ["seadex-exact", "seadex-alternative", "seadex-bonus=40"]},

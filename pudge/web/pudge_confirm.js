@@ -4,15 +4,24 @@
   let pendingResolve = null;
   let pendingDanger = false;
   let pendingChoice = false;
+  // pudgeChoose: the dialog's buttons are the choices; it resolves to the chosen value.
+  let pendingChooser = false;
 
   const finish = value => {
     const backdrop = document.getElementById('pudgeConfirmBackdrop');
     if (backdrop) backdrop.classList.remove('open');
     const resolve = pendingResolve;
     const choice = pendingChoice;
+    const chooser = pendingChooser;
     pendingResolve = null;
     pendingDanger = false;
     pendingChoice = false;
+    pendingChooser = false;
+    if (backdrop) backdrop.querySelector('.pudge-confirm-extra')?.replaceChildren();
+    if (chooser) {
+      if (resolve) resolve(typeof value === 'string' ? value : null);
+      return;
+    }
     // A dialog with a choice resolves to the chosen value (null when cancelled).
     if (resolve) resolve(choice ? (value ? document.getElementById('pudgeConfirmChoice').value : null) : Boolean(value));
   };
@@ -55,6 +64,7 @@
         <label class="pudge-confirm-choice" id="pudgeConfirmChoiceRow" hidden><span id="pudgeConfirmChoiceLabel"></span><select id="pudgeConfirmChoice"></select></label>
         <div class="pudge-confirm-actions">
           <button type="button" data-pudge-confirm="cancel">${PudgeI18n.t('action.cancel')}</button>
+          <span class="pudge-confirm-extra" style="display:contents"></span>
           <button type="button" class="confirm" data-pudge-confirm="ok">${PudgeI18n.t('ui.confirm')}</button>
         </div>
       </div>
@@ -62,6 +72,11 @@
     document.body.appendChild(backdrop);
 
     backdrop.addEventListener('click', event => {
+      const chosen = event.target.closest?.('[data-pudge-choose]');
+      if (chosen) {
+        finish(chosen.dataset.pudgeChoose);
+        return;
+      }
       const action = event.target.closest?.('[data-pudge-confirm]')?.dataset.pudgeConfirm;
       if (action === 'ok') finish(true);
       else if (action === 'cancel' || event.target === backdrop) finish(false);
@@ -73,7 +88,11 @@
   document.addEventListener('keydown', event => {
     const backdrop = document.getElementById('pudgeConfirmBackdrop');
     if (!backdrop?.classList.contains('open')) return;
-    if (event.key === 'Enter' && !pendingDanger) {
+    if (event.key === 'Enter' && !pendingDanger && !pendingChooser) {
+      // Enter on Cancel (reached with Tab) presses Cancel: it used to confirm whatever the
+      // question was, "Remove the torrent and its files?" included.
+      const pressed = event.target?.closest?.('button');
+      if (pressed && backdrop.contains(pressed) && pressed.dataset.pudgeConfirm !== 'ok') return;
       event.preventDefault();
       finish(true);
     }
@@ -92,10 +111,12 @@
     if (pendingResolve) {
       const previous = pendingResolve;
       pendingResolve = null;
-      previous(false);
+      previous(pendingChooser ? null : false);
     }
 
     const backdrop = ensureDialog();
+    backdrop.querySelector('.pudge-confirm-extra')?.replaceChildren();
+    backdrop.querySelector('[data-pudge-confirm="ok"]').hidden = false;
     const danger = Boolean(options?.danger);
     document.getElementById('pudgeConfirmMessage').textContent = String(message ?? '');
     document.getElementById('pudgeConfirmTitle').textContent = String(options?.title || 'Pudge');
@@ -126,7 +147,45 @@
     pendingResolve = resolve;
     pendingDanger = danger;
     pendingChoice = Boolean(choice);
+    pendingChooser = false;
     backdrop.classList.add('open');
     requestAnimationFrame(() => ok.focus());
+  });
+
+  // A question with several answers (Keep both / Replace / Cancel): `actions` are the buttons
+  // ({value, label, danger, primary}); resolves to the chosen value, null when cancelled.
+  window.pudgeChoose = (message, options = {}) => new Promise(resolve => {
+    if (pendingResolve) {
+      const previous = pendingResolve;
+      pendingResolve = null;
+      previous(pendingChooser ? null : false);
+    }
+    const backdrop = ensureDialog();
+    document.getElementById('pudgeConfirmMessage').textContent = String(message ?? '');
+    document.getElementById('pudgeConfirmTitle').textContent = String(options?.title || 'Pudge');
+    document.getElementById('pudgeConfirmChoiceRow').hidden = true;
+    const cancel = backdrop.querySelector('[data-pudge-confirm="cancel"]');
+    cancel.hidden = false;
+    cancel.textContent = String(options?.cancelText || PudgeI18n.t('action.cancel'));
+    backdrop.querySelector('[data-pudge-confirm="ok"]').hidden = true;
+    const extra = backdrop.querySelector('.pudge-confirm-extra');
+    extra.replaceChildren();
+    let first = null;
+    for (const action of Array.isArray(options?.actions) ? options.actions : []) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.pudgeChoose = String(action.value);
+      button.textContent = String(action.label ?? action.value);
+      if (action.primary || action.danger) button.classList.add('confirm');
+      if (action.danger) button.classList.add('danger');
+      extra.appendChild(button);
+      if (action.primary) first = button;
+    }
+    pendingResolve = resolve;
+    pendingDanger = false;
+    pendingChoice = false;
+    pendingChooser = true;
+    backdrop.classList.add('open');
+    requestAnimationFrame(() => (first || cancel).focus());
   });
 })();

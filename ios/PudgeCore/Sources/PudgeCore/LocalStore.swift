@@ -38,10 +38,24 @@ public final class LocalStore: @unchecked Sendable {
         try execute("CREATE TABLE IF NOT EXISTS activity_rejected(id TEXT PRIMARY KEY,created REAL NOT NULL,body TEXT NOT NULL,reason TEXT NOT NULL)")
         // After switching Macs: the last unsent place of a Mac's book, by its audio (MacSwitchSummary).
         try execute("CREATE TABLE IF NOT EXISTS carried_positions(media TEXT PRIMARY KEY,body TEXT NOT NULL)")
+        // Queued changes the Mac refused (HTTP 409/422): set aside with the reason, never resent,
+        // so one of them no longer stops everything queued after it.
+        try execute("CREATE TABLE IF NOT EXISTS outbox_parked(id TEXT PRIMARY KEY,asset TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,reason TEXT NOT NULL,created REAL NOT NULL)")
+        // Books of the Mac its complete catalog no longer lists: "edition" (it has a newer
+        // edition of the book) or "removed"; kept while downloaded, hidden otherwise.
+        try execute("CREATE TABLE IF NOT EXISTS retired_manifests(id TEXT PRIMARY KEY,reason TEXT NOT NULL)")
         try execute("PRAGMA user_version=3")
         encoder.outputFormatting = [.sortedKeys]
     }
     deinit { sqlite3_close(db) }
+    private var mergesPeriodic = false
+    /// Merge a new periodic checkpoint into the unsent periodic one of the same session (the
+    /// Mac counts the run through `continuousSince`): ten hours offline queued 7200 checkpoints,
+    /// sent one request each. Only for a Mac that knows merged runs ("checkpoint-runs").
+    public var mergePeriodic: Bool {
+        get { withLock { mergesPeriodic } }
+        set { withLock { mergesPeriodic = newValue } }
+    }
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock(); defer { lock.unlock() }; return try body()
     }
@@ -75,15 +89,40 @@ public final class LocalStore: @unchecked Sendable {
         try book.validate()
         try withLock { try execute("INSERT INTO manifests(asset,body) VALUES(?,?) ON CONFLICT(asset) DO UPDATE SET body=excluded.body", [book.id, try json(book)]) }
     }
+    /// A saved manifest that can no longer be read (damaged, or refused by a newer rule) is left
+    /// out: it made every call throw, and the library showed no book at all.
     public func manifests() throws -> [AudioManifest] {
-        try withLock { try query("SELECT body FROM manifests ORDER BY asset").map { try AudioManifest.decode(Data($0[0].utf8)) } }
+        try withLock { try query("SELECT body FROM manifests ORDER BY asset").compactMap { try? AudioManifest.decode(Data($0[0].utf8)) } }
+    }
+    /// Ids (asset:edition) of saved manifests `manifests()` leaves out (Settings → Diagnostics).
+    public func unreadableManifests() throws -> [String] {
+        try withLock {
+            try query("SELECT asset,body FROM manifests ORDER BY asset").compactMap { row -> String? in
+                if (try? AudioManifest.decode(Data(row[1].utf8))) != nil { return nil }
+                return row[0]
+            }
+        }
+    }
+    /// Ids (asset:edition) of the saved manifests, without decoding them.
+    public func manifestIds() throws -> Set<String> {
+        try withLock { Set(try query("SELECT asset FROM manifests").map { $0[0] }) }
     }
     public func enqueue(_ checkpoint: AudioCheckpoint) throws {
         try withLock { try transaction { try enqueueLocked(checkpoint) } }
     }
-    private func enqueueLocked(_ checkpoint: AudioCheckpoint) throws {
-                let body = try json(checkpoint)
+    private func enqueueLocked(_ incoming: AudioCheckpoint) throws {
+                var checkpoint = incoming
                 let old = try query("SELECT body FROM outbox WHERE id=?", [checkpoint.checkpointId]).first
+                if old == nil, mergesPeriodic, checkpoint.reason == "periodic",
+                   let last = try query("SELECT id,body FROM outbox WHERE kind='checkpoint' AND asset=? ORDER BY seq DESC LIMIT 1", [checkpoint.assetId]).first,
+                   let previous = try? decoded(last[1], as: AudioCheckpoint.self),
+                   previous.reason == "periodic", previous.playbackSessionId == checkpoint.playbackSessionId,
+                   previous.editionId == checkpoint.editionId, previous.deviceId == checkpoint.deviceId,
+                   previous.sequence < checkpoint.sequence, previous.observedAt <= checkpoint.observedAt {
+                    checkpoint.continuousSince = previous.continuousSince ?? CheckpointRun(observedAt: previous.observedAt, positionMs: previous.positionMs)
+                    try execute("DELETE FROM outbox WHERE id=?", [last[0]])
+                }
+                let body = try json(checkpoint)
                 if let old, old[0] != body { throw PudgeError.invalid("Event retry with different data") }
                 try execute("INSERT OR IGNORE INTO outbox(id,asset,kind,body) VALUES(?,?,?,?)", [checkpoint.checkpointId, checkpoint.assetId, "checkpoint", body])
                 if old == nil {
@@ -187,16 +226,16 @@ public final class LocalStore: @unchecked Sendable {
         try withLock { Int(try query("SELECT COUNT(*) FROM carried_positions").first?[0] ?? "0") ?? 0 }
     }
     /// A book of the new Mac with the same audio as a book of the previous one: its last unsent
-    /// place is queued for the new Mac. True when a place moved.
+    /// place is queued for the new Mac (as `deviceId`, this device's current ID). True when a place moved.
     @discardableResult
-    public func adoptCarried(_ book: AudioManifest) throws -> Bool {
+    public func adoptCarried(_ book: AudioManifest, deviceId: String? = nil) throws -> Bool {
         try withLock {
             try transaction {
                 guard let row = try query("SELECT body FROM carried_positions WHERE media=?", [book.mediaKey]).first else { return false }
                 try execute("DELETE FROM carried_positions WHERE media=?", [book.mediaKey])
                 guard try !hasPending(assetId: book.assetId) else { return false }
                 let old = try decoded(row[0], as: AudioCheckpoint.self)
-                let moved = try AudioCheckpoint.make(book: book, deviceId: old.deviceId, sessionId: UUID().uuidString.lowercased(),
+                let moved = try AudioCheckpoint.make(book: book, deviceId: deviceId ?? old.deviceId, sessionId: UUID().uuidString.lowercased(),
                                                      sequence: 1, revision: try revision(assetId: book.assetId),
                                                      positionMs: min(max(0, old.positionMs), book.durationMs), reason: "pause")
                 try enqueueLocked(moved)
@@ -212,11 +251,87 @@ public final class LocalStore: @unchecked Sendable {
             return count
         }
     }
+    /// This device got a new ID next to existing data (restored from a backup or moved to a new
+    /// iPhone: the Keychain ID stays on the old device, this database comes along). Unsent and
+    /// carried places are re-addressed to the new ID, so the Mac takes them; it refused every
+    /// one of them and the whole sync stopped. Returns how many changed.
+    @discardableResult
+    public func adoptDeviceId(_ deviceId: String) throws -> Int {
+        try withLock {
+            try transaction {
+                var changed = 0
+                for row in try query("SELECT id,body FROM outbox WHERE kind='checkpoint'") {
+                    var checkpoint = try decoded(row[1], as: AudioCheckpoint.self)
+                    guard checkpoint.deviceId != deviceId else { continue }
+                    checkpoint.deviceId = deviceId
+                    try execute("UPDATE outbox SET body=? WHERE id=?", [try json(checkpoint), row[0]])
+                    changed += 1
+                }
+                for row in try query("SELECT media,body FROM carried_positions") {
+                    var checkpoint = try decoded(row[1], as: AudioCheckpoint.self)
+                    guard checkpoint.deviceId != deviceId else { continue }
+                    checkpoint.deviceId = deviceId
+                    try execute("UPDATE carried_positions SET body=? WHERE media=?", [try json(checkpoint), row[0]])
+                    changed += 1
+                }
+                // Pauses saved for handoffs of the earlier ID: nobody asks for them any more.
+                try execute("DELETE FROM handoff_pauses")
+                return changed
+            }
+        }
+    }
+    /// A queued checkpoint or bookmark the Mac refused (HTTP 409/422): out of the queue, kept
+    /// with the reason (Settings → Diagnostics).
+    public func park(_ id: String, reason: String) throws {
+        try withLock {
+            try transaction {
+                try execute("INSERT OR REPLACE INTO outbox_parked(id,asset,kind,body,reason,created) SELECT id,asset,kind,body,?,? FROM outbox WHERE id=?", [reason, String(Date().timeIntervalSince1970), id])
+                try execute("DELETE FROM outbox WHERE id=?", [id])
+                try execute("DELETE FROM outbox_parked WHERE id NOT IN (SELECT id FROM outbox_parked ORDER BY created DESC LIMIT 500)")
+            }
+        }
+    }
+    public func parkedCount() throws -> Int {
+        try withLock { Int(try query("SELECT COUNT(*) FROM outbox_parked").first?[0] ?? "0") ?? 0 }
+    }
+    /// The Mac refused a bookmark edit because it changed there first: the local copy goes, so the
+    /// Mac's version is taken on the next merge (both sides kept their own version for good).
+    public func dropLocalBookmark(_ bookmarkId: String) throws {
+        try withLock { try execute("DELETE FROM bookmarks WHERE id=?", [bookmarkId]) }
+    }
+    /// After a complete catalog of the bound Mac (`listed`, plus books it still has to prepare:
+    /// `pendingAssets`): its books no longer listed are marked as an older edition or removed on
+    /// the Mac; a book listed again is unmarked. Books imported on this device are never marked.
+    public func retireMissing(serverId: String, listed: [AudioManifest], pendingAssets: Set<String> = []) throws {
+        let ids = Set(listed.map(\.id)), assets = Set(listed.map(\.assetId)).union(pendingAssets)
+        try withLock {
+            try transaction {
+                for book in try manifests() {
+                    if ids.contains(book.id) { try execute("DELETE FROM retired_manifests WHERE id=?", [book.id]); continue }
+                    guard try isRemote(book, serverId: serverId), try !isPhoneBook(book) else { continue }
+                    try execute("INSERT OR REPLACE INTO retired_manifests(id,reason) VALUES(?,?)", [book.id, assets.contains(book.assetId) ? "edition" : "removed"])
+                }
+            }
+        }
+    }
+    /// Book id (asset:edition) → "edition" or "removed" (see retireMissing).
+    public func retiredReasons() throws -> [String: String] {
+        try withLock {
+            var reasons: [String: String] = [:]
+            for row in try query("SELECT id,reason FROM retired_manifests") { reasons[row[0]] = row[1] }
+            return reasons
+        }
+    }
     public func markRemote(_ book: AudioManifest, serverId: String) throws {
         try withLock { try bindMac(serverId: serverId); try execute("INSERT OR IGNORE INTO remote_editions(server,asset,edition) VALUES(?,?,?)", [serverId, book.assetId, book.editionId]) }
     }
     public func isRemote(_ book: AudioManifest, serverId: String) throws -> Bool {
         try withLock { !(try query("SELECT 1 FROM remote_editions WHERE server=? AND asset=? AND edition=?", [serverId, book.assetId, book.editionId])).isEmpty }
+    }
+    /// Ids (asset:edition, as `AudioManifest.id`) of the books marked as this Mac's, in one query:
+    /// an unchanged catalog marks only those not marked yet (not one write per book).
+    public func remoteIds(serverId: String) throws -> Set<String> {
+        try withLock { Set(try query("SELECT asset,edition FROM remote_editions WHERE server=?", [serverId]).map { $0[0] + ":" + $0[1] }) }
     }
     public func latestCheckpointId(_ book: AudioManifest) throws -> String? {
         try withLock { try query("SELECT id FROM latest_checkpoints WHERE asset=? AND edition=?", [book.assetId, book.editionId]).first?[0] }
@@ -265,6 +380,11 @@ public final class LocalStore: @unchecked Sendable {
             return (try decoded(row[0], as: LocalResource.self), resolvedURL(row[1]))
         }
     }
+    /// The files of every resource record, relative to the store directory (Settings → Storage:
+    /// an audiobook file no record references is an "other" file).
+    public func resourcePaths() throws -> Set<String> {
+        try withLock { Set(try query("SELECT path FROM resources").map { storedPath(resolvedURL($0[0])) }) }
+    }
     /// iOS moves the app container on every reinstall/update from Xcode, so
     /// resource paths are stored relative to the store directory. Older
     /// absolute paths are re-based onto the current container.
@@ -281,8 +401,14 @@ public final class LocalStore: @unchecked Sendable {
         let path = url.standardizedFileURL.path
         return path.hasPrefix(base) ? String(path.dropFirst(base.count)) : path
     }
-    public func markVerified(_ part: AudioPart, at url: URL, original: Bool = false) throws {
-        try FileIntegrity.verify(url, sha256: part.sha256, sizeBytes: part.sizeBytes)
+    /// `hashed`: the SHA-256 the caller just computed for this file (it is not hashed twice).
+    public func markVerified(_ part: AudioPart, at url: URL, original: Bool = false, hashed: String? = nil) throws {
+        if let hashed, hashed == part.sha256 {
+            let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
+            guard Int64(size) == part.sizeBytes else { throw PudgeError.invalid("File size or SHA-256 does not match") }
+        } else {
+            try FileIntegrity.verify(url, sha256: part.sha256, sizeBytes: part.sizeBytes)
+        }
         try withLock {
             let old = try resource(part.resourceId)
             let value = LocalResource(resourceId: part.resourceId, sha256: part.sha256, sizeBytes: part.sizeBytes,
@@ -311,12 +437,20 @@ public final class LocalStore: @unchecked Sendable {
         }
     }
     public func evict(resourceId: String, expectedGeneration: Int64, receipt: ArchiveReceipt, nowMs: Int64, verifiedLocallyAt: Int64? = nil) throws {
+        let refused = PudgeError.invalid("The file changed or is protected from deletion")
+        guard let checked = try resource(resourceId),
+              StoragePolicy.canEvict(checked.state, receipt: receipt, expectedGeneration: expectedGeneration, nowMs: nowMs, verifiedLocallyAt: verifiedLocallyAt) else {
+            throw refused
+        }
+        // Hashed before taking the lock: a whole part takes seconds and every other call (the
+        // library on screen) waited for it. The generation, checked again under the lock,
+        // tells whether the file was replaced meanwhile.
+        try FileIntegrity.verify(checked.url, sha256: checked.state.sha256, sizeBytes: checked.state.sizeBytes)
         try withLock {
-            guard var copy = try resource(resourceId),
+            guard var copy = try resource(resourceId), copy.state.generation == checked.state.generation,
                   StoragePolicy.canEvict(copy.state, receipt: receipt, expectedGeneration: expectedGeneration, nowMs: nowMs, verifiedLocallyAt: verifiedLocallyAt) else {
-                throw PudgeError.invalid("The file changed or is protected from deletion")
+                throw refused
             }
-            try FileIntegrity.verify(copy.url, sha256: copy.state.sha256, sizeBytes: copy.state.sizeBytes)
             try transaction {
                 try FileManager.default.removeItem(at: copy.url)
                 copy.state.verified = false; copy.state.generation += 1
@@ -324,11 +458,20 @@ public final class LocalStore: @unchecked Sendable {
             }
         }
     }
+    /// Files of an import that failed: their rows go too (they were left pointing at nothing).
+    public func forgetResources(_ ids: [String]) throws {
+        guard !ids.isEmpty else { return }
+        try withLock { try transaction { for id in ids { try execute("DELETE FROM resources WHERE id=?", [id]) } } }
+    }
     public func saveTransfer(_ transfer: TransferRecord) throws {
         try withLock { try execute("INSERT INTO transfers(id,body) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body", [transfer.id, try json(transfer)]) }
     }
     public func transfers() throws -> [TransferRecord] {
         try withLock { try query("SELECT body FROM transfers").map { try decoded($0[0], as: TransferRecord.self) } }
+    }
+    /// One transfer by id (a download's progress: not every record read and decoded each tick).
+    public func transfer(_ id: String) throws -> TransferRecord? {
+        try withLock { try query("SELECT body FROM transfers WHERE id=?", [id]).first.map { try decoded($0[0], as: TransferRecord.self) } }
     }
     public func enqueueBookmark(_ incoming: Bookmark) throws {
         try withLock { try transaction {
@@ -469,7 +612,7 @@ public struct MacSwitchSummary: Equatable {
     }
 }
 
-public struct TransferRecord: Codable, Identifiable {
+public struct TransferRecord: Codable, Identifiable, Equatable {
     public var id: String
     public var assetId: String
     public var part: AudioPart

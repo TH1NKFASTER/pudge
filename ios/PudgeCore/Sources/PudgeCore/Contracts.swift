@@ -7,6 +7,69 @@ public enum PudgeError: Error, LocalizedError {
     }
 }
 
+/// A JSON list decoded item by item: an item that cannot be read (a missing field, another
+/// type) is left out and named in `skipped`, instead of failing the whole answer. One audiobook
+/// the phone could not read made the whole catalog (every other book) fail to load.
+public struct LenientList<Item: Decodable>: Decodable {
+    public let items: [Item]
+    /// What was left out: "<its title or id, else its place in the list>: <why>".
+    public let skipped: [String]
+
+    public init(items: [Item], skipped: [String] = []) { self.items = items; self.skipped = skipped }
+
+    public init(from decoder: Decoder) throws {
+        var list = try decoder.unkeyedContainer()
+        var items: [Item] = []
+        var skipped: [String] = []
+        while !list.isAtEnd {
+            let index = list.currentIndex
+            do {
+                items.append(try list.decode(Item.self))
+            } catch {
+                var label = "item \(index + 1)"
+                // A failed decode leaves the list at the item: it is read once more as anything
+                // at all (only for its name), which moves on to the next one.
+                if list.currentIndex == index, let name = (try? list.decode(SkippedItem.self))?.name { label = name }
+                skipped.append(label + ": " + Self.reason(error))
+                // Still there (never seen with JSON): the rest cannot be read one by one.
+                if list.currentIndex == index { break }
+            }
+        }
+        self.items = items
+        self.skipped = skipped
+    }
+
+    /// A short reason for the log: `no "parts"`, `"durationMs" has another type`.
+    static func reason(_ error: Error) -> String {
+        guard let failure = error as? DecodingError else { return error.localizedDescription }
+        switch failure {
+        case .keyNotFound(let key, _):
+            return "no \"\(key.stringValue)\""
+        case .typeMismatch(_, let context):
+            return "\"\(context.codingPath.last?.stringValue ?? "?")\" has another type"
+        case .valueNotFound(_, let context):
+            return "\"\(context.codingPath.last?.stringValue ?? "?")\" is empty"
+        default:
+            return "not readable"
+        }
+    }
+}
+
+/// Any JSON value, read only for a name to log (`title`, else `assetId`).
+private struct SkippedItem: Decodable {
+    let name: String?
+    private enum Keys: String, CodingKey { case title, assetId }
+    init(from decoder: Decoder) throws {
+        var found: String?
+        if let fields = try? decoder.container(keyedBy: Keys.self) {
+            for key in [Keys.title, Keys.assetId] where found == nil {
+                if let text = try? fields.decode(String.self, forKey: key), !text.isEmpty { found = text }
+            }
+        }
+        name = found
+    }
+}
+
 public struct AudioPart: Codable, Hashable, Identifiable {
     public var partId: String
     public var resourceId: String
@@ -71,6 +134,9 @@ public struct AudioManifest: Codable, Hashable, Identifiable {
         self.parts = parts; self.chapters = chapters; self.cover = cover
     }
 
+    /// Audio file types a book's parts may have (an import checks before copying).
+    public static let audioExtensions: Set<String> = ["mp3", "m4a", "m4b", "aac", "wav", "flac", "opus", "ogg"]
+
     public static func decode(_ data: Data) throws -> AudioManifest {
         let value = try JSONDecoder().decode(Self.self, from: data)
         try value.validate()
@@ -92,7 +158,7 @@ public struct AudioManifest: Codable, Hashable, Identifiable {
                   part.sha256.count == 64, part.sha256.allSatisfy({ "0123456789abcdef".contains($0) }),
                   !part.fileName.isEmpty, part.fileName.count <= 240, !part.fileName.contains("/"),
                   !part.fileName.contains("\\"), !part.fileName.contains("\0"),
-                  ["mp3", "m4a", "m4b", "aac", "wav", "flac", "opus", "ogg"].contains((part.fileName as NSString).pathExtension.lowercased()) else {
+                  Self.audioExtensions.contains((part.fileName as NSString).pathExtension.lowercased()) else {
                 throw PudgeError.invalid("Invalid audio file map")
             }
             let sum = total.addingReportingOverflow(part.sizeBytes)
@@ -152,6 +218,10 @@ public struct AudioCheckpoint: Codable, Hashable, Identifiable {
     public var partPositionMs: Int64
     public var reason: String
     public var observedAt: Int64
+    /// A periodic checkpoint that replaced unsent periodic ones of its session (LocalStore
+    /// merges them while the Mac is away): where that uninterrupted playback began, so the
+    /// Mac still counts the listening time. Absent otherwise.
+    public var continuousSince: CheckpointRun? = nil
     public var id: String { checkpointId }
 
     public static func make(book: AudioManifest, deviceId: String, sessionId: String,
@@ -164,6 +234,13 @@ public struct AudioCheckpoint: Codable, Hashable, Identifiable {
                     partId: book.parts[location.index].partId, partPositionMs: location.localMs,
                     reason: reason, observedAt: Int64(Date().timeIntervalSince1970 * 1000))
     }
+}
+
+/// Start of a run of merged periodic checkpoints (phone clock, ms; position on the book's timeline).
+public struct CheckpointRun: Codable, Hashable {
+    public var observedAt: Int64
+    public var positionMs: Int64
+    public init(observedAt: Int64, positionMs: Int64) { self.observedAt = observedAt; self.positionMs = positionMs }
 }
 
 /// Reading or watching time measured on the iPhone for the Mac's Statistics.
@@ -261,7 +338,7 @@ public struct LocalResource: Codable {
     }
 }
 
-public struct Bookmark: Codable, Identifiable {
+public struct Bookmark: Codable, Identifiable, Equatable {
     public var bookmarkId: String
     public var eventId: String
     public var assetId: String

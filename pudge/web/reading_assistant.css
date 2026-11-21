@@ -72,6 +72,7 @@
 .pa-window-button{position:relative;flex:0 0 22px;width:22px;height:22px;min-width:22px;max-width:22px;min-height:22px;max-height:22px;margin:0;padding:0;border:0;border-radius:50%;box-sizing:border-box;appearance:none;background:transparent!important;display:block;cursor:pointer;transform:none!important}
 .pa-window-button::before{content:"";position:absolute;left:5px;top:5px;width:12px;height:12px;border-radius:50%;pointer-events:none}
 .pa-window-close{color:#7b0b06}.pa-window-close::before{background:#ff5f57}.pa-window-collapse{color:#805900}.pa-window-collapse::before{background:#febc2e}
+.pa-window-dock{color:#0a5d0f}.pa-window-dock::before{background:#28c840}
 .pa-window-button svg{position:absolute;left:6px;top:6px;width:10px;height:10px;display:block;fill:none;stroke:currentColor;stroke-width:1.2;stroke-linecap:round;opacity:0;pointer-events:none}.pa-window-controls:hover svg,.pa-window-button:focus-visible svg{opacity:1}
 .pa-window-button:focus-visible{outline:2px solid #9ec5ff;outline-offset:1px}
 .pa-head .pa-clear{flex:0 0 auto;display:grid;place-items:center;width:26px;min-width:26px;height:26px;padding:0}
@@ -81,3 +82,16 @@
 
 .pa-head>.pa-avatar{flex:0 0 auto;width:22px;height:22px;font-size:12px}
 .pa-code .pa-syntax-keyword{color:#c792ea}.pa-code .pa-syntax-string{color:#c3e88d}.pa-code .pa-syntax-property{color:#82aaff}.pa-code .pa-syntax-comment{color:#8593a8;font-style:italic}.pa-code .pa-syntax-number,.pa-code .pa-syntax-literal{color:#f78c6c}.pa-code .pa-syntax-function{color:#82aaff}.pa-code .pa-syntax-operator{color:#89ddff}
+
+/* Docked to an edge of the light-novel reader (green button; elsewhere the chat is a window):
+   no rounded corners or shadow, only the inner edge has a border and resizes the chat. */
+.pudge-assistant:not(.pa-in-reader) .pa-window-dock{display:none}
+.pudge-assistant.pa-docked{border-width:0;border-radius:0;box-shadow:none}
+.pudge-assistant.pa-docked-right{border-left-width:1px}
+.pudge-assistant.pa-docked-left{border-right-width:1px}
+.pudge-assistant.pa-docked-bottom{border-top-width:1px}
+.pudge-assistant.pa-docked .pa-resize-handle{display:none}
+.pudge-assistant.pa-docked-right .pa-resize-w,.pudge-assistant.pa-docked-left .pa-resize-e{display:block;top:0;bottom:0;width:8px}
+.pudge-assistant.pa-docked-bottom .pa-resize-n{display:block;left:0;right:0;height:8px}
+.pa-dock-preview{position:fixed;z-index:12019;box-sizing:border-box;border:2px solid var(--accent,#4a68e0);background:rgba(74,104,224,.16);pointer-events:none}
+.pa-dock-preview[hidden]{display:none}

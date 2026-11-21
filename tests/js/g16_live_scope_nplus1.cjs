@@ -29,8 +29,8 @@ vm.runInNewContext(fs.readFileSync(process.argv[2],'utf8'),{
   assert.equal(rows.length,1);
   assert.equal(rows[0].account_scope,'jiten:test-account','capability scope backfills mixed-version batch');
 
-  const sentence='個人的には普段通りにしてくれていれば、それがベストだったのだが……。';
-  const surfaces=['個人的','に','は','普段通り','に','して','くれて','いれば','それ','が','ベスト','だった','の','だが'];
+  const sentence='明日もまた普段通りに起きて、駅まで歩いていくつもりだったのだが……。';
+  const surfaces=['明日','も','また','普段通り','に','起きて','駅','まで','歩いて','いく','つもり','だった','の','だが'];
   let cursor=0;
   const tokens=surfaces.map((surface,index)=>{
     const start=sentence.indexOf(surface,cursor); cursor=Math.max(cursor,start+surface.length);

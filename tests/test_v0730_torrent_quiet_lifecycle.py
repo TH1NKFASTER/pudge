@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from pudge import agent, app_session, web_app
 from pudge.config import AppConfig
@@ -72,6 +75,7 @@ def test_aria2_shutdown_saves_session_and_stops_sidecar(tmp_path, monkeypatch):
     probes = iter([True, False])
     calls: list[str] = []
     monkeypatch.setattr(client, "_probe", lambda: next(probes, False))
+    monkeypatch.setattr(client, "_rpc_is_own_sidecar", lambda: True)  # Pudge's own sidecar
     monkeypatch.setattr(
         client,
         "_rpc_raw",
@@ -299,6 +303,7 @@ def test_background_check_refreshes_the_torrent_switch_without_redrawing_cards(p
     assert out["redraws"] == 0
 
 
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="install.sh is a zsh script")
 def test_installer_leaves_agent_unloaded_until_gui_starts(tmp_path) -> None:
     # The installer's last steps (from writing the agent's plist on), macOS tools stubbed.
     stubs = tmp_path / "bin"

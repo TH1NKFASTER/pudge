@@ -21,6 +21,8 @@ DEFAULT_CONFIG_PATH = APP_DIR / "config.toml"
 DEFAULT_CACHE_DIR = CACHE_DIR
 _SECRET_STORE = SecretStore()
 _CONFIG_FILE_LOCK = threading.RLock()
+# A TOML table header line: "[name]" or "[[name]]", with optional spaces and a trailing comment.
+_TOML_TABLE_HEADER = re.compile(r"^\s*\[\[?\s*([^\]\s]+)\s*\]\]?\s*(?:#.*)?$")
 
 
 @dataclass(slots=True)
@@ -71,7 +73,9 @@ class LibraryConfig:
 @dataclass(slots=True)
 class NyaaConfig:
     enabled: bool = True
-    base_url: str = "https://nyaa.si"
+    # Read only to move an older config's release search into sources.json
+    # (pudge/sources.py); Pudge ships with no source and no longer writes it.
+    base_url: str = ""
     category: str = "1_2"
     proxy_mode: str = "direct_then_proxy"
     proxy_url: str = ""
@@ -91,6 +95,8 @@ class NyaaConfig:
     preferred_sources: list[str] = field(default_factory=lambda: ["BluRay", "WEB-DL", "WEBRip"])
     require_japanese_audio: bool = True
     avoid_upscaled: bool = True
+    # Cinema recordings (CAM, TELESYNC ...): off = dropped from every release search.
+    allow_camrips: bool = False
     trusted_groups: list[str] = field(
         default_factory=lambda: ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
     )
@@ -103,7 +109,7 @@ class NyaaConfig:
     upgrade_min_score_gain: float = 30.0
     upgrade_check_hours: float = 24.0
     max_upgrade_checks_per_run: int = 2
-    # SeaDex (releases.moe) recommendations in interactive release search.
+    # Release recommendations (Settings → Sources) in interactive release search.
     seadex_enabled: bool = True
     seadex_timeout_seconds: float = 3.0
     seadex_cache_hours: float = 24.0
@@ -186,8 +192,66 @@ class ShortcutsConfig:
     mpv_explain_subtitle: str = "Ctrl+Shift+t"
     # Active only while the skip button is visible (inside an OP/ED).
     mpv_skip_segment: str = "Tab"
+    # Line keys in mpv (pudge_line_keys.lua); "" leaves a key unbound. mpv itself has
+    # previous/next line on Ctrl+Left/Right, so only replay has a key by default.
+    mpv_replay_line: str = "Ctrl+r"
+    mpv_previous_line: str = ""
+    mpv_next_line: str = ""
+    mpv_auto_pause: str = ""
+    # Sets a subtitle delay carried from other episodes back to zero.
+    mpv_reset_carried_delay: str = "Ctrl+z"
     # System-wide: opens/closes the Screen text panel (OCR of the game window).
     screen_text_toggle: str = "Meta+Alt+Shift+v"
+
+
+# Settings field -> (ShortcutsConfig field, variable the mpv scripts read).
+MPV_LINE_SHORTCUTS: dict[str, tuple[str, str]] = {
+    "shortcut_mpv_replay_line": ("mpv_replay_line", "PUDGE_SHORTCUT_REPLAY_LINE"),
+    "shortcut_mpv_previous_line": ("mpv_previous_line", "PUDGE_SHORTCUT_PREVIOUS_LINE"),
+    "shortcut_mpv_next_line": ("mpv_next_line", "PUDGE_SHORTCUT_NEXT_LINE"),
+    "shortcut_mpv_auto_pause": ("mpv_auto_pause", "PUDGE_SHORTCUT_AUTO_PAUSE"),
+    "shortcut_mpv_reset_carried_delay": ("mpv_reset_carried_delay", "PUDGE_SHORTCUT_RESET_CARRIED_DELAY"),
+}
+
+
+def mpv_line_shortcut_env(shortcuts: ShortcutsConfig) -> dict[str, str]:
+    """The line keys for mpv's environment (an empty value is an unbound key)."""
+    return {env: str(getattr(shortcuts, attribute) or "") for attribute, env in MPV_LINE_SHORTCUTS.values()}
+
+
+def mpv_line_shortcut_settings(shortcuts: ShortcutsConfig) -> dict[str, str]:
+    """The line keys as the Settings page reads them."""
+    return {
+        name: str(getattr(shortcuts, attribute) or "")
+        for name, (attribute, _env) in MPV_LINE_SHORTCUTS.items()
+    }
+
+
+def apply_mpv_line_shortcut_settings(shortcuts: ShortcutsConfig, values: dict) -> None:
+    """Take the line keys the Settings page sent (a missing field stays; "" unbinds).
+
+    A key Pudge already uses in mpv is not taken over: the line key is left unbound.
+    """
+    taken = {
+        str(value).strip().casefold()
+        for value in (
+            shortcuts.mpv_mark_watched,
+            shortcuts.mpv_translate_subtitle,
+            shortcuts.mpv_explain_subtitle,
+            shortcuts.mpv_skip_segment,
+            "Meta+Shift+l",
+        )
+        if str(value).strip()
+    }
+    for name, (attribute, _env) in MPV_LINE_SHORTCUTS.items():
+        if name not in values:
+            continue
+        text = str(values.get(name) or "").strip()
+        if text.casefold() in taken:
+            text = ""
+        if text:
+            taken.add(text.casefold())
+        setattr(shortcuts, attribute, text)
 
 
 @dataclass(slots=True)
@@ -200,6 +264,9 @@ class DiagnosticsConfig:
 class PowerConfig:
     manual_energy_saving: bool = False
     auto_battery_energy_saving: bool = True
+    # Experimental, off by default: the hidden window lets go of its page, heavy one-off
+    # work runs in short-lived worker processes, the page renders lighter (pudge/low_ram.py).
+    low_ram_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -323,10 +390,6 @@ class SyncConfig:
     pgs_onset_min_improvement: float = 0.08
     use_container_chapters: bool = True
     japanese_stt_fallback: bool = True
-    # Internal A/B switch used by the local alignment comparator. Production
-    # keeps the text clock enabled; disabling it reproduces the pre-v138 STT
-    # fallback while leaving every other alignment heuristic unchanged.
-    japanese_stt_text_clock: bool = True
     japanese_stt_model: str = "mlx-community/whisper-tiny"
     japanese_stt_timeout_seconds: float = 600.0
     japanese_stt_min_activity: float = 0.55
@@ -481,9 +544,17 @@ def _keep_broken_config_copy(config_path: Path, data: bytes) -> Path | None:
                     return existing
             except OSError:
                 continue
-        copy = config_path.with_name(f"{config_path.name}.bad-{time.strftime('%Y%m%d-%H%M%S')}")
-        copy.write_bytes(data)
-        copy.chmod(0o600)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        copy = config_path.with_name(f"{config_path.name}.bad-{stamp}")
+        counter = 1
+        while copy.exists():  # another broken content in the same second: never overwrite a copy
+            counter += 1
+            copy = config_path.with_name(f"{config_path.name}.bad-{stamp}-{counter}")
+        # Private from creation: the copy holds the same API keys as config.toml.
+        fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(data)
         return copy
     except OSError:
         return None
@@ -524,6 +595,38 @@ def _parse_config_bytes(config_path: Path, data: bytes) -> dict[str, Any]:
     # Safe Mode notice is in the user's language.
     language = re.search(rb'(?m)^\s*language\s*=\s*"(en|ru)"', data)
     return {"ui": {"language": language.group(1).decode()}} if language else {}
+
+
+def _on_absent_volume(path: Path) -> bool:
+    """``path`` lies on /Volumes/<name> and that disk is not mounted (unplugged, not up yet)."""
+    parts = Path(path).parts
+    if len(parts) < 3 or parts[0] != os.sep or parts[1] != "Volumes":
+        return False
+    volume = Path(parts[0], parts[1], parts[2])
+    return not (os.path.ismount(volume) or (volume.is_symlink() and volume.is_dir()))
+
+
+def _make_configured_folder(folder: Path) -> None:
+    """Create a configured folder, never on a disk that is away.
+
+    With the library (or the database, or the caches) on an external disk that was
+    unplugged, every config load ran mkdir under /Volumes: macOS refused it
+    (PermissionError: the app, the CLI and the agent did not start at all) or, where
+    /Volumes is writable, an empty folder on the system disk took the disk's name and
+    the real disk then mounted as "/Volumes/<name> 1". The folder is made once the disk
+    is back; until then the features that need it say it is missing.
+    """
+    import logging
+
+    if _on_absent_volume(folder):
+        logging.getLogger("pudge.config").warning(
+            "SKIP step=config.mkdir path=%s reason=volume_unmounted", folder
+        )
+        return
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        logging.getLogger("pudge.config").warning("FAIL step=config.mkdir path=%s error=%r", folder, str(exc))
 
 
 def load_config(
@@ -578,6 +681,13 @@ def load_config(
 
     matching = _section(raw, "matching")
     sync = _section(raw, "sync")
+    # One Keychain read for both Jimaku fields (each read is a `security` process).
+    jimaku_api_key = _SECRET_STORE.resolve(
+        "jimaku-api-key",
+        jimaku.get("api_key", ""),
+        env="JIMAKU_API_KEY",
+        use_keychain=use_keychain,
+    )
 
     cfg = AppConfig(
         ui=UIConfig(
@@ -617,7 +727,7 @@ def load_config(
         ),
         nyaa=NyaaConfig(
             enabled=bool(nyaa.get("enabled", True)),
-            base_url=str(nyaa.get("base_url", "https://nyaa.si")).rstrip("/"),
+            base_url=str(nyaa.get("base_url", "")).strip().rstrip("/"),
             category=str(nyaa.get("category", "1_2")),
             proxy_mode=str(nyaa.get("proxy_mode", "direct_then_proxy")),
             proxy_url=str(nyaa.get("proxy_url", "")).strip(),
@@ -637,6 +747,7 @@ def load_config(
             preferred_sources=[str(x) for x in nyaa.get("preferred_sources", ["BluRay", "WEB-DL", "WEBRip"])],
             require_japanese_audio=True,
             avoid_upscaled=True,
+            allow_camrips=bool(nyaa.get("allow_camrips", False)),
             trusted_groups=[
                 str(x)
                 for x in nyaa.get("trusted_groups", ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"])
@@ -713,6 +824,11 @@ def load_config(
             mpv_explain_subtitle=str(shortcuts.get("mpv_explain_subtitle", "Ctrl+Shift+t")).strip(),
             mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
             mpv_skip_segment=_skip_shortcut(shortcuts.get("mpv_skip_segment", "Tab")),
+            mpv_replay_line=str(shortcuts.get("mpv_replay_line", "Ctrl+r")).strip(),
+            mpv_previous_line=str(shortcuts.get("mpv_previous_line", "")).strip(),
+            mpv_next_line=str(shortcuts.get("mpv_next_line", "")).strip(),
+            mpv_auto_pause=str(shortcuts.get("mpv_auto_pause", "")).strip(),
+            mpv_reset_carried_delay=str(shortcuts.get("mpv_reset_carried_delay", "Ctrl+z")).strip(),
             screen_text_toggle=str(shortcuts.get("screen_text_toggle", "Meta+Alt+Shift+v")).strip(),
         ),
         diagnostics=DiagnosticsConfig(
@@ -724,6 +840,7 @@ def load_config(
         power=PowerConfig(
             manual_energy_saving=bool(power.get("manual_energy_saving", False)),
             auto_battery_energy_saving=bool(power.get("auto_battery_energy_saving", True)),
+            low_ram_mode=bool(power.get("low_ram_mode", False)),
         ),
         tools=ToolsConfig(
             mpv=str(tools.get("mpv", "mpv")),
@@ -736,18 +853,8 @@ def load_config(
             mpv_study_plugin=str(tools.get("mpv_study_plugin", "auto")).strip().casefold(),
         ),
         jimaku=JimakuConfig(
-            api_key=_SECRET_STORE.resolve(
-                "jimaku-api-key",
-                jimaku.get("api_key", ""),
-                env="JIMAKU_API_KEY",
-                use_keychain=use_keychain,
-            ),
-            personal_api_key=_SECRET_STORE.resolve(
-                "jimaku-api-key",
-                jimaku.get("api_key", ""),
-                env="JIMAKU_API_KEY",
-                use_keychain=use_keychain,
-            ),
+            api_key=jimaku_api_key,
+            personal_api_key=jimaku_api_key,
             base_url=str(jimaku.get("base_url", "https://jimaku.cc")).rstrip("/"),
         ),
         anilist=AniListConfig(
@@ -866,19 +973,49 @@ def load_config(
         config_path=config_path,
     )
     if CONFIG_LOAD_ERROR:
-        # The file exists, so this is not a first run: no onboarding that would
-        # write defaults over the user's (broken) settings.
+        # The file exists, so this is not a first run: no onboarding or first-run
+        # permission prompt that would write defaults over the user's (broken) settings.
         cfg.ui.onboarding_completed = True
-    cfg.paths.cache_dir.mkdir(parents=True, exist_ok=True)
-    cfg.library.root_dir.mkdir(parents=True, exist_ok=True)
-    cfg.library.database_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.library.cover_cache_dir.mkdir(parents=True, exist_ok=True)
+        cfg.ui.permissions_requested = True
+    for folder in (
+        cfg.paths.cache_dir,
+        cfg.library.root_dir,
+        cfg.library.database_path.parent,
+        cfg.library.cover_cache_dir,
+    ):
+        _make_configured_folder(folder)
     apply_jimaku_trial(cfg)
     if apply_language:
         from .i18n import set_language
 
         set_language(cfg.ui.language)  # console, mpv and notification texts (audit 68Б)
     return cfg
+
+
+class ConfigUnreadableError(RuntimeError):
+    """config.toml could not be read: it is not overwritten with the defaults in use."""
+
+
+def _config_unreadable_at(destination: Path) -> bool:
+    """CONFIG_LOAD_ERROR is set for this file: the settings in memory are defaults."""
+    if not CONFIG_LOAD_ERROR:
+        return False
+    try:
+        broken = Path(str(CONFIG_LOAD_ERROR.get("path") or "")).expanduser().resolve()
+        return broken == Path(destination).expanduser().resolve()
+    except OSError:
+        return True
+
+
+def _refuse_unreadable_config_write(destination: Path) -> None:
+    # Every page load used to write the defaults over a config.toml with one
+    # broken line (watched folders, library and database paths were lost).
+    if _config_unreadable_at(destination):
+        from .i18n import err
+
+        raise ConfigUnreadableError(
+            err("config.unreadableNotSaved", line=CONFIG_LOAD_ERROR.get("line") or "?")
+        )
 
 
 def _toml_string(value: str | Path) -> str:
@@ -893,6 +1030,18 @@ def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _write_private_temporary(temporary: Path, text: str) -> None:
+    """Create a config temp file 0600 from the start.
+
+    It used to be written 0644 and chmod-ed afterwards, so the API keys in it
+    were briefly readable by other users of the Mac.
+    """
+    temporary.unlink(missing_ok=True)  # left behind by a killed write of this pid/thread
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def _atomic_config_text_write(destination: Path, text: str) -> Path:
     """Replace config.toml atomically, serialized with narrow hot-path updates."""
     destination = destination.expanduser()
@@ -900,8 +1049,7 @@ def _atomic_config_text_write(destination: Path, text: str) -> Path:
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     with _CONFIG_FILE_LOCK:
         try:
-            temporary.write_text(text, encoding="utf-8")
-            temporary.chmod(0o600)
+            _write_private_temporary(temporary, text)
             os.replace(temporary, destination)
             destination.chmod(0o600)
         finally:
@@ -925,6 +1073,14 @@ def write_torrents_enabled(
     destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
     if not destination.exists():
         return write_config(config, destination)
+    if _config_unreadable_at(destination):
+        # The session keeps its On/Off; the broken file stays as the user left it.
+        import logging
+
+        logging.getLogger("pudge.config").warning(
+            "SKIP step=config.write_torrents_enabled path=%s reason=unreadable", destination
+        )
+        return destination
 
     with _CONFIG_FILE_LOCK:
         text = destination.read_text(encoding="utf-8")
@@ -932,11 +1088,13 @@ def write_torrents_enabled(
         section_start = None
         section_end = len(lines)
         for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped == "[nyaa]":
+            header = _TOML_TABLE_HEADER.match(line)
+            if header is None:
+                continue
+            if section_start is None and header.group(1) == "nyaa":
                 section_start = index
                 continue
-            if section_start is not None and index > section_start and re.fullmatch(r"\[[^]]+\]", stripped):
+            if section_start is not None:
                 section_end = index
                 break
 
@@ -964,10 +1122,23 @@ def write_torrents_enabled(
                 lines[key_index] = indent + replacement + newline
             updated = "".join(lines)
 
+        try:
+            written = tomllib.loads(updated).get("nyaa", {}).get("torrents_enabled")
+        except (tomllib.TOMLDecodeError, AttributeError):
+            written = None
+        if written is not bool(config.nyaa.torrents_enabled):
+            # A layout this line editor does not understand (e.g. a second [nyaa] table would
+            # make the whole file unreadable and every setting fall back to defaults).
+            import logging
+
+            logging.getLogger("pudge.config").warning(
+                "SKIP step=config.write_torrents_enabled path=%s reason=unsupported_layout", destination
+            )
+            return destination
+
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            temporary.write_text(updated, encoding="utf-8")
-            temporary.chmod(0o600)
+            _write_private_temporary(temporary, updated)
             os.replace(temporary, destination)
             destination.chmod(0o600)
         finally:
@@ -977,6 +1148,7 @@ def write_torrents_enabled(
 
 def write_config(config: AppConfig, destination: Path | None = None) -> Path:
     destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
+    _refuse_unreadable_config_write(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     use_keychain = destination.resolve() == DEFAULT_CONFIG_PATH.expanduser().resolve()
     qbt_password = _SECRET_STORE.persisted_config_value(
@@ -1049,7 +1221,6 @@ disk_free_reserve_gb = {config.library.disk_free_reserve_gb}
 
 [nyaa]
 enabled = {_toml_bool(config.nyaa.enabled)}
-base_url = {_toml_string(config.nyaa.base_url)}
 category = {_toml_string(config.nyaa.category)}
 proxy_mode = {_toml_string(config.nyaa.proxy_mode)}
 proxy_url = {_toml_string(config.nyaa.proxy_url)}
@@ -1067,6 +1238,7 @@ preferred_video_codecs = {_toml_string_list(config.nyaa.preferred_video_codecs)}
 preferred_sources = {_toml_string_list(config.nyaa.preferred_sources)}
 require_japanese_audio = {_toml_bool(config.nyaa.require_japanese_audio)}
 avoid_upscaled = {_toml_bool(config.nyaa.avoid_upscaled)}
+allow_camrips = {_toml_bool(config.nyaa.allow_camrips)}
 trusted_groups = {_toml_string_list(config.nyaa.trusted_groups)}
 preferred_groups = {_toml_string_list(config.nyaa.preferred_groups)}
 blocked_groups = {_toml_string_list(config.nyaa.blocked_groups)}
@@ -1127,6 +1299,11 @@ mpv_mark_watched = {_toml_string(config.shortcuts.mpv_mark_watched)}
 mpv_explain_subtitle = {_toml_string(config.shortcuts.mpv_explain_subtitle)}
 mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 mpv_skip_segment = {_toml_string(config.shortcuts.mpv_skip_segment)}
+mpv_replay_line = {_toml_string(config.shortcuts.mpv_replay_line)}
+mpv_previous_line = {_toml_string(config.shortcuts.mpv_previous_line)}
+mpv_next_line = {_toml_string(config.shortcuts.mpv_next_line)}
+mpv_auto_pause = {_toml_string(config.shortcuts.mpv_auto_pause)}
+mpv_reset_carried_delay = {_toml_string(config.shortcuts.mpv_reset_carried_delay)}
 screen_text_toggle = {_toml_string(config.shortcuts.screen_text_toggle)}
 
 [diagnostics]
@@ -1136,6 +1313,7 @@ energy_sample_seconds = {config.diagnostics.energy_sample_seconds}
 [power]
 manual_energy_saving = {_toml_bool(config.power.manual_energy_saving)}
 auto_battery_energy_saving = {_toml_bool(config.power.auto_battery_energy_saving)}
+low_ram_mode = {_toml_bool(config.power.low_ram_mode)}
 
 [tools]
 mpv = {_toml_string(config.tools.mpv)}

@@ -16,8 +16,8 @@ def _anime() -> LibraryAnime:
 def _release() -> NyaaRelease:
     return NyaaRelease(
         title="[Erai-raws] Youjo Senki II - 05 [1080p CR WEB-DL AVC AAC][MultiSub]",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="abc123",
         size_text="1.4 GiB",
         size_bytes=int(1.4 * 1024**3),

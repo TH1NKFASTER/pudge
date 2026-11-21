@@ -68,7 +68,9 @@ def test_torrent_http_status_is_plain_authoritative_endpoint(tmp_path) -> None:
     try:
         answers = []
         for _ in range(2):
-            with urllib.request.urlopen(url, timeout=2) as response:
+            # The page sends its session token with every request (GETs too).
+            request = urllib.request.Request(url, headers={"X-Pudge-Token": api._http_session_token})
+            with urllib.request.urlopen(request, timeout=2) as response:
                 answers.append(json.loads(response.read()))
     finally:
         server.shutdown()

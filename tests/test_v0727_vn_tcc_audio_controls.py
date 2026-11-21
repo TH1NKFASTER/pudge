@@ -20,7 +20,7 @@ def test_vn_false_preflight_is_diagnostic_not_capture_gate(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "_capture_loop", fake_loop)
     state = service.start(123, "VN")
-    assert entered.wait(1.0)
+    assert entered.wait(30)
     state = service.state()
     assert state.get("error_code") != "permission_required"
     assert state.get("screen_recording_preflight") is False

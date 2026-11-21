@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -7,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from . import jiten_client
 from .branding import APP_SLUG
 from .i18n import err
 
@@ -17,6 +19,21 @@ JITEN_SOURCE_REVISION = "216df6378db619fc0b803f5695dc925c0311ee84"
 
 class ReviewProviderError(RuntimeError):
     """A provider rejected a request or returned a deterministic invalid response."""
+
+
+class ReviewSetupRequired(ReviewProviderError):
+    """No token for the provider: lasting until the user sets it up (the iPhone gets HTTP 422)."""
+
+    setup_required = True
+
+
+class ReviewNotSent(ReviewProviderError):
+    """Pudge did not send the request (its Jiten budget or a Retry-After held it back):
+    nothing changed on the provider, so the same request may simply be sent again later."""
+
+    def __init__(self, message: str, *, retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_after = max(0.0, float(retry_after))
 
 
 class ReviewOutcomeUnknown(ReviewProviderError):
@@ -167,7 +184,7 @@ class JitenReviewProvider:
     def __init__(self, token: str) -> None:
         self.token = str(token or "")
         if not self.token:
-            raise ReviewProviderError(err("ln.jitenTokenMissing"))
+            raise ReviewSetupRequired(err("ln.jitenTokenMissing"))
 
     @property
     def account_key(self) -> str:
@@ -200,12 +217,20 @@ class JitenReviewProvider:
             params["extraReviews"] = max(0, min(int(extra_reviews), 500))
         if session_id:
             params["sessionId"] = session_id
-        response = httpx.get(
-            f"{JITEN_API_BASE}/srs/study-batch",
-            headers=self._headers(),
-            params=params,
-            timeout=30,
-        )
+        try:
+            response = jiten_client.request(
+                "GET",
+                f"{JITEN_API_BASE}/srs/study-batch",
+                headers=self._headers(),
+                params=params,
+                timeout=30,
+            )
+        except jiten_client.JitenRefused as exc:
+            raise ReviewProviderError(str(exc)) from exc
+        except httpx.HTTPError as exc:
+            # A raw httpx error used to escape the strict pool, which only
+            # handles ReviewProviderError, and drop every collected card.
+            raise ReviewProviderError(err("ln.jitenRequestFailed", error=exc)) from exc
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
@@ -255,11 +280,18 @@ class JitenReviewProvider:
         for _round in range(max_rounds):
             rounds_used += 1
             before = len(raw_by_key)
-            batch = self.list_review_candidates(
-                limit=500,
-                session_id=session_id,
-                extra_reviews=wanted,
-            )
+            try:
+                batch = self.list_review_candidates(
+                    limit=500,
+                    session_id=session_id,
+                    extra_reviews=wanted,
+                )
+            except ReviewProviderError:
+                # A failed later round must not throw away the cards already
+                # collected; only the first round has nothing to fall back on.
+                if not raw_by_key:
+                    raise
+                break
             session_id = str(batch.get("session_id") or session_id or "")
             last_reviews_remaining = int(batch.get("reviews_remaining") or 0)
             batch_cards = [card for card in (batch.get("cards") or []) if isinstance(card, dict)]
@@ -318,7 +350,12 @@ class JitenReviewProvider:
         if pending:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pudge-jiten-review") as pool:
                 futures = {
-                    pool.submit(self.lookup_state, word_id, reading_index): (position, card, key)
+                    # Each lookup keeps the caller's Jiten priority (background warm-up or a click).
+                    pool.submit(contextvars.copy_context().run, self.lookup_state, word_id, reading_index): (
+                        position,
+                        card,
+                        key,
+                    )
                     for position, card, word_id, reading_index, key in pending
                 }
                 for future in as_completed(futures):
@@ -366,11 +403,19 @@ class JitenReviewProvider:
         return state
 
     def lookup_state(self, word_id: int, reading_index: int) -> dict[str, Any]:
-        response = httpx.get(
-            f"{JITEN_API_BASE}/srs/review-history/{int(word_id)}/{int(reading_index)}",
-            headers=self._headers(),
-            timeout=30,
-        )
+        try:
+            response = jiten_client.request(
+                "GET",
+                f"{JITEN_API_BASE}/srs/review-history/{int(word_id)}/{int(reading_index)}",
+                headers=self._headers(),
+                timeout=30,
+            )
+        except jiten_client.JitenRefused as exc:
+            raise ReviewNotSent(str(exc), retry_after=exc.retry_after) from exc
+        except httpx.HTTPError as exc:
+            # One dropped history read used to abort the whole review pool;
+            # as a provider error the pool just skips this card.
+            raise ReviewProviderError(err("ln.jitenRequestFailed", error=exc)) from exc
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
@@ -420,13 +465,20 @@ class JitenReviewProvider:
         if review_duration_ms is not None:
             body["reviewDuration"] = max(0, min(int(review_duration_ms), 60_000))
         try:
-            response = httpx.post(
+            response = jiten_client.request(
+                "POST",
                 f"{JITEN_API_BASE}/srs/review",
                 headers=self._headers(),
                 json=body,
                 timeout=30,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except jiten_client.JitenRefused as exc:
+            # not sent: the card is not graded and the same grade can go again later
+            raise ReviewNotSent(str(exc), retry_after=exc.retry_after) from exc
+        except httpx.TransportError as exc:
+            # Any transport failure, including a connection dropped after the
+            # request was sent (RemoteProtocolError) or a proxy error, may
+            # already have graded the card; a plain error invited a second grade.
             raise ReviewOutcomeUnknown(
                 "jiten", attempt, err("review.jitenOutcomeUnknown", error=exc)
             ) from exc
@@ -456,13 +508,14 @@ class JitenReviewProvider:
 
     def undo_review(self, word_id: int, reading_index: int) -> dict[str, Any]:
         try:
-            response = httpx.post(
+            response = jiten_client.request(
+                "POST",
                 f"{JITEN_API_BASE}/srs/undo-review",
                 headers=self._headers(),
                 json={"wordId": int(word_id), "readingIndex": int(reading_index)},
                 timeout=30,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.NetworkError, jiten_client.JitenRefused) as exc:
             raise ReviewProviderError(err("review.jitenUndoFailed", error=exc)) from exc
         if response.status_code >= 400:
             detail = _error_detail(response)
@@ -483,22 +536,12 @@ class JitenReviewProvider:
             "result": payload if isinstance(payload, dict) else {},
         }
 
-    def reconcile_attempt(self, word_id: int, reading_index: int, attempt_id: str) -> dict[str, Any]:
-        state = self.lookup_state(word_id, reading_index)
-        return {
-            "provider": "jiten",
-            "attempt_id": str(attempt_id or ""),
-            "status": "indeterminate",
-            "reason": "Jiten review history does not expose ClientRequestId",
-            "state": state,
-        }
-
 
 class JpdbReviewProvider:
     def __init__(self, token: str) -> None:
         self.token = str(token or "")
         if not self.token:
-            raise ReviewProviderError(err("ln.jpdbTokenMissing"))
+            raise ReviewSetupRequired(err("ln.jpdbTokenMissing"))
 
     @property
     def account_key(self) -> str:
@@ -541,7 +584,9 @@ class JpdbReviewProvider:
                 json={"vid": int(vid), "sid": int(sid), "grade": mapped},
                 timeout=30,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except httpx.TransportError as exc:
+            # Same as Jiten: a dropped connection after sending may have graded
+            # the card, and jpdb has no request id to dedupe a second grade.
             raise ReviewOutcomeUnknown("jpdb", attempt, err("review.jpdbOutcomeUnknown", error=exc)) from exc
         if response.status_code == 408 or response.status_code >= 500:
             raise ReviewOutcomeUnknown(
@@ -563,12 +608,4 @@ class JpdbReviewProvider:
             "account_key": self.account_key,
             "attempt_id": attempt,
             "result": result,
-        }
-
-    def reconcile_attempt(self, _vid: int, _sid: int, attempt_id: str) -> dict[str, Any]:
-        return {
-            "provider": "jpdb",
-            "attempt_id": str(attempt_id or ""),
-            "status": "unsupported",
-            "reason": "No verified JPDB attempt-id/review-history reconciliation contract",
         }

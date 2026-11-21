@@ -282,19 +282,21 @@ def test_numeric_title_range_does_not_hide_explicit_final_episode():
 
 
 def test_empty_mirrors_probe_backed_off_primary_once(monkeypatch):
-    client = nyaa.NyaaClient("https://nyaa.si", proxy_mode="direct")
-    client._mirror_backoff = {"https://nyaa.si": nyaa.time.monotonic() + 300}
+    from sources_support import release_search_client
+
+    client = release_search_client(proxy_mode="direct")
+    client._mirror_backoff = {"https://releases.invalid": nyaa.time.monotonic() + 300}
     urls = []
 
     def get(url, proxy):
         urls.append(url)
-        if url.startswith("https://nyaa.si/"):
-            return '<rss xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>Show - 01</title><link>https://nyaa.si/view/1</link><nyaa:infoHash>one</nyaa:infoHash></item></channel></rss>'
+        if url.startswith("https://releases.invalid/"):
+            return '<rss xmlns:nyaa="https://releases.invalid/xmlns/nyaa"><channel><item><title>Show - 01</title><link>https://releases.invalid/view/1</link><nyaa:infoHash>one</nyaa:infoHash></item></channel></rss>'
         return "<rss><channel/></rss>"
 
     monkeypatch.setattr(client, "_get", get)
     assert len(client.search("Show")) == 1
-    assert sum(url.startswith("https://nyaa.si/") for url in urls) == 1
+    assert sum(url.startswith("https://releases.invalid/") for url in urls) == 1
     client.close()
 
 

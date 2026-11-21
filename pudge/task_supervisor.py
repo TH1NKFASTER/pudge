@@ -4,7 +4,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal
 
 
 @dataclass(slots=True)
@@ -152,73 +152,6 @@ class TaskSupervisor:
             if process is not None and process.poll() is None:
                 process.terminate()
             return True
-
-    def run_process(
-        self,
-        name: str,
-        command: Sequence[str],
-        *,
-        cancel_event: threading.Event | None = None,
-        timeout: float | None = None,
-        **kwargs: Any,
-    ) -> tuple[int, Any, Any]:
-        """Run a cancellable child while continuously draining stdout/stderr.
-
-        Repeated ``communicate(timeout=...)`` calls keep pipe reader threads active,
-        so a verbose child cannot deadlock on a full PIPE before it exits.
-        """
-
-        started = time.monotonic()
-        process_name = str(name)
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("task supervisor is closed")
-            if self._suspended:
-                raise RuntimeError("task supervisor is suspended")
-            existing = self._processes.get(process_name)
-            if existing is not None and existing.poll() is None:
-                raise RuntimeError(f"process already running: {process_name}")
-            # Spawn while ownership is locked so shutdown cannot pass between
-            # Popen() and registration and lose the child process.
-            process = subprocess.Popen(list(command), **kwargs)
-            self._processes[process_name] = process
-        try:
-            while True:
-                try:
-                    stdout, stderr = process.communicate(timeout=0.10)
-                    return int(process.returncode or 0), stdout or b"", stderr or b""
-                except subprocess.TimeoutExpired:
-                    pass
-
-                if cancel_event is not None and cancel_event.is_set():
-                    process.terminate()
-                    try:
-                        stdout, stderr = process.communicate(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        stdout, stderr = process.communicate()
-                    return int(process.returncode or 0), stdout or b"", stderr or b""
-
-                if timeout is not None and time.monotonic() - started >= float(timeout):
-                    process.terminate()
-                    try:
-                        process.communicate(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.communicate()
-                    raise subprocess.TimeoutExpired(list(command), timeout)
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-            with self._lock:
-                current = self._processes.get(process_name)
-                if current is process:
-                    self._processes.pop(process_name, None)
 
     def status(self) -> list[dict[str, Any]]:
         with self._lock:

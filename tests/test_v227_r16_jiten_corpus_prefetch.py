@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import json
-import threading
 from pathlib import Path
 
 import pytest
 
-from pudge.config import AppConfig, write_config
+from pudge.config import AppConfig
 from pudge.light_novels import LightNovelError, LightNovelService
 from pudge.web_app import WebAppApi
 
@@ -86,56 +84,6 @@ def test_batch_failure_keeps_stale_r15_snapshot(tmp_path: Path, monkeypatch: pyt
     assert result[0]["knowledgeStatus"] == "stale_live_state_cache"
 
 
-def test_corpus_orders_global_frequency_first_then_local_occurrences(tmp_path: Path) -> None:
-    service = _service(tmp_path)
-    parsed = {
-        "paragraphs": ["dummy"],
-        "vocabulary": [
-            {"wordId": 10, "readingIndex": 0, "frequencyRank": 100},
-            {"wordId": 20, "readingIndex": 0, "frequencyRank": 50},
-            {"wordId": 30, "readingIndex": 1, "frequencyRank": 100},
-            {"wordId": 40, "readingIndex": 0},
-        ],
-        "tokens": [
-            [
-                {"wordId": 10, "readingIndex": 0},
-                {"wordId": 20, "readingIndex": 0},
-                {"wordId": 30, "readingIndex": 1},
-                {"wordId": 30, "readingIndex": 1},
-                {"wordId": 40, "readingIndex": 0},
-            ]
-        ],
-    }
-    with service._connection() as conn:
-        conn.execute(
-            "INSERT INTO ln_parse_cache(text_hash,parsed_json,parser_schema,created_at) VALUES(?,?,?,?)",
-            ("corpus", json.dumps(parsed), "jiten-v1", 1.0),
-        )
-
-    assert service.jiten_corpus_pairs() == [(20, 0), (30, 1), (10, 0), (40, 0)]
-
-
-def test_corpus_prefetch_uses_batches_in_priority_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = _service(tmp_path)
-    monkeypatch.setattr(service, "jiten_corpus_pairs", lambda: [(1, 0), (2, 0), (3, 0)])
-    calls: list[list[tuple[int, int]]] = []
-
-    def fake_live_states(pairs, *, force=False):
-        assert force is False
-        calls.append(list(pairs))
-        return [{"ok": True} for _ in pairs]
-
-    monkeypatch.setattr(service, "jiten_live_states", fake_live_states)
-    monkeypatch.setattr(service, "JITEN_STATE_PREFETCH_PAUSE_SECONDS", 0.0)
-
-    result = service.jiten_prefetch_corpus_states(batch_size=2)
-
-    assert calls == [[(1, 0), (2, 0)], [(3, 0)]]
-    assert result == {"ok": True, "reason": "complete", "total": 3, "warmed": 3, "batches": 2}
-
-
 def test_web_api_exposes_batch_state_lookup() -> None:
     class LightNovels:
         class Settings:
@@ -163,40 +111,6 @@ def test_web_api_exposes_batch_state_lookup() -> None:
             {"wordId": 44, "readingIndex": 0, "force": True},
         ],
     }
-
-
-def test_app_start_warms_the_jiten_states_of_the_whole_corpus_in_background(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cfg = AppConfig()
-    cfg.config_path = tmp_path / "config.toml"
-    cfg.library.database_path = tmp_path / "library.sqlite3"
-    cfg.library.cover_cache_dir = tmp_path / "cache" / "covers"
-    cfg.paths.cache_dir = tmp_path / "cache"
-    cfg.library.root_dir = tmp_path / "library"
-    cfg.library.root_dir.mkdir(parents=True)
-    write_config(cfg, cfg.config_path)
-    LightNovelService(cfg).save_settings({"jiten_api_key": "jiten-token", "study_backend": "jiten"})
-    runs: list[dict] = []
-
-    def prefetch(self, **kwargs):
-        runs.append(kwargs)
-        return {"ok": True, "reason": "complete", "total": 3, "warmed": 3, "batches": 1}
-
-    monkeypatch.setattr(LightNovelService, "jiten_prefetch_corpus_states", prefetch)
-    api = WebAppApi(cfg.config_path)
-    for thread in threading.enumerate():
-        if "jiten-state-prefetch" in thread.name:
-            thread.join(timeout=5)
-
-    assert len(runs) == 1 and runs[0]["cancel_event"].is_set() is False
-    # A finished warm-up is not repeated on the next request.
-    again = api.jiten_state_prefetch()
-    assert (again["started"], again["reason"], again["warmed"]) == (False, "complete", 3)
-    assert len(runs) == 1
-    # Without Jiten there is nothing to warm.
-    api.light_novels.save_settings({"study_backend": "jpdb"})
-    assert api.jiten_state_prefetch(force=True) == {"started": False, "reason": "jiten_disabled"}
 
 
 # A reader paragraph of Jiten words (vocabulary = the parse snapshot) and live Jiten states.

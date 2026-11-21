@@ -7,7 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .process_utils import pid_alive
+from .process_utils import pid_alive, session_process_alive
 from typing import Any
 
 from .app_session import SESSION_PATH
@@ -30,6 +30,8 @@ class SafeModeController:
         self.detected_at = 0.0
         self.crash_count = 0
         self.startup_database_check = "unchecked"
+        # The previous window did not quit cleanly (crash, power loss, kill).
+        self.interrupted = False
         # config.toml could not be read: the app runs on default settings.
         self.config_error = dict(config_error or {})
 
@@ -53,7 +55,12 @@ class SafeModeController:
         except (TypeError, ValueError):
             previous_crash_count = 0
         forced = os.getenv("PUDGE_SAFE_MODE", "").strip().casefold() in {"1", "true", "yes"}
-        interrupted = previous_pid > 0 and not _pid_alive(previous_pid)
+        # A pid reused by another process (after a reboot) is not this marker's
+        # window: compare its start time with the marker's, as install.sh does.
+        interrupted = previous_pid > 0 and not (
+            _pid_alive(previous_pid) and session_process_alive(previous_pid, previous.get("started_at"))
+        )
+        self.interrupted = bool(interrupted)
         self.crash_count = previous_crash_count + 1 if interrupted else 0
         self.startup_database_check = self._database_check() if interrupted else "unchecked"
         database_failed = self.startup_database_check.startswith("error:")
@@ -120,14 +127,20 @@ class SafeModeController:
         if not self.database_path.is_file():
             return "missing"
         try:
-            connection = sqlite3.connect(f"file:{self.database_path}?mode=ro", uri=True, timeout=3)
+            # Escaped like backup._check_database_file: "?", "#" or "%" in the
+            # folder name must not point the check at a different file.
+            uri = Path(self.database_path).resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=3)
             try:
                 row = connection.execute("PRAGMA quick_check").fetchone()
             finally:
                 connection.close()
         except sqlite3.Error as exc:
             return f"error:{exc}"
-        return str(row[0] if row else "unknown")
+        result = str(row[0] if row else "no result")
+        # quick_check reports damage as text ("*** in database main *** ..."): anything
+        # but "ok" is a failed check.
+        return "ok" if result.casefold() == "ok" else f"error:{result}"
 
     def leave_on_restart(self) -> None:
         self.active = False

@@ -126,9 +126,9 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
         start = 119.622 + index * 30.0
         cues.append((start, start + 3.0, f"line {index}"))
     refs = [
-        (11.490, 14.490, "Krrrack!!"),
-        (15.240, 20.210, "Krrrack!!"),
-        (15.760, 18.520, "A krrrack to open the episode?!"),
+        (11.490, 14.490, "Bzzzt!!"),
+        (15.240, 20.210, "Bzzzt!!"),
+        (15.760, 18.520, "A bzzzt to start the morning?!"),
     ]
     for index in range(10):
         start = 119.972 + index * 30.0

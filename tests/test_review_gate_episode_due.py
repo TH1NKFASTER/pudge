@@ -484,7 +484,9 @@ def test_episode_due_resolver_extracts_selected_embedded_japanese_text_track_onc
 
     def fake_run(args, **_kwargs):
         calls.append([str(value) for value in args])
-        Path(args[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nやれやれだぜ。\n", encoding="utf-8")
+        Path(args[-1]).write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\nまいったな、まったく。\n", encoding="utf-8"
+        )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(review_episode_due_module.subprocess, "run", fake_run)

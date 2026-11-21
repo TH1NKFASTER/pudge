@@ -5,9 +5,11 @@ from itertools import pairwise
 from ..subtitle_formats import convert_to_plain_srt, parse_srt
 
 
-def final_timing_runs(raw, output):
+def final_timing_runs(raw, output, cache_dir=None):
     if raw.suffix.lower() != ".srt":
-        raw, _ = convert_to_plain_srt(raw, output.parent, force=False, verbose=False)
+        # The cache root, so the conversion lands in the managed converted/.
+        root = cache_dir if cache_dir is not None else output.parent
+        raw, _ = convert_to_plain_srt(raw, root, force=False, verbose=False)
     source, final = parse_srt(raw), parse_srt(output)
     if len(source) != len(final) or not source:
         return []

@@ -19,6 +19,25 @@ REQUIRED = (
     "pudge/legacy_install.py",
     ".github/workflows/release.yml",
 )
+# Removed from Pudge: a developer folder that still holds them (built without git, or
+# copied over an older version) must not ship them again.
+RETIRED = (
+    "pudge/web/companion",
+    "pudge/mobile_sync.py",
+    "pudge/mobile_sync_http.py",
+    "pudge/companion_streaming.py",
+    "pudge/web/library.js",
+    "pudge/alignment_replay.py",
+    "pudge/manga_review_diff.py",
+    "pudge/ocr_geometry.py",
+    "pudge/subtitles/normalization.py",
+    "anime_mpv",
+    "rename_brand.py",
+    "brand_migration.py",
+    "MOBILE_SYNC_PROTOCOL.md",
+    "docs/LLM_HANDOFF.md",
+    "tests/golden",
+)
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 
 
@@ -27,6 +46,9 @@ def validate(root: Path) -> list[str]:
     for rel in REQUIRED:
         if not (root / rel).exists():
             errors.append(f"missing required release path: {rel}")
+    for rel in RETIRED:
+        if (root / rel).exists() or (root / rel).is_symlink():
+            errors.append(f"retired path in release: {rel}")
     for doc in root.rglob("*.md"):
         try:
             text = doc.read_text(encoding="utf-8")

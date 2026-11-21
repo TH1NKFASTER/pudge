@@ -14,6 +14,10 @@ local shortcut_mark_watched = os.getenv('PUDGE_SHORTCUT_MARK_WATCHED') or 'Ctrl+
 local shortcut_translate_subtitle = os.getenv('PUDGE_SHORTCUT_TRANSLATE_SUBTITLE') or 'Ctrl+t'
 local app_name = os.getenv('PUDGE_APP_NAME') or 'pudge'
 local subtitle_path = os.getenv('PUDGE_SUBTITLE_PATH') or ''
+-- The original subtitle files found for the episode (JSON list), added as extra
+-- tracks that are not selected: the prepared subtitles stay on, the originals
+-- are there to switch to (j) just in case.
+local subtitle_originals = os.getenv('PUDGE_SUBTITLE_ORIGINALS') or ''
 -- Two episodes in one file (audit 17А): episode one counts where episode two
 -- starts ("half" until subtitles have found that point).
 local part_boundary_setting = os.getenv('PUDGE_ANILIST_PART_BOUNDARY') or ''
@@ -85,6 +89,39 @@ local save_sequence = 0
 local save_session = tostring(utils.getpid()) .. ":" .. tostring(mp.get_time())
 local last_active_clock = nil
 local deferred_until = 0.0
+-- Subtitle delay (z/x): sent with the playback save so the next launch of the
+-- same subtitle starts with it (Pudge passes --sub-delay).
+local playback_subtitle = os.getenv('PUDGE_SUBTITLE_PATH') or ''
+local playback_sid = tonumber(os.getenv('PUDGE_SUBTITLE_SID') or '')
+local current_sub_delay = nil
+local sub_delay_dirty = false
+-- A delay the viewer set on other episodes of this release, passed as
+-- --sub-delay for an episode without its own (cli.py). Shown once; the reset
+-- key sets it to zero, and that zero is remembered for this video.
+local carried_sub_delay = tonumber(os.getenv('PUDGE_SUBTITLE_DELAY_CARRIED') or '')
+local shortcut_reset_carried_delay = os.getenv('PUDGE_SHORTCUT_RESET_CARRIED_DELAY') or 'Ctrl+z'
+local carried_delay_notice_shown = false
+
+-- The delay belongs to the prepared subtitle only: not to an "Original: ..."
+-- track or an embedded English one the viewer switched to.
+local function prepared_subtitle_shown()
+    if playback_subtitle == '' and not playback_sid then return false end
+    local external = mp.get_property('current-tracks/sub/external-filename')
+    local sid = mp.get_property_number('current-tracks/sub/id')
+    if external == nil and sid == nil then
+        -- mpv without current-tracks: the selected primary subtitle in track-list.
+        for _, track in ipairs(mp.get_property_native('track-list') or {}) do
+            if type(track) == 'table' and track.type == 'sub' and track.selected
+                and (track['main-selection'] == nil or track['main-selection'] == 0) then
+                external = track['external-filename']
+                sid = tonumber(track.id)
+                break
+            end
+        end
+    end
+    if playback_subtitle ~= '' then return external ~= nil and external == playback_subtitle end
+    return external == nil and sid ~= nil and sid == playback_sid
+end
 
 
 -- Work around an mpv/libass rendering glitch where the first external text
@@ -183,6 +220,24 @@ local function show_translation(value, seconds)
     end)
 end
 
+
+local function add_original_subtitles()
+    if subtitle_originals == '' then return end
+    local paths = utils.parse_json(subtitle_originals)
+    if type(paths) ~= 'table' then return end
+    local present = {}
+    for _, track in ipairs(mp.get_property_native('track-list') or {}) do
+        if track.type == 'sub' and track['external-filename'] then present[track['external-filename']] = true end
+    end
+    for _, path in ipairs(paths) do
+        if type(path) == 'string' and path ~= '' and not present[path] then
+            local name = (path:match('([^/]+)$') or path):gsub('^%d%d ', '')
+            -- 'auto': added, not selected.
+            mp.commandv('sub-add', path, 'auto', tr_key('osd.originalSubtitleTrack', 'Original: {name}', {name = name}))
+            present[path] = true
+        end
+    end
+end
 
 local function disable_secondary_subtitles()
     mp.set_property('secondary-sid', 'no')
@@ -326,8 +381,10 @@ local function translate_visible_subtitle()
     local args = {
         python, '-m', 'pudge.cli',
         '--subtitle-translate',
-        '--subtitle-study-text', text,
-        '--subtitle-study-context', translation_context(),
+        -- One argument each: a line starting with "-" ("-はい") made argparse
+        -- stop with "expected one argument".
+        '--subtitle-study-text=' .. text,
+        '--subtitle-study-context=' .. translation_context(),
     }
     if subtitle_path ~= '' then
         -- A line of the prepared subtitle file: Python builds the same text and
@@ -549,13 +606,16 @@ local function save_playback(force)
     local position = mp.get_property_number('time-pos')
     local duration = mp.get_property_number('duration')
     if not position or position < 0 then return end
-    if not force and last_saved_position >= 0 and math.abs(position - last_saved_position) < 5 then return end
+    if not force and not sub_delay_dirty and last_saved_position >= 0
+        and math.abs(position - last_saved_position) < 5 then return end
 
     playback_busy = true
     last_saved_position = position
     save_sequence = save_sequence + 1
     local captured_active = active_since_save
     active_since_save = 0.0
+    local captured_delay_dirty = sub_delay_dirty
+    sub_delay_dirty = false
     local args = {
         python, '-m', 'pudge.playback_save',
         '--playback-save',
@@ -567,6 +627,18 @@ local function save_playback(force)
         '--playback-sequence', tostring(save_sequence),
         '--playback-active-total', string.format('%.3f', active_total),
     }
+    local sent_delay = nil
+    if current_sub_delay ~= nil and prepared_subtitle_shown() then
+        sent_delay = current_sub_delay
+        table.insert(args, '--playback-sub-delay')
+        table.insert(args, string.format('%.3f', sent_delay))
+        table.insert(args, '--playback-subtitle')
+        table.insert(args, playback_subtitle)
+        if playback_subtitle == '' and playback_sid then
+            table.insert(args, '--playback-subtitle-sid')
+            table.insert(args, tostring(playback_sid))
+        end
+    end
     if config_path ~= '' then
         table.insert(args, '--config')
         table.insert(args, config_path)
@@ -588,7 +660,9 @@ local function save_playback(force)
             args={'/usr/bin/curl','--noproxy','*','--max-time','3','--silent','--show-error','--fail',
                   '--request','POST','--header','Content-Type: application/json','--header','X-Pudge-Token: '..owner_token,
                   '--data-raw',utils.format_json({video=playback_video,position=position,duration=duration or 0,
-                     session=save_session,sequence=save_sequence,active_total=active_total}),
+                     session=save_session,sequence=save_sequence,active_total=active_total,
+                     sub_delay=sent_delay,subtitle=playback_subtitle,
+                     subtitle_sid=(sent_delay ~= nil and playback_subtitle == '') and playback_sid or nil}),
                   (owner_url:gsub('/explain$','/playback-save'))}
         }
     end
@@ -596,6 +670,7 @@ local function save_playback(force)
         playback_busy = false
         if not success or not result or result.status ~= 0 then
             active_since_save = active_since_save + captured_active
+            if captured_delay_dirty then sub_delay_dirty = true end
             mp.msg.warn(app_name .. ' playback position save failed')
             return false
         end
@@ -667,7 +742,9 @@ local function update_anilist(manual)
             return
         end
     end
-    if triggered and not manual then return end
+    -- Counted already (Ctrl+A or an earlier automatic count): the automatic
+    -- path does not try again, its watch-time check would only say "not counted".
+    if (triggered or counted) and not manual then return end
     if manual then
         -- Give immediate feedback even before the Python helper starts. This
         -- makes a missing tracker or a subprocess failure visible instead of
@@ -718,7 +795,7 @@ end
 
 local function check_progress()
     accumulate_active_time()
-    if not auto_update or triggered then return end
+    if not auto_update or triggered or counted then return end
     if tracking_file == '' or paused or busy then return end
     if check_part_boundary() then return end
     local percent = mp.get_property_number('percent-pos')
@@ -766,6 +843,7 @@ mp.register_event('file-loaded', function()
         translation_prewarm_timer = nil
     end
     disable_secondary_subtitles()
+    add_original_subtitles()
     cancel_subtitle_refresh_timers()
     if subtitle_refresh_enabled then
         subtitle_refresh_arm_timer = mp.add_timeout(0.05, function()
@@ -835,6 +913,14 @@ mp.register_event('shutdown', function()
     save_playback(true)
     if active_timer then active_timer:stop() end
 end)
+-- The final save runs while the file is still open. At end-file (and shutdown) mpv has
+-- already closed it: time-pos, duration and the subtitle tracks are unavailable, so the save
+-- there found no position and was skipped, and the watching since the last periodic save (up
+-- to the save interval), the place and a z/x delay set meanwhile were lost. on_unload runs
+-- before mpv closes the file; the saves above then have nothing left to send.
+if mp.add_hook then
+    mp.add_hook('on_unload', 50, function() save_playback(true) end)
+end
 -- OP/ED skip (pudge_skip_segments.lua): close the active-time interval at
 -- the jump.  Active seconds are wall-clock play time, so the skipped part is
 -- never counted as watched; percent/remaining checks stay as they are and the
@@ -844,6 +930,56 @@ mp.register_script_message('pudge-segment-skip', function(kind, from, to, reason
     mp.msg.info(string.format('pudge segment skip: %s %s -> %s (%s)',
         tostring(kind), tostring(from), tostring(to), tostring(reason)))
 end)
+local function forget_carried_delay()
+    carried_sub_delay = nil
+    mp.remove_key_binding('pudge_reset_carried_delay')
+end
+local function reset_carried_delay()
+    if not carried_sub_delay then return end
+    forget_carried_delay()
+    -- The observer below marks the change; the save sends zero, which Pudge
+    -- remembers for this video instead of carrying the delay again.
+    mp.set_property_number('sub-delay', 0)
+    sub_delay_dirty = true
+    mp.osd_message(tr_key('osd.subtitleDelayReset', 'Subtitle delay reset to 0'), 3)
+    save_playback(false)
+end
+local function show_carried_delay_notice()
+    if not carried_sub_delay or carried_delay_notice_shown then return end
+    carried_delay_notice_shown = true
+    local delay = string.format('%+.2f', carried_sub_delay)
+    if shortcut_reset_carried_delay ~= '' then
+        mp.osd_message(tr_key('osd.subtitleDelayCarried',
+            'Subtitle delay {delay} s carried from other episodes — press {key} to reset',
+            {delay = delay, key = shortcut_reset_carried_delay}), 8)
+    else
+        mp.osd_message(tr_key('osd.subtitleDelayCarriedNoKey',
+            'Subtitle delay {delay} s carried from other episodes', {delay = delay}), 8)
+    end
+end
+mp.observe_property('sub-delay', 'number', function(_, value)
+    if value == nil then return end
+    -- The first value is the one the launch passed; only a change needs a save.
+    if current_sub_delay ~= nil and math.abs(value - current_sub_delay) > 0.0005 then
+        sub_delay_dirty = true
+    end
+    current_sub_delay = value
+    -- Changed by hand (z/x): it is the viewer's own delay now, not a carried one.
+    if carried_sub_delay and math.abs(value - carried_sub_delay) > 0.0005 then
+        forget_carried_delay()
+    end
+end)
+if carried_sub_delay and math.abs(carried_sub_delay) >= 0.0005 then
+    if shortcut_reset_carried_delay ~= '' then
+        mp.add_key_binding(shortcut_reset_carried_delay, 'pudge_reset_carried_delay', reset_carried_delay)
+    end
+    mp.register_event('file-loaded', function()
+        -- After the AniList "manual mode" message of the same moment.
+        mp.add_timeout((tracking_file ~= '' and not auto_update) and 3.5 or 1.0, show_carried_delay_notice)
+    end)
+else
+    carried_sub_delay = nil
+end
 mp.observe_property('pause', 'bool', on_pause)
 mp.observe_property('sub-text', 'string', on_subtitle_text)
 local function add_reliable_binding(key, name, callback)

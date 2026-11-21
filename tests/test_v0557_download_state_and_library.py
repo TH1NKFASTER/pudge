@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from css_support import css_rules
+from sources_support import configure_sources
 
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
@@ -56,10 +57,13 @@ def test_download_available_card_contains_active_download_state(tmp_path: Path) 
     )
     api.manager.db.upsert_download(partial_download(tmp_path))
 
-    card = api.get_state()["home"]["download_available"][0]
+    home = api.get_state()["home"]
+    # A download under way is preparation: "Waiting for preparation", not "Available to download".
+    card = home["waiting"][0]
 
     assert card["download"]["progress"] == 0.35
     assert card["download"]["state"] == "downloading"
+    assert home["download_available"] == []
 
 
 def test_partial_qbittorrent_file_is_hidden_from_library_and_ready_sections(tmp_path: Path) -> None:
@@ -166,6 +170,7 @@ def test_existing_old_torrent_for_same_anime_blocks_second_batch(tmp_path: Path,
 
 def test_download_card_keeps_normal_height_and_hides_button_while_active(tmp_path: Path, page) -> None:
     api = make_api(tmp_path)
+    configure_sources(api.config)  # without a source the window shows a hint instead of searching
     api.manager.db.upsert_anime(
         LibraryAnime(
             media_id=42, title="Backlog anime", status="CURRENT", episodes=12, media_status="FINISHED"
@@ -192,14 +197,9 @@ def test_download_card_keeps_normal_height_and_hides_button_while_active(tmp_pat
             const card = id => document.querySelector(`[data-home-section="section.availableDownload"] [data-media-id="${id}"]`);
             const look = id => ({button: card(id).querySelector('button.download-card-button')?.innerText ?? null,
                                  state: card(id).querySelector('.download-card-state')?.innerText ?? null});
-            const download = ui.state.home.download_available.find(a => a.media_id === 42).download;
-            const out = {stale: look(42), staleExpected: compactDownloadStatus(download), idle: look(43),
-                         downloadAnime: t('action.downloadAnime')};
-            // Torrent traffic is fresh: the card says how far the download is.
-            ui.torrentTraffic = {enabled: true, stale: false, updated_at: Date.now() / 1000, transition: 'on'};
-            renderCurrent();
-            out.running = look(42);
-            out.runningExpected = t('label.downloading', {progress: 35});
+            const waiting = document.querySelector('[data-home-section="section.waitingPreparation"] [data-media-id="42"]');
+            const out = {downloading: {available: !!card(42), waiting: waiting?.innerText.includes('35%') ?? false},
+                         idle: look(43), downloadAnime: t('action.downloadAnime')};
             // Downloading the other one: the backend says it is already being downloaded.
             await __click('[data-home-section="section.availableDownload"] [data-media-id="43"] button.download-card-button');
             await __tick(10);
@@ -215,8 +215,8 @@ def test_download_card_keeps_normal_height_and_hides_button_while_active(tmp_pat
         )
         out = result.value
         assert out["idle"] == {"button": out["downloadAnime"], "state": None}
-        assert out["stale"] == {"button": None, "state": out["staleExpected"]}
-        assert out["running"] == {"button": None, "state": out["runningExpected"]}
+        # The title whose download is under way waits for preparation with its progress.
+        assert out["downloading"] == {"available": False, "waiting": True}
         assert result.calls_of("add_release") == [[43, None, True, release]]
         assert out["toast"] == out["already"]
     # The state label replaces the button without changing the card's height.

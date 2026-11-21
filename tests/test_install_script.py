@@ -22,7 +22,6 @@ import pytest
 from desktop_isolation import _REAL_POPEN
 from t71g00_support import (
     FAKE_REVISION,
-    TOOLS,
     build_launcher,
     build_wheel,
     clone_install,
@@ -151,8 +150,9 @@ def test_agent_gets_the_tool_paths_and_the_apps_notification_helper(fresh) -> No
         str(fresh.config),
     ]
     env = agent["EnvironmentVariables"]
-    # Finder-started processes have no Homebrew PATH: 7-Zip and aria2 come as absolute paths.
-    assert env["PUDGE_7ZIP"] == fresh.prefix("sevenzip/bin/7zz")
+    # Finder-started processes have no Homebrew PATH: aria2 comes as an absolute path
+    # (archives are unpacked by macOS's /usr/bin/bsdtar, 7-Zip is not installed).
+    assert "PUDGE_7ZIP" not in env
     assert env["PUDGE_ARIA2C"] == fresh.prefix("aria2/bin/aria2c")
     assert env["PUDGE_NOTIFICATION_HELPER"] == str(fresh.app / "Contents/MacOS/pudge")
     assert ["bootout", "gui/" + str(os.getuid()), str(fresh.agent_plist)] in fresh.calls_of("launchctl")
@@ -236,7 +236,6 @@ def test_launcher_runs_pudge_in_its_own_process_after_its_startup_pool(fresh, tm
     assert report["env"] == {
         "PUDGE_PYTHON": str(fresh.venv / "bin/python"),
         "PUDGE_CONFIG": str(fresh.config),
-        "PUDGE_7ZIP": fresh.prefix("sevenzip/bin/7zz"),
         "PUDGE_ARIA2C": fresh.prefix("aria2/bin/aria2c"),
         "PUDGE_APP_ICON": str(fresh.app / "Contents/Resources/AppIcon.icns"),
     }
@@ -273,7 +272,8 @@ def test_update_quits_running_pudge_like_cmd_q_and_keeps_its_session_marker(upda
         index for index, call in enumerate(result.calls) if call[:3] == ["venv-python", "-m", "pip"]
     )
     assert names.index("terminate") < first_pip
-    assert result.calls_of("pkill") == [] and result.calls_of("killall") == [["Dock"]]
+    # The Dock restarts only when mac_app_aliases.py changed its pins, not on every install.
+    assert result.calls_of("pkill") == [] and result.calls_of("killall") == []
     # The marker of a PID that now belongs to a younger process is not Pudge's: the update goes
     # on, and the marker is left for Pudge's crash detection.
     assert (result.data_dir / "app-session.json").read_text(encoding="utf-8") == before["marker"]
@@ -338,8 +338,23 @@ def test_update_replaces_the_installed_package_with_the_bundled_wheel(updated) -
     result, _before = updated
     site = result.site_packages()
     wheel = str(result.project / "pudge-9.8.8-py3-none-any.whl")
-    assert ["venv-python", "-m", "pip", "install", "--no-cache-dir", "--no-deps", wheel] in result.calls
-    # The old package folder is removed first: no file of 9.8.7 survives a same-name install.
+    # Installed into a staging root and renamed into place: no file of 9.8.7 survives a
+    # same-name install, and the package is never missing while pip runs.
+    stage = str(result.data_dir / "update-package-stage")
+    assert [
+        "venv-python",
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-deps",
+        "--ignore-installed",
+        "--no-warn-script-location",
+        "--root",
+        stage,
+        wheel,
+    ] in result.calls
+    assert not Path(stage).exists() and not (result.data_dir / "update-package-previous").exists()
     assert not (site / "pudge/stale_module.py").exists()
     assert (site / "pudge/__init__.py").read_text(encoding="utf-8").startswith("__version__ = '9.8.8'")
     assert sorted(path.name for path in site.glob("pudge-*.dist-info")) == ["pudge-9.8.8.dist-info"]
@@ -428,15 +443,21 @@ def test_release_folder_installs_its_wheel_and_records_the_release_channel(fresh
         "install",
         "--no-cache-dir",
         "--no-deps",
+        "--ignore-installed",
+        "--no-warn-script-location",
+        "--root",
+        str(fresh.data_dir / "update-package-stage"),
         str(fresh.project / "pudge-9.8.7-py3-none-any.whl"),
     ] in fresh.calls
 
 
-def test_missing_7zip_stops_the_install_with_a_clear_error(tmp_path: Path) -> None:
-    result = run_install(tmp_path, tools=tuple(tool for tool in TOOLS if not tool.startswith("sevenzip/")))
-    assert result.returncode == 1
-    assert "Installer error: sevenzip was installed but 7zz/7z was not found." in result.completed.stderr
-    assert not result.data_dir.exists()
+def test_install_needs_neither_7zip_nor_tk(fresh) -> None:
+    # 7-Zip (only for .7z/.rar subtitles: macOS's bsdtar reads them) and python-tk (nothing
+    # uses tkinter) are not installed any more; the install works without them.
+    assert fresh.returncode == 0
+    checked = [call[2] for call in fresh.calls_of("brew") if call[:2] == ["list", "--versions"]]
+    assert checked == ["ffmpeg", "alass", "aria2", "python@3.12"]
+    assert not [call for call in fresh.calls_of("brew") if "sevenzip" in call or "python-tk@3.12" in call]
 
 
 def test_brand_env_names_everything_the_installer_creates(tmp_path: Path) -> None:
@@ -461,7 +482,9 @@ def test_brand_env_names_everything_the_installer_creates(tmp_path: Path) -> Non
     )
     assert (home / "Applications/Kappa.app/Contents/MacOS/Kappa").is_file()
     assert not (home / "Applications/pudge.app").exists()
-    agent = result.plist(home / "Library/LaunchAgents/com.kappa.agent.plist")
+    # The agent works only while the app is open: its plist is not in ~/Library/LaunchAgents.
+    agent = result.plist(home / ".local/share/kappa/launchd/com.kappa.agent.plist")
+    assert not (home / "Library/LaunchAgents/com.kappa.agent.plist").exists()
     assert agent["Label"] == "com.kappa.agent"
     assert agent["ProgramArguments"][0] == str(home / ".local/share/kappa/venv/bin/python")
     assert os.readlink(home / ".local/bin/kappa") == str(home / ".local/share/kappa/venv/bin/pudge")
@@ -486,7 +509,8 @@ def test_install_migrates_and_retires_the_old_brand(fresh) -> None:
     config = tomllib.loads(fresh.config.read_text(encoding="utf-8"))
     assert config["library"]["root_dir"] == str(home / "Movies/pudge")
     assert config["qbittorrent"]["category"] == "pudge"
-    # Old command names keep working; Dock pins move to the new app, then the Dock restarts.
+    # Old command names keep working; Dock pins move to the new app (mac_app_aliases.py
+    # restarts the Dock itself when it changed a pin; the installer does not).
     assert os.readlink(home / ".local/bin/anime-mpv") == str(fresh.venv / "bin/pudge")
     assert os.readlink(home / ".local/bin/anime-mpv-agent") == str(fresh.venv / "bin/pudge-agent")
     aliases = [
@@ -495,4 +519,4 @@ def test_install_migrates_and_retires_the_old_brand(fresh) -> None:
         if call[:2] == ["venv-python", str(fresh.project / "pudge/mac_app_aliases.py")]
     ]
     assert len(aliases) == 1 and fresh.calls[aliases[0]][2:] == [str(fresh.app), "com.pudge.app", "Anime MPV"]
-    assert fresh.calls.index(["killall", "Dock"]) > aliases[0]
+    assert ["killall", "Dock"] not in fresh.calls

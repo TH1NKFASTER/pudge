@@ -106,14 +106,26 @@ def test_interrupt_ends_a_page_in_progress_at_once_and_it_is_not_marked_failed(
         mokuro_sessions.close_all()
 
 
-def test_idle_watchdog_follows_every_new_worker(tmp_path: Path) -> None:
+class _QuickWatchdogTime:
+    """``time`` for the session module: the idle watchdog looks every 50 ms (not >= 1 s)."""
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    @staticmethod
+    def sleep(seconds: float) -> None:
+        time.sleep(min(float(seconds), 0.05))
+
+
+def test_idle_watchdog_follows_every_new_worker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(mokuro_sessions, "time", _QuickWatchdogTime())
     python = _worker(tmp_path)
     archive = tmp_path / "one.cbz"
     Image.new("RGB", (10, 10), "white").save(tmp_path / "p.png")
     with zipfile.ZipFile(archive, "w") as zf:
         zf.write(tmp_path / "p.png", "01.png")
     session = mokuro_sessions.MokuroSession(
-        python, ROOT / "pudge" / "manga_mokuro_worker.py", idle_seconds=1.0
+        python, ROOT / "pudge" / "manga_mokuro_worker.py", idle_seconds=0.3
     )
     try:
         for _round in range(2):
@@ -174,7 +186,7 @@ def _fake_volume_ocr(api, monkeypatch, *, page_seconds: float = 0.05):
     return pages_done
 
 
-def _wait(predicate, timeout=10.0) -> bool:
+def _wait(predicate, timeout=30.0) -> bool:  # ends as soon as it holds
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():

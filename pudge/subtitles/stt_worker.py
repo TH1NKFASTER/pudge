@@ -4,7 +4,12 @@ import gc
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+from pudge.i18n import err
+from pudge.fsutil import atomic_write_json
 
 
 def _mlx_memory_snapshot() -> dict[str, int]:
@@ -66,10 +71,6 @@ def _release_mlx_memory() -> None:
     gc.collect()
 
 
-# Where the tqdm reporter writes; a serving worker points it at each request's file.
-_PROGRESS_TARGET: list[Path | None] = [None]
-
-
 def _reset_peak_memory() -> None:
     try:
         import mlx.core as mx  # type: ignore[import-not-found]
@@ -81,56 +82,45 @@ def _reset_peak_memory() -> None:
         pass
 
 
-def _install_progress_reporter(progress_path: Path | None) -> None:
-    """Expose mlx-whisper's tqdm position to the parent without parsing terminal output."""
-    import tqdm
+def _progress_reporter(progress_path: Path | None) -> Callable[[int, int], None] | None:
+    """Whisper's progress (frames done of total) as a JSON file the parent reads.
 
-    _PROGRESS_TARGET[0] = progress_path
-    if getattr(tqdm.tqdm, "_pudge_progress_reporter", False):
-        return
-    base = tqdm.tqdm
+    It used to patch tqdm.tqdm, whose bar mlx-whisper updated; the vendored Whisper calls
+    this callback at the same points with the same running count.
+    """
+    if progress_path is None:
+        return None
+    last_reported = [-1]
 
-    class ProgressBar(base):  # type: ignore[misc,valid-type]
-        _last_reported = -1
+    def report(current_frames: int, total_frames: int) -> None:
+        total = max(0, int(total_frames or 0))
+        current = max(0, int(current_frames or 0))
+        percent = min(100, round(current / total * 100)) if total else 0
+        if percent == last_reported[0]:
+            return
+        last_reported[0] = percent
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            progress_path,
+            {"percent": percent, "current": current, "total": total, "memory": _mlx_memory_snapshot()},
+        )
 
-        def _report(self) -> None:
-            progress_path = _PROGRESS_TARGET[0]
-            if progress_path is None:
-                return
-            total = max(0, int(self.total or 0))
-            current = max(0, int(self.n or 0))
-            percent = min(100, round(current / total * 100)) if total else 0
-            if percent == self._last_reported:
-                return
-            self._last_reported = percent
-            progress_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = progress_path.with_suffix(progress_path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(
-                    {"percent": percent, "current": current, "total": total, "memory": _mlx_memory_snapshot()}
-                ),
-                encoding="utf-8",
-            )
-            temporary.replace(progress_path)
+    return report
 
-        def __init__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            super().__init__(*args, **kwargs)
-            self._report()
 
-        def update(self, n=1):  # type: ignore[no-untyped-def]
-            result = super().update(n)
-            self._report()
-            return result
-
-    ProgressBar._pudge_progress_reporter = True
-    tqdm.tqdm = ProgressBar
+def _load_transcribe() -> Callable[..., Any] | None:
+    """The vendored MLX Whisper, or None when mlx or tiktoken is missing (exit code 3)."""
+    try:
+        from pudge.whisper_mlx import transcribe
+    except ImportError as exc:
+        print(f"MLX Whisper needs mlx and tiktoken ({exc}); STT fallback remains disabled", file=sys.stderr)
+        return None
+    return transcribe
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload, ensure_ascii=False)
 
 
 def _serve(model: str) -> int:
@@ -140,16 +130,13 @@ def _serve(model: str) -> int:
     one JSON line on the original stdout (anything else the libraries print goes
     to stderr). An empty line or ``{"op": "exit"}`` / end of stdin stops the worker.
     """
-    try:
-        import mlx_whisper  # type: ignore[import-not-found]
-    except ImportError:
-        print("mlx-whisper is not installed; STT fallback remains disabled", file=sys.stderr)
+    transcribe = _load_transcribe()
+    if transcribe is None:
         return 3
     protocol = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
     os.dup2(2, 1)
     sys.stdout = sys.stderr
     _configure_mlx_memory()
-    _install_progress_reporter(None)
 
     def answer(payload: dict[str, object]) -> None:
         protocol.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -175,26 +162,41 @@ def _serve(model: str) -> int:
             answer({"id": request_id, "ok": False, "error": "bad request"})
             continue
         progress_path = Path(str(request["progress"])) if request.get("progress") else None
-        _install_progress_reporter(progress_path)
         _reset_peak_memory()
         try:
-            result = mlx_whisper.transcribe(
+            result = transcribe(
                 str(audio),
                 path_or_hf_repo=model,
                 language="ja",
                 word_timestamps=bool(request.get("words", True)),
                 verbose=False,
+                progress_callback=_progress_reporter(progress_path),
             )
         except Exception as exc:
             snapshot = _mlx_memory_snapshot()
             _release_mlx_memory()
-            answer({"id": request_id, "ok": False, "error": f"MLX Whisper failed: {exc}", "memory": snapshot})
+            answer(
+                {
+                    "id": request_id,
+                    "ok": False,
+                    "error": err("stt.whisperFailed", error=exc),
+                    "memory": snapshot,
+                }
+            )
             continue
         memory = _mlx_memory_snapshot()
         _release_mlx_memory()  # the buffer cache; the model itself stays loaded
-        _write_json_atomic(output, result)
-        if progress_path is not None:
-            _write_json_atomic(progress_path, {"percent": 100, "current": 1, "total": 1, "memory": memory})
+        try:
+            _write_json_atomic(output, result)
+            if progress_path is not None:
+                _write_json_atomic(
+                    progress_path, {"percent": 100, "current": 1, "total": 1, "memory": memory}
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            # A full disk (or an unserializable value) fails this request only: the worker
+            # used to die here without an answer, and the model was loaded again.
+            answer({"id": request_id, "ok": False, "error": f"write failed: {exc}", "memory": memory})
+            continue
         answer({"id": request_id, "ok": True, "memory": memory})
     return 0
 
@@ -205,12 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     lower_if_requested()
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--check"]:
-        try:
-            import mlx_whisper  # type: ignore[import-not-found]  # noqa: F401
-        except ImportError:
-            print("mlx-whisper is not installed; STT fallback remains disabled", file=sys.stderr)
-            return 3
-        return 0
+        # Loads the vendored Whisper with mlx and tiktoken, as mlx-whisper's import did.
+        return 0 if _load_transcribe() is not None else 3
     if len(args) == 2 and args[0] == "--serve":
         return _serve(args[1])
     word_timestamps = bool(args and args[0] == "--words")
@@ -221,36 +219,31 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     audio, output, model = Path(args[0]), Path(args[1]), args[2]
     progress_path = Path(args[3]) if len(args) == 4 else None
-    try:
-        import mlx_whisper  # type: ignore[import-not-found]
-    except ImportError:
-        print("mlx-whisper is not installed; STT fallback remains disabled", file=sys.stderr)
+    transcribe = _load_transcribe()
+    if transcribe is None:
         return 3
     _configure_mlx_memory()
-    if progress_path is not None:
-        _install_progress_reporter(progress_path)
     try:
-        result = mlx_whisper.transcribe(
+        result = transcribe(
             str(audio),
             path_or_hf_repo=model,
             language="ja",
             word_timestamps=word_timestamps,
             verbose=False,
+            progress_callback=_progress_reporter(progress_path),
         )
     except Exception as exc:
         snapshot = _mlx_memory_snapshot()
         _release_mlx_memory()
-        print(f"MLX Whisper failed: {exc}; memory={snapshot}", file=sys.stderr)
+        print(f"{err('stt.whisperFailed', error=exc)}; memory={snapshot}", file=sys.stderr)
         return 4
     memory = _mlx_memory_snapshot()
     _release_mlx_memory()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    # Atomic, as in --serve: the parent's timeout can kill this process mid-write, and a
+    # half-written transcript must never be read as a result.
+    _write_json_atomic(output, result)
     if progress_path is not None:
-        progress_path.write_text(
-            json.dumps({"percent": 100, "current": 1, "total": 1, "memory": memory}),
-            encoding="utf-8",
-        )
+        _write_json_atomic(progress_path, {"percent": 100, "current": 1, "total": 1, "memory": memory})
     return 0
 
 

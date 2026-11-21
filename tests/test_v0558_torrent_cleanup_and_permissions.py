@@ -77,6 +77,10 @@ class FakeClient:
         assert category == ""
         return list(self.items)
 
+    def files(self, _torrent_hash: str) -> list[dict]:
+        # The client answers the file list (the real clients always do): no other file.
+        return []
+
     def set_metadata(self, torrent_hash: str, *, category: str, tags: list[str]) -> None:
         self.metadata.append((torrent_hash, category, tuple(tags)))
 

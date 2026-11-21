@@ -22,6 +22,7 @@
     mediaOptionsSignature: '',
     legendHover: '',
     legendPinned: '',
+    speedMode: 'days',
   };
 
   const KIND_LABELS = {
@@ -66,9 +67,11 @@
     return Number.isFinite(n)?n/1000:null;
   };
 
+  // The toolbar and tabs are built once per interface language: after a language switch the
+  // next load rebuilds them (the listeners stay on #statisticsContent, bound once).
   function staticShell(){
     const root=$('statisticsContent');if(!root)return;
-    root.innerHTML=`<div class="stats-shell">
+    root.innerHTML=`<div class="stats-shell" data-stats-lang="${esc(PudgeI18n.lang())}">
       <div class="stats-filterbar">
         <div class="stats-periods">
           ${[['7d',PudgeI18n.t('stats.period7d')],['30d',PudgeI18n.t('stats.period30d')],['year',PudgeI18n.t('stats.year')],['all',PudgeI18n.t('stats.allTime')],['custom',PudgeI18n.t('stats.custom')]].map(([v,l])=>`<button type="button" data-stats-period="${v}">${l}</button>`).join('')}
@@ -86,7 +89,19 @@
       <div id="statsBody"></div>
       <div id="statsModalHost"></div>
     </div>`;
-    bindControls();syncControls();
+    if(root.dataset.statsBound!=='1'){root.dataset.statsBound='1';bindControls();}
+    syncControls();
+  }
+  function ensureShell(){
+    const shell=$('statisticsContent')?.querySelector('.stats-shell');
+    // Only a shell marked with another language is rebuilt (an unmarked one is left alone).
+    const built=shell?.dataset?.statsLang;
+    if(shell&&(!built||built===PudgeI18n.lang()))return;
+    staticShell();
+    if(!shell)return;
+    // Rebuilt for another language: the works list and the page body in it too.
+    state.mediaOptionsSignature='';
+    if(state.payload){updateMediaOptions(state.payload,state.displayedScope||state.scope);render();}
   }
 
   // Scope identity is distinct from the payload already displayed. Relative
@@ -101,6 +116,25 @@
       period==='custom'?String(scope.end_date||''):'',
       period==='custom'||period==='all'?'':`${today.toDateString()}:${today.getTimezoneOffset()}`,
     ]);
+  }
+  function isoDay(date){
+    const pad=n=>String(n).padStart(2,'0');
+    return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;
+  }
+  // Custom starts from the period on screen: switching to it used to send empty dates,
+  // and the page fell over with an invalid-period error before any date could be picked.
+  function currentRange(){
+    const scope=state.scope;
+    if(scope.period==='custom'&&scope.start_date)return {start_date:scope.start_date,end_date:scope.end_date||scope.start_date};
+    const now=new Date(),today=isoDay(now);
+    const back=days=>isoDay(new Date(now.getFullYear(),now.getMonth(),now.getDate()-days));
+    if(scope.period==='7d')return {start_date:back(6),end_date:today};
+    if(scope.period==='year')return {start_date:`${now.getFullYear()}-01-01`,end_date:today};
+    if(scope.period==='all'){
+      const first=(state.payload?.days||[]).map(row=>String(row?.day||'')).filter(day=>/^\d{4}-\d{2}-\d{2}$/.test(day)).sort()[0];
+      return {start_date:first&&first<today?first:today,end_date:today};
+    }
+    return {start_date:back(29),end_date:today};
   }
   function changeScope(patch){
     const next={...state.scope,...patch};
@@ -133,7 +167,8 @@
   function bindControls(){
     const root=$('statisticsContent');if(!root)return;
     root.addEventListener('click',async event=>{
-      const period=event.target.closest?.('[data-stats-period]');if(period){if(changeScope({period:period.dataset.statsPeriod}))await load();return;}
+      const period=event.target.closest?.('[data-stats-period]');if(period){const value=period.dataset.statsPeriod;if(changeScope(value==='custom'?{period:'custom',...currentRange()}:{period:value}))await load();return;}
+      const speedMode=event.target.closest?.('[data-stats-speed-mode]');if(speedMode){if(state.speedMode!==speedMode.dataset.statsSpeedMode){state.speedMode=speedMode.dataset.statsSpeedMode;const card=document.querySelector('#statsBody .stats-speed');if(card)card.innerHTML=readingSpeedInner(state.payload?.reading_speed);}return;}
       const legend=event.target.closest?.('[data-stats-legend]');if(legend){const kind=legend.dataset.statsLegend;state.legendPinned=state.legendPinned===kind?'':kind;applyLegendFocus();return;}
       const tab=event.target.closest?.('[data-stats-tab]');if(tab){if(state.tab!==tab.dataset.statsTab){state.tab=tab.dataset.statsTab;syncControls();render();}return;}
       const day=event.target.closest?.('[data-stats-day]');if(day){const changed=changeScope({period:'custom',start_date:day.dataset.statsDay,end_date:day.dataset.statsDay});const tabChanged=state.tab!=='journal';state.tab='journal';syncControls();if(changed)await load();else if(tabChanged)render();return;}
@@ -156,8 +191,11 @@
       if(event.target.id==='statsKind'){if(changeScope({kind:event.target.value,media_uuid:''}))await load();}
       else if(event.target.id==='statsMedia'){if(changeScope({media_uuid:event.target.value}))await load();}
       else if(event.target.id==='statsStartDate'||event.target.id==='statsEndDate'){
-        const start=$('statsStartDate')?.value||'',end=$('statsEndDate')?.value||start;
+        let start=$('statsStartDate')?.value||'',end=$('statsEndDate')?.value||start;
+        // Dates picked in either order are one range (the end before the start was an error page).
+        if(start&&end&&end<start)[start,end]=[end,start];
         if(start&&end&&changeScope({start_date:start,end_date:end}))await load();
+        else syncControls();
       }
     });
   }
@@ -193,7 +231,7 @@
     const more=document.querySelector('[data-stats-more]');if(more)more.disabled=state.loadingMore;
   }
   async function load({more=false}={}){
-    if(!$('statisticsContent')?.querySelector('.stats-shell'))staticShell();
+    ensureShell();
     if(!API()?.consumption_statistics_query){
       // Opened before the bridge exists: wait for it. A bridge without the call is an error
       // the page shows (it used to stay blank).
@@ -305,6 +343,31 @@
     return cards.length?`<section class="stats-highlights" aria-label="${esc(PudgeI18n.t('stats.fun.title'))}">${cards.join('')}</section>`:'';
   }
 
+  // Reading speed: light novels read without audio, one bar per day or per week (Monday first).
+  function speedColumnHtml(row,max,weeks){
+    const seconds=Number(row.seconds||0),cpm=row.cpm==null?null:Number(row.cpm);
+    const when=weeks?PudgeI18n.t('stats.readingSpeed.weekRange',{start:row.week_start,end:row.week_end}):String(row.day||'');
+    const parts=[when];
+    if(seconds>0){
+      parts.push(cpm!=null?PudgeI18n.t('stats.readingSpeed.cpm',{value:number(cpm)}):PudgeI18n.t('stats.readingSpeed.tooShort'));
+      parts.push(PudgeI18n.t('stats.readingSpeed.reading',{duration:duration(seconds)}));
+    }else parts.push(PudgeI18n.t('stats.readingSpeed.none'));
+    const title=parts.join(' · ');
+    const bar=cpm!=null?`<span class="stats-speed-bar" data-stats-kind="light_novel" style="height:${Math.max(2,cpm/max*100).toFixed(2)}%"></span>`:(seconds>0?'<span class="stats-speed-bar stats-speed-unmeasured"></span>':'');
+    const label=String((weeks?row.week_start:row.day)||'').slice(5);
+    return `<div class="stats-speed-col" data-tooltip="${esc(title)}"${seconds>0?` tabindex="0" aria-label="${esc(title)}"`:''}>${bar}<small>${esc(label)}</small></div>`;
+  }
+  function readingSpeedInner(speed){
+    const weeks=state.speedMode==='weeks',rows=(weeks?speed?.weeks:speed?.days)||[];
+    const any=rows.some(row=>Number(row.seconds||0)>0);
+    const average=speed?.total?.cpm!=null?` · ${PudgeI18n.t('stats.readingSpeed.average',{value:number(speed.total.cpm)})}`:'';
+    const modes=[['days','stats.readingSpeed.days'],['weeks','stats.readingSpeed.weeks']].map(([mode,key])=>`<button type="button" data-stats-speed-mode="${mode}" class="${state.speedMode===mode?'active':''}" aria-pressed="${state.speedMode===mode?'true':'false'}">${esc(PudgeI18n.t(key))}</button>`).join('');
+    const max=Math.max(1,...rows.map(row=>Number(row.cpm||0)));
+    const chart=any?`<div class="stats-speed-chart" role="group" aria-label="${esc(PudgeI18n.t('stats.readingSpeed.title'))}" style="--stats-columns:${Math.max(1,rows.length)}">${rows.map(row=>speedColumnHtml(row,max,weeks)).join('')}</div>`:`<div class="stats-empty">${esc(PudgeI18n.t('stats.readingSpeed.empty'))}</div>`;
+    return `<div class="stats-speed-head"><strong>${esc(PudgeI18n.t('stats.readingSpeed.title'))}</strong><span class="stats-muted">${esc(PudgeI18n.t('stats.readingSpeed.note'))}${esc(average)}</span><span class="spacer"></span><div class="stats-periods stats-speed-modes" role="group">${modes}</div></div>${chart}`;
+  }
+  const readingSpeedHtml = speed => speed?`<section class="stats-speed">${readingSpeedInner(speed)}</section>`:'';
+
   function applyLegendFocus(){
     const kind=state.legendHover||state.legendPinned||'';
     const chart=document.querySelector('#statsBody .stats-chart');
@@ -324,7 +387,6 @@
 
   function renderOverview(body){
     const p=state.payload,s=p.summary||{},days=p.days||[],max=Math.max(1,...days.map(d=>Number(d.seconds||0)));
-    const timezoneNote=PudgeI18n.t('stats.timezoneNote',{zone:p.timezone?.label||PudgeI18n.t('stats.localZone')});
     let chart='';
     if((state.displayedScope||state.scope).period==='year'){
       chart=`<div class="stats-calendar">${days.map(d=>`<button class="stats-day" data-stats-day="${esc(d.day)}" style="--heat:${Math.max(.08,Number(d.seconds||0)/max).toFixed(3)}" title="${esc([`${d.day} · ${duration(d.seconds)}`,...dayParts(d).map(([kind,seconds])=>`${kindLabel(kind)}: ${duration(seconds)}`)].join('\n'))}"></button>`).join('')}</div>`;
@@ -336,12 +398,13 @@
     // chart; a click (or tap) keeps it shown until clicked again.
     const breakdown=Object.entries(p.breakdown||{}).filter(([,seconds])=>Number(seconds||0)>0).sort(byKindOrder).map(([kind,seconds])=>`<button type="button" class="stats-chip" data-stats-kind="${esc(kind)}" data-stats-legend="${esc(kind)}" aria-pressed="false"><i class="stats-swatch" aria-hidden="true"></i>${esc(kindLabel(kind))}: ${esc(duration(seconds))}</button>`).join('');
     // Amounts only (no repeats), and only for types with something done in the period.
-    const native=Object.values(p.volume?.by_kind||{}).filter(row=>row.exact&&Number(row.consumed||0)>0).sort((a,b)=>kindRank(a.kind)-kindRank(b.kind)).map(row=>`<span class="stats-chip">${esc(kindLabel(row.kind))}: ${esc(nativeNumber(row.consumed,row.unit))}</span>`).join('');
-    const coverageNote=p.volume?.coverage_started_at_utc?PudgeI18n.t('stats.coverageNote') : '';
-    body.innerHTML=`<div class="stats-shell"><div class="stats-cards"><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.timeWithContent')}</span><strong>${esc(duration(s.total_seconds))}</strong></div><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.activeDays')}</span><strong>${Number(s.active_days||0)}</strong></div><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.sessions')}</span><strong>${Number(s.sessions||0)}</strong></div></div><div class="stats-muted stats-note">${esc(timezoneNote)}${coverageNote?` · ${esc(coverageNote)}`:''}${Number(s.manual_unplaced_seconds||0)>0?` · ${esc(PudgeI18n.t('stats.manualWithoutTimeValue', {duration: duration(s.manual_unplaced_seconds)}))}`:''}</div>${chart}${breakdown?`<div class="stats-breakdown stats-legend" role="group" aria-label="${esc(PudgeI18n.t('stats.legend'))}">${breakdown}</div>`:''}${native?`<div class="stats-breakdown">${native}</div>`:''}${highlightsHtml(p.highlights)}</div>`;
+    const native=Object.values(p.volume?.by_kind||{}).filter(row=>row.exact&&Number(row.consumed||0)>0&&row.kind!=='anime').sort((a,b)=>kindRank(a.kind)-kindRank(b.kind)).map(row=>`<span class="stats-chip">${esc(kindLabel(row.kind))}: ${esc(nativeNumber(row.consumed,row.unit))}</span>`).join('');
+    body.innerHTML=`<div class="stats-shell"><div class="stats-cards"><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.timeWithContent')}</span><strong>${esc(duration(s.total_seconds))}</strong></div><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.activeDays')}</span><strong>${Number(s.active_days||0)}</strong></div><div class="stats-card"><span class="stats-muted">${PudgeI18n.t('stats.sessions')}</span><strong>${Number(s.sessions||0)}</strong></div></div>${Number(s.manual_unplaced_seconds||0)>0?`<div class="stats-muted stats-note">${esc(PudgeI18n.t('stats.manualWithoutTimeValue', {duration: duration(s.manual_unplaced_seconds)}))}</div>`:''}${chart}${breakdown?`<div class="stats-breakdown stats-legend" role="group" aria-label="${esc(PudgeI18n.t('stats.legend'))}">${breakdown}</div>`:''}${native?`<div class="stats-breakdown">${native}</div>`:''}${readingSpeedHtml(p.reading_speed)}${highlightsHtml(p.highlights)}</div>`;
     if(state.legendPinned&&!(p.breakdown||{})[state.legendPinned])state.legendPinned='';
     state.legendHover='';
     applyLegendFocus();
+    // "Met often, not in deck" (met_words.js) draws itself under the overview.
+    window.PudgeMetWords?.mount(body,state.displayedScope||state.scope);
   }
 
   const cell = (label, value, cls='') => `<td${cls?` class="${cls}"`:''}${label?` data-label="${esc(label)}"`:''}>${value}</td>`;
@@ -392,7 +455,7 @@
   function contexts(){
     const rows=[];
     try{const ln=window.PudgeLnConsumptionContext?.();if(ln?.open&&ln.book_id)rows.push({key:`light_novel:${ln.book_id}`,kind:'light_novel',id:Number(ln.book_id),locator:{chapter_index:Number(ln.chapter_index||0),chapter_key:String(ln.chapter_key||`chapter:${Number(ln.chapter_index||0)}`),character_offset:Number(ln.character_offset||0)},payload:{paired_audio_id:Number(ln.paired_audio_id||0),character_count:Number(ln.character_count||0),locator_policy:'ln-text-hash-v1'}});}catch(_e){}
-    try{const manga=window.PudgeMangaReaderV2?.consumptionContext?.();if(manga?.open&&manga.book_id)rows.push({key:`manga:${manga.book_id}`,kind:'manga',id:Number(manga.book_id),locator:{page_index:Number(manga.page_index||0),page_id:String(manga.page_id||`page:${Number(manga.page_index||0)}`)},payload:{page_count:Number(manga.page_count||0),dwell_policy:'page-dwell-v1'}});}catch(_e){}
+    try{const manga=window.PudgeMangaReaderV2?.consumptionContext?.();if(manga?.open&&manga.book_id)rows.push({key:`manga:${manga.book_id}`,kind:'manga',id:Number(manga.book_id),locator:{page_index:Number(manga.page_index||0),page_id:String(manga.page_id||`page:${Number(manga.page_index||0)}`),...(Array.isArray(manga.page_ids)&&manga.page_ids.length===2?{page_ids:manga.page_ids.map(String)}:{})},payload:{page_count:Number(manga.page_count||0),dwell_policy:'page-dwell-v1'}});}catch(_e){}
     return rows;
   }
   async function sampleReaders(){

@@ -149,3 +149,7 @@
 }
 .pudge-review-gate-word-link:hover { color:var(--accent-text,#8aa2ff); background:none; }
 .pudge-review-gate-word-link:focus-visible { outline:2px solid var(--accent); outline-offset:6px; }
+/* The pitch and reading lines centre under the word above even with a classic scrollbar in the
+   answer (review_gate.js alignAnswerUnderWord sets the scrollbar's width). */
+.pudge-review-gate-back .pudge-review-gate-pitch,
+.pudge-review-gate-back .pudge-review-gate-reading{box-sizing:border-box;padding-left:var(--pudge-gate-gutter,0px)}

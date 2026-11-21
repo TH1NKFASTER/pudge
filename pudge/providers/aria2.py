@@ -1,31 +1,181 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
+import logging
 import os
 import secrets
 import signal
 import shutil
 import socket
+import stat as stat_module
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote
 
 import httpx
 
 from ..branding import APP_SLUG, DATA_DIR
+from ..fsutil import atomic_write_json, hide_from_finder
 from ..manager_models import DownloadItem, NyaaRelease
 from ..i18n import err
+from .base import read_capped_body
 from .qbittorrent import QBittorrentError
 from .nyaa import BATCH_RE, release_episode_range
 from .nyaa import release_episode as parsed_release_episode
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - supported deployment is macOS
+    fcntl = None  # type: ignore[assignment]
+
 
 class Aria2Error(QBittorrentError):
     """aria2 failure exposed through the existing torrent error hierarchy."""
+
+
+_TORRENT_LAYOUT_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _hollow(path: Path, length: int, info: os.stat_result | None = None) -> bool:
+    """A file of ``length`` bytes with much less than that on disk (a sparse file being
+    downloaded). False when the file system does not tell (no st_blocks)."""
+    try:
+        blocks = getattr(info if info is not None else path.stat(), "st_blocks", None)
+    except OSError:
+        return False
+    if blocks is None or length <= 0:
+        return False
+    return int(blocks) * 512 < length - max(4 * 1024 * 1024, length // 50)
+
+
+def torrent_layout(payload: bytes) -> tuple[str, list[tuple[str, int]], bool] | None:
+    """(name, [(path inside the torrent, length)], multi-file) of a .torrent, or None.
+
+    Only the bencode needed for the file table; paths that would leave the
+    torrent's folder are refused.
+    """
+    data = bytes(payload or b"")
+    if not data.startswith(b"d") or len(data) > _TORRENT_LAYOUT_MAX_BYTES:
+        return None
+    pos = 0
+
+    def parse(depth: int = 0) -> Any:
+        nonlocal pos
+        if depth > 32 or pos >= len(data):
+            raise ValueError("invalid bencode")
+        token = data[pos : pos + 1]
+        if token == b"i":
+            end = data.index(b"e", pos)
+            value = int(data[pos + 1 : end])
+            pos = end + 1
+            return value
+        if token in {b"l", b"d"}:
+            pos += 1
+            values: list[Any] = []
+            while data[pos : pos + 1] != b"e":
+                if pos >= len(data):
+                    raise ValueError("unterminated")
+                values.append(parse(depth + 1))
+            pos += 1
+            if token == b"l":
+                return values
+            if len(values) % 2:
+                raise ValueError("invalid dictionary")
+            return dict(zip(values[::2], values[1::2]))
+        if token.isdigit():
+            colon = data.index(b":", pos)
+            size = int(data[pos:colon])
+            pos = colon + 1 + size
+            if size < 0 or pos > len(data):
+                raise ValueError("truncated")
+            return data[colon + 1 : pos]
+        raise ValueError("unsupported token")
+
+    def text(value: object) -> str:
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else ""
+
+    try:
+        root = parse()
+    except (ValueError, TypeError, OverflowError, IndexError):
+        return None
+    info = root.get(b"info") if isinstance(root, dict) else None
+    if not isinstance(info, dict):
+        return None
+    name = text(info.get(b"name.utf-8") or info.get(b"name")).strip()
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        return None
+    raw_files = info.get(b"files")
+    if not isinstance(raw_files, list):
+        length = info.get(b"length")
+        return (name, [(name, int(length))], False) if isinstance(length, int) and length >= 0 else None
+    files: list[tuple[str, int]] = []
+    for raw in raw_files:
+        if not isinstance(raw, dict):
+            return None
+        parts = [text(part) for part in (raw.get(b"path.utf-8") or raw.get(b"path") or [])]
+        length = raw.get(b"length")
+        if not parts or any(part in {"", ".", ".."} or "/" in part for part in parts):
+            return None
+        if not isinstance(length, int) or length < 0:
+            return None
+        files.append(("/".join(parts), length))
+    return (name, files, True) if files else None
+
+
+# (.torrent path, mtime_ns, size) -> its parsed layout. Every listing checks each
+# finished task aria2 forgot (all of them after aria2 restarts) against its saved
+# .torrent; a batch's .torrent is hundreds of KB of piece hashes, so reading and
+# parsing them all again on every poll cost ~1 ms each.
+_TORRENT_LAYOUT_CACHE: dict[tuple[str, int, int], tuple[str, list[tuple[str, int]], bool] | None] = {}
+_TORRENT_LAYOUT_CACHE_MAX = 2048
+_TORRENT_LAYOUT_CACHE_GUARD = threading.Lock()
+
+
+def _saved_torrent_layout(torrent: Path) -> tuple[str, list[tuple[str, int]], bool] | None:
+    """``torrent_layout`` of a saved .torrent file, parsed again only when the file changed."""
+    try:
+        info = torrent.stat()
+    except OSError:
+        return None
+    if not stat_module.S_ISREG(info.st_mode) or info.st_size > _TORRENT_LAYOUT_MAX_BYTES:
+        return None
+    key = (str(torrent), int(info.st_mtime_ns), int(info.st_size))
+    with _TORRENT_LAYOUT_CACHE_GUARD:
+        if key in _TORRENT_LAYOUT_CACHE:
+            return _TORRENT_LAYOUT_CACHE[key]
+    try:
+        layout = torrent_layout(torrent.read_bytes())
+    except OSError:
+        return None
+    with _TORRENT_LAYOUT_CACHE_GUARD:
+        if len(_TORRENT_LAYOUT_CACHE) >= _TORRENT_LAYOUT_CACHE_MAX:
+            _TORRENT_LAYOUT_CACHE.clear()
+        _TORRENT_LAYOUT_CACHE[key] = layout
+    return layout
+
+
+# (state dir, RPC port) -> aria2 session id proven to enforce Pudge's secret.
+_OWN_SIDECAR_SESSIONS: dict[tuple[str, int], str] = {}
+# RPC port -> (pid, start time, monotonic time last seen alive) of the listener
+# proven to be Pudge's aria2c. Shared because the manager makes a client per
+# call: lsof runs again only when that process is gone (or its pid was reused).
+_TRUSTED_RPC_LISTENERS: dict[int, tuple[int, str, float]] = {}
+# metadata.json path -> [lock, depth]. The manager makes a client per call, from many
+# threads (and the agent is another process): every read-change-write of the ownership
+# records holds this lock and a file lock, or a listing that saved its snapshot dropped
+# the record of a release added meanwhile (that download was no longer Pudge's).
+_METADATA_LOCKS: dict[str, list[Any]] = {}
+_METADATA_LOCKS_GUARD = threading.Lock()
+
+
+# A finished download whose files are gone is forgotten only this long after it finished.
+_PRUNE_AFTER_SECONDS = 3600.0
 
 
 class Aria2Client:
@@ -238,6 +388,9 @@ class Aria2Client:
                 # exact session argv still proves ownership.
                 stopped = self._stop_unreachable_managed_sidecars()
                 return bool(stopped)
+            if not self._rpc_is_own_sidecar():
+                # Never shut down an aria2 that Pudge did not start.
+                return False
             if save_session:
                 try:
                     self._rpc_raw("aria2.saveSession")
@@ -250,7 +403,10 @@ class Aria2Client:
                     self._rpc_raw("aria2.shutdown")
                 except Aria2Error:
                     return False
-            for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+            _TRUSTED_RPC_LISTENERS.pop(self.rpc_port, None)  # whoever takes the port next is checked again
+            # Saving a large session under load can take seconds: waiting only
+            # ~1.5 s reported "not stopped" for an aria2 that exited right after.
+            for delay in (0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.0):
                 time.sleep(delay)
                 if not self._probe():
                     return True
@@ -284,12 +440,33 @@ class Aria2Client:
             except Aria2Error:
                 return False
             stopped = self.shutdown(save_session=True)
+            if not stopped:
+                # The shutdown was sent; aria2 may exit after the wait above. Its
+                # marker must still say "stopped on purpose" so the next add or
+                # resume starts it instead of failing on a dead RPC.
+                time.sleep(2.0)
+                stopped = not self._probe()
             if stopped:
                 try:
                     (self.state_dir / self._IDLE_MARKER).write_text(f"{time.time():.0f}\n", encoding="utf-8")
                 except OSError:
                     pass
             return stopped
+
+    def mark_deliberately_stopped(self) -> bool:
+        """Record that the sidecar is down on purpose (Torrents Off, app start or quit).
+
+        Like an idle stop: status reads then report nothing instead of an error,
+        and the next add or resume starts aria2 again.
+        """
+        if self._probe():
+            return False
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            (self.state_dir / self._IDLE_MARKER).write_text(f"{time.time():.0f}\n", encoding="utf-8")
+        except OSError:
+            return False
+        return True
 
     def idle_stopped(self) -> bool:
         """True while the sidecar is down because it was stopped for being idle."""
@@ -303,12 +480,23 @@ class Aria2Client:
             value = ""
         if not value:
             value = secrets.token_urlsafe(32)
-            path.write_text(value + "\n", encoding="utf-8")
-            try:
-                path.chmod(0o600)
-            except OSError:
-                pass
+            self._write_private(path, value + "\n")
         return value
+
+    @staticmethod
+    def _write_private(path: Path, text: str) -> None:
+        # Created 0600 from the start: write-then-chmod left the secret
+        # readable by other users for a moment.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)  # an existing file may still have wider permissions
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def _conf_path(self) -> Path:
+        return self.state_dir / "aria2-rpc.conf"
 
     def _binary_path(self) -> str:
         env = os.getenv("PUDGE_ARIA2C", "").strip()
@@ -335,10 +523,37 @@ class Aria2Client:
         return raw if isinstance(raw, dict) else {}
 
     def _save_metadata(self, data: dict[str, dict[str, Any]]) -> None:
+        atomic_write_json(self._metadata_path(), data, ensure_ascii=False, indent=2, sort_keys=True)
+
+    @contextmanager
+    def _metadata_transaction(self) -> Iterator[dict[str, dict[str, Any]]]:
+        """The current records, saved after the block (not when it raises), with no other
+        client (thread or process) changing them in between."""
         path = self._metadata_path()
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+        with _METADATA_LOCKS_GUARD:
+            entry = _METADATA_LOCKS.setdefault(str(path), [threading.RLock(), 0])
+        with entry[0]:
+            handle = None
+            if entry[1] == 0 and fcntl is not None:
+                try:
+                    handle = os.open(self.state_dir / "metadata.lock", os.O_CREAT | os.O_RDWR, 0o600)
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                except OSError:
+                    if handle is not None:
+                        os.close(handle)
+                    handle = None  # the thread lock still applies
+            entry[1] += 1
+            try:
+                data = self._load_metadata()
+                yield data
+                self._save_metadata(data)
+            finally:
+                entry[1] -= 1
+                if handle is not None:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+                    finally:
+                        os.close(handle)
 
     def prepare_network_start(self, *, hook: bool) -> None:
         """Run the pre-download hook (up to 90 s) before the start is admitted under the shared Off lock."""
@@ -352,14 +567,19 @@ class Aria2Client:
         prepared, self._hook_prepared_at = getattr(self, "_hook_prepared_at", 0.0), 0.0
         if prepared and time.monotonic() - prepared < 60.0:
             return  # prepare_network_start() has just run it.
-        completed = subprocess.run(
-            self.pre_download_command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                self.pre_download_command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            # A hung VPN script: the add fails like any refused command (callers catch
+            # QBittorrentError), not with a TimeoutExpired out of the bridge.
+            raise Aria2Error(err("manager.vpnCommandFailed", error=str(exc)[:300])) from exc
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             raise Aria2Error(err("manager.vpnCommandFailed", error=detail))
@@ -394,6 +614,8 @@ class Aria2Client:
                 raise Aria2Error(err("aria2.rpcUnavailableResponse", error=exc, response=detail)) from exc
             raise Aria2Error(err("aria2.rpcUnavailable", error=exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
+            if isinstance(exc, httpx.ConnectError):
+                _TRUSTED_RPC_LISTENERS.pop(self.rpc_port, None)  # stopped: check whoever listens next
             raise Aria2Error(err("aria2.rpcUnavailable", error=exc)) from exc
         if isinstance(body, dict) and body.get("error"):
             error = body["error"]
@@ -402,11 +624,208 @@ class Aria2Client:
         return body.get("result") if isinstance(body, dict) else None
 
     def _probe(self) -> bool:
+        # Another program (e.g. another account's) on the port never gets the secret.
+        self._port_held_by_stranger = self._rpc_port_held_by_stranger()
+        if self._port_held_by_stranger:
+            return False
         try:
             self._rpc_raw("aria2.getVersion")
             return True
         except Aria2Error:
             return False
+
+    def _rpc_listener_pids(self) -> list[int] | None:
+        """PIDs listening on the RPC port that this account can see, or None when lsof could not tell.
+
+        lsof run by an ordinary user lists only that user's processes, so a
+        port held by another account's process comes back empty.
+        """
+        lsof = shutil.which("lsof") or next(
+            (path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.access(path, os.X_OK)), None
+        )
+        if not lsof:
+            return None
+        try:
+            completed = subprocess.run(
+                [lsof, "-nP", "-w", "-t", f"-iTCP:{self.rpc_port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        # 1 with no output is "no such listener"; anything else is a failure.
+        if completed.returncode not in (0, 1) or (completed.returncode == 1 and completed.stderr.strip()):
+            return None
+        pids: list[int] = []
+        for line in completed.stdout.split():
+            try:
+                pids.append(int(line))
+            except ValueError:
+                return None
+        return sorted(set(pids))
+
+    def _process_is_own_aria2(self, pid: int) -> bool:
+        """An aria2c process of this account (``ps``: uid and executable name)."""
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "uid=,comm=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
+        parts = completed.stdout.strip().split(None, 1)
+        if completed.returncode != 0 or len(parts) != 2:
+            return False
+        try:
+            uid = int(parts[0])
+        except ValueError:
+            return False
+        name = Path(parts[1].strip()).name.casefold()
+        return uid == os.getuid() and (name.startswith("aria2c") or name == Path(self.binary).name.casefold())
+
+    @staticmethod
+    def _process_start_time(pid: int) -> str | None:
+        """When the process started (``ps -o lstart=``): with the pid it names one process."""
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        started = " ".join(completed.stdout.split())
+        return started if completed.returncode == 0 and started else None
+
+    @staticmethod
+    def _own_process_alive(pid: int) -> bool:
+        """The pid exists and belongs to this account (signal 0; no subprocess)."""
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError):
+            return False  # gone, or another account's process (PermissionError)
+        return True
+
+    # A listener not seen alive for this long has its start time compared again
+    # (its pid may have been reused meanwhile); polls in between cost one signal-0 call.
+    _LISTENER_RECHECK_SECONDS = 10.0
+
+    def _trusted_listener_still_there(self) -> bool:
+        cached = _TRUSTED_RPC_LISTENERS.get(self.rpc_port)
+        if cached is None:
+            return False
+        pid, started, seen_at = cached
+        now = time.monotonic()
+        if not self._own_process_alive(pid) or (
+            now - seen_at > self._LISTENER_RECHECK_SECONDS and self._process_start_time(pid) != started
+        ):
+            _TRUSTED_RPC_LISTENERS.pop(self.rpc_port, None)
+            return False
+        # Alive, same process: it still holds the port, nobody else can listen there.
+        _TRUSTED_RPC_LISTENERS[self.rpc_port] = (pid, started, now)
+        return True
+
+    def _remember_trusted_listener(self, pid: int) -> None:
+        started = self._process_start_time(pid)
+        if started is not None:
+            _TRUSTED_RPC_LISTENERS[self.rpc_port] = (int(pid), started, time.monotonic())
+
+    def _rpc_listener_trusted(self) -> bool | None:
+        """Whether the process on the RPC port is Pudge's aria2: True, False, or None (cannot tell).
+
+        Ours is the aria2c this client started, or an aria2c of this account
+        (a sidecar an earlier Pudge started). Anything else, e.g. another
+        account's process that took the port while the sidecar was stopped,
+        must never see the RPC secret or be asked which files to delete.
+        """
+        if self._trusted_listener_still_there():
+            return True
+        process = getattr(self, "_managed_process", None)
+        started_pid = getattr(process, "pid", None) if self._started_sidecar_alive() else None
+        pids = self._rpc_listener_pids()
+        if pids is None:
+            return None
+        for pid in pids:
+            if pid == started_pid or self._process_is_own_aria2(pid):
+                self._remember_trusted_listener(pid)
+                return True
+        return False
+
+    def _rpc_port_held_by_stranger(self) -> bool:
+        """True when a process that is not Pudge's aria2 holds the RPC port.
+
+        Asked before a request carries the RPC secret. Nobody listening, or no
+        way to tell (no lsof), is no stranger. Once a listener is proven ours,
+        later calls only check that the same process is still alive.
+        """
+        if self._trusted_listener_still_there():
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", self.rpc_port), timeout=0.5):
+                pass
+        except OSError:
+            return False  # nothing listens: the request fails as before
+        trusted = self._rpc_listener_trusted()
+        if trusted is False:
+            logging.getLogger(__name__).warning(
+                "SKIP step=aria2.rpc reason=port_held_by_other_process port=%s", self.rpc_port
+            )
+        return trusted is False
+
+    def _rpc_is_own_sidecar(self) -> bool:
+        """True only when the aria2 answering on our port is Pudge's own sidecar.
+
+        aria2 started without --rpc-secret accepts any token, so someone else's
+        aria2 on this port used to pass _probe(); Pudge then changed its global
+        options and shut it down. Pudge always sets a secret, so its sidecar
+        rejects a wrong token with "Unauthorized". The proof is remembered per
+        aria2 session id, because aria2 delays its answer to a wrong token.
+        Before that, the listening process must be Pudge's aria2c: any program
+        can answer "Unauthorized" (macOS lsof; without lsof only the token test).
+        """
+        key = (str(self.state_dir), self.rpc_port)
+        if self._rpc_port_held_by_stranger():
+            _OWN_SIDECAR_SESSIONS.pop(key, None)
+            return False
+        try:
+            info = self._rpc_raw("aria2.getSessionInfo")
+        except Aria2Error:
+            info = None
+        session = str(info.get("sessionId") or "") if isinstance(info, dict) else ""
+        if session and _OWN_SIDECAR_SESSIONS.get(key) == session:
+            return True
+        payload = {
+            "jsonrpc": "2.0",
+            "id": f"{APP_SLUG}-{time.time_ns()}",
+            "method": "aria2.getVersion",
+            "params": [f"token:not-{APP_SLUG}-{secrets.token_urlsafe(16)}"],
+        }
+        try:
+            body = self._http.post(self._rpc_url, json=payload).json()
+        except httpx.TransportError:
+            # No answer at all (it may be stopping): only the process this
+            # client started itself still counts as ours.
+            return self._started_sidecar_alive()
+        except (httpx.HTTPError, ValueError):
+            return False
+        error = body.get("error") if isinstance(body, dict) else None
+        message = str(error.get("message") or "") if isinstance(error, dict) else ""
+        owned = "unauthorized" in message.casefold()
+        if owned and session:
+            _OWN_SIDECAR_SESSIONS[key] = session
+        return owned
+
+    def _started_sidecar_alive(self) -> bool:
+        process = getattr(self, "_managed_process", None)
+        poll = getattr(process, "poll", None)
+        return callable(poll) and poll() is None
 
     def _interface_names(self) -> set[str]:
         try:
@@ -474,7 +893,10 @@ class Aria2Client:
 
     def _launch_options(self) -> list[str]:
         values = [
-            "--no-conf=true",
+            # Pudge's own 0600 config holds only the RPC secret, so it is not in
+            # argv (visible to every user via ps). It also keeps the user's
+            # ~/.aria2/aria2.conf from being read, which --no-conf did before.
+            f"--conf-path={self._conf_path()}",
             "--bt-detach-seed-only=true",
             # Preallocation writes zeros over the whole file before the first
             # piece arrives; APFS does not need it.
@@ -493,16 +915,20 @@ class Aria2Client:
             raise Aria2Error(err("aria2.disabled"))
         self._validate_network_guard()
         binary = self._binary_path()
+        _TRUSTED_RPC_LISTENERS.pop(self.rpc_port, None)  # the new process is checked once it listens
         session = self.state_dir / "session.txt"
         session.touch(exist_ok=True)
         (self.state_dir / self._IDLE_MARKER).unlink(missing_ok=True)
         log = self.state_dir / "aria2.log"
+        try:
+            self._write_private(self._conf_path(), f"rpc-secret={self._secret}\n")
+        except OSError as exc:
+            raise Aria2Error(err("aria2.startFailed", error=exc)) from exc
         cmd = [
             binary,
             "--enable-rpc=true",
             "--rpc-listen-all=false",
             f"--rpc-listen-port={self.rpc_port}",
-            f"--rpc-secret={self._secret}",
             "--rpc-max-request-size=16M",
             "--rpc-save-upload-metadata=true",
             "--continue=true",
@@ -538,18 +964,27 @@ class Aria2Client:
         for delay in (0.15, 0.25, 0.4, 0.7, 1.0, 1.5):
             time.sleep(delay)
             if self._probe():
+                if not self._rpc_is_own_sidecar():
+                    # Another aria2 holds the port; ours could not take it.
+                    raise Aria2Error(err("aria2.portInUse", port=self.rpc_port))
                 self._apply_runtime_options()
                 try:
                     self._runtime_profile_path().write_text(self._RUNTIME_PROFILE + "\n", encoding="utf-8")
                 except OSError:
                     pass
                 return
+        if getattr(self, "_port_held_by_stranger", False):
+            raise Aria2Error(err("aria2.portInUse", port=self.rpc_port))
         raise Aria2Error(err("aria2.rpcNoResponse", port=self.rpc_port))
 
     def ensure_running(self) -> None:
         with self._lock:
             self._validate_network_guard()
             if self._probe():
+                if not self._rpc_is_own_sidecar():
+                    # Someone else's aria2 answers on Pudge's port: never change
+                    # its options, add downloads to it or shut it down.
+                    raise Aria2Error(err("aria2.portInUse", port=self.rpc_port))
                 try:
                     runtime_profile = self._runtime_profile_path().read_text(encoding="utf-8").strip()
                 except OSError:
@@ -586,6 +1021,8 @@ class Aria2Client:
                         return
                 self._apply_runtime_options()
                 return
+            if getattr(self, "_port_held_by_stranger", False):
+                raise Aria2Error(err("aria2.portInUse", port=self.rpc_port))
             if not self.auto_start:
                 raise Aria2Error(err("aria2.rpcNotRunning"))
             # Repair a Pudge-owned orphan from an older RPC secret/port before
@@ -650,6 +1087,10 @@ class Aria2Client:
 
     def _resolve_gid(self, torrent_hash: str) -> str:
         wanted = str(torrent_hash or "").strip().lower()
+        if not wanted:
+            # An empty hash names nothing: it matched a task or record without an
+            # info hash (an HTTP download, a bad record), and delete("") removed that.
+            return ""
         # Prefer the live payload GID. Magnet metadata downloads can retain the
         # same info hash in our ownership map after handing off to followedBy.
         for item in self._all_statuses():
@@ -687,9 +1128,9 @@ class Aria2Client:
                     proxy=proxy,
                     headers={"User-Agent": APP_SLUG},
                 ) as client:
-                    response = client.get(source)
-                    response.raise_for_status()
-                    payload = bytes(response.content)
+                    # Streamed with a byte cap and an overall deadline: the
+                    # whole body used to be read before the 10 MB check.
+                    payload = read_capped_body(client, source, max_bytes=10 * 1024 * 1024)
             except (ImportError, httpx.HTTPError, ValueError):
                 continue
             # A bencoded torrent is a dictionary. Refuse HTML/error pages and
@@ -821,7 +1262,7 @@ class Aria2Client:
                     score = float(tag.split(":", 1)[1].strip())
                 except ValueError:
                     pass
-        metadata[returned_gid] = {
+        record = {
             "info_hash": wanted_hash,
             "title": release.title,
             "save_path": str(target),
@@ -839,8 +1280,36 @@ class Aria2Client:
             "added_on": int(time.time()),
             "completed_on": 0,
         }
-        self._save_metadata(metadata)
+        with self._metadata_transaction() as current:
+            current[returned_gid] = record
+        # A .torrent added by upload is saved at once; a magnet's later (torrents()).
+        self._hide_saved_metadata(target, wanted_hash)
         return wanted_hash or returned_gid
+
+    @staticmethod
+    def _hide_saved_metadata(directory: object, info_hash: object) -> bool:
+        """Hide aria2's ``<dir>/<info hash>.torrent`` from Finder in the library folder.
+
+        aria2 writes it next to the download (``--bt-save-metadata``,
+        ``--rpc-save-upload-metadata``) and reads it back from exactly there on a
+        restart (the session and ``--bt-load-saved-metadata``), so it can be
+        neither moved nor renamed: it only gets macOS's hidden flag.
+        """
+        value = str(info_hash or "").strip().lower()
+        folder = str(directory or "").strip()
+        if len(value) != 40 or not folder:
+            return False
+        try:
+            int(value, 16)
+        except ValueError:
+            return False
+        path = Path(folder) / f"{value}.torrent"
+        try:
+            if not path.is_file():
+                return False
+        except OSError:
+            return False
+        return hide_from_finder(path)
 
     def start(self, torrent_hash: str) -> None:
         self.ensure_running()
@@ -932,10 +1401,10 @@ class Aria2Client:
             returned_gid = str(self._rpc_raw("aria2.addTorrent", [encoded, [], options]) or gid)
         else:
             returned_gid = str(self._rpc_raw("aria2.addUri", [[magnet], options]) or gid)
-        metadata.pop(gid, None)
         meta["recovery_started_at"] = int(time.time())
-        metadata[returned_gid] = meta
-        self._save_metadata(metadata)
+        with self._metadata_transaction() as current:
+            current.pop(gid, None)
+            current[returned_gid] = meta
         try:
             self._rpc_raw("aria2.saveSession")
         except Aria2Error:
@@ -991,11 +1460,11 @@ class Aria2Client:
             pass
 
         returned_gid = str(self._rpc_raw("aria2.addUri", [[replacement], options]) or gid)
-        metadata.pop(gid, None)
         meta["magnet"] = replacement
         meta["recovery_started_at"] = int(time.time())
-        metadata[returned_gid] = meta
-        self._save_metadata(metadata)
+        with self._metadata_transaction() as current:
+            current.pop(gid, None)
+            current[returned_gid] = meta
         try:
             self._rpc_raw("aria2.saveSession")
         except Aria2Error:
@@ -1064,6 +1533,50 @@ class Aria2Client:
             return True
         return state == "active"
 
+    def prioritize_queue(self, torrent_hashes: list[str]) -> bool:
+        """Order Pudge downloads in aria2's queue as given (first = most wanted).
+
+        Waiting ones move to the front in that order. When the first one still waits while a
+        later one of the list is active, that later one gives its slot up (pause, then back to
+        the waiting queue) so the first starts now."""
+        hashes = [str(value or "").strip() for value in torrent_hashes if str(value or "").strip()]
+        if len(hashes) < 2:
+            return False
+        self.ensure_running()
+        gids: list[str] = []
+        states: dict[str, str] = {}
+        for value in hashes:
+            try:
+                gid = self._resolve_gid(value)
+                status = self._rpc_raw("aria2.tellStatus", [gid, ["status"]]) or {}
+            except Aria2Error:
+                continue
+            gids.append(gid)
+            states[gid] = str(status.get("status") or "").casefold()
+        moved = False
+        for gid in reversed(gids):
+            if states.get(gid) in {"waiting", "paused"}:
+                try:
+                    self._rpc_raw("aria2.changePosition", [gid, 0, "POS_SET"])
+                    moved = True
+                except Aria2Error:
+                    continue
+        if gids and states.get(gids[0]) == "waiting":
+            for gid in reversed(gids[1:]):
+                if states.get(gid) != "active":
+                    continue
+                try:
+                    self._rpc_raw("aria2.forcePause", [gid])
+                    self._rpc_raw("aria2.unpause", [gid])
+                    # A paused active download goes to the front of the waiting queue: the
+                    # wanted one is put back in front of it, or it took its slot again.
+                    self._rpc_raw("aria2.changePosition", [gids[0], 0, "POS_SET"])
+                    moved = True
+                except Aria2Error:
+                    pass
+                break
+        return moved
+
     def known_offline(self, torrent_hash: str) -> bool:
         """Whether Pudge's aria2 records hold this torrent, without the RPC.
 
@@ -1076,6 +1589,28 @@ class Aria2Client:
         return any(
             wanted in {str(gid).lower(), str((meta or {}).get("info_hash") or "").lower()}
             for gid, meta in self._load_metadata().items()
+        )
+
+    def has_torrent(self, torrent_hash: str) -> bool:
+        """Whether aria2 already holds this torrent, so add_release would reuse it."""
+        wanted = str(torrent_hash or "").strip().lower()
+        if not wanted:
+            return False
+        if not self._probe():
+            if not self.known_offline(wanted):
+                return False  # no record: starting aria2 cannot restore it either
+            # Starting aria2 restores the task from its session. Start it the
+            # way add_release does (hook first), then look.
+            self.prepare_network_start(hook=True)
+            self.ensure_running()
+        gids = {self._safe_gid(wanted, "")} | {
+            str(gid).lower()
+            for gid, meta in self._load_metadata().items()
+            if str((meta or {}).get("info_hash") or "").lower() == wanted
+        }
+        return any(
+            str(item.get("infoHash") or "").lower() == wanted or str(item.get("gid") or "").lower() in gids
+            for item in self._all_statuses()
         )
 
     def torrent_status(self, torrent_hash: str) -> dict[str, Any] | None:
@@ -1113,6 +1648,9 @@ class Aria2Client:
             if str(exc).strip().casefold() in {message.casefold() for message in missing}:
                 return None
             raise
+        if str(item.get("status") or "").casefold() == "removed":
+            # A removed task never resumes; only its result is still listed.
+            return None
         total = max(0, int(item.get("totalLength") or 0))
         downloaded = max(0, int(item.get("completedLength") or 0))
         progress = downloaded / total if total > 0 else 0.0
@@ -1182,7 +1720,6 @@ class Aria2Client:
         except Aria2Error:
             pass
         returned_gid = self._add_source(release, options, torrent_payload=payload)
-        metadata.pop(gid, None)
         meta.update(
             {
                 "info_hash": str(release.info_hash or meta.get("info_hash") or "").lower(),
@@ -1194,8 +1731,9 @@ class Aria2Client:
                 "expected_size_bytes": max(0, int(release.size_bytes or 0)),
             }
         )
-        metadata[returned_gid] = meta
-        self._save_metadata(metadata)
+        with self._metadata_transaction() as current:
+            current.pop(gid, None)
+            current[returned_gid] = meta
         return True
 
     @staticmethod
@@ -1255,6 +1793,135 @@ class Aria2Client:
             return count > 1
         return not (title_fallback and cls._single_episode_title(str(meta.get("title") or "")))
 
+    @classmethod
+    def _completed_payload_on_disk(cls, save_path: Path, info_hash: str) -> tuple[Path, int] | None:
+        """The finished payload of a torrent, proven by aria2's own saved .torrent.
+
+        aria2 keeps a task's metadata as ``<dir>/<info hash>.torrent`` and deletes
+        the ``<name>.aria2`` control file only when the download is complete. So:
+        no control file, every file of the torrent with its exact length (a file
+        that is not there at all was deselected or deleted), and at least one video.
+        Returns (content path, bytes present).
+        """
+        value = str(info_hash or "").strip().lower()
+        if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+            return None
+        torrent = save_path / f"{value}.torrent"
+        layout = _saved_torrent_layout(torrent)
+        if layout is None:
+            return None
+        name, files, multi = layout
+        content = save_path / name
+        if (save_path / f"{name}.aria2").exists():
+            return None
+        present = 0
+        videos = 0
+        for relative, length in files:
+            path = content / relative if multi else content
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+            if info.st_size != length or Path(str(path) + ".aria2").exists():
+                return None
+            if _hollow(path, length, info):
+                # aria2 writes the last pieces early (tail priority, no preallocation): the file
+                # has its full length while most of it is a hole. Not finished.
+                return None
+            present += length
+            if path.suffix.casefold() in cls._VIDEO_EXTENSIONS:
+                videos += 1
+        return (content, present) if videos else None
+
+    def _orphan_download_item(
+        self,
+        gid: str,
+        meta: dict[str, Any],
+        *,
+        save_path: Path,
+        content: Path,
+        size: int,
+    ) -> DownloadItem | None:
+        title = str(meta.get("title") or "").strip()
+        media_id = meta.get("media_id")
+        media_episode = meta.get("episode")
+        if media_id is None:
+            return None
+        release_number = meta.get("release_episode")
+        if release_number is None:
+            release_number = parsed_release_episode(title) or media_episode
+        torrent_hash = str(meta.get("info_hash") or gid).strip().lower() or str(gid)
+        is_batch = self._batch_flag(meta, title_fallback=True)
+        if content.is_dir():
+            release_number = meta.get("release_episode")
+        video_episodes = list(meta.get("video_episodes") or [])
+        if not video_episodes and not is_batch and release_number is not None:
+            video_episodes = [int(release_number)]
+        return DownloadItem(
+            torrent_hash=torrent_hash,
+            name=title or content.name,
+            state="complete",
+            progress=1.0,
+            save_path=str(save_path.resolve()),
+            content_path=str(content.resolve()),
+            media_id=int(media_id),
+            episode=int(media_episode) if media_episode is not None else None,
+            media_episode=int(media_episode) if media_episode is not None else None,
+            release_episode=int(release_number) if release_number is not None else None,
+            is_batch=is_batch,
+            added_on=int(meta.get("added_on") or 0),
+            completed_on=int(meta.get("completed_on") or 0) or int(time.time()),
+            raw={
+                "backend": "aria2",
+                "gid": str(gid),
+                "infohash_v1": str(meta.get("info_hash") or "").lower(),
+                "total_size": size,
+                "downloaded": size,
+                "download_speed": 0,
+                "upload_speed": 0,
+                "orphaned_metadata": True,
+                "video_episodes": video_episodes,
+                "single_video_file": bool(meta.get("is_batch")) and not is_batch,
+                "verified": size,
+                "verifying": False,
+                "_media_id_source": "aria2_metadata_orphan",
+                "_release_score_tag": float(meta.get("release_score") or 0.0),
+                "_anime_title_tag": str(meta.get("anime_title") or ""),
+            },
+        )
+
+    def completed_on_disk(
+        self, *, skip_hashes: set[str] | frozenset[str] = frozenset()
+    ) -> list[DownloadItem]:
+        """Managed torrents found finished on disk, without asking aria2 (no RPC).
+
+        With Torrents off aria2 is not running, and a task that finished just
+        before aria2 stopped is no longer in its session (Rakugo Shinjuu S2: a
+        12-episode batch complete on disk, its row "downloading 99.8%" for good).
+        Only the exact check against the saved .torrent is used here.
+        """
+        skip = {str(value).strip().casefold() for value in skip_hashes}
+        result: list[DownloadItem] = []
+        for gid, meta in self._load_metadata().items():
+            if not isinstance(meta, dict):
+                continue
+            info_hash = str(meta.get("info_hash") or "").strip().casefold()
+            if not info_hash or info_hash in skip:
+                continue
+            save_path = Path(str(meta.get("save_path") or "")).expanduser()
+            found = self._completed_payload_on_disk(save_path, info_hash)
+            if found is None:
+                continue
+            item = self._orphan_download_item(
+                str(gid), dict(meta), save_path=save_path, content=found[0], size=found[1]
+            )
+            if item is not None:
+                result.append(item)
+                skip.add(info_hash)
+        return result
+
     def _orphaned_completed_item(self, gid: str, meta: dict[str, Any]) -> DownloadItem | None:
         """Recover a completed managed torrent after aria2 forgot its task row.
 
@@ -1262,13 +1929,20 @@ class Aria2Client:
         contains the ownership information. The payload itself remains on disk.
         Reconstructing a read-only DownloadItem here lets normal sync_downloads()
         recreate the missing LibraryEpisode without re-adding or touching traffic.
+        A batch is recognised only by aria2's saved .torrent: no folder guessing.
         """
         save_path = Path(str(meta.get("save_path") or "")).expanduser()
         if not save_path.is_dir():
             return None
+        found = self._completed_payload_on_disk(save_path, str(meta.get("info_hash") or ""))
+        if found is not None:
+            return self._orphan_download_item(gid, meta, save_path=save_path, content=found[0], size=found[1])
         title = str(meta.get("title") or "").strip()
         candidates: list[Path] = []
-        if title:
+        # The title is the release name from the feed: only a plain file name can be the
+        # payload. "../../Movies/x.mkv" named a file outside the download folder, which was
+        # then taken for a finished episode of this anime.
+        if title and "/" not in title and title not in {".", ".."}:
             exact = save_path / title
             if exact.is_file():
                 candidates.append(exact)
@@ -1313,57 +1987,109 @@ class Aria2Client:
             # normal completed torrent remains well inside this range.
             if size_ratio < 0.65 or size_ratio > 1.35:
                 return None
-        media_id = meta.get("media_id")
-        media_episode = meta.get("episode")
-        if media_id is None:
-            return None
-        release_number = meta.get("release_episode")
-        if release_number is None:
-            release_number = parsed_release_episode(title) or media_episode
-        torrent_hash = str(meta.get("info_hash") or gid).strip().lower() or str(gid)
-        is_batch = self._batch_flag(meta, title_fallback=True)
-        video_episodes = list(meta.get("video_episodes") or [])
-        if not video_episodes and not is_batch and release_number is not None:
-            video_episodes = [int(release_number)]
-        return DownloadItem(
-            torrent_hash=torrent_hash,
-            name=title or content.name,
-            state="complete",
-            progress=1.0,
-            save_path=str(save_path.resolve()),
-            content_path=str(content),
-            media_id=int(media_id),
-            episode=int(media_episode) if media_episode is not None else None,
-            media_episode=int(media_episode) if media_episode is not None else None,
-            release_episode=int(release_number) if release_number is not None else None,
-            is_batch=is_batch,
-            added_on=int(meta.get("added_on") or 0),
-            completed_on=int(meta.get("completed_on") or 0) or int(time.time()),
-            raw={
-                "backend": "aria2",
-                "gid": str(gid),
-                "infohash_v1": str(meta.get("info_hash") or "").lower(),
-                "total_size": size,
-                "downloaded": size,
-                "download_speed": 0,
-                "upload_speed": 0,
-                "orphaned_metadata": True,
-                "video_episodes": video_episodes,
-                "single_video_file": bool(meta.get("is_batch")) and not is_batch,
-                "verified": size,
-                "verifying": False,
-                "_media_id_source": "aria2_metadata_orphan",
-                "_release_score_tag": float(meta.get("release_score") or 0.0),
-                "_anime_title_tag": str(meta.get("anime_title") or ""),
-            },
-        )
+        return self._orphan_download_item(gid, meta, save_path=save_path, content=content, size=size)
+
+    @staticmethod
+    def _folder_reachable(save_path: Path) -> bool:
+        """The download folder's parent is there: a missing folder below it was deleted, not on
+        an unmounted drive (whose files are only out of reach)."""
+        try:
+            return save_path.parent.is_dir()
+        except OSError:
+            return False
+
+    @classmethod
+    def _live_payload_gone(cls, item: dict[str, Any]) -> bool:
+        """Every selected file of a live aria2 task is gone from a reachable folder."""
+        paths = [
+            Path(str(entry.get("path") or "")).expanduser()
+            for entry in item.get("files") or []
+            if isinstance(entry, dict) and entry.get("path") and entry.get("selected") != "false"
+        ]
+        if not paths or not cls._folder_reachable(Path(str(item.get("dir") or paths[0].parent))):
+            return False
+        try:
+            return not any(path.exists() for path in paths)
+        except OSError:
+            return False
+
+    @classmethod
+    def _recorded_payload_gone(cls, meta: dict[str, Any]) -> bool:
+        """A finished torrent aria2 no longer lists has none of its files on disk (proven by its
+        saved .torrent, or its folder gone). In doubt (no layout, drive away): not gone."""
+        raw = str(meta.get("save_path") or "").strip()
+        if not raw:
+            return False
+        save_path = Path(raw).expanduser()
+        if not cls._folder_reachable(save_path):
+            return False
+        try:
+            if not save_path.is_dir():
+                return True  # its folder was deleted
+        except OSError:
+            return False
+        value = str(meta.get("info_hash") or "").strip().lower()
+        layout = _saved_torrent_layout(save_path / f"{value}.torrent") if len(value) == 40 else None
+        if layout is None:
+            return False
+        name, files, multi = layout
+        content = save_path / name
+        try:
+            return not any((content / relative if multi else content).exists() for relative, _length in files)
+        except OSError:
+            return False
+
+    def _forget_finished_gone(
+        self, metadata: dict[str, dict[str, Any]], live: dict[str, dict[str, Any]], stale: set[str]
+    ) -> set[str]:
+        """metadata.json grew by every finished download for ever: a record whose download is
+        finished and whose files are gone from disk (the episode deleted, the folder removed)
+        goes, with aria2's own row of it (a stopped result or a paused finished task). Records
+        sharing its info hash (a magnet's [METADATA] parent) go with it. Returns the gids."""
+        dead_hashes = {
+            str(metadata[gid].get("info_hash") or "").strip().lower() for gid in stale if gid in metadata
+        }
+        dead_hashes.discard("")
+        # Not a live download of its own: a new download of the same torrent (added again
+        # after its files were deleted) keeps its record; a parent aria2 lists still goes.
+        gone = set(stale) | {
+            gid
+            for gid, meta in metadata.items()
+            if str((meta or {}).get("info_hash") or "").strip().lower() in dead_hashes
+            and (gid not in live or (live.get(gid) or {}).get("followedBy"))
+        }
+        for gid in sorted(gone):
+            row = live.get(gid)
+            if row is None:
+                continue
+            try:
+                if gid in stale and str(row.get("status") or "") in {"active", "waiting", "paused"}:
+                    self._rpc_raw("aria2.forceRemove", [gid])
+                self._rpc_raw("aria2.removeDownloadResult", [gid])
+            except Aria2Error:
+                pass  # removed again on a later listing; its record goes now
+        if gone:
+            with self._metadata_transaction() as current:
+                for gid in gone:
+                    current.pop(gid, None)
+            try:
+                self._rpc_raw("aria2.saveSession")
+            except Aria2Error:
+                pass
+            logging.getLogger(__name__).info(
+                "STEP=aria2.metadata_pruned count=%d reason=finished_and_files_gone", len(gone)
+            )
+        return gone
 
     def torrents(self, *, category: str = "") -> list[DownloadItem]:
         del category
         statuses = self._all_statuses()
         metadata = self._load_metadata()
+        loaded = copy.deepcopy(metadata)
         changed = False
         result: list[DownloadItem] = []
+        # Finished downloads whose files are gone: their records (and aria2 rows) go.
+        stale: set[str] = set()
         # First propagate ownership from magnet metadata downloads to their
         # followed payload GIDs. The metadata-only parent is not shown as a
         # second download in Activity.
@@ -1380,6 +2106,7 @@ class Aria2Client:
 
         for item in statuses:
             gid = str(item.get("gid") or "")
+            self._hide_saved_metadata(item.get("dir"), item.get("infoHash"))
             if item.get("followedBy"):
                 continue
             meta = metadata.get(gid)
@@ -1452,6 +2179,16 @@ class Aria2Client:
                 meta["completed_on"] = int(time.time())
                 metadata[gid] = meta
                 changed = True
+            if (
+                public_status == "complete"
+                # Finished a while ago: files moved or renamed right after finishing (an
+                # import, a rename) are not mistaken for a deleted download.
+                and 0 < int(meta.get("completed_on") or 0) < time.time() - _PRUNE_AFTER_SECONDS
+                and not verifying
+                and self._live_payload_gone(item)
+            ):
+                stale.add(gid)
+                continue
             info_hash = str(item.get("infoHash") or meta.get("info_hash") or "").lower()
             public_hash = info_hash or gid
             raw = {
@@ -1512,18 +2249,46 @@ class Aria2Client:
         represented_paths = {
             str(item.content_path or "").strip() for item in result if str(item.content_path or "").strip()
         }
+        live = {str(item.get("gid") or ""): item for item in statuses if item.get("gid")}
         for gid, meta in metadata.items():
             info_hash = str(meta.get("info_hash") or "").strip().casefold()
-            if info_hash and info_hash in represented_hashes:
+            if gid in stale or (info_hash and info_hash in represented_hashes):
                 continue
             orphan = self._orphaned_completed_item(str(gid), dict(meta))
+            if (
+                orphan is None
+                and gid not in live
+                and 0 < int(meta.get("completed_on") or 0) < time.time() - _PRUNE_AFTER_SECONDS
+                and self._recorded_payload_gone(meta)
+            ):
+                stale.add(str(gid))
+                continue
             if orphan is None or str(orphan.content_path) in represented_paths:
                 continue
             result.append(orphan)
             represented_hashes.add(str(orphan.torrent_hash or "").strip().casefold())
             represented_paths.add(str(orphan.content_path))
+        if stale:
+            # A live record sharing a pruned hash (a magnet's parent) is no longer written back.
+            for gid in self._forget_finished_gone(metadata, live, stale):
+                metadata.pop(gid, None)
+                loaded.pop(gid, None)
         if changed:
-            self._save_metadata(metadata)
+            # Only what this listing changed goes back: the records were read before the
+            # RPC calls, and a release added (or a task deleted) meanwhile must stay so.
+            with self._metadata_transaction() as current:
+                for gid, meta in metadata.items():
+                    before = loaded.get(gid)
+                    if before == meta:
+                        continue
+                    if before is not None and gid not in current:
+                        continue  # deleted meanwhile
+                    delta = {
+                        key: value
+                        for key, value in meta.items()
+                        if not isinstance(before, dict) or before.get(key) != value
+                    }
+                    current[gid] = {**(current.get(gid) or {}), **delta}
         return result
 
     def files(self, torrent_hash: str) -> list[dict[str, Any]]:
@@ -1573,12 +2338,31 @@ class Aria2Client:
         gid = self._resolve_gid(torrent_hash)
         self._rpc_raw("aria2.changeOption", [gid, {"select-file": value}])
 
+    def _remove_result(self, gid: str) -> None:
+        """Drop the stopped task; forceRemove only asks aria2 to stop it."""
+        for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+            try:
+                self._rpc_raw("aria2.removeDownloadResult", [gid])
+                return
+            except Aria2Error:
+                pass
+            # Still stopping: its result stayed listed ("removed") and the
+            # removal was never confirmed. Gone already: nothing to wait for.
+            try:
+                self._rpc_raw("aria2.tellStatus", [gid, ["status"]])
+            except Aria2Error:
+                return
+            time.sleep(delay)
+
     def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
         self._require_observable()
         gid = self._resolve_gid(torrent_hash)
+        if not gid:
+            return  # no hash: nothing of Pudge's to remove (never another download)
+        wanted = str(torrent_hash or "").strip().lower()
         status: dict[str, Any] = {}
         try:
-            status = self._rpc_raw("aria2.tellStatus", [gid, ["status", "files", "dir"]]) or {}
+            status = self._rpc_raw("aria2.tellStatus", [gid, ["status", "files", "dir", "following"]]) or {}
         except Aria2Error:
             pass
         try:
@@ -1587,26 +2371,82 @@ class Aria2Client:
             detail = str(exc).casefold()
             if "not found" not in detail and "invalid gid" not in detail:
                 raise
-        try:
-            self._rpc_raw("aria2.removeDownloadResult", [gid])
-        except Aria2Error:
-            pass
+        self._remove_result(gid)
         metadata = self._load_metadata()
-        metadata.pop(gid, None)
-        self._save_metadata(metadata)
+        # Files are deleted only inside the folder Pudge chose for this torrent
+        # (its own record), never wherever the RPC answer says they are.
+        owned_dirs = self._recorded_save_dirs(metadata, gid, wanted)
+        # A magnet's finished [METADATA] task (the one this payload follows)
+        # kept the hash's record: the hash still resolved to it after the
+        # delete, so removing a race candidate never looked confirmed and the
+        # race ended without a word (Sora yori mo Tooi Basho, 2026-10-15).
+        parents = {str(status.get("following") or "")} | {
+            key
+            for key, meta in metadata.items()
+            if key != gid and wanted and str((meta or {}).get("info_hash") or "").lower() == wanted
+        }
+        for parent in sorted(parents - {""}):
+            try:
+                self._rpc_raw("aria2.removeDownloadResult", [parent])
+            except Aria2Error:
+                pass
+        with self._metadata_transaction() as current:
+            for key in parents | {gid}:
+                current.pop(key, None)
         try:
             self._rpc_raw("aria2.saveSession")
         except Aria2Error:
             pass
         if delete_files:
             for entry in status.get("files") or []:
-                path = Path(str(entry.get("path") or "")).expanduser()
+                raw = str(entry.get("path") or "").strip()
+                if not raw:
+                    continue
+                path = Path(raw).expanduser()
+                if not self._inside_dirs(path, owned_dirs):
+                    logging.getLogger(__name__).warning(
+                        "SKIP step=aria2.delete_file reason=outside_download_dir path=%r dirs=%s",
+                        raw,
+                        [str(item) for item in owned_dirs],
+                    )
+                    continue
                 try:
-                    if path.is_file():
+                    if path.is_file() and not path.is_symlink():
                         path.unlink()
-                    Path(str(path) + ".aria2").unlink(missing_ok=True)
+                    control = Path(str(path) + ".aria2")
+                    if not control.is_symlink():
+                        control.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _recorded_save_dirs(metadata: dict[str, dict[str, Any]], gid: str, wanted: str) -> tuple[Path, ...]:
+        """The download folders Pudge recorded when it added this torrent (metadata.json)."""
+        dirs: list[Path] = []
+        for key, meta in metadata.items():
+            meta = meta or {}
+            if key != gid and not (wanted and str(meta.get("info_hash") or "").lower() == wanted):
+                continue
+            raw = str(meta.get("save_path") or "").strip()
+            if not raw:
+                continue
+            try:
+                folder = Path(raw).expanduser().resolve()
+            except OSError:
+                continue
+            # A record pointing at / or a home folder is no download folder.
+            if folder == Path(folder.anchor) or folder == Path.home().resolve():
+                continue
+            dirs.append(folder)
+        return tuple(dict.fromkeys(dirs))
+
+    @staticmethod
+    def _inside_dirs(path: Path, dirs: tuple[Path, ...]) -> bool:
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except OSError:
+            return False
+        return any(folder in resolved.parents for folder in dirs)
 
     def cleanup_tags(self) -> dict[str, int]:
         return {"score_tags_removed": 0, "unused_tags_deleted": 0}

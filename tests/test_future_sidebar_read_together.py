@@ -257,7 +257,19 @@ def test_sidebar_card_waits_for_the_interval_by_the_wall_clock(page) -> None:
         const out = {start: dueShown()};
         await __tick(117000); out.at118s = dueShown();
         await __tick(4000); out.at122s = dueShown();
-        // Reviewing elsewhere (the reader's study card) restarts the wait.
+        return out;
+        """,
+        before=DUE,
+        **LAST_MINUTE,
+    )
+    out = result.value
+    assert (out["start"], out["at118s"], out["at122s"]) == (False, False, True)
+    # Reviewing elsewhere (the reader's study card) while no card is on show restarts the wait.
+    reviewed = page.run(
+        DUE_VIEW
+        + r"""
+        await __tick(30000);
+        const out = {start: dueShown()};
         """
         + READER_REVIEW
         + r"""
@@ -269,34 +281,37 @@ def test_sidebar_card_waits_for_the_interval_by_the_wall_clock(page) -> None:
         before=DUE,
         **LAST_MINUTE,
     )
-    out = result.value
-    assert (out["start"], out["at118s"], out["at122s"]) == (False, False, True)
-    assert result.calls_of("study_action")[0][0]["action"] == "review"
+    out = reviewed.value
+    assert out["start"] is False
+    assert reviewed.calls_of("study_action")[0][0]["action"] == "review"
     assert (
         out["reviewed"]["shown"] is False and abs(out["reviewed"]["lastAt"] - out["reviewed"]["now"]) < 1000
     )
     assert (out["before3min"], out["after3min"]) == (False, True)
 
 
-def test_a_review_gate_review_also_restarts_the_sidebar_wait(page) -> None:
+def test_a_review_gate_review_of_another_card_leaves_the_sidebar_card(page) -> None:
+    # The gate before an episode grades other cards: the sidebar card on show stays as it
+    # is (it was refetched and swapped after every gate grade); the wait still restarts.
     result = page.run(
         DUE_VIEW
         + GATE_VIEW
         + r"""
         await __tick(122000);
-        const out = {before: dueShown()};
+        const out = {before: dueShown(), fetchesBefore: __apiCalls.filter(c => c.name === 'sidebar_due_review_cards').length};
         await startPlay(EPISODE); await __tick(20);
         await space(); await gradeKey(3); await space(); await __tick(50);   // reveal, choose Good, confirm
         out.after = {shown: dueShown(), lastAt: lastAt(), now: Date.now()};
         return out;
         """,
-        before=DUE + GATE,
+        before=DUE.replace("wordId: 1,", "wordId: 9,") + GATE,  # the sidebar shows another card
         **LAST_MINUTE,
     )
     out = result.value
     assert out["before"] is True
     assert result.called("review_gate_review")
-    assert out["after"]["shown"] is False and abs(out["after"]["lastAt"] - out["after"]["now"]) < 1000
+    assert out["after"]["shown"] is True and abs(out["after"]["lastAt"] - out["after"]["now"]) < 1000
+    assert len(result.calls_of("sidebar_due_review_cards")) == out["fetchesBefore"]  # no refetch per grade
 
 
 def test_sidebar_says_it_waits_for_the_next_review_during_the_interval(page) -> None:

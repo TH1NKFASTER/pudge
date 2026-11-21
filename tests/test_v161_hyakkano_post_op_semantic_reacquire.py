@@ -5,6 +5,7 @@ from pudge.syncing import (
     _local_stt_text_shift_estimate,
     _refine_stt_opening_plateaus,
 )
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def _post_cues():
@@ -140,7 +141,6 @@ def test_upgrade_requeues_old_onset_only_opening_plateau(tmp_path: Path) -> None
     assert manager._requeue_stt_opening_plateau_semantic_upgrade() == 1
     repaired = manager.db.episode_by_path(video)
     assert repaired is not None
-    assert repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert manager.db.get_state("subtitle_stt_plateau_semantic_generation", "") == "1"
     assert manager._requeue_stt_opening_plateau_semantic_upgrade() == 0

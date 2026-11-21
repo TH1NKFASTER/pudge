@@ -18,8 +18,8 @@ from pudge.reading_audio_alignment import (
 
 def _real_v181_second_act_shape(*, stored_pause_count: int) -> dict:
     text = (
-        "緩やかに下る坂も終わり、しばらくは土地の起伏といえば"
-        "申し訳程度の小さい丘、という実に進みやすい道だった。"
+        "緩やかな雨も夜に終わり、しばらくは辺りに見えるものは"
+        "見渡す限りの青い麦畑、そんな静かで単調な旅路だった。"
     )
     boundaries = _punctuation_boundaries(chapter_audio_text(text))
     assert {"offset": 11, "strength": 1} in boundaries

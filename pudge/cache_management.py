@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from .cache_registry import CacheRegistry, FolderPolicy
+from .database import STATE_PREFIX_SQL, state_prefix_bounds
+from .fsutil import STALE_TEMPORARY_SECONDS
 
 SEGMENT_AUDIO_MAX_AGE_SECONDS = 24 * 60 * 60
 SEGMENT_AUDIO_MAX_BYTES = 2 * 1024**3
@@ -41,10 +43,68 @@ DERIVED_CACHE_POLICIES: dict[str, FolderPolicy] = {
         SEGMENT_AUDIO_MAX_AGE_SECONDS,
         min_age_seconds=SEGMENT_AUDIO_CAP_MIN_AGE_SECONDS,
     ),
+    # These grew without any limit (834 MB of Jimaku downloads on one Mac). All are cheap
+    # to make again; a file an episode still plays (or its manifest names) is protected.
+    # Jimaku downloads, one folder per file (archive, unpacked subtitles, manifest): they
+    # are downloaded again when needed; a reused one counts as used (JimakuClient.download).
+    "jimaku": FolderPolicy("jimaku", 512 * _MB, 90 * _DAY, entries="dirs"),
+    # An embedded subtitle track as SRT: ffmpeg extracts it again in seconds.
+    "timing-reference": FolderPolicy("timing-reference", 128 * _MB, 90 * _DAY),
+    # Timeline-repaired subtitles, like "synced".
+    "timeline-alignment": FolderPolicy("timeline-alignment", 256 * _MB, 180 * _DAY),
+    # Clipped subtitle windows of one segment check, rewritten when missing.
+    "segment-subs": FolderPolicy("segment-subs", 64 * _MB, 30 * _DAY, entries="dirs"),
+    # Work files of Pudge's removed OCR engine: nothing writes or reads them any more.
+    "manga-text-regions": FolderPolicy("manga-text-regions", 0, _DAY),
+    # How each manga volume's scanned pages are straightened and aligned (about 200 KB a
+    # volume): worked out again in the background when missing.
+    "manga-align": FolderPolicy("manga-align", 256 * _MB, 365 * _DAY, pattern="*.json"),
+    # Intermediate alignment repairs (one SRT per video/subtitle/settings key), like
+    # "synced": recomputed from the cached inputs in seconds when missing.
+    **{
+        name: FolderPolicy(name, 128 * _MB, 180 * _DAY)
+        for name in (
+            "piecewise",
+            "semantic-offset",
+            "embedded-opening-scaffold",
+            "salvaged-sparse-preop",
+            "reference-dialogue-anchor",
+            "reference-early-prefix-clock",
+            "reference-groups",
+            "reference-opening-plateau",
+            "reference-piecewise",
+            "reference-sparse-cold-open",
+            "stt-opening-plateau",
+            "stt-text-clock",
+            "stt-timeline-late-cut",
+            "speech-constant",
+            "source-repairs",
+        )
+    },
+    # Japanese speech transcripts, one folder per video and model (about 1 MB, plus
+    # the audio a killed run left behind). Minutes of Whisper to make again, so a
+    # generous cap; an unused one goes after half a year.
+    "stt": FolderPolicy("stt", _GB, 180 * _DAY, entries="dirs", min_age_seconds=6 * 3600.0),
+    # Jimaku API responses (kept as the offline copy; a manual refresh sets their
+    # mtime to 0 instead of deleting them) and the request-budget notes: size only.
+    "jimaku-api": FolderPolicy("jimaku-api", 64 * _MB, 0.0, pattern="*.json"),
+    # Not here: audiobook-transcripts (Whisper), reading-audio-alignment and manga-ocr
+    # (Mokuro) take minutes to hours to make again, so they are never evicted by size.
 }
 # Folders whose files belong to one episode's preparation: purged with the episode.
 DERIVED_EPISODE_FOLDERS = frozenset(
-    policy.folder for name, policy in DERIVED_CACHE_POLICIES.items() if name != "segment-audio"
+    policy.folder
+    for name, policy in DERIVED_CACHE_POLICIES.items()
+    if name
+    not in {
+        "segment-audio",
+        "jimaku",
+        "segment-subs",
+        "manga-text-regions",
+        "manga-align",
+        "stt",
+        "jimaku-api",
+    }
 )
 
 # iPhone data beside the library database (``<db dir>/iphone``).
@@ -54,6 +114,26 @@ IPHONE_CACHE_POLICIES: dict[str, FolderPolicy] = {
     # AAC copies of audiobooks: only copies whose source is gone or changed can go.
     "iphone-prepared": FolderPolicy("prepared", 20 * _GB, 30 * _DAY, min_age_seconds=_DAY),
     "iphone-cover-sources": FolderPolicy("cover-sources", 256 * _MB, 90 * _DAY),
+}
+# Audiobook speech-to-text, its unfinished chunks and speech maps, named by the audio's
+# content: they stay when a book is deleted, so adding the same files again reuses hours
+# of Whisper. The audiobook service marks those of its books as used at each launch;
+# what no book used for half a year goes. No size cap: they take hours to make again.
+AUDIOBOOK_CACHE_POLICIES: dict[str, FolderPolicy] = {
+    "audiobook-transcripts": FolderPolicy(
+        "audiobook-transcripts", 1 << 50, 180 * _DAY, pattern="*.json", min_age_seconds=_DAY
+    ),
+    "audiobook-stt-chunks": FolderPolicy(
+        "audiobook-transcripts",
+        1 << 50,
+        180 * _DAY,
+        pattern=".*-chunks",
+        min_age_seconds=_DAY,
+        entries="dirs",
+    ),
+    "audiobook-activity": FolderPolicy(
+        "audiobook-activity", 1 << 50, 180 * _DAY, pattern="*.json", min_age_seconds=_DAY
+    ),
 }
 DERIVED_CACHE_ENFORCE_INTERVAL_SECONDS = 60 * 60
 
@@ -152,7 +232,13 @@ def cleanup_segment_audio_cache(
 
     survivors: list[tuple[Path, float, int]] = []
     for path, modified, size in entries:
-        if current - modified > max(0.0, float(max_age_seconds)) and remove(path, size):
+        # An extraction cut off by a quit or crash leaves its hidden temporary file.
+        stale_temporary = (
+            path.name.startswith(".")
+            and path.name.endswith(".tmp")
+            and current - modified > STALE_TEMPORARY_SECONDS
+        )
+        if (stale_temporary or current - modified > max(0.0, float(max_age_seconds))) and remove(path, size):
             continue
         survivors.append((path, modified, size))
 
@@ -306,13 +392,28 @@ def purge_episode_derived_files(db: Any, cache_dir: Path, video_path: Path) -> i
 
 
 def _iphone_prepared_in_use(db: Any) -> set[Path]:
-    """AAC copies whose audiobook source still exists unchanged (the phone catalog uses them)."""
+    """AAC copies whose audiobook source still exists unchanged and that an iPhone/iPad (still
+    paired) downloaded: the phone's book refers to that exact copy. Copies of books downloaded
+    nowhere fall under the folder's size and age limits (the Mac prepares them again when a
+    phone asks); every one of them was kept, so the folder grew without limit."""
     in_use: set[Path] = set()
     try:
         with db.connect() as conn:
             rows = conn.execute("SELECT source,size,mtime_ns,result FROM iphone_prepared").fetchall()
     except sqlite3.Error:
         return in_use
+    downloaded: set[str] | None
+    try:
+        with db.connect() as conn:
+            downloaded = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT r.path FROM iphone_resources r JOIN iphone_downloads d ON d.resource=r.id "
+                    "LEFT JOIN iphone_devices v ON v.id=d.device WHERE d.device='legacy' OR v.revoked=0"
+                )
+            }
+    except sqlite3.Error:
+        downloaded = None  # an older library: every current copy stays, as before
     for row in rows:
         try:
             result = json.loads(row["result"])
@@ -320,6 +421,8 @@ def _iphone_prepared_in_use(db: Any) -> set[Path]:
         except (OSError, ValueError, TypeError):
             continue
         if stat.st_size != row["size"] or stat.st_mtime_ns != row["mtime_ns"] or not isinstance(result, dict):
+            continue
+        if downloaded is not None and str(result.get("path")) not in downloaded:
             continue
         path = _resolved(result.get("path"))
         if path is not None:
@@ -355,6 +458,15 @@ def enforce_derived_caches(
         protected_paths=protected | active_segment_audio(),
         now=current,
     )
+    # Speech-to-text of the library's books never goes; only orphans age out, and only
+    # when every book's cache names are known (otherwise not this run).
+    audiobook_in_use = audiobook_caches_in_use(db, root)
+    if audiobook_in_use is not None:
+        report.update(
+            CacheRegistry(db, root).enforce_folders(
+                AUDIOBOOK_CACHE_POLICIES, protected_paths=audiobook_in_use, now=current
+            )
+        )
     if iphone_root is not None and Path(iphone_root).expanduser().is_dir():
         report.update(
             CacheRegistry(db, Path(iphone_root)).enforce_folders(
@@ -371,3 +483,41 @@ def enforce_derived_caches(
         "remaining_bytes": sum(item["remaining_bytes"] for item in report.values()),
         "folders": report,
     }
+
+
+# The audiobook service stores the cache names of each book (``<prefix><book id>``: a JSON
+# list of paths under the cache folder) while its audio files are there: they are named
+# by the audio's content, which the cleanup cannot read.
+AUDIOBOOK_CACHE_NAMES_PREFIX = "audiobook_cache_names:v1:"
+
+
+def audiobook_caches_in_use(db: Any, cache_dir: Path) -> set[Path] | None:
+    """Speech-to-text, chunk and speech-map files of every audiobook in the library.
+
+    None when that cannot be known for every book (a book never named yet, e.g. before
+    the first launch of this version, or one whose drive was away since; a database
+    error): the age rule for those folders then waits for another run.
+    """
+    try:
+        with db.connect() as conn:
+            ids = [int(row[0]) for row in conn.execute("SELECT id FROM audiobooks").fetchall()]
+            stored = {
+                str(row[0]): str(row[1])
+                for row in conn.execute(
+                    f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}",
+                    state_prefix_bounds(AUDIOBOOK_CACHE_NAMES_PREFIX),
+                ).fetchall()
+            }
+    except sqlite3.Error:
+        return None
+    root = Path(cache_dir).expanduser().resolve()
+    in_use: set[Path] = set()
+    for book_id in ids:
+        try:
+            names = json.loads(stored[f"{AUDIOBOOK_CACHE_NAMES_PREFIX}{book_id}"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(names, list):
+            return None
+        in_use.update((root / str(name)).resolve() for name in names)
+    return in_use

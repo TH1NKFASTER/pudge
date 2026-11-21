@@ -11,6 +11,7 @@ from pudge.syncing import (
     _stt_alass_map_safe,
     _stt_alass_transition_safety,
 )
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def _bleach_transient_excursion(tmp_path: Path) -> tuple[Path, Path]:
@@ -218,7 +219,6 @@ def test_upgrade_requeues_cached_bleach_style_unsafe_stt_selection(tmp_path: Pat
     assert manager._requeue_unsafe_stt_transition_maps() == 1
     row = manager.db.episode_by_path(video)
     assert row is not None
-    assert row.subtitle_path is None
-    assert row.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert manager.db.get_state("subtitle_stt_transition_safety_generation", "") == "1"
     assert manager._requeue_unsafe_stt_transition_maps() == 0

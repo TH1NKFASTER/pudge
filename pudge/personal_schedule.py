@@ -316,22 +316,6 @@ def preserve_committed_items(
     return result
 
 
-def materialize_weekly_items(
-    episodes: list[int] | tuple[int, ...],
-    *,
-    start_local_datetime: str,
-    timezone_iana: str,
-) -> list[PersonalReleaseItem]:
-    """Backward-compatible weekly planner used by older callers/tests."""
-
-    return materialize_schedule_items(
-        episodes,
-        start_local_datetime=start_local_datetime,
-        timezone_iana=timezone_iana,
-        rule=PersonalReleaseRule(),
-    )
-
-
 def local_iso_from_epoch(value: float, timezone_iana: str) -> str:
     zone = validate_timezone(timezone_iana)
     return (
@@ -387,18 +371,29 @@ def preview_schedule_dates(
     ]
 
 
-def preview_weekly_dates(
-    *,
-    start_local_datetime: str,
-    timezone_iana: str,
-    count: int = 3,
-) -> list[dict[str, object]]:
-    """Backward-compatible ordinal preview for the original weekly UI."""
+READY_BEFORE_PLAYBACK = "ready_before_previous_playback"
 
-    episodes = list(range(1, max(1, int(count)) + 1))
-    return preview_schedule_dates(
-        episodes,
-        start_local_datetime=start_local_datetime,
-        timezone_iana=timezone_iana,
-        rule=PersonalReleaseRule(),
+
+def ready_marker_is_stale(schedule: PersonalReleaseSchedule, episode: int, value: str) -> bool:
+    """A "ready before the previous playback" marker set while ``episode`` was locked.
+
+    Older builds set it for the next episode of a batch on a schedule whenever the
+    previous one was played, so every unlock after the first stayed silent. Such a
+    marker is wrong when the episode is still locked, or when the previous episode
+    was finished before this one unlocked (playback started even earlier).
+    """
+    if value != READY_BEFORE_PLAYBACK:
+        return False
+    items = list(schedule.items)
+    index = next((i for i, row in enumerate(items) if int(row.episode) == int(episode)), None)
+    if index is None:
+        return False
+    item = items[index]
+    if not item.unlocked:
+        return True
+    previous = items[index - 1] if index > 0 else None
+    return bool(
+        previous is not None
+        and previous.watched_at is not None
+        and float(previous.watched_at) < float(item.unlock_at_utc)
     )

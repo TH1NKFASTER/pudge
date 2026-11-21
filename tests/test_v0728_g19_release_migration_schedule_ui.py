@@ -8,6 +8,7 @@ from pathlib import Path
 
 from source_policy import source
 from t71g01_support import Recorder, build_release, load_workflow, release_history, run_step, workflow_step
+from repository_files import in_repository
 
 ROOT = Path(__file__).parents[1]
 NOW = 1_790_856_000  # the page's clock: 2026-10-01 12:00 UTC
@@ -101,8 +102,8 @@ def test_release_ci_runs_the_same_quality_gate_as_a_local_release(tmp_path: Path
 
 
 def test_legacy_migrator_is_a_packaged_step_of_the_installer() -> None:
-    assert not (ROOT / "brand_migration.py").exists()
-    assert not (ROOT / "rename_brand.py").exists()
+    assert not in_repository("brand_migration.py")
+    assert not in_repository("rename_brand.py")
     history = release_history()
     project, install = history.projects["9.8.6"], history.steps["install"].result
     migrator = str(project / "pudge/legacy_install.py")

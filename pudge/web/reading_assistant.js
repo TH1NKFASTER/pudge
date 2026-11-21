@@ -3,6 +3,9 @@
 // opens it with the structured grammar analysis as the first assistant
 // message; the learner can then ask follow-up questions about the sentence.
 // The panel can be collapsed to a tab on the right edge and expanded again.
+// In the light-novel reader the green button docks it to an edge of the window
+// (right; dragged to the left or bottom edge): the book's box ends where the chat
+// starts, the inner edge sets its width (height at the bottom).
 (() => {
   const g = globalThis;
   const API = () => g.window?.pywebview?.api || g.pywebview?.api;
@@ -21,6 +24,16 @@
   const DEFAULT_WIDTH = 420;
   const MIN_WIDTH = 300;
   const MIN_HEIGHT = 260;
+  const DOCK_KEY = 'pudge.assistant.dock.v1';
+  const DOCK_EDGES = ['right', 'left', 'bottom'];
+  const DOCK_DEFAULT = {side: 420, bottom: 320};
+  const DOCK_MIN = {side: 300, bottom: 180};
+  // The book keeps at least this much of the window next to the docked chat.
+  const DOCK_TEXT_MIN = {side: 320, bottom: 200};
+  // A docked chat dragged by its header this close to an edge docks there on release.
+  const DOCK_SNAP = 48;
+  const DOCK_DETACH = 8;
+  let dock = null;
   let thread = loadThread();
   let pending = false;
   let generation = 0;
@@ -110,13 +123,14 @@
     root.hidden = true;
     root.innerHTML = `
       <header class="pa-head">
-        <button type="button" class="pa-avatar" data-pa-reset-geometry aria-label="${PudgeI18n.t('assistant.resetAssistantSizeAndPosition')}">✦</button>
         <div class="pa-window-controls">
           <button type="button" class="pa-window-button pa-window-close" data-pa-close><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3 9 9M9 3 3 9"/></svg></button>
           <button type="button" class="pa-window-button pa-window-collapse" data-pa-collapse><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg></button>
+          <button type="button" class="pa-window-button pa-window-dock" data-pa-dock><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3.5 8.5V4.5M3.5 8.5h4M8.5 3.5v4M8.5 3.5h-4"/></svg></button>
         </div>
         <button type="button" class="pa-icon pa-clear" data-pa-new><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 10v7M14 10v7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></button>
         <div class="pa-title"><span data-pa-title></span></div>
+        <button type="button" class="pa-avatar" data-pa-reset-geometry aria-label="${PudgeI18n.t('assistant.resetAssistantSizeAndPosition')}">✦</button>
       </header>
       <div class="pa-messages" data-pa-messages></div>
       <form class="pa-composer" data-pa-form>
@@ -143,6 +157,11 @@
         else form?.dispatchEvent?.(new Event('submit', {bubbles: true, cancelable: true}));
       }
     });
+    const preview = document.createElement('div');
+    preview.id = 'pudgeAssistantDockPreview';
+    preview.className = 'pa-dock-preview';
+    preview.hidden = true;
+    document.body.appendChild(preview);
     const tab = document.createElement('button');
     tab.type = 'button';
     tab.id = 'pudgeAssistantTab';
@@ -178,7 +197,7 @@
   }
 
   function saveGeometry(root) {
-    if (!root?.isConnected || root.hidden) return;
+    if (!root?.isConnected || root.hidden || root.classList.contains('pa-docked')) return;
     const rect = root.getBoundingClientRect();
     try { const value=clampGeometry({x:rect.left,y:rect.top,width:rect.width,height:rect.height});if(g.PudgeUiStorage)g.PudgeUiStorage.set(GEOMETRY_KEY,value);else g.localStorage?.setItem?.(GEOMETRY_KEY, JSON.stringify(value)); }
     catch (_) {}
@@ -197,10 +216,172 @@
 
   function resetGeometry() {
     const root = panel();
+    if (root.classList.contains('pa-docked')) {
+      // Docked: back to the right edge at the default width.
+      Object.assign(dockPrefs(), {edge: 'right', last: 'right', side: DOCK_DEFAULT.side, bottom: DOCK_DEFAULT.bottom});
+      saveDock();
+      keepReaderPlace(syncDock);
+      return null;
+    }
     const next = defaultGeometry();
     applyGeometry(root, next);
     try { if(g.PudgeUiStorage)g.PudgeUiStorage.set(GEOMETRY_KEY,next);else g.localStorage?.setItem?.(GEOMETRY_KEY, JSON.stringify(next)); } catch (_) {}
     return next;
+  }
+
+  function loadDock() {
+    let raw = null;
+    try { raw = g.PudgeUiStorage ? g.PudgeUiStorage.get(DOCK_KEY) : JSON.parse(g.localStorage?.getItem?.(DOCK_KEY) || 'null'); }
+    catch (_) { raw = null; }
+    const edge = DOCK_EDGES.includes(raw?.edge) ? raw.edge : '';
+    return {
+      edge,
+      last: DOCK_EDGES.includes(raw?.last) ? raw.last : (edge || 'right'),
+      side: Number(raw?.side) || DOCK_DEFAULT.side,
+      bottom: Number(raw?.bottom) || DOCK_DEFAULT.bottom,
+    };
+  }
+
+  const dockPrefs = () => dock || (dock = loadDock());
+
+  function saveDock() {
+    const value = {...dockPrefs()};
+    try { if (g.PudgeUiStorage) g.PudgeUiStorage.set(DOCK_KEY, value); else g.localStorage?.setItem?.(DOCK_KEY, JSON.stringify(value)); }
+    catch (_) {}
+  }
+
+  const readerShell = () => document.getElementById('lnReaderShell');
+  const inReader = () => Boolean(readerShell()?.classList?.contains('open'));
+  // Docking is for the light-novel reader only; elsewhere the chat is a window.
+  const dockEdge = () => (inReader() ? dockPrefs().edge : '');
+
+  function dockSize(edge, wanted) {
+    const bottom = edge === 'bottom';
+    const span = Math.max(1, bottom ? window.innerHeight : window.innerWidth);
+    const min = bottom ? DOCK_MIN.bottom : DOCK_MIN.side;
+    const max = Math.max(min, span - (bottom ? DOCK_TEXT_MIN.bottom : DOCK_TEXT_MIN.side));
+    const value = Number(wanted ?? (bottom ? dockPrefs().bottom : dockPrefs().side)) || (bottom ? DOCK_DEFAULT.bottom : DOCK_DEFAULT.side);
+    return Math.round(Math.min(span, Math.max(min, Math.min(max, value))));
+  }
+
+  function dockBox(edge, size = dockSize(edge)) {
+    if (edge === 'bottom') return {x: 0, y: window.innerHeight - size, width: window.innerWidth, height: size};
+    return {x: edge === 'left' ? 0 : window.innerWidth - size, y: 0, width: size, height: window.innerHeight};
+  }
+
+  function placeBox(node, box) {
+    node.style.left = `${box.x}px`;
+    node.style.top = `${box.y}px`;
+    node.style.width = `${box.width}px`;
+    node.style.height = `${box.height}px`;
+    node.style.right = 'auto';
+    node.style.bottom = 'auto';
+  }
+
+  // The part of the window the docked chat leaves to the book (the whole window otherwise).
+  function freeArea() {
+    const area = {left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight};
+    const root = document.getElementById('pudgeAssistant');
+    const edge = root && !root.hidden ? dockEdge() : '';
+    if (!edge) return area;
+    const size = dockSize(edge);
+    if (edge === 'right') area.right -= size;
+    else if (edge === 'left') area.left += size;
+    else area.bottom -= size;
+    return area;
+  }
+
+  // Docked (and shown, in the reader): the chat takes its edge and the reader's box gives
+  // that strip up, so the text in any mode ends exactly at the chat.
+  function syncDock() {
+    const root = document.getElementById('pudgeAssistant');
+    const shell = readerShell();
+    const edge = root && !root.hidden ? dockEdge() : '';
+    const size = edge ? dockSize(edge) : 0;
+    if (shell?.style) {
+      for (const name of DOCK_EDGES) {
+        if (edge === name) {
+          shell.style.setProperty(name, `${size}px`);
+          shell.style.setProperty(`--pa-dock-${name}`, `${size}px`);
+        } else {
+          shell.style.removeProperty(name);
+          shell.style.removeProperty(`--pa-dock-${name}`);
+        }
+      }
+    }
+    if (!root) return edge;
+    const wasDocked = root.classList.contains('pa-docked');
+    root.classList.toggle('pa-in-reader', inReader());
+    root.classList.toggle('pa-docked', Boolean(edge));
+    for (const name of DOCK_EDGES) root.classList.toggle(`pa-docked-${name}`, edge === name);
+    if (edge) placeBox(root, dockBox(edge, size));
+    else if (wasDocked && !root.hidden) applyGeometry(root);
+    dockLabel(root);
+    return edge;
+  }
+
+  // The words in the middle of the reader stay where they were while its box changes size.
+  function keepReaderPlace(change) {
+    const scroll = document.getElementById('lnReaderScroll');
+    const reader = document.getElementById('lnReader');
+    let place = null;
+    if (scroll && reader && inReader()) {
+      const view = scroll.getBoundingClientRect();
+      // Under the floating chat too: the topmost element of the book at the middle of the view.
+      const x = view.left + view.width / 2, y = view.top + view.height / 2;
+      const hits = document.elementsFromPoint?.(x, y) || [document.elementFromPoint?.(x, y)];
+      const node = hits.find(hit => hit && reader.contains(hit))?.closest?.('[data-ln-token],[data-ln-paragraph]');
+      if (node && reader.contains(node) && view.width > 0 && view.height > 0) {
+        const box = node.getClientRects?.()[0] || node.getBoundingClientRect();
+        place = {node, fx: (box.left - view.left) / view.width, fy: (box.top - view.top) / view.height};
+      }
+    }
+    const result = change();
+    if (place?.node?.isConnected) {
+      const view = scroll.getBoundingClientRect();
+      const box = place.node.getClientRects?.()[0] || place.node.getBoundingClientRect();
+      const dx = box.left - (view.left + place.fx * view.width);
+      const dy = box.top - (view.top + place.fy * view.height);
+      if (Math.abs(dx) >= 1) scroll.scrollLeft += dx;
+      if (Math.abs(dy) >= 1) scroll.scrollTop += dy;
+    }
+    return result;
+  }
+
+  function setDock(edge) {
+    const prefs = dockPrefs();
+    prefs.edge = DOCK_EDGES.includes(edge) ? edge : '';
+    if (prefs.edge) prefs.last = prefs.edge;
+    saveDock();
+    return keepReaderPlace(syncDock);
+  }
+
+  // Green button: dock to the last edge (right at first) / back to a window.
+  function toggleDock() {
+    if (!inReader()) return '';
+    return setDock(dockEdge() ? '' : dockPrefs().last || 'right');
+  }
+
+  function dockLabel(root) {
+    const button = root?.querySelector?.('[data-pa-dock]');
+    if (!button) return;
+    const title = PudgeI18n.t(root.classList.contains('pa-docked') ? 'assistant.undock' : 'assistant.dockToTheScreenEdge');
+    button.title = title;
+    button.setAttribute('aria-label', title);
+  }
+
+  function snapEdge(x, y) {
+    if (x >= window.innerWidth - DOCK_SNAP) return 'right';
+    if (x <= DOCK_SNAP) return 'left';
+    if (y >= window.innerHeight - DOCK_SNAP) return 'bottom';
+    return '';
+  }
+
+  function showPreview(edge) {
+    const preview = document.getElementById('pudgeAssistantDockPreview');
+    if (!preview) return;
+    preview.hidden = !edge;
+    if (edge) placeBox(preview, dockBox(edge));
   }
 
   function installGeometry(root) {
@@ -213,18 +394,34 @@
     head.addEventListener('pointerdown', event => {
       if (event.button !== 0 || event.target.closest('button,input,textarea,select,a')) return;
       const rect = root.getBoundingClientRect();
-      drag = {id:event.pointerId, dx:event.clientX-rect.left, dy:event.clientY-rect.top, width:rect.width, height:rect.height};
+      drag = {id:event.pointerId, dx:event.clientX-rect.left, dy:event.clientY-rect.top, width:rect.width, height:rect.height,
+        startX:event.clientX, startY:event.clientY, docked:root.classList.contains('pa-docked'), snap:'', moved:false};
       head.setPointerCapture?.(event.pointerId);
       root.classList.add('pa-dragging');
       event.preventDefault();
     });
     head.addEventListener('pointermove', event => {
       if (!drag || event.pointerId !== drag.id) return;
+      if (drag.docked && !drag.moved) {
+        if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < DOCK_DETACH) return;
+        // Off the edge: a window of its own size again, under the pointer.
+        const floating = loadGeometry();
+        drag.dx = Math.max(12, Math.min(floating.width - 60, drag.dx));
+        drag.dy = Math.max(4, Math.min(30, drag.dy));
+        drag.width = floating.width; drag.height = floating.height;
+        dockPrefs().edge = '';
+        keepReaderPlace(syncDock);
+      }
+      drag.moved = true;
       applyGeometry(root, {x:event.clientX-drag.dx,y:event.clientY-drag.dy,width:drag.width,height:drag.height});
+      if (drag.docked) { drag.snap = snapEdge(event.clientX, event.clientY); showPreview(drag.snap); }
     });
     const finish = event => {
       if (!drag || (event?.pointerId != null && event.pointerId !== drag.id)) return;
-      drag = null; root.classList.remove('pa-dragging'); saveGeometry(root);
+      const {docked, moved, snap} = drag;
+      drag = null; root.classList.remove('pa-dragging'); showPreview('');
+      if (docked && moved) { if (snap) { setDock(snap); return; } saveDock(); }
+      saveGeometry(root);
     };
     head.addEventListener('pointerup', finish);
     head.addEventListener('pointercancel', finish);
@@ -233,8 +430,9 @@
     resize.addEventListener('pointerdown', event => {
       if (event.button !== 0) return;
       const rect = root.getBoundingClientRect();
+      const docked = dockEdge() && root.classList.contains('pa-docked') ? dockEdge() : '';
       sizing = {id:event.pointerId, x:rect.left, y:rect.top, width:rect.width, height:rect.height,
-        startX:event.clientX, startY:event.clientY, edge:resize.dataset.paResize};
+        startX:event.clientX, startY:event.clientY, edge:resize.dataset.paResize, docked, size:docked ? dockSize(docked) : 0};
       resize.setPointerCapture?.(event.pointerId);
       event.preventDefault(); event.stopPropagation();
     });
@@ -242,6 +440,12 @@
       if (!sizing || event.pointerId !== sizing.id) return;
       const {edge, x, y, width, height} = sizing;
       const dx = event.clientX - sizing.startX, dy = event.clientY - sizing.startY;
+      if (sizing.docked) {
+        const wanted = sizing.docked === 'right' ? sizing.size - dx : sizing.docked === 'left' ? sizing.size + dx : sizing.size - dy;
+        dockPrefs()[sizing.docked === 'bottom' ? 'bottom' : 'side'] = dockSize(sizing.docked, wanted);
+        keepReaderPlace(syncDock);
+        return;
+      }
       const next = clampGeometry({x, y,
         width:width + (edge.includes('e') ? dx : edge.includes('w') ? -dx : 0),
         height:height + (edge.includes('s') ? dy : edge.includes('n') ? -dy : 0)});
@@ -251,19 +455,22 @@
     });
     const finishSize = event => {
       if (!sizing || event.pointerId !== sizing.id) return;
-      sizing = null; saveGeometry(root);
+      const docked = sizing.docked;
+      sizing = null;
+      if (docked) saveDock(); else saveGeometry(root);
     };
     resize.addEventListener('pointerup', finishSize);
     resize.addEventListener('pointercancel', finishSize);
     }
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => {
-      if (root.hidden || root.classList.contains('pa-dragging')) return;
+      if (root.hidden || root.classList.contains('pa-dragging') || root.classList.contains('pa-docked')) return;
       clearTimeout(root._paResizeSaveTimer);
       root._paResizeSaveTimer = setTimeout(() => saveGeometry(root), 180);
     }) : null;
     observer?.observe?.(root);
     window.addEventListener?.('resize', () => {
       if (root.hidden) return;
+      if (root.classList.contains('pa-docked')) { keepReaderPlace(syncDock); return; }
       const rect = root.getBoundingClientRect();
       applyGeometry(root, {x:rect.left,y:rect.top,width:rect.width,height:rect.height});
       saveGeometry(root);
@@ -281,6 +488,7 @@
     set('[data-pa-reset-geometry]', PudgeI18n.t('assistant.resetAssistantSizeAndPosition'));
     set('[data-pa-collapse]', PudgeI18n.t('ui.collapse'));
     set('[data-pa-close]', PudgeI18n.t('action.close'));
+    dockLabel(root);
     set('[data-pa-send]', PudgeI18n.t('assistant.send'));
     const input = root.querySelector('[data-pa-input]');
     if (input) input.placeholder = PudgeI18n.t('assistant.askAboutThisSentence');
@@ -376,6 +584,7 @@
     collapsed = false;
     root.hidden = false;
     document.getElementById('pudgeAssistantTab').hidden = true;
+    keepReaderPlace(syncDock);
     render();
   }
 
@@ -385,6 +594,7 @@
     if (!root || root.hidden) return false;
     collapsed = true;
     root.hidden = true;
+    keepReaderPlace(syncDock);
     const tab = document.getElementById('pudgeAssistantTab');
     if (tab) { labels(); tab.hidden = false; }
     return true;
@@ -394,8 +604,11 @@
     const root = document.getElementById('pudgeAssistant');
     const tab = document.getElementById('pudgeAssistantTab');
     collapsed = false;
+    const wasShown = Boolean(root && !root.hidden);
     if (root) root.hidden = true;
     if (tab) tab.hidden = true;
+    if (wasShown) keepReaderPlace(syncDock);
+    else syncDock();
   }
 
   function refreshAvailability() {
@@ -466,9 +679,14 @@
       if (result?.ok) {
         reply = {role: 'assistant', content: String(result.reply || '')};
       } else {
+        const transport = {
+          llm_auth: 'reading.grammar.llmAuth',
+          llm_rate_limited: 'reading.grammar.llmRateLimited',
+          llm_service_unavailable: 'reading.grammar.llmUnavailable',
+        }[String(result?.reason || '')];
         const why = result?.reason === 'llm_disabled'
           ? (PudgeI18n.t('assistant.enableTheLlmInSettings'))
-          : (PudgeI18n.t('assistant.couldNotGetAnAnswer'));
+          : PudgeI18n.t(transport || 'assistant.couldNotGetAnAnswer');
         reply = {role: 'assistant', content: `${why}${result?.detail ? `\n\n\`${result.detail}\`` : ''}`, error: true};
       }
     } catch (error) {
@@ -502,6 +720,7 @@
     if (target.closest('[data-pa-reset-geometry]')) { resetGeometry(); return; }
     if (target.closest('[data-pa-close]')) { close(); return; }
     if (target.closest('[data-pa-collapse]')) { collapse(); return; }
+    if (target.closest('[data-pa-dock]')) { toggleDock(); return; }
     if (target.closest('[data-pa-new]')) { newChat(); return; }
     const copyCode = target.closest('[data-pa-copy-code]');
     if (copyCode) {
@@ -606,8 +825,24 @@
     copyText,
     resetGeometry,
     refreshAvailability,
+    toggleDock,
+    dockEdge: () => {
+      const root = document.getElementById('pudgeAssistant');
+      return root && !root.hidden ? dockEdge() : '';
+    },
+    freeArea,
     state: () => ({thread, pending, collapsed}),
   };
   refreshAvailability();
+  // The reader opening or closing docks / releases the chat.
+  const shell = readerShell();
+  if (shell && typeof MutationObserver === 'function') {
+    let open = inReader();
+    new MutationObserver(() => {
+      if (inReader() === open) return;
+      open = inReader();
+      syncDock();
+    }).observe(shell, {attributes: true, attributeFilter: ['class']});
+  }
   window.addEventListener?.('pywebviewready', refreshAvailability);
 })();

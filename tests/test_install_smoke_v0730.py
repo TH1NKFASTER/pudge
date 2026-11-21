@@ -71,7 +71,7 @@ def test_alias_refresh_failure_preserves_a_successful_install(tmp_path):
     # policy: install.sh cannot be sourced; this block runs alone with a failing python.
     source = source_policy.source("install.sh")
     start = source.index('"$VENV_DIR/bin/python" "$PROJECT_DIR/pudge/mac_app_aliases.py"')
-    end = source.index("killall Dock", start)
+    end = source.index("\n", source.index("old Dock aliases could not be refreshed", start)) + 1
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     python = venv / "bin/python"

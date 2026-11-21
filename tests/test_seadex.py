@@ -33,8 +33,8 @@ def test_parse_real_response():
 def test_match_is_exact_hash_or_nyaa_id_never_group():
     rec = sd.parse_entries(165790, _with_best_nyaa(SAMPLE), fetched_at=1.0)
     assert rec.match(HASH_B.upper()) == "preferred"
-    assert rec.match("", "https://nyaa.si/view/1880265") == "alternative"
-    assert rec.match("f" * 40, "https://nyaa.si/view/999") == ""
+    assert rec.match("", "https://releases.invalid/view/1880265") == "alternative"
+    assert rec.match("f" * 40, "https://releases.invalid/view/999") == ""
     assert sd.bonus_for(rec, HASH_B)[0] == sd.PREFERRED_BONUS
     assert sd.bonus_for(rec, HASH_A)[1] == ["seadex-exact", "seadex-alternative", "seadex-bonus=40"]
     assert sd.bonus_for(rec, "f" * 40) == (0.0, [])
@@ -58,7 +58,7 @@ def test_cache_ttls_and_errors(tmp_path):
         calls.append(params["filter"])
         return responses.pop(0) if responses else (403, None)
 
-    client = sd.SeaDexClient(tmp_path, fetch=fetch, now=clock)
+    client = sd.SeaDexClient(tmp_path, base_url="https://recommendations.invalid", fetch=fetch, now=clock)
     assert client.recommendations(165790).status == "found"
     assert client.recommendations(165790).status == "found" and len(calls) == 1, "24 h cache"
     assert client.recommendations(2).status == "missing"
@@ -101,7 +101,7 @@ def test_score_release_bonus_is_additive_and_not_doubled(monkeypatch):
     def release(info_hash):
         return NyaaRelease(
             title="[SubsPlease] 365 Days to the Wedding - 01 (1080p) [ABCD1234].mkv",
-            link="https://nyaa.si/view/1",
+            link="https://releases.invalid/view/1",
             torrent_url="",
             info_hash=info_hash,
             size_text="1.4 GiB",

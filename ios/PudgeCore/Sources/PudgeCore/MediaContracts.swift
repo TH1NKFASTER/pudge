@@ -19,13 +19,18 @@ public struct StudyToken: Codable, Hashable {
     /// Mature/mastered on Jiten.
     public var isMature: Bool { flags & 4 != 0 || state == 3 }
     public var key: String { "\(wordId):\(readingIndex)" }
+    /// Due for review on Jiten (the Mac's state code 2 is its "due" word state).
+    public var isDue: Bool { state == 2 || wordState == "due" }
     /// The Mac reader's word state (flags bits 7-10, one of `ReaderLook.wordStates`); nil from older Macs.
     public var wordState: String? {
         let index = (flags >> 7) & 15
         return index > 0 && index <= ReaderLook.wordStates.count ? ReaderLook.wordStates[index - 1] : nil
     }
     /// JitenMPV KnownState (0 New, 1 Young, 2 Mature, 3 Blacklisted, 4 Due, 5 Mastered, 6 Redundant, 7 Suspended).
+    /// A due word is Due whatever else it is, as on the Mac (older Macs sent e.g. Mastered for a
+    /// mastered-and-due word: its subtitle colour said Mastered while the reader said Due).
     public var jitenState: Int {
+        if isDue { return 4 }
         let encoded = (flags >> 3) & 15
         if encoded > 0 { return encoded - 1 }
         switch state { case 1: return 1; case 2: return 4; case 3: return flags & 4 != 0 ? 5 : 2; case 4: return 3; default: return 0 }
@@ -109,6 +114,9 @@ public struct StudyStateRow: Codable, Hashable {
     public let state: Int
     public let flags: Int
     public var key: String { "\(wordId):\(readingIndex)" }
+    public init(wordId: Int, readingIndex: Int, state: Int, flags: Int) {
+        self.wordId = wordId; self.readingIndex = readingIndex; self.state = state; self.flags = flags
+    }
     public init(from decoder: Decoder) throws {
         var row = try decoder.unkeyedContainer()
         wordId = try row.decode(Int.self); readingIndex = try row.decode(Int.self)
@@ -156,12 +164,15 @@ public struct ReaderLook: Codable, Hashable {
     public let colors: [String: String]
     /// The Mac reader blurs illustrations until they are tapped.
     public let blurImages: Bool?
+    /// false: "Auto-bookmark after 20 s" is off on the Mac, so no automatic read markers.
+    public let autoBookmarks: Bool?
     public init(markStyle: String = "underline", showFurigana: Bool = true, font: String = "mincho", lineHeight: Double = 1.9,
                 textColor: String = "#c9c7c2", backgroundColor: String = "#000000",
                 colors: [String: String] = ReaderLook.defaultColors,
-                blurImages: Bool? = nil) {
+                blurImages: Bool? = nil, autoBookmarks: Bool? = nil) {
         self.markStyle = markStyle; self.showFurigana = showFurigana; self.font = font; self.lineHeight = lineHeight
         self.textColor = textColor; self.backgroundColor = backgroundColor; self.colors = colors; self.blurImages = blurImages
+        self.autoBookmarks = autoBookmarks
     }
     /// The Mac's nine word states (Jiten's, "not_in_deck" = New and in no study deck).
     public static let wordStates = ["new", "not_in_deck", "young", "mature", "mastered", "due", "blacklisted", "suspended", "redundant"]
@@ -187,7 +198,7 @@ public struct ReaderLook: Codable, Hashable {
 }
 
 public struct ParsedText: Codable {
-    public let paragraphs: [TextParagraph]
+    public var paragraphs: [TextParagraph]
     public init(paragraphs: [TextParagraph]) { self.paragraphs = paragraphs }
 }
 
@@ -213,6 +224,12 @@ public struct LightNovelItem: Codable, Hashable, Identifiable {
     public let franchiseTitle: String?
     public let franchiseOrder: Int?
     public let progress: Double?
+    /// Characters of the volume and its AniList year (the Mac card's chips; absent from older Macs).
+    public let characters: Int?
+    public let year: Int?
+    /// The phone assets of its linked audiobooks (absent from older Macs): a finished
+    /// audiobook offers to mark this volume read.
+    public var audioAssetIds: [String]? = nil
 }
 
 public struct LightNovelChapterInfo: Codable, Hashable, Identifiable {
@@ -231,6 +248,29 @@ public struct LightNovelDetail: Codable {
     public let offset: Double
     public let finished: Bool
     public let chapters: [LightNovelChapterInfo]
+    /// The volume's "read up to here" marker (older Macs send none).
+    public var marker: ReadMarker? = nil
+}
+
+/// The "read up to here" marker of a volume, one for the Mac and every iPhone/iPad
+/// (pudge/ln_read_marker.py): `paragraph` is the reader paragraph, `paragraphOffset` the
+/// UTF-16 offset in its text, `kind` "manual" (Read up to here) or "auto" (reading on, the
+/// audio), `at` when (seconds), `here` set on this device.
+public struct ReadMarker: Codable, Hashable {
+    public let chapter: Int
+    public let paragraph: Int
+    public let paragraphOffset: Int
+    public let char: Int?
+    public let kind: String
+    public let at: Double
+    public let device: String?
+    public let deviceName: String?
+    public let here: Bool?
+    public init(chapter: Int, paragraph: Int, paragraphOffset: Int, char: Int? = nil, kind: String, at: Double,
+                device: String? = nil, deviceName: String? = nil, here: Bool? = nil) {
+        self.chapter = chapter; self.paragraph = paragraph; self.paragraphOffset = paragraphOffset; self.char = char
+        self.kind = kind; self.at = at; self.device = device; self.deviceName = deviceName; self.here = here
+    }
 }
 
 public struct ChapterText: Codable {
@@ -303,6 +343,28 @@ public struct MangaPageText: Codable {
     public let regions: [MangaRegion]
 }
 
+/// `media/manga/<id>/spreads`: the pages that are one wide picture (a double-page spread, shown
+/// alone in the two-page view), the usual page's height / width (nil: not known), the
+/// volume's "Shift pairs by one page" and "Align scanned pages" and the pages' transforms (nil:
+/// an older Mac, or one that cannot work them out). The Mac also sends its `spreads` table;
+/// the phone makes the same one (MangaSpreads.spreads).
+public struct MangaSpreadPages: Codable, Equatable, Sendable {
+    public let wide: [Int]
+    public let aspect: Double?
+    public let shift: Bool?
+    public let align: Bool?
+    public let alignment: MangaAlignment?
+    public init(wide: [Int], aspect: Double?, shift: Bool? = nil, align: Bool? = nil, alignment: MangaAlignment? = nil) {
+        self.wide = wide; self.aspect = aspect; self.shift = shift; self.align = align; self.alignment = alignment
+    }
+}
+
+/// `POST media/manga/<id>/spreads`: "Shift pairs by one page" on or off for the volume.
+public struct MangaPairShiftRequest: Codable { public let shift: Bool; public init(shift: Bool) { self.shift = shift } }
+
+/// `POST media/manga/<id>/spreads`: "Align scanned pages" on or off for the volume.
+public struct MangaPageAlignRequest: Codable { public let align: Bool; public init(align: Bool) { self.align = align } }
+
 // MARK: Video
 
 public struct EpisodeItem: Codable, Hashable, Identifiable {
@@ -318,6 +380,90 @@ public struct EpisodeItem: Codable, Hashable, Identifiable {
     public let preparing: Bool
     /// Changes when the Mac's subtitle changes.
     public let subtitleRevision: String?
+    /// The Mac shows raw subtitles it could not align (timing may be off). Absent from older Macs.
+    public let subtitleNotAligned: Bool?
+    /// The copies the phone may download or stream, with their sizes (absent from older Macs).
+    public let qualities: [VideoQualityOption]?
+    /// The Mac's mpv delay for this subtitle (ms, + later); absent from older Macs.
+    public let subtitleDelayMs: Int?
+    /// Detected opening/ending of the file (the Skip button); absent from older Macs.
+    public let skipSegments: [SkipSegment]?
+    /// An episode kept on the device that the Mac no longer lists (the Watch list builds these
+    /// on every redraw: no JSON round trip, nothing that can trap).
+    public init(id: Int, mediaId: Int, number: Int, title: String, episodeTitle: String, watched: Bool,
+                position: Double, duration: Double, prepared: Bool, preparing: Bool,
+                subtitleRevision: String? = nil, subtitleNotAligned: Bool? = nil, qualities: [VideoQualityOption]? = nil,
+                subtitleDelayMs: Int? = nil, skipSegments: [SkipSegment]? = nil) {
+        self.id = id; self.mediaId = mediaId; self.number = number; self.title = title; self.episodeTitle = episodeTitle
+        self.watched = watched; self.position = position; self.duration = duration; self.prepared = prepared; self.preparing = preparing
+        self.subtitleRevision = subtitleRevision; self.subtitleNotAligned = subtitleNotAligned; self.qualities = qualities
+        self.subtitleDelayMs = subtitleDelayMs; self.skipSegments = skipSegments
+    }
+}
+
+/// A copy of an episode: the original or a smaller re-encode the Mac makes (to keep more
+/// episodes on the device, like a video site's download quality).
+public enum VideoQuality: String, CaseIterable, Codable, Sendable {
+    case original, smaller, saver
+
+    public static let downloadKey = "pudge.downloadQuality"
+    public static let streamKey = "pudge.streamQuality"
+
+    /// Only the resolution (the pickers and the Download menu): "720p", "540p". The original keeps
+    /// the file's own resolution, which differs between releases, so it stays "Original".
+    public var title: String {
+        switch self {
+        case .original: return "Original"
+        case .smaller: return "720p"
+        case .saver: return "540p"
+        }
+    }
+
+    /// Bits per second of a re-encode (video + audio, as the Mac makes it); nil: the original.
+    public var bitsPerSecond: Double? {
+        switch self {
+        case .original: return nil
+        case .smaller: return (1400 + 96) * 1000
+        case .saver: return (750 + 64) * 1000
+        }
+    }
+
+    /// Bytes of a re-encode of `seconds` (nil: the original, or no duration).
+    public func estimatedBytes(seconds: Double) -> Int64? {
+        guard let bitsPerSecond, seconds.isFinite, seconds > 0 else { return nil }
+        return Int64(bitsPerSecond / 8 * seconds * 1.015)
+    }
+
+    /// The choice kept in Settings (`key`); the original when none was made.
+    public static func stored(_ key: String, _ defaults: UserDefaults = .standard) -> VideoQuality {
+        defaults.string(forKey: key).flatMap(VideoQuality.init(rawValue:)) ?? .original
+    }
+
+    /// The size the phone shows for this copy: the Mac's (exact once prepared), else estimated
+    /// from the episode's duration; nil: not known (an original not sized by the Mac yet).
+    public func size(in options: [VideoQualityOption]?, durationSeconds: Double) -> (bytes: Int64, estimated: Bool)? {
+        if let option = options?.first(where: { $0.id == rawValue }), let bytes = option.sizeBytes, bytes > 0 {
+            return (bytes: bytes, estimated: option.estimated ?? false)
+        }
+        return estimatedBytes(seconds: durationSeconds).map { (bytes: $0, estimated: true) }
+    }
+}
+
+/// The Mac's word on one copy of an episode.
+public struct VideoQualityOption: Codable, Hashable, Sendable {
+    public let id: String
+    public let sizeBytes: Int64?
+    public let prepared: Bool?
+    public let estimated: Bool?
+    public init(id: String, sizeBytes: Int64?, prepared: Bool?, estimated: Bool?) {
+        self.id = id; self.sizeBytes = sizeBytes; self.prepared = prepared; self.estimated = estimated
+    }
+}
+
+/// `POST media/episodes/<id>/prepare|stream`: the copy wanted (nil: the original, `{}` as before).
+public struct VideoQualityRequest: Codable, Sendable {
+    public let quality: String?
+    public init(_ quality: VideoQuality) { self.quality = quality == .original ? nil : quality.rawValue }
 }
 
 public struct ResourceRef: Codable, Hashable {
@@ -336,6 +482,9 @@ public struct EpisodeState: Codable {
     public let message: String
     public let video: ResourceRef?
     public let durationMs: Int64?
+    /// The copy this state is about and every copy's size (absent from older Macs).
+    public let quality: String?
+    public let qualities: [VideoQualityOption]?
 }
 
 public struct SubtitleCue: Codable, Hashable {
@@ -400,7 +549,12 @@ public struct StudyActionResult: Codable {
     public let ok: Bool
     public let outcome: String
     public let message: String
-    public init(ok: Bool, outcome: String, message: String) { self.ok = ok; self.outcome = outcome; self.message = message }
+    /// The word's state after the grade or add, `[wordId, readingIndex, state, flags]`; nil from
+    /// older Macs or when Jiten's answer was not fresh (the phone then asks for it).
+    public let row: StudyStateRow?
+    public init(ok: Bool, outcome: String, message: String, row: StudyStateRow? = nil) {
+        self.ok = ok; self.outcome = outcome; self.message = message; self.row = row
+    }
 }
 
 /// The Mac's personal weekly schedule for a title.
@@ -417,11 +571,54 @@ public struct AnimeGroup: Codable, Hashable, Identifiable {
     public let progress: Int
     public let total: Int?
     public let schedule: AnimeSchedule?
+    /// Ongoing on the Mac (airing, a personal schedule, or its New episodes ready); nil from an older Mac.
+    public let airing: Bool?
+    /// A movie on AniList (the Mac's "Movie • resume at …"); nil from an older Mac.
+    public let movie: Bool?
     public var episodes: [EpisodeItem]
     public var id: String { mediaId > 0 ? "anime:\(mediaId)" : "title:\(title):\(episodes.first?.id ?? 0)" }
-    public init(mediaId: Int, title: String, progress: Int = 0, total: Int? = nil, schedule: AnimeSchedule? = nil, episodes: [EpisodeItem]) {
-        self.mediaId = mediaId; self.title = title; self.progress = progress; self.total = total; self.schedule = schedule; self.episodes = episodes
+    public init(mediaId: Int, title: String, progress: Int = 0, total: Int? = nil, schedule: AnimeSchedule? = nil, airing: Bool? = nil,
+                movie: Bool? = nil, episodes: [EpisodeItem]) {
+        self.mediaId = mediaId; self.title = title; self.progress = progress; self.total = total; self.schedule = schedule
+        self.airing = airing; self.movie = movie; self.episodes = episodes
     }
+}
+
+/// A Mac Home card of a title with nothing to play yet (GET media/anime `home`; nil from an older Mac).
+/// `section`: the Mac's caught_up, needs_action, waiting or download_available; `status`: its episode
+/// presentation (downloading, waiting_subtitles, missing, …); `nextAt`: next airing or unlock (seconds).
+/// `actionCode` / `extraKinds`: an Action required card's reason; `downloadKind`: its torrent's state as
+/// the Mac card names it (downloading, paused, waiting, stalled, checking, error, finished, unknown);
+/// `queuedRelease`: a release waits for torrents to be turned on. Absent from older Macs.
+public struct MacHomeCard: Codable, Hashable, Identifiable {
+    public let mediaId: Int
+    public let title: String
+    public let progress: Int
+    public let total: Int?
+    public let section: String
+    public let status: String?
+    public let nextEpisode: Int?
+    public let nextAt: Double?
+    public let downloadFraction: Double?
+    public let downloadKind: String?
+    public let queuedRelease: Bool?
+    public let actionCode: String?
+    public let extraKinds: [String]?
+    public var id: Int { mediaId }
+    public init(mediaId: Int, title: String, progress: Int = 0, total: Int? = nil, section: String, status: String? = nil,
+                nextEpisode: Int? = nil, nextAt: Double? = nil, downloadFraction: Double? = nil, downloadKind: String? = nil,
+                queuedRelease: Bool? = nil, actionCode: String? = nil, extraKinds: [String]? = nil) {
+        self.mediaId = mediaId; self.title = title; self.progress = progress; self.total = total; self.section = section
+        self.status = status; self.nextEpisode = nextEpisode; self.nextAt = nextAt; self.downloadFraction = downloadFraction
+        self.downloadKind = downloadKind; self.queuedRelease = queuedRelease; self.actionCode = actionCode; self.extraKinds = extraKinds
+    }
+}
+
+/// The Mac Home's Caught up and its Waiting / Available to download titles, in the Mac's order.
+public struct MacHomeShelves: Codable, Hashable {
+    public let caughtUp: [MacHomeCard]
+    public let waiting: [MacHomeCard]
+    public init(caughtUp: [MacHomeCard], waiting: [MacHomeCard]) { self.caughtUp = caughtUp; self.waiting = waiting }
 }
 
 // MARK: JitenMPV look for subtitles
@@ -558,6 +755,11 @@ public struct StatsSummary: Codable {
     public let works: [StatsWork]
     /// Stats cards (longest streak, words met ...); absent from older Macs.
     public let highlights: StatsHighlights?
+    /// The Mac's kept copy while it rebuilds a newer one (asked again a moment later); absent
+    /// from older Macs.
+    public let stale: Bool?
+    /// When the Mac built this copy (seconds since 1970); absent from older Macs.
+    public let builtAt: Double?
 }
 
 /// A day, a session or a work named in the fun stats (only the fields that apply are set).

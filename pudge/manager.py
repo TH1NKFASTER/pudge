@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import datetime
 import email.utils
@@ -8,14 +9,16 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
-from contextlib import contextmanager
-from dataclasses import replace
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, replace
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 import httpx
 from rapidfuzz import fuzz
@@ -23,35 +26,69 @@ from rapidfuzz import fuzz
 
 if TYPE_CHECKING:
     from .providers.seadex import SeaDexRecommendation
-from .anilist_tracking import flush_pending_progress
+from .anilist_tracking import (
+    flush_pending_progress,
+    flush_pending_scores,
+    flush_pending_statuses,
+    pending_progress_by_media,
+    pending_scores,
+    pending_statuses,
+)
 from . import disk_space
+from .fsutil import atomic_write_bytes
+from .personal_schedule import READY_BEFORE_PLAYBACK, ready_marker_is_stale
+from .backup import prune_one_off_copies
 from .cache_management import enforce_derived_caches, purge_episode_derived_files
 from .cache_registry import CacheRegistry
 from .config import AppConfig
 from .branding import APP_SLUG, LEGACY_APP_NAMES, LEGACY_APP_SLUGS
-from .database import Database, reused_connection
-from .filename import parse_anime_filename, title_similarity
+from .database import (
+    EXTRA_FILE_ACTION_CODES,
+    STATE_PREFIX_SQL,
+    Database,
+    reused_connection,
+    state_prefix_bounds,
+)
+from .database_storage import maintain_database_storage
+from .filename import (
+    looks_like_release_name,
+    parse_anime_filename,
+    release_name_display_title,
+    title_similarity,
+    with_title_memo,
+)
 from .language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS
 from .jimaku_trial import apply_jimaku_trial
 from .identity import IdentityResolver, MediaIdentity
 from .library import (
     VIDEO_EXTENSIONS,
+    aria2_control_file,
+    aria2_control_infohash,
     japanese_subtitle_details,
     japanese_subtitle_source,
     scan_library,
+    sidecar_subtitle,
     strict_title_similarity,
+    unfinished_video,
+    user_episode_identity,
+    user_identity_state_key,
 )
 from .runtime import python_executable
 from .download_intents import DownloadIntentStore, UnconfirmedCandidatesError
+from .download_priority import download_order
+from .queued_releases import QueuedReleaseStore
 from .episode_numbering import (
+    automatic_lookups as automatic_numbering_lookups,
+    clear_lookup_failures as clear_numbering_lookup_failures,
     episode_numbering_from_graph,
     media_episode_from_release as shared_media_episode_from_release,
     resolve_episode_numbering,
     match_release_episode,
     is_split_stage,
 )
+from . import extra_files
 from .release_parser import double_episode_span, parse_release_name
-from .episode_state import watched_by_anilist_progress
+from .episode_state import single_unit_title, watched_by_anilist_progress
 from .presentation_state import derive_episode_presentation, download_complete
 from .work_scheduler import WorkPriority, WorkScheduler
 from .torrent_admission import TorrentAdmission
@@ -63,16 +100,29 @@ from .manager_services import ReleaseTelemetryService
 from .notifications import send_native_notification
 from .i18n import err, message as i18n_message, t
 from .pipeline_cache import invalidate_final_pipeline_result
-from .providers.anilist import AniListClient, AniListError, AniListHTTPError
+from .providers.anilist import (
+    ANILIST_USER_AGENT,
+    AniListClient,
+    AniListError,
+    AniListHTTPError,
+    AniListNotFoundError,
+    anilist_refusal,
+    bulk_requests,
+)
 from .providers.nyaa import (
+    NoReleaseSourceError,
     NyaaClient,
     NyaaError,
+    ReleaseSearchUnavailableError,
     SubsPleaseClient,
     ShanaProjectClient,
     fresh_trusted_zero_seeders_allowed,
+    is_camrip_release,
     search_ranked,
     search_shana_ranked,
     search_subsplease_ranked,
+    same_web_encode,
+    seadex_batch_candidates,
     _season_number,
     release_is_safe_batch_candidate,
     release_episode as parsed_release_episode,
@@ -82,6 +132,7 @@ from .providers.nyaa import (
 )
 from .providers.qbittorrent import QBittorrentClient, QBittorrentError
 from .providers.aria2 import Aria2Client
+from .sources import load_sources
 from .relation_graphs import (
     compact_relations_from_graph,
     graph_for_root,
@@ -91,6 +142,7 @@ from .relation_graphs import (
 from .subtitles.jobs import read_job_report
 from .subtitles.selection import upgrade_is_better
 from .subtitle_formats import subtitle_has_genuine_overlaps
+from . import subtitle_migrations
 from .debug_snapshot import (
     append_debug_trace,
     prune_subtitle_debug,
@@ -103,6 +155,34 @@ from .process_priority import mark_background
 
 
 LogFn = Callable[[str], None]
+
+# The release search failure of the last search_releases() call in this thread.
+# The Planning batch step must tell "the release search is unavailable" from
+# "nothing found": search_releases() falls back to the other feeds and returns
+# a list either way (it runs in the caller's thread, so this is per call).
+_RELEASE_SEARCH_OUTCOME = threading.local()
+# Inside AnimeManager.release_search_cancellable(): the check that says whether this
+# thread's release search may go on (Torrent Off cancels the On toggle's search).
+_RELEASE_SEARCH_CANCEL = threading.local()
+# Inside AnimeManager.ignore_auto_search_backoff(): the user asked for a search now (Refresh,
+# "search new releases", Torrents On), so episodes that keep missing are searched too.
+_AUTO_SEARCH_BYPASS = threading.local()
+
+
+# WEBFLOW-8: reconcile_completed_download_rows called by the foreground poll.
+_RECONCILE_FROM_POLL: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "pudge_reconcile_from_poll", default=False
+)
+# WEBFLOW-6: ignore-marker answers per folder for one Home build (library_ignore_memo).
+_IGNORE_ROOT_MEMO: contextvars.ContextVar[dict[str, Path | None] | None] = contextvars.ContextVar(
+    "pudge_ignore_root_memo", default=None
+)
+
+
+@functools.lru_cache(maxsize=16)
+def _root_parts(roots: tuple[Any, ...]) -> frozenset[tuple[str, ...]]:
+    """Components of each root for AnimeManager._path_within (one build reuses one roots tuple)."""
+    return frozenset(root.parts for root in roots if isinstance(root, PurePath))
 
 
 def _reusing_db_connection(method: Any) -> Any:
@@ -118,6 +198,46 @@ def _reusing_db_connection(method: Any) -> Any:
 
 class ManagerError(RuntimeError):
     pass
+
+
+def _identified_anime(media_id: int, entry: dict[str, Any] | None) -> LibraryAnime:
+    """A local row for an AniList entry the person picked for a file (not on their list)."""
+    entry = entry if isinstance(entry, dict) else {}
+
+    def text(key: str, limit: int = 300) -> str:
+        value = entry.get(key)
+        return str(value).strip()[:limit] if isinstance(value, (str, int, float)) else ""
+
+    def number(key: str) -> int | None:
+        try:
+            value = int(entry.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def web_url(key: str) -> str:
+        value = text(key, 2000)
+        return value if value.startswith(("https://", "http://")) else ""
+
+    title = text("title") or f"AniList {int(media_id)}"
+    native = text("native_title")
+    return LibraryAnime(
+        media_id=int(media_id),
+        title=title,
+        titles=[name for name in dict.fromkeys((title, native)) if name],
+        cover_url=web_url("cover"),
+        site_url=web_url("site_url") or f"https://anilist.co/anime/{int(media_id)}",
+        status="",
+        episodes=number("episodes"),
+        format=re.sub(r"[^A-Z_]", "", text("format", 40).upper()) or None,
+        season_year=number("year"),
+        media_status=re.sub(r"[^A-Z_]", "", text("media_status", 40).upper()) or None,
+        duration=number("duration"),
+    )
+
+
+class NotEnoughDiskSpaceError(ManagerError):
+    """A download that would eat into the free-space reserve of the library volume."""
 
 
 def _process_rss_mb(pid: int) -> float | None:
@@ -193,6 +313,103 @@ def _subtitle_retry_is_network_error(detail: str) -> bool:
     )
 
 
+_DETERMINISTIC_VALIDATION_MARKERS = (
+    "all subtitle candidates failed synchronization/validation",
+    "too_many_large_jumps",
+    "full_range_oscillation",
+    "no_stable_offset_cluster",
+    "timeline_validation_failed",
+    "timeline_segment_support_too_low",
+    "timeline_unstable_segments",
+    "timeline_weak_path",
+)
+
+# "Nothing on Jimaku yet" is waiting for an upload, not a failure that repeats.
+_SUBTITLES_NOT_FOUND_MARKERS = (
+    "jimaku: no matching anime found",
+    "jimaku: no sufficiently confident file found",
+    "japanese subtitles not found yet",
+    "subtitles not found yet",
+)
+
+# The same failure this many times in a row (a 20-minute timeout, one error) ends the
+# automatic retries: the job asks the person (Action required) instead.
+SUBTITLE_FAILURE_STREAK_CAP = 5
+SUBTITLE_RETRY_EXHAUSTED = "subtitle_retry_exhausted"
+
+
+def _subtitle_failure_signature(detail: str, prepare_status: str = "") -> str:
+    """Name a failed preparation so equal failures in a row can be counted."""
+    lowered = str(detail or "").casefold()
+    if prepare_status == "waiting_subtitles" or any(
+        marker in lowered for marker in _SUBTITLES_NOT_FOUND_MARKERS
+    ):
+        return "not_found"
+    if any(marker in lowered for marker in _DETERMINISTIC_VALIDATION_MARKERS):
+        return "validation"
+    lines = [line.strip() for line in lowered.splitlines() if line.strip()]
+    last = re.sub(r"\d+", "#", lines[-1] if lines else "")[:240]
+    return "error:" + hashlib.sha1(last.encode("utf-8")).hexdigest()[:12]
+
+
+def _jimaku_lookup_incomplete(detail: str) -> bool:
+    """The Jimaku lookup stopped on an error (unreachable, rate limited): it kept only the
+    candidates found before, so its result says nothing final about the episode."""
+    lowered = str(detail or "").casefold()
+    return "jimaku api error" in lowered or _subtitle_retry_is_rate_limit(lowered)
+
+
+def _upgrade_request_priority(request: dict[str, Any], default: int) -> int:
+    """Queue priority stored with an upgrade check or rebuild, ``default`` without one."""
+    try:
+        return max(0, int(request.get("requeue_priority", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _subtitle_failure_backoff_seconds(*, poll_minutes: float, streak: int) -> float:
+    """The configured interval, doubled for each identical failure before, at most a day."""
+    configured = max(60.0, float(poll_minutes) * 60.0)
+    return min(24 * 3600.0, configured * (2 ** max(0, min(int(streak) - 1, 16))))
+
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _signal_prepare_child(process: Any, sig: int, *, fallback: bool = True) -> None:
+    """Signal a prepare worker together with what it started (ffmpeg, alass, its pool).
+
+    The worker runs in its own process group (``start_new_session``), so the group
+    id is its pid. Stand-ins without a real process get terminate()/kill().
+    """
+    pid = getattr(process, "pid", None)
+    if isinstance(process, _REAL_POPEN) and isinstance(pid, int) and pid > 0 and pid != os.getpgrp():
+        try:
+            os.killpg(pid, sig)
+            return
+        except OSError:
+            pass
+    if not fallback:
+        return
+    if sig == signal.SIGKILL:
+        process.kill()
+    else:
+        process.terminate()
+
+
+def _stop_prepare_child(process: Any) -> None:
+    """SIGTERM to the worker's group, SIGKILL after 5 s; then nothing of it is left."""
+    _signal_prepare_child(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _signal_prepare_child(process, signal.SIGKILL)
+        process.wait(timeout=5)
+    else:
+        # The worker stopped; a child of it that ignored SIGTERM must not run on.
+        _signal_prepare_child(process, signal.SIGKILL, fallback=False)
+
+
 def _subtitle_retry_delay_seconds(
     *,
     poll_minutes: float,
@@ -202,17 +419,7 @@ def _subtitle_retry_delay_seconds(
     """Use the configured interval unless this is a network/service failure."""
     configured = max(1.0, float(poll_minutes) * 60.0)
     deterministic_validation = any(
-        marker in str(detail or "").casefold()
-        for marker in (
-            "all subtitle candidates failed synchronization/validation",
-            "too_many_large_jumps",
-            "full_range_oscillation",
-            "no_stable_offset_cluster",
-            "timeline_validation_failed",
-            "timeline_segment_support_too_low",
-            "timeline_unstable_segments",
-            "timeline_weak_path",
-        )
+        marker in str(detail or "").casefold() for marker in _DETERMINISTIC_VALIDATION_MARKERS
     )
     if deterministic_validation:
         return max(configured, 6 * 3600.0)
@@ -354,6 +561,24 @@ def _download_remaining_bytes(item: Any) -> int | None:
         return None
 
 
+def _download_written_bytes(item: Any) -> int:
+    """Bytes an unfinished download has written so far (0 while unknown)."""
+    raw = getattr(item, "raw", None) or {}
+    try:
+        if raw.get("completed") is not None:  # qBittorrent: done bytes of the wanted files
+            return max(0, int(raw.get("completed") or 0))
+        total = int(raw.get("size") or raw.get("total_size") or 0)
+        if total > 0 and raw.get("amount_left") is not None:
+            return max(0, total - int(raw["amount_left"]))
+        if raw.get("downloaded") is not None:
+            return max(0, int(raw.get("downloaded") or 0))
+        if total > 0:
+            return max(0, int(total * max(0.0, min(1.0, float(getattr(item, "progress", 0.0) or 0.0)))))
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
 def _torrent_app_may_start(method):
     """Adding a torrent may launch a closed qBittorrent; reads and polls never do."""
 
@@ -365,10 +590,45 @@ def _torrent_app_may_start(method):
     return wrapper
 
 
+class AniListSyncResult(list):
+    """The Watching/Planning list of one AniList refresh, and where it came from.
+
+    ``used_cache`` is True when AniList did not answer and the saved list was
+    returned; ``error`` is then AniList's reason. A list subclass, so callers
+    that only want the titles keep working.
+    """
+
+    def __init__(
+        self,
+        items: Iterable[LibraryAnime] = (),
+        *,
+        used_cache: bool = False,
+        warning: str = "",
+        error: str = "",
+    ) -> None:
+        super().__init__(items)
+        self.used_cache = bool(used_cache)
+        self.warning = str(warning or "")
+        self.error = str(error or "")
+
+
 class AnimeManager:
-    def __init__(self, config: AppConfig, log: LogFn | None = None) -> None:
+    _acquisition_keys_lock = threading.Lock()
+
+    def __init__(self, config: AppConfig, log: LogFn | None = None, *, owns_database: bool = False) -> None:
         self.config = config
-        self.db = Database(config.library.database_path)
+        # Only the window owns the library schema (DB-6): the agent and CLI runs open
+        # it without the write lock, schema script and full-file check; the window
+        # decides when quick_check is due (WebAppApi._startup_integrity_check).
+        self.db = Database(
+            config.library.database_path,
+            initialize=owns_database,
+            integrity_check=False,
+            # The window's repository calls (each phone request, every poll) keep one
+            # connection per thread; retire() before a restore closes them.
+            thread_connections=owns_database,
+        )
+        self._owns_database = bool(owns_database)  # the window's manager (not the agent / CLI)
         self.logger = configure_logging()
         self.log = log or self.logger.info
         self.work_scheduler = WorkScheduler(
@@ -380,23 +640,31 @@ class AnimeManager:
         self.identity_resolver = IdentityResolver(self.db)
         self.release_telemetry = ReleaseTelemetryService(self.db)
         self.download_intents = DownloadIntentStore(self.db)
-        self._last_anilist_warning = ""
-        self._last_anilist_used_cache = False
+        self.queued_releases = QueuedReleaseStore(self.db)
+        # Two threads (a manual download and auto_search_current) must not race
+        # the same episode: check-and-add under the lock.
+        self._active_acquisition_keys: set[str] = set()
         self._last_missing_episode_rows = 0
         self._last_completed_video_paths: tuple[Path, ...] = ()
+        # Completed downloads waiting for their OP/ED detection step (request_intro_detection).
+        self._intro_requested: dict[Path, None] = {}
+        self._intro_request_lock = threading.Lock()
+        self._intro_request_thread: threading.Thread | None = None
         feed_cache = config.paths.cache_dir / "release-feeds"
         self._subsplease_client = SubsPleaseClient(
+            base_url=self._weekly_rss_url,
             timeout=8.0,
             cache_ttl=300.0,
             history_path=feed_cache / "subsplease.json",
         )
         self._shana_client = ShanaProjectClient(
+            feed_url=self._release_feed_url,
             timeout=8.0,
             cache_ttl=600.0,
             history_path=feed_cache / "shana.json",
         )
         missing_schedule_repaired = self.db.repair_missing_cleanup_schedule(
-            config.agent.delete_after_watched_hours
+            config.agent.delete_after_watched_hours, library_root=config.library.root_dir
         )
         repaired = self.db.reconcile_watched_cleanup(config.agent.delete_after_watched_hours)
         if missing_schedule_repaired or repaired:
@@ -444,15 +712,6 @@ class AnimeManager:
                 str(exc),
             )
 
-    @staticmethod
-    def _release_provider(release: NyaaRelease) -> str:
-        category = str(release.category_id or "").casefold()
-        if "subsplease" in category:
-            return "subsplease"
-        if "shana" in category:
-            return "shana"
-        return "nyaa"
-
     def _anime_is_fully_ready(self, anime: LibraryAnime) -> bool:
         episodes = self.db.episodes(anime.media_id)
         ready_states = {"ready", "watched"}
@@ -466,7 +725,11 @@ class AnimeManager:
         return all(number in ready_numbers for number in range(1, int(anime.episodes) + 1))
 
     def remember_ready_before_playback(self, video: Path) -> None:
-        """Suppress an unlock notification for the next episode already on disk."""
+        """Suppress the ready notification for a next episode the user can already play.
+
+        On a personal schedule only an already unlocked next episode counts; a
+        locked one still gets its unlock notification later.
+        """
         current = self.db.episode_by_path(video)
         if current is None or current.media_id is None or current.media_episode is None:
             return
@@ -488,13 +751,19 @@ class AnimeManager:
         if ready is None:
             return
         schedule = self.db.personal_release_schedule(current.media_id)
+        if schedule is not None and schedule.enabled:
+            item = next((row for row in schedule.items if int(row.episode) == next_number), None)
+            if item is not None and not item.unlocked:
+                # A batch on a personal schedule has every file on disk, but the
+                # next episode is still locked: its unlock is news and must notify.
+                return
         key = (
             f"personal_schedule_notification:{schedule.schedule_id}:{schedule.cycle_id}:{next_number}:ready"
             if schedule is not None and schedule.enabled
             else f"ready_notification:episode:{current.media_id}:{next_number}"
         )
         if not self.db.get_state(key, ""):
-            self.db.set_state(key, "ready_before_previous_playback")
+            self.db.set_state(key, READY_BEFORE_PLAYBACK)
 
     def _notify_ready_episode(
         self,
@@ -527,7 +796,11 @@ class AnimeManager:
                     )
                     return
                 episode_key = f"personal_schedule_notification:{personal_schedule.schedule_id}:{personal_schedule.cycle_id}:{int(episode)}:ready"
-                if self.db.get_state(episode_key, ""):
+                marker = self.db.get_state(episode_key, "")
+                if marker and ready_marker_is_stale(personal_schedule, int(episode), marker):
+                    self.db.delete_state(episode_key)
+                    marker = ""
+                if marker:
                     return
             else:
                 next_episode = int(anime.next_episode)
@@ -612,44 +885,60 @@ class AnimeManager:
             delivered,
         )
 
-    def sync_anilist(self) -> list[LibraryAnime]:
-        self._last_anilist_warning = ""
-        self._last_anilist_used_cache = False
+    def sync_anilist(self) -> AniListSyncResult:
+        """Refresh the Watching/Planning list from AniList (or keep the saved one).
+
+        The result says itself whether AniList answered (``used_cache``), so a
+        caller never reads a flag another thread's refresh just changed.
+        """
         self._last_missing_episode_rows = 0
         if not self.config.anilist.enabled or not self.config.anilist.access_token:
             self.log("AniList: token is not set; list not refreshed")
-            return self.db.anime_list()
+            return AniListSyncResult(self.db.anime_list())
         self.db.set_state("anilist_last_attempt_at", str(time.time()))
         client = AniListClient(
             self.config.anilist.endpoint,
             access_token=self.config.anilist.access_token,
         )
+        full_list = False
         try:
             try:
                 # Watched episodes that could not reach AniList earlier go
                 # first, so the refreshed list already contains them.
+                flush_pending_statuses(self.db, client, self.logger)
+                flush_pending_scores(self.db, client, self.logger)
                 flush_pending_progress(self.db, client, self.config, self.logger)
             except Exception as exc:  # noqa: BLE001 - the list refresh still runs
                 self.logger.warning("FAIL step=anilist.pending_progress error=%r", exc)
+            # Episodes watched (mpv, iPhone) while the list is on its way are not in it.
+            list_requested_at = time.time()
             try:
                 with timed_step(self.logger, "anilist.library", mode="compact"):
-                    compact_library = getattr(client, "library_compact", None)
-                    items = compact_library() if callable(compact_library) else client.library()
-                other_entries = dict(getattr(client, "last_list_entries", None) or {})
+                    items = self._anilist_library(client)
+                entries = getattr(client, "last_list_entries", None)
+                # Every entry of every list (Completed, Paused, custom lists ...):
+                # only then is "missing from the list" a real removal.
+                full_list = isinstance(entries, dict)
+                if full_list and getattr(client, "last_list_incomplete", False):
+                    # An entry came back without its media: "missing" proves nothing.
+                    full_list = False
+                    self.logger.warning("SKIP step=anilist.list_removal reason=entry_without_media")
+                other_entries = dict(entries or {})
+                media_of_entries = getattr(client, "last_list_media", None)
+                other_media = dict(media_of_entries) if isinstance(media_of_entries, dict) else {}
             except AniListError as exc:
                 cached = self.db.anime_list(("CURRENT", "PLANNING"))
                 if not cached:
                     raise
-                self._last_anilist_used_cache = True
-                self._last_anilist_warning = err("anilist.listFromCache")
+                warning = err("anilist.listFromCache")
                 self.db.set_state("anilist_last_error", str(exc))
-                self.log(f"AniList: {self._last_anilist_warning}: {exc}")
+                self.log(f"AniList: {warning}: {exc}")
                 self.logger.warning(
                     "FALLBACK step=anilist.library cached=%s error=%r",
                     len(cached),
                     exc,
                 )
-                return cached
+                return AniListSyncResult(cached, used_cache=True, warning=warning, error=str(exc))
 
             cached_by_id = {item.media_id: item for item in self.db.anime_list(("CURRENT", "PLANNING"))}
             for item in items:
@@ -669,10 +958,37 @@ class AnimeManager:
                         cached_graph["graph"],
                         item.media_id,
                     )
-            self._last_anilist_warning = str(getattr(client, "last_library_warning", ""))
         finally:
             client.close()
 
+        # A status set in the window that AniList has not received yet stays local.
+        unsent = pending_statuses(self.db)
+        for item in items:
+            if int(item.media_id) in unsent:
+                item.status = unsent[int(item.media_id)]
+        unsent_scores = pending_scores(self.db)
+        for item in items:
+            if int(item.media_id) in unsent_scores:
+                item.user_score = unsent_scores[int(item.media_id)]
+        # So does an episode watched while AniList refused it: without this the
+        # older AniList progress would put the watched episode back to ready.
+        unsent_progress = pending_progress_by_media(self.db)
+        # An episode counted here after the list was requested (the iPhone's or mpv's
+        # watch reached AniList meanwhile): the older list would take it back to ready.
+        for media_id, number in self.db.episodes_watched_since(list_requested_at).items():
+            if number > unsent_progress.get(media_id, 0):
+                unsent_progress[media_id] = number
+        for item in items:
+            queued = unsent_progress.get(int(item.media_id), 0)
+            if queued > int(item.progress or 0):
+                item.progress = queued
+        for media_id, entry in other_entries.items():
+            if int(media_id) in unsent:
+                # Titles outside Watching/Planning keep an unsent status too.
+                entry["status"] = unsent[int(media_id)]
+            queued = unsent_progress.get(int(media_id), 0)
+            if queued > int(entry.get("progress") or 0):
+                entry["progress"] = queued
         list_entries = {
             int(item.media_id): {
                 "status": str(item.status or "").upper(),
@@ -715,24 +1031,243 @@ class AnimeManager:
                     reset,
                 )
             self.db.upsert_anime(item)
-        restored += self._sync_other_list_entries(other_entries, {int(item.media_id) for item in items})
+        restored += self._sync_other_list_entries(
+            other_entries, {int(item.media_id) for item in items}, media=other_media
+        )
+        removed = (
+            self._mark_removed_on_anilist({int(item.media_id) for item in items} | set(other_entries), unsent)
+            if full_list
+            else 0
+        )
         self.db.set_state("anilist_synced_at", str(time.time()))
         self.db.set_state("anilist_last_error", "")
-        self.db.set_state("anilist_last_warning", self._last_anilist_warning)
+        # AniList answers again: automatic searches may look episode numbering up again.
+        clear_numbering_lookup_failures(self.config)
+        self.db.set_state("anilist_last_warning", "")
         self.log(f"AniList: refreshed cards: {len(items)}")
-        if self._last_anilist_warning:
-            self.log(f"AniList: {self._last_anilist_warning}")
+        if removed:
+            self.log(f"AniList: titles removed from the AniList list: {removed}")
         if restored:
             self.log(f"AniList: local episodes unwatched: {restored}; returned to ready")
-        return items
+        return AniListSyncResult(items)
 
-    def _sync_other_list_entries(self, entries: dict[int, dict[str, Any]], refreshed: set[int]) -> int:
+    _ANILIST_LIST_STATUSES = frozenset({"CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"})
+
+    _ANILIST_LIST_IDS_KEY = "anilist_list_ids_v1"
+    # More removals than this in one refresh look like a glitch, not the user.
+    ANILIST_REMOVAL_LIMIT = 5
+
+    def _mark_removed_on_anilist(self, present: set[int], unsent: dict[int, str]) -> int:
+        """Titles deleted from the AniList list (website, phone app) become REMOVED here too.
+
+        Watching/Planning entries removed on anilist.co used to stay CURRENT /
+        PLANNING locally forever: their episodes kept downloading and Planning
+        kept offering premieres. Only a title that was in the previous full list
+        of the same account and is missing now counts as removed, so titles
+        followed locally before AniList was connected stay. Local-only titles
+        (status ""), changes waiting to be sent, an empty list and more than
+        ANILIST_REMOVAL_LIMIT removals at once are never applied.
+        """
+        account = hashlib.sha256(str(self.config.anilist.access_token or "").strip().encode()).hexdigest()
+        if not present:
+            self.logger.warning("SKIP step=anilist.list_removal reason=empty_list")
+            return 0
+        try:
+            stored = json.loads(self.db.get_state(self._ANILIST_LIST_IDS_KEY, "") or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        previous: set[int] | None = None
+        if (
+            isinstance(stored, dict)
+            and stored.get("account") == account
+            and isinstance(stored.get("ids"), list)
+        ):
+            previous = {int(value) for value in stored["ids"] if isinstance(value, int)}
+        self.db.set_state(
+            self._ANILIST_LIST_IDS_KEY,
+            json.dumps({"account": account, "ids": sorted(int(value) for value in present)}),
+        )
+        if previous is None:
+            self.logger.info("DONE step=anilist.list_removal reason=first_list entries=%s", len(present))
+            return 0
+        gone = previous - present
+        rows = [
+            anime
+            for anime in self.db.anime_list()
+            if int(anime.media_id) in gone
+            and int(anime.media_id) not in unsent
+            and (anime.status or "").upper() in self._ANILIST_LIST_STATUSES
+        ]
+        self._forget_returned_anilist_removals(present, account)
+        if len(rows) > self.ANILIST_REMOVAL_LIMIT:
+            self.logger.warning(
+                "SKIP step=anilist.list_removal reason=too_many count=%s media_ids=%s",
+                len(rows),
+                sorted(int(anime.media_id) for anime in rows),
+            )
+            self._hold_anilist_removals(rows, account)
+            return 0
+        for anime in rows:
+            self.db.set_anime_status(int(anime.media_id), "REMOVED")
+            self.logger.info(
+                "EVENT anilist.removed_on_anilist media_id=%s previous_status=%s title=%r",
+                anime.media_id,
+                anime.status,
+                anime.title,
+            )
+        return len(rows)
+
+    _ANILIST_REMOVAL_HELD_KEY = "anilist_removal_held_v1"
+    _ANILIST_REMOVAL_KEPT_KEY = "anilist_removal_kept_v1"
+
+    def _anilist_removal_json(self, key: str) -> dict[str, Any]:
+        try:
+            value = json.loads(self.db.get_state(key, "") or "{}")
+        except (TypeError, ValueError):
+            value = {}
+        return value if isinstance(value, dict) else {}
+
+    def _hold_anilist_removals(self, rows: list[LibraryAnime], account: str) -> None:
+        """Too many titles left the list at once: they stay, and the window asks the user.
+
+        Titles the user chose to keep before are not asked about again."""
+        kept_state = self._anilist_removal_json(self._ANILIST_REMOVAL_KEPT_KEY)
+        kept = (
+            {int(value) for value in kept_state.get("ids") or [] if isinstance(value, int)}
+            if kept_state.get("account") == account
+            else set()
+        )
+        held = self._anilist_removal_json(self._ANILIST_REMOVAL_HELD_KEY)
+        titles = {
+            int(item["media_id"]): str(item.get("title") or "")
+            for item in (held.get("titles") or [] if held.get("account") == account else [])
+            if isinstance(item, dict) and isinstance(item.get("media_id"), int)
+        }
+        for anime in rows:
+            if int(anime.media_id) not in kept:
+                titles[int(anime.media_id)] = str(anime.title or "")
+        if not titles:
+            return
+        self.db.set_state(
+            self._ANILIST_REMOVAL_HELD_KEY,
+            json.dumps(
+                {
+                    "account": account,
+                    "titles": [{"media_id": key, "title": value} for key, value in sorted(titles.items())],
+                    "at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        self.logger.warning(
+            "EVENT anilist.list_removal_held count=%s titles=%s (kept until the user chooses Remove from Pudge or Keep)",
+            len(titles),
+            "; ".join(f"{key} {value!r}" for key, value in sorted(titles.items())),
+        )
+        self.log(
+            "AniList: "
+            + str(len(titles))
+            + " titles left the AniList list at once; Pudge keeps them until you choose: "
+            + ", ".join(value or str(key) for key, value in sorted(titles.items()))
+        )
+
+    def _forget_returned_anilist_removals(self, present: set[int], account: str) -> None:
+        """Held titles back on the list (or whose account changed) are not asked about any more."""
+        held = self._anilist_removal_json(self._ANILIST_REMOVAL_HELD_KEY)
+        if not held:
+            return
+        titles = held.get("titles") or [] if held.get("account") == account else []
+        remaining = [
+            item
+            for item in titles
+            if isinstance(item, dict)
+            and isinstance(item.get("media_id"), int)
+            and int(item["media_id"]) not in present
+        ]
+        if remaining != titles or held.get("account") != account:
+            self.db.set_state(
+                self._ANILIST_REMOVAL_HELD_KEY,
+                json.dumps({**held, "titles": remaining}, ensure_ascii=False) if remaining else "",
+            )
+
+    def anilist_removal_notice(self) -> dict[str, Any]:
+        """The titles held back from a mass removal, for the window ({} when none)."""
+        held = self._anilist_removal_json(self._ANILIST_REMOVAL_HELD_KEY)
+        account = hashlib.sha256(str(self.config.anilist.access_token or "").strip().encode()).hexdigest()
+        if held.get("account") != account:
+            return {}
+        titles = []
+        for item in held.get("titles") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("media_id"), int):
+                continue
+            anime = self.db.get_anime(int(item["media_id"]))
+            if anime is None or (anime.status or "").upper() not in self._ANILIST_LIST_STATUSES:
+                continue  # removed or deleted meanwhile
+            titles.append(
+                {"media_id": int(anime.media_id), "title": str(anime.title or item.get("title") or "")}
+            )
+        if not titles:
+            return {}
+        notice_id = hashlib.sha256(json.dumps([item["media_id"] for item in titles]).encode()).hexdigest()[
+            :16
+        ]
+        return {"id": notice_id, "titles": titles}
+
+    def resolve_anilist_removal_notice(self, action: str, notice_id: str = "") -> dict[str, Any]:
+        """``remove``: the held titles become removed (as a removal on AniList does); ``keep``:
+        they stay and are never asked about again."""
+        action = str(action or "").strip().casefold()
+        if action not in {"remove", "keep"}:
+            raise ManagerError(err("manager.anilistRemovalUnknownAction"))
+        notice = self.anilist_removal_notice()
+        if not notice:
+            self.db.set_state(self._ANILIST_REMOVAL_HELD_KEY, "")
+            return {"ok": True, "changed": 0}
+        if notice_id and str(notice_id) != notice["id"]:
+            # The list changed since the window asked: it asks again about what is held now.
+            return {"ok": False, "changed": 0, "stale": True}
+        ids = [int(item["media_id"]) for item in notice["titles"]]
+        account = hashlib.sha256(str(self.config.anilist.access_token or "").strip().encode()).hexdigest()
+        if action == "remove":
+            for item in notice["titles"]:
+                anime = self.db.get_anime(int(item["media_id"]))
+                self.db.set_anime_status(int(item["media_id"]), "REMOVED")
+                self.logger.info(
+                    "EVENT anilist.removed_on_anilist media_id=%s previous_status=%s title=%r source=user_confirmed",
+                    item["media_id"],
+                    anime.status if anime is not None else "",
+                    item["title"],
+                )
+        else:
+            kept_state = self._anilist_removal_json(self._ANILIST_REMOVAL_KEPT_KEY)
+            kept = (
+                {int(value) for value in kept_state.get("ids") or [] if isinstance(value, int)}
+                if kept_state.get("account") == account
+                else set()
+            )
+            self.db.set_state(
+                self._ANILIST_REMOVAL_KEPT_KEY,
+                json.dumps({"account": account, "ids": sorted(kept | set(ids))}),
+            )
+            self.logger.info("EVENT anilist.list_removal_kept media_ids=%s", ids)
+        self.db.set_state(self._ANILIST_REMOVAL_HELD_KEY, "")
+        return {"ok": True, "changed": len(ids), "action": action}
+
+    def _sync_other_list_entries(
+        self,
+        entries: dict[int, dict[str, Any]],
+        refreshed: set[int],
+        *,
+        media: dict[int, LibraryAnime] | None = None,
+    ) -> int:
         """Keep list status/progress of titles outside Watching/Planning current.
 
         Completed, Repeating, Paused or Dropped titles can still have local
         episodes. Their cleanup depends on the AniList list state, so a title
         moved to Repeating (or whose progress was lowered) must not keep an
-        old Completed row locally. Returns how many watched episodes were reset.
+        old Completed row locally. A local row made before its title was known
+        (a placeholder: no AniList titles) gets its metadata from ``media``, the
+        same list answer. Returns how many watched episodes were reset.
         """
         restored = 0
         now = time.time()
@@ -743,6 +1278,9 @@ class AnimeManager:
             local = self.db.get_anime(media_id)
             if local is None:
                 continue
+            metadata = (media or {}).get(media_id)
+            if metadata is not None and not local.titles and metadata.titles:
+                local = self._fill_placeholder_metadata(local, metadata, source="anilist.list")
             status = str(entry.get("status") or "").upper()
             progress = int(entry.get("progress") or 0)
             if status == (local.status or "").upper() and progress == int(local.progress or 0):
@@ -754,6 +1292,7 @@ class AnimeManager:
                     "UPDATE anime SET status=?,progress=?,updated_at=? WHERE media_id=?",
                     (status or local.status, progress, now, media_id),
                 )
+                self.db.note_anilist_progress(media_id, progress, now=now, conn=conn)
             self.logger.info(
                 "EVENT anilist.list_entry_sync media_id=%s status=%s progress=%s previous_status=%s previous_progress=%s episodes_reset=%s",
                 media_id,
@@ -765,18 +1304,164 @@ class AnimeManager:
             )
         return restored
 
+    ANILIST_WORKER_TIMEOUT_SECONDS = 180.0
+
+    def _anilist_library(self, client: Any) -> list[LibraryAnime]:
+        """The AniList list. A short-lived worker asks AniList and parses the
+        answer (its peak, ~100 MB for a long list, goes with the process); the window gets
+        the compact rows and the same ``last_list_*`` facts on ``client``. A worker that fails
+        (not an AniList refusal) falls back to asking here."""
+
+        def inline() -> list[LibraryAnime]:
+            compact_library = getattr(client, "library_compact", None)
+            return compact_library() if callable(compact_library) else client.library()
+
+        from . import low_ram
+
+        if not self._low_ram_worker_allowed():
+            return inline()
+        answer = low_ram.worker_or_inline(
+            "anilist_library",
+            {
+                "config_path": str(self.config.config_path),
+                "endpoint": str(self.config.anilist.endpoint),
+                "access_token": str(self.config.anilist.access_token),
+                # Only rows made before their title was known use the list's media (every
+                # entry of every list as full rows was MBs of JSON parsed here).
+                "media_for": self._placeholder_media_ids(),
+            },
+            lambda: None,
+            use_worker=True,
+            logger=self.logger,
+            timeout=self.ANILIST_WORKER_TIMEOUT_SECONDS,
+        )
+        if not isinstance(answer, dict):
+            return inline()
+        refused = answer.get("anilist_error")
+        if isinstance(refused, dict):
+            raise self._anilist_error_from_worker(refused)
+        try:
+            items = [LibraryAnime(**row) for row in answer.get("items") or []]
+            entries = answer.get("entries")
+            media = answer.get("media")
+            client.last_list_entries = (
+                {int(key): value for key, value in entries.items()} if isinstance(entries, dict) else None
+            )
+            client.last_list_media = (
+                {int(key): LibraryAnime(**value) for key, value in media.items()}
+                if isinstance(media, dict)
+                else {}
+            )
+            client.last_list_incomplete = bool(answer.get("incomplete"))
+        except (TypeError, ValueError) as exc:
+            self.logger.warning("FALLBACK step=anilist.library_worker error=%r", str(exc)[:200])
+            return inline()
+        return items
+
+    def _placeholder_media_ids(self) -> list[int] | None:
+        """Local rows without AniList titles: _sync_other_list_entries fills them from the list.
+
+        None when they could not be read: the worker then sends every entry's media (an
+        empty list would have kept none of it)."""
+        try:
+            return sorted(int(anime.media_id) for anime in self.db.anime_list() if not anime.titles)
+        except Exception:  # noqa: BLE001 - unknown: the worker sends every entry's media
+            return None
+
+    @staticmethod
+    def _anilist_error_from_worker(refused: dict[str, Any]) -> AniListError:
+        """The AniList refusal a worker met, as the error asking here would have raised."""
+        message = str(refused.get("message") or "AniList error")
+        if int(refused.get("status_code") or 0):
+            return AniListHTTPError(
+                message,
+                status_code=int(refused["status_code"]),
+                detail=str(refused.get("detail") or ""),
+                refusal=bool(refused.get("refusal")),
+            )
+        return AniListError(message)
+
+    def _low_ram_worker_allowed(self) -> bool:
+        """Not already a worker (both modes) and the worker can read the config."""
+        from . import low_ram
+
+        if not low_ram.worker_allowed(self.config):
+            return False
+        try:
+            return Path(self.config.config_path).is_file()
+        except (TypeError, OSError):
+            return False
+
+    def _anilist_worker(self, task: str, extra: dict[str, Any] | None = None) -> Any:
+        """``task`` of pudge.low_ram_worker with the window's AniList request mode; None when
+        the worker failed (the caller does the work here). A refusal AniList gave the worker
+        is raised here, so it is not asked a second time."""
+        from . import low_ram
+        from .providers.anilist import request_modes
+
+        payload: dict[str, Any] = {
+            "config_path": str(self.config.config_path),
+            "anilist": {
+                "enabled": bool(self.config.anilist.enabled),
+                "endpoint": str(self.config.anilist.endpoint),
+                "access_token": str(self.config.anilist.access_token),
+            },
+            **request_modes(),
+            **(extra or {}),
+        }
+        answer = low_ram.worker_or_inline(
+            task,
+            payload,
+            lambda: None,
+            use_worker=True,
+            logger=self.logger,
+            timeout=self.ANILIST_REFRESH_WORKER_TIMEOUT_SECONDS,
+        )
+        if not isinstance(answer, dict):
+            return None
+        refused = answer.get("anilist_error")
+        if isinstance(refused, dict):
+            raise self._anilist_error_from_worker(refused)
+        return answer
+
+    # The list, one relation graph (paced bulk requests) and the cover files.
+    ANILIST_REFRESH_WORKER_TIMEOUT_SECONDS = 300.0
+
     def refresh_anilist_cache(self) -> dict[str, object]:
-        with timed_step(self.logger, "anilist.refresh_cache"):
+        """The AniList list, covers, one due relation graph and off-list metadata.
+
+        All of it runs in a short-lived worker (``anilist_refresh``): the
+        GraphQL answers, the parsed rows and the transient Python objects (≈ 100–200 MB at
+        launch) go with that process instead of leaving the window's heap fragmented. The
+        worker writes the same database; a failed worker falls back to the work here."""
+        if self._low_ram_worker_allowed():
+            with timed_step(self.logger, "anilist.refresh_cache", via="worker"):
+                answer = self._anilist_worker("anilist_refresh")
+            stats = answer.get("stats") if isinstance(answer, dict) else None
+            if isinstance(stats, dict):
+                return stats
+        return self.refresh_anilist_cache_inline()
+
+    def refresh_anilist_cache_inline(self, *, step: str = "anilist.refresh_cache") -> dict[str, object]:
+        with timed_step(self.logger, step):
             items = self.sync_anilist()
+            used_cache = bool(getattr(items, "used_cache", False))
             with timed_step(self.logger, "covers.prefetch", anime_count=len(items)):
                 covers = self.prefetch_covers(("CURRENT", "PLANNING"))
-            relation_graphs = self.refresh_due_relation_graphs(limit=1)
+            # AniList did not answer the list: its relation graphs would fail too.
+            relation_graphs = 0 if used_cache else self.refresh_due_relation_graphs(limit=1)
+            try:
+                self.refresh_off_list_entry_metadata()
+            except Exception as exc:  # noqa: BLE001 - covers of split entries never block the sync
+                self.logger.warning("FAIL step=anime.off_list_metadata error=%r", str(exc)[:200])
         return {
             "anime": len(items),
             "covers": covers,
             "relation_graphs": relation_graphs,
-            "cached": self._last_anilist_used_cache,
-            "warning": self._last_anilist_warning,
+            "cached": used_cache,
+            "warning": str(getattr(items, "warning", "") or ""),
+            # AniList's own reason (HTTP status and message) when the saved list is shown.
+            "error": str(getattr(items, "error", "") or ""),
         }
 
     def anilist_refresh_due(self, *, now: float | None = None) -> bool:
@@ -797,6 +1482,22 @@ class AnimeManager:
     def refresh_anilist_if_due(self, *, now: float | None = None) -> int:
         if not self.anilist_refresh_due(now=now):
             return 0
+        if getattr(self, "_owns_database", False) and self._low_ram_worker_allowed():
+            # The window (both modes): the periodic list refresh and its relation graph in a
+            # worker (the agent is a short-lived process of its own already).
+            try:
+                with timed_step(self.logger, "anilist.periodic_refresh", via="worker"):
+                    answer = self._anilist_worker("anilist_periodic", {"now": now})
+            except Exception as exc:  # an AniList refusal: the same handling as here
+                self.log(f"AniList: background refresh failed: {exc}")
+                self.logger.warning("RETRY step=anilist.periodic_refresh error=%r", exc)
+                return 0
+            if isinstance(answer, dict) and "count" in answer:
+                return int(answer.get("count") or 0)
+        return self.refresh_anilist_if_due_inline(now=now)
+
+    def refresh_anilist_if_due_inline(self, *, now: float | None = None) -> int:
+        """The periodic refresh here (due already checked by the caller)."""
         try:
             with timed_step(
                 self.logger,
@@ -809,7 +1510,8 @@ class AnimeManager:
             self.log(f"AniList: background refresh failed: {exc}")
             self.logger.warning("RETRY step=anilist.periodic_refresh error=%r", exc)
             return 0
-        self.refresh_due_relation_graphs(limit=1, now=now)
+        if not getattr(items, "used_cache", False):
+            self.refresh_due_relation_graphs(limit=1, now=now)
         return len(items)
 
     @staticmethod
@@ -1056,10 +1758,12 @@ class AnimeManager:
             return 0
         due = self.db.due_relation_graphs(now=now, limit=limit)
         refreshed = 0
-        for item in due:
-            graph = self.relation_graph(int(item["media_id"]), force_refresh=True)
-            if not graph.get("refresh_failed"):
-                refreshed += 1
+        # Background bulk work: paced under AniList's degraded-mode limit.
+        with bulk_requests():
+            for item in due:
+                graph = self.relation_graph(int(item["media_id"]), force_refresh=True)
+                if not graph.get("refresh_failed"):
+                    refreshed += 1
         return refreshed
 
     @staticmethod
@@ -1087,7 +1791,19 @@ class AnimeManager:
 
         raw = getattr(item, "raw", {}) or {}
         if str(raw.get("backend") or "").casefold() != "aria2":
-            return True
+            # qBittorrent rounds: a 56 GB batch at 99.91 % (52 MiB left) is still
+            # downloading. Bytes left decide; without them only a settled state.
+            try:
+                left = int(raw["amount_left"]) if raw.get("amount_left") is not None else None
+            except (TypeError, ValueError):
+                left = None
+            if left is not None:
+                return left <= 0
+            return (
+                float(item.progress or 0.0) >= 1.0
+                or state.endswith("up")
+                or state in {"uploading", "seeding"}
+            )
         if bool(raw.get("verifying")):
             return False
         if str(raw.get("error_code") or "").strip():
@@ -1240,17 +1956,25 @@ class AnimeManager:
         return True
 
     @classmethod
-    def _completed_download_video_files(cls, item: DownloadItem) -> list[Path]:
+    def _completed_download_video_files(
+        cls, item: DownloadItem, *, walk_save_path: bool = True
+    ) -> list[Path]:
         """Resolve videos owned by one completed download without stealing siblings.
 
         A historical single-episode aria2 row can lose ``content_path`` while its
         ``save_path`` still points at the whole series directory.  Scanning every
         video below that directory lets an old episode claim a newer sibling.
         Batch rows may own many files; single-episode rows must resolve to one
-        unambiguous episode only.
+        unambiguous episode only. ``walk_save_path=False`` (the foreground poll,
+        WEBFLOW-8) looks only at the download's own entry, never the whole folder.
         """
         content_value = str(item.content_path or "").strip()
         content = Path(content_value).expanduser() if content_value else None
+        if not walk_save_path:
+            if content is None and str(item.save_path or "").strip() and str(item.name or "").strip():
+                content = Path(str(item.save_path).strip()).expanduser() / str(item.name).strip()
+            if content is None or not (content.is_file() or content.is_dir()):
+                return []
         if content is not None and content.is_file():
             resolved = content.resolve()
             if item.is_batch:
@@ -1438,18 +2162,40 @@ class AnimeManager:
 
     def incomplete_download_paths(self) -> tuple[Path, ...]:
         paths: list[Path] = []
+        shared: set[Path] = set()  # folders other files live in too: never "incomplete content"
+        for root in self._library_scan_roots():
+            shared.add(root)
+            shared.update(root.parents)
         for item in self.db.downloads():
             if self._download_is_complete(item):
                 continue
             path = self._download_content_path(item)
-            if path is not None:
-                paths.append(path)
+            if path is None:
+                continue
+            save = str(item.save_path or "").strip()
+            try:
+                save_path = Path(save).expanduser().resolve() if save else None
+            except (OSError, RuntimeError):
+                save_path = None
+            if path in shared or (save_path is not None and path == save_path):
+                # A season pack without its own folder reports the title's folder (where every
+                # other episode lives) as its content: every row there was deleted and the title
+                # hidden until the pack finished, watched episodes included.
+                continue
+            paths.append(path)
         return tuple(dict.fromkeys(paths))
 
     @staticmethod
     def _path_within(path: Path, roots: tuple[Path, ...]) -> bool:
-        resolved = path.expanduser().resolve()
-        return any(resolved == root or root in resolved.parents for root in roots)
+        # Compare path components, not ``root in resolved.parents``: that built a Path for every
+        # ancestor of every root on every call (a Home build asks once per episode with every
+        # unfinished download as a root, ~3 s of a 5 s build on a 120-title probe library).
+        # No roots (nothing downloading): no realpath walk at all.
+        root_parts = _root_parts(tuple(roots))
+        if not root_parts:
+            return False
+        parts = path.expanduser().resolve().parts
+        return any(parts[:depth] in root_parts for depth in range(1, len(parts) + 1))
 
     def _repair_legacy_library_episode_paths(self) -> int:
         """Collapse stale pre-rename episode paths onto the current library root."""
@@ -1480,26 +2226,433 @@ class AnimeManager:
         return repaired
 
     _LIBRARY_SCAN_CACHE_KEY = "library_scan_cache_v39"
-    _LIBRARY_SCAN_CACHE_GENERATION = 2
+    # 3: empty and unfinished aria2 files are no episodes (and .aria2 files count).
+    # 4: S00Exx / "Specials" files of a series are specials, never its episodes.
+    _LIBRARY_SCAN_CACHE_GENERATION = 4
     _LIBRARY_SCAN_CACHE_TTL_SECONDS = 6 * 60 * 60
     _LIBRARY_SCAN_IGNORE_MARKER = ".pudge-ignore-library-scan"
 
     @classmethod
+    @contextmanager
+    def library_ignore_memo(cls) -> Iterator[None]:
+        """Answer ignore-marker lookups from one walk per folder inside this block.
+
+        A Home build asks for every episode and download several times, and each
+        question stat'ed every folder up to "/" (54,700 stats of 64,254 per build in
+        the WEBFLOW-6 probe). Inside the block each folder is checked once.
+        """
+        if _IGNORE_ROOT_MEMO.get() is not None:
+            yield
+            return
+        token = _IGNORE_ROOT_MEMO.set({})
+        try:
+            yield
+        finally:
+            _IGNORE_ROOT_MEMO.reset(token)
+
+    @classmethod
     def _library_scan_ignore_root_for_path(cls, path: Path) -> Path | None:
         """Return nearest ancestor explicitly isolated from Library discovery."""
+        memo = _IGNORE_ROOT_MEMO.get()
+        key = str(path)
+        if memo is not None and key in memo:
+            return memo[key]
         try:
             current = Path(path).expanduser().resolve()
         except (OSError, RuntimeError):
             return None
         if current.is_file():
             current = current.parent
+        walked: list[str] = []
+        result: Path | None = None
         while True:
+            folder_key = "\0" + str(current)
+            if memo is not None and folder_key in memo:
+                result = memo[folder_key]
+                break
+            walked.append(folder_key)
             if (current / cls._LIBRARY_SCAN_IGNORE_MARKER).is_file():
-                return current
+                result = current
+                break
             parent = current.parent
             if parent == current:
-                return None
+                break
             current = parent
+        if memo is not None:
+            for folder_key in walked:
+                memo[folder_key] = result
+            memo[key] = result
+        return result
+
+    # An extra file a batch download brings along: an OVA, special or movie inside the batch
+    # of a TV series, or an NCOP/NCED/PV. It is not an episode of the title: Home asks
+    # whether to delete or keep it instead of searching subtitles for it forever.
+    EXTRA_FILE_REVIEW = "review_extra_file"
+    EXTRA_FILE_KEPT = "extra_file_kept"
+
+    @staticmethod
+    def _extra_file_kind(anime: LibraryAnime | None, name: str) -> str:
+        """ "OVA", "Movie", "NCOP"... when ``name`` is an extra file of ``anime``, else ""."""
+        return extra_files.extra_file_kind(anime, name)
+
+    def _downloaded_extra_file_kind(self, video: Path, media_id: int | None, episode: int | None) -> str:
+        """The kind of an extra file that came with a download, or "".
+
+        Of the person's own files only a special (S00Exx) the library scan took out of a TV
+        series' episodes counts (it had the number of a regular episode).
+        """
+        if media_id is None or episode is not None:
+            return ""
+        row = self.db.episode_by_path(video)
+        if row is None:
+            return ""
+        if self._special_set_aside(video):
+            return "Special"  # the library scan set it aside: a second file of a regular episode
+        anime = self.db.get_anime(int(media_id))
+        if not str(row.torrent_hash or "").strip():
+            special = extra_files.season_zero_series(anime) and parse_release_name(video.name).season == 0
+            return "Special" if special else ""
+        return self._extra_file_kind(anime, video.name)
+
+    def _own_extra_file(self, video: Path) -> bool:
+        """An NCOP/NCED/PV in the person's own folder (not downloaded by Pudge)."""
+        row = self.db.episode_by_path(video)
+        if row is None or str(row.torrent_hash or "").strip():
+            return False
+        return bool(parse_release_name(video.name).extra)
+
+    @staticmethod
+    def _extra_file_kept_state_key(video: Path) -> str:
+        return extra_files.kept_state_key(video)
+
+    def _extra_file_kept(self, video: Path) -> bool:
+        return bool(self.db.get_state(self._extra_file_kept_state_key(video), ""))
+
+    def _special_set_aside(self, video: Path) -> bool:
+        """A season-0 file the library scan set aside; it waits for the person (Keep/Delete)."""
+        return bool(self.db.get_state(extra_files.set_aside_state_key(video), ""))
+
+    def keep_extra_download_file(self, video: Path, episode: int | None = None) -> bool:
+        """Keep an extra file. An NCOP/NCED/PV stays in the Library only; an OVA or movie
+        belongs to its own AniList entry (the series' only fitting related entry), otherwise
+        it is a title of its own. Its subtitles are then prepared as for any episode.
+
+        A season-0 file the library scan set aside becomes episode ``episode`` of its series
+        when the person chose one, or of a TV_SHORT/ONA series its S00 number (TVDB numbers such
+        series in season 0), unless another file is that episode. Of a TV series it stays an
+        unnumbered extra of the title: its S00E01 is no episode 1, also once that one is gone."""
+        from .library import _regular_episode_exists
+
+        video = Path(video).expanduser().resolve()
+        row = self.db.episode_by_path(video)
+        if row is None:
+            return False
+        series = self.db.get_anime(int(row.media_id)) if row.media_id is not None else None
+        set_aside = self._special_set_aside(video)
+        self.db.set_state(self._extra_file_kept_state_key(video), "1")
+        self.db.delete_state(extra_files.set_aside_state_key(video))  # the person decided
+        number = episode
+        if number is None and series is not None and not extra_files.season_zero_series(series):
+            number = parse_anime_filename(video).episode  # TV_SHORT/ONA: its S00 number
+        if set_aside and series is not None and episode is None and extra_files.season_zero_series(series):
+            # A TV series' special: kept as an extra of the title, without an episode number.
+            self.db.mark_subtitle_job_needs_action(video, err("jobs.extraFileKept"), self.EXTRA_FILE_KEPT)
+            self.logger.info(
+                "EVENT extra_file.kept media_id=%s episode=- reason=season_zero_extra video=%r",
+                row.media_id,
+                str(video),
+            )
+            return True
+        if (
+            set_aside
+            and series is not None
+            and number is not None
+            and int(number) >= 1
+            and not _regular_episode_exists(self.db, series, video, int(number))
+        ):
+            self.db.set_episode_identity(video, series.media_id, int(number), series.title)
+            self.db.queue_subtitle_job(
+                video, series.media_id, int(number), priority=100, error=err("jobs.newDownload")
+            )
+            self.logger.info(
+                "EVENT extra_file.kept media_id=%s episode=%s reason=season_zero_episode video=%r",
+                series.media_id,
+                number,
+                str(video),
+            )
+            return True
+        if not extra_files.is_story_extra(series, video.name):
+            self.db.mark_subtitle_job_needs_action(video, err("jobs.extraFileKept"), self.EXTRA_FILE_KEPT)
+            self.logger.info("EVENT extra_file.kept media_id=%s video=%r", row.media_id, str(video))
+            return True
+        node = extra_files.own_title_for_extra(self.db, series, video.name)
+        if node is not None:
+            anime = extra_files.own_title_anime(self.db, node, series)
+            media_id, episode, title = (
+                anime.media_id,
+                extra_files.own_title_episode(anime, video.name),
+                anime.title,
+            )
+        else:
+            identity = parse_anime_filename(video)
+            media_id, episode, title = None, identity.episode, identity.title or video.stem
+        self.db.set_episode_identity(video, media_id, episode, title)
+        candidates = self._subtitle_candidate_fingerprint_state_key(video)
+        for key in (candidates, candidates + ":outcome", candidates + ":verification_failures"):
+            self.db.delete_state(key)
+        self.db.queue_subtitle_job(video, media_id, episode, priority=100, error=err("jobs.newDownload"))
+        self.logger.info(
+            "EVENT extra_file.kept media_id=%s episode=%s from_media_id=%s video=%r",
+            media_id,
+            episode,
+            row.media_id,
+            str(video),
+        )
+        return True
+
+    # ------------------------------------------------------------------ Identify…
+    # A file Pudge could not match (an OVA in the person's own folder, an unmatched or
+    # misnumbered video) is given its AniList entry and episode by the person. The choice is
+    # stored per file and wins in every later scan (library.user_episode_identity).
+
+    @staticmethod
+    def identify_allowed(row: LibraryEpisode | None) -> bool:
+        return bool(row is not None and row.state not in {"ready", "watched"} and row.video_path.is_file())
+
+    def identify_search_local(self, query: str, limit: int = 8) -> list[LibraryAnime]:
+        """Titles of the local list that fit ``query`` (works while AniList is unreachable)."""
+        cleaned = re.sub(r"\s+", " ", str(query or "")).strip().casefold()
+        if len(cleaned) < 2:
+            return []
+        scored: list[tuple[float, str, LibraryAnime]] = []
+        for anime in self.db.anime_list():
+            names = [str(name or "") for name in (anime.title, *anime.titles, *anime.synonyms) if name]
+            score = max(
+                (
+                    100.0
+                    if cleaned in name.casefold()
+                    else float(fuzz.token_set_ratio(cleaned, name.casefold()))
+                    for name in names
+                ),
+                default=0.0,
+            )
+            if score >= 80:
+                scored.append((score, anime.title.casefold(), anime))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        return [anime for _score, _title, anime in scored[: max(1, int(limit))]]
+
+    def identify_episode_file(
+        self,
+        video: Path,
+        media_id: Any,
+        episode: Any = None,
+        entry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Give a local file the AniList entry and episode the person chose (Identify…)."""
+        video = Path(video).expanduser().resolve()
+        row = self.db.episode_by_path(video)
+        if row is None or not video.is_file():
+            raise ManagerError(err("identify.fileNotFound"))
+        if not self.identify_allowed(row):
+            raise ManagerError(err("identify.fileReady"))
+        try:
+            media_id = int(media_id)
+        except (TypeError, ValueError):
+            media_id = 0
+        if media_id <= 0:
+            raise ManagerError(err("identify.entryRequired"))
+        anime = self.db.get_anime(media_id)
+        new_entry = anime is None
+        if anime is None:
+            anime = _identified_anime(media_id, entry)
+        total = int(anime.episodes or 0)
+        number: int | None
+        if episode is None or str(episode).strip() == "":
+            number = None
+        else:
+            try:
+                number = int(str(episode).strip())
+            except ValueError:
+                raise ManagerError(err("identify.episodeRequired")) from None
+        if str(anime.format or "").upper() == "MOVIE":
+            number = None  # a movie has no episode in the library (as when matched by a scan)
+        elif number is None:
+            if total != 1:
+                raise ManagerError(err("identify.episodeRequired"))
+            number = 1
+        elif number <= 0 or (total and number > total):
+            raise ManagerError(err("identify.episodeOutOfRange", title=anime.title, episode=number))
+        if number is not None and any(
+            other.video_path != video and other.video_path.is_file()
+            for other in self.db.episode_rows(media_id, number)
+        ):
+            # Another file is that episode already: one episode never gets two files (a
+            # set-aside S00E02 named TV episode 2 while S01E02 is there). Another number can be picked.
+            raise ManagerError(err("identify.episodeTaken", title=anime.title, episode=number))
+        if new_entry:
+            self.db.upsert_anime(anime)
+            anime = self.db.get_anime(media_id) or anime
+        self.db.set_episode_identity(video, media_id, number, anime.title)
+        self.db.set_state(
+            user_identity_state_key(video),
+            json.dumps({"media_id": media_id, "episode": number}, separators=(",", ":")),
+        )
+        candidates = self._subtitle_candidate_fingerprint_state_key(video)
+        for key in (
+            candidates,
+            candidates + ":outcome",
+            candidates + ":verification_failures",
+            self._subtitle_failure_streak_state_key(video),
+            extra_files.set_aside_state_key(video),  # a set-aside special has an identity now
+        ):
+            self.db.delete_state(key)
+        self.db.queue_subtitle_job(video, media_id, number, priority=100, error=err("jobs.identityChosen"))
+        self.logger.info(
+            "EVENT episode.identified media_id=%s episode=%s from_media_id=%s from_episode=%s video=%r",
+            media_id,
+            number,
+            row.media_id,
+            row.episode,
+            str(video),
+        )
+        return {"media_id": media_id, "episode": number, "title": anime.title}
+
+    def diagnose_video(self, video: Path) -> dict[str, Any]:
+        """ "Why not ready?" for one file, also for a file without an AniList entry."""
+        video = Path(video).expanduser().resolve()
+        row = self.db.episode_by_path(video)
+        if row is None:
+            raise ManagerError(err("identify.fileNotFound"))
+        if row.media_id is not None and self.db.get_anime(int(row.media_id)) is not None:
+            return self.diagnose_episode(int(row.media_id), row.episode)
+        language = self.config.ui.language
+        jobs = [job for job in self.db.subtitle_jobs() if str(job["video_path"]) == str(video)]
+        exists = video.is_file()
+        external_ready = False
+        if row.subtitle_path is not None:
+            try:
+                external_ready = row.subtitle_path.is_file() and row.subtitle_path.stat().st_size > 0
+            except OSError:
+                external_ready = False
+        subtitle_ready = bool(
+            row.state in {"ready", "watched"} and (external_ready or row.embedded_subtitle_id is not None)
+        )
+        last_error = (
+            i18n_message(
+                _localize_preparation_detail(str(jobs[0]["last_error"] or ""), language=language), language
+            )
+            if jobs
+            else ""
+        )
+        label = lambda key: t(f"manager.{key}", lang=language)  # noqa: E731
+        checks = [
+            {"key": "anilist", "ok": False, "label": label("diagAnilistNotMatched"), "detail": video.name},
+            {
+                "key": "file",
+                "ok": exists,
+                "label": label("diagLocalVideo"),
+                "detail": str(video) if exists else label("diagNoVideo"),
+            },
+            {
+                "key": "subtitle",
+                "ok": subtitle_ready,
+                "label": label("diagSubtitlesPrepared"),
+                "detail": str(row.subtitle_path) if row.subtitle_path else label("diagNoSubtitles"),
+            },
+            {
+                "key": "job",
+                "ok": subtitle_ready or bool(jobs),
+                "label": label("diagPreparationJob"),
+                "detail": (
+                    f"{jobs[0]['state']}; attempts={jobs[0]['attempts']}; {last_error}"
+                    if jobs
+                    else label("diagCompleted" if subtitle_ready else "diagMissingJob")
+                ),
+            },
+        ]
+        return {
+            "media_id": None,
+            "title": row.title,
+            "episode": row.episode,
+            "ready": subtitle_ready,
+            "video_path": str(video),
+            "state": row.state,
+            "watched_on_anilist": False,
+            "presentation": derive_episode_presentation(
+                local=row,
+                download=None,
+                action_job=jobs[0] if jobs else None,
+                watched_externally=False,
+                allow_ocr_ready=bool(self.config.matching.ocr_counts_as_ready),
+            ),
+            "checks": checks,
+            "downloads": [],
+            "download_intent": None,
+            "job": (
+                {
+                    "state": str(jobs[0]["state"]),
+                    "attempts": int(jobs[0]["attempts"] or 0),
+                    "next_check": float(jobs[0]["next_check"] or 0),
+                    "error": last_error,
+                }
+                if jobs
+                else None
+            ),
+            "identify_allowed": self.identify_allowed(row),
+        }
+
+    def _deselect_torrent_file(self, torrent_hash: str, video: Path) -> None:
+        """Stop the torrent client from fetching a deleted file again (best effort)."""
+        if not str(torrent_hash or "").strip() or not self.downloads_enabled():
+            return
+        try:
+            clients = self.torrent_clients()
+        except Exception as exc:  # noqa: BLE001 - deleting the file must not depend on the client
+            self.logger.warning("SKIP step=extra_file.deselect reason=%r", str(exc))
+            return
+        for name, client in clients:
+            try:
+                rows = client.files(torrent_hash)
+                indices = [
+                    int(row.get("index"))
+                    for row in rows
+                    if row.get("index") is not None and Path(str(row.get("name") or "")).name == video.name
+                ]
+                if indices:
+                    client.set_file_priority(torrent_hash, indices, 0)
+                    self.logger.info(
+                        "DONE step=extra_file.deselect backend=%s hash=%s files=%s",
+                        name,
+                        torrent_hash,
+                        indices,
+                    )
+            except Exception as exc:  # noqa: BLE001 - a stopped or unreachable client keeps the file selected
+                self.logger.info("SKIP step=extra_file.deselect backend=%s reason=%r", name, str(exc))
+            finally:
+                client.close()
+
+    def delete_extra_download_file(self, video: Path) -> bool:
+        """Delete an extra file that came with a download (only one Pudge flagged as extra)."""
+        video = Path(video).expanduser().resolve()
+        row = self.db.episode_by_path(video)
+        if row is None or not self._downloaded_extra_file_kind(video, row.media_id, row.episode):
+            return False
+        self._deselect_torrent_file(str(row.torrent_hash or ""), video)
+        video.unlink(missing_ok=True)
+        if row.subtitle_path is not None:
+            Path(row.subtitle_path).unlink(missing_ok=True)
+        self.db.delete_episode_record(video)
+        self.db.delete_state(self._extra_file_kept_state_key(video))
+        self.db.delete_state(extra_files.set_aside_state_key(video))
+        self._forget_video_state([video])
+        self._remove_empty_episode_parent(video)
+        self.logger.info(
+            "DONE step=extra_file.delete media_id=%s video=%r torrent_hash=%s",
+            row.media_id,
+            str(video),
+            row.torrent_hash,
+        )
+        return True
 
     @classmethod
     def _library_path_is_ignored(cls, path: Path) -> bool:
@@ -1523,6 +2676,137 @@ class AnimeManager:
                 continue
         return tuple(found)
 
+    def forget_isolated_library_episodes(self) -> int:
+        """Forget episode rows of videos in a folder marked ``.pudge-ignore-library-scan``.
+
+        The scan never adds such a video, so a row there was written by something
+        else that ran Pudge's code against this library (a benchmark or test harness
+        whose corpus carries the marker). Home hides those rows, but they stayed in
+        the database and reached the iPhone as ready episodes. Only the database
+        record and its subtitle job go: the video file stays. A row with watch
+        history (watched, a playback position) is kept (and still never offered).
+        Idempotent; returns rows forgotten.
+        """
+        forgotten = 0
+        with self.library_ignore_memo():
+            for item in list(self.db.episodes()):
+                marker_root = self._library_scan_ignore_root_for_path(item.video_path)
+                if marker_root is None:
+                    continue
+                if item.state == "watched" or item.watched_at or float(item.playback_position or 0.0) > 0.0:
+                    self.logger.info(
+                        "SKIP step=library.isolated_episode reason=watch_history video=%r",
+                        str(item.video_path),
+                    )
+                    continue
+                self.db.delete_episode_record(item.video_path)
+                forgotten += 1
+                self.logger.info(
+                    "RESULT step=library.isolated_episode action=forget media_id=%s episode=%s state=%s "
+                    "marker=%r video=%r",
+                    item.media_id,
+                    item.episode,
+                    item.state,
+                    str(marker_root),
+                    str(item.video_path),
+                )
+        return forgotten
+
+    _DROPPED_MEDIA_FOLDERS_KEY = "library_dropped_media_folders_v1"
+
+    def dropped_media_folders(self) -> tuple[Path, ...]:
+        """Anime folders dropped on the window: scanned like watched folders, not listed in Settings."""
+        try:
+            values = json.loads(self.db.get_state(self._DROPPED_MEDIA_FOLDERS_KEY, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if not isinstance(values, list):
+            return ()
+        return tuple(Path(value) for value in values if isinstance(value, str) and value.strip())
+
+    def _save_dropped_media_folders(self, folders: Iterable[Path]) -> None:
+        values = list(dict.fromkeys(str(folder) for folder in folders))
+        self.db.set_state(self._DROPPED_MEDIA_FOLDERS_KEY, json.dumps(values, ensure_ascii=False))
+
+    def _watched_media_folders(self) -> tuple[Path, ...]:
+        """Settings' watched folders, then the folders dropped on the window."""
+        return (*self.config.paths.download_dirs, *self.dropped_media_folders())
+
+    _DROPPED_MEDIA_FILES_KEY = "library_dropped_media_files_v1"
+
+    def dropped_media_files(self) -> tuple[Path, ...]:
+        """Single videos dropped on the window: kept in the library, never scanned as a folder."""
+        try:
+            values = json.loads(self.db.get_state(self._DROPPED_MEDIA_FILES_KEY, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if not isinstance(values, list):
+            return ()
+        return tuple(Path(value) for value in values if isinstance(value, str) and value.strip())
+
+    def _remember_dropped_media_file(self, video: Path) -> None:
+        """Remember one dropped video (only the file, not its folder) for the library scan.
+
+        A file inside the library root, a watched folder or a dropped folder is
+        found by the scan anyway. Entries whose file is gone are dropped here.
+        """
+        resolved = Path(video).expanduser().resolve()
+        roots: list[Path] = []
+        for root in (self.config.library.root_dir, *self._watched_media_folders()):
+            try:
+                roots.append(Path(root).expanduser().resolve())
+            except OSError:
+                continue
+        if self._path_within(resolved, tuple(roots)):
+            return
+        kept = [value for value in self.dropped_media_files() if value.is_file() and value != resolved]
+        values = list(dict.fromkeys(str(value) for value in (*kept, resolved)))
+        self.db.set_state(self._DROPPED_MEDIA_FILES_KEY, json.dumps(values, ensure_ascii=False))
+
+    def import_dropped_media_folder(self, folder: Path) -> list[LibraryEpisode]:
+        """A folder of anime dropped on the window, from anywhere: its episodes, matched like a watched folder's.
+
+        The folder is remembered (only it, not its parent) so its episodes stay in the
+        library and files added to it later are found; a folder in which no anime was
+        recognized is forgotten again. Nothing is moved or copied.
+        """
+        resolved = Path(folder).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ManagerError(err("manager.unsupportedVideo", name=resolved.name))
+        previous = self.dropped_media_folders()
+        covered = any(resolved == root or root in resolved.parents for root in self._library_scan_roots())
+        if not covered:
+            # A dropped folder that holds earlier dropped folders replaces them.
+            kept = [value for value in previous if resolved not in Path(value).parents]
+            self._save_dropped_media_folders([*kept, resolved])
+        self.logger.info("START step=library.dropped_folder path=%r new_root=%s", str(resolved), not covered)
+        report: dict[str, Any] = {}
+        self._scan_library_uncached(report=report)
+        found = [
+            item
+            for item in self.db.episodes()
+            if item.media_id is not None
+            and self._path_within(item.video_path.expanduser().resolve(), (resolved,))
+        ]
+        if not found and report.get("resolver_incomplete"):
+            # AniList refused or the lookup budget ran out: "nothing recognized" is
+            # not an answer yet. The folder stays and later scans match it.
+            self.logger.warning(
+                "DEFER step=library.dropped_folder path=%r reason=anilist_unavailable", str(resolved)
+            )
+            raise ManagerError(err("web.dropFolderAniListUnavailable"))
+        if not found and not covered:
+            self._save_dropped_media_folders(previous)
+        self.logger.info(
+            "DONE step=library.dropped_folder path=%r episodes=%s anime=%s",
+            str(resolved),
+            len(found),
+            sorted({int(item.media_id) for item in found if item.media_id is not None}),
+        )
+        return sorted(
+            found, key=lambda item: (int(item.media_id or 0), item.episode or 0, str(item.video_path))
+        )
+
     def _library_scan_roots(self) -> tuple[Path, ...]:
         roots: list[Path] = []
         main_root = self.config.library.root_dir.expanduser()
@@ -1530,7 +2814,7 @@ class AnimeManager:
             roots.append(main_root.resolve())
         except (OSError, RuntimeError):
             roots.append(main_root)
-        for configured in self.config.paths.download_dirs:
+        for configured in self._watched_media_folders():
             root = Path(configured).expanduser()
             if not root.is_dir():
                 continue
@@ -1542,6 +2826,71 @@ class AnimeManager:
                 continue
             roots.append(resolved)
         return tuple(roots)
+
+    def _finished_torrent_hashes(self) -> frozenset[str]:
+        """Info hashes of the downloads that are complete (seeding or paused after finishing)."""
+        hashes: set[str] = set()
+        for item in self.db.downloads():
+            if not self._download_is_complete(item):
+                continue
+            raw = getattr(item, "raw", {}) or {}
+            for value in (item.torrent_hash, raw.get("infohash_v1")):
+                text = str(value or "").strip().casefold()
+                if text:
+                    hashes.add(text)
+        return frozenset(hashes)
+
+    def _finished_torrent_check(self) -> Callable[[str], bool]:
+        """finished_torrent() for unfinished_video(); reads the downloads once, on first use."""
+        cache: list[frozenset[str]] = []
+
+        def finished(info_hash: str) -> bool:
+            if not cache:
+                cache.append(self._finished_torrent_hashes())
+            return str(info_hash or "").casefold() in cache[0]
+
+        return finished
+
+    def _missing_video_was_watched(self, video: Path, media_id: int | None, episode: int | None) -> bool:
+        """A gone file's episode is watched: locally, on a phone, or by AniList progress."""
+        row = self.db.episode_by_path(video)
+        if row is not None and str(row.state or "") == "watched":
+            return True
+        if media_id is None:
+            return False
+        anime = self.db.get_anime(int(media_id))
+        if anime is None:
+            return False
+        return watched_by_anilist_progress(
+            episode,
+            anime.progress,
+            total_episodes=anime.episodes,
+            media_format=anime.format,
+        )
+
+    def unfinished_library_video(
+        self,
+        video: Path,
+        *,
+        roots: tuple[Path, ...] | None = None,
+        finished: Callable[[str], bool] | None = None,
+    ) -> bool:
+        """unfinished_video(), looking for control files up to the library folder holding the file.
+
+        The control file of a finished torrent (aria2 keeps it while the pack seeds)
+        does not make its files unfinished: they were "unfinished_video" and lost their
+        episode rows every second while the reconcile restored them.
+        """
+        try:
+            resolved = Path(video).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return False
+        folders = self._library_scan_roots() if roots is None else roots
+        return unfinished_video(
+            resolved,
+            next((root for root in folders if root in resolved.parents), None),
+            finished_torrent=finished or self._finished_torrent_check(),
+        )
 
     def _library_scan_snapshot(self) -> dict[str, Any] | None:
         """Build a cheap filesystem signature for files relevant to library import.
@@ -1555,26 +2904,51 @@ class AnimeManager:
             f"generation={self._LIBRARY_SCAN_CACHE_GENERATION};recursive={int(self.config.library.recursive)}\n".encode()
         )
         relevant = (
-            set(VIDEO_EXTENSIONS) | set(TEXT_SUBTITLE_EXTENSIONS) | set(IMAGE_SUBTITLE_EXTENSIONS) | {".pgs"}
+            set(VIDEO_EXTENSIONS)
+            | set(TEXT_SUBTITLE_EXTENSIONS)
+            | set(IMAGE_SUBTITLE_EXTENSIONS)
+            | {".pgs", ".aria2"}
         )
         file_count = 0
         roots = self._library_scan_roots()
+        # A download still being written changed size and mtime on every pass, so
+        # the fingerprint never matched and each pass ran the full scan (MGR-9).
+        # The scan skips those files anyway: an unfinished download counts by its
+        # path only, and so do aria2 control files and the videos they belong to.
+        try:
+            incomplete = tuple(path.expanduser().resolve() for path in self.incomplete_download_paths())
+        except (OSError, RuntimeError, sqlite3.Error):
+            incomplete = ()
         try:
             for root in roots:
                 digest.update(f"root={root}\n".encode("utf-8", errors="surrogateescape"))
                 if not root.exists():
                     continue
                 iterator = root.rglob("*") if self.config.library.recursive else root.glob("*")
+                files: list[tuple[Path, str]] = []
+                controls: set[Path] = set()
                 for path in iterator:
-                    if path.suffix.casefold() not in relevant or not path.is_file():
+                    suffix = path.suffix.casefold()
+                    if suffix not in relevant or not path.is_file():
                         continue
-                    stat = path.stat()
                     resolved = path.resolve()
-                    digest.update(
-                        f"{resolved}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode(
-                            "utf-8", errors="surrogateescape"
+                    files.append((resolved, suffix))
+                    if suffix == ".aria2":
+                        controls.add(resolved.with_name(resolved.stem))
+                for resolved, suffix in files:
+                    if (
+                        suffix == ".aria2"
+                        or (
+                            controls
+                            and (resolved in controls or any(p in controls for p in resolved.parents))
                         )
-                    )
+                        or any(resolved == item or item in resolved.parents for item in incomplete)
+                    ):
+                        line = f"{resolved}\0unfinished\n"
+                    else:
+                        stat = resolved.stat()
+                        line = f"{resolved}\0{stat.st_size}\0{stat.st_mtime_ns}\n"
+                    digest.update(line.encode("utf-8", errors="surrogateescape"))
                     file_count += 1
         except (OSError, PermissionError, RuntimeError):
             return None
@@ -1608,6 +2982,11 @@ class AnimeManager:
             "rows": max(0, int(rows)),
             "completed_at": time.time(),
         }
+        # A row of a gone file that the scan keeps for now: the file list does not
+        # change when its wait ends, so an "unchanged" library kept it for hours.
+        due_at = getattr(self, "_library_scan_forget_due_at", None)
+        if due_at:
+            payload["forget_due_at"] = float(due_at)
         self.db.set_state(
             self._LIBRARY_SCAN_CACHE_KEY,
             json.dumps(payload, separators=(",", ":"), sort_keys=True),
@@ -1618,7 +2997,11 @@ class AnimeManager:
         *,
         reuse_unchanged: bool = False,
         user_requested: bool = False,
+        outcome: dict[str, Any] | None = None,
     ) -> list[LibraryEpisode]:
+        """Scan the library roots. ``outcome`` (optional) receives ``skipped="busy"`` when the
+        heavy-work lease was taken (subtitle alignment, OCR, the agent) and the cached rows
+        were returned instead of a scan."""
         if not reuse_unchanged:
             return self._scan_library_uncached()
 
@@ -1630,11 +3013,16 @@ class AnimeManager:
         except (TypeError, ValueError):
             completed_at = 0.0
         age = max(0.0, now - completed_at) if completed_at else float("inf")
+        try:
+            forget_due_at = float(cached.get("forget_due_at") or 0.0)
+        except (TypeError, ValueError):
+            forget_due_at = 0.0
         cache_hit = bool(
             snapshot is not None
             and int(cached.get("generation") or 0) == self._LIBRARY_SCAN_CACHE_GENERATION
             and str(cached.get("fingerprint") or "") == str(snapshot.get("fingerprint") or "")
             and age <= self._LIBRARY_SCAN_CACHE_TTL_SECONDS
+            and not (forget_due_at and now >= forget_due_at)
         )
         if cache_hit:
             items = self._cached_library_items()
@@ -1655,6 +3043,8 @@ class AnimeManager:
         )
         if lease is None:
             items = self._cached_library_items()
+            if outcome is not None:
+                outcome["skipped"] = "busy"
             self.logger.info(
                 "SKIP step=library.scan reason=heavy_work_active files=%s rows=%s",
                 snapshot.get("file_count", 0) if snapshot else -1,
@@ -1663,19 +3053,45 @@ class AnimeManager:
             return items
 
         with lease:
-            items = self._scan_library_uncached()
-            final_snapshot = self._library_scan_snapshot()
-            if final_snapshot is not None:
-                self._store_library_scan_cache(final_snapshot, len(items))
-                self.logger.info(
-                    "CACHE step=library.scan_fingerprint_write files=%s rows=%s",
-                    final_snapshot.get("file_count", 0),
-                    len(items),
-                )
-            return items
+            return self._scan_library_under_lease()
+
+    def _scan_library_under_lease(self) -> list[LibraryEpisode]:
+        items = self._scan_library_uncached()
+        final_snapshot = self._library_scan_snapshot()
+        if final_snapshot is not None:
+            self._store_library_scan_cache(final_snapshot, len(items))
+            self.logger.info(
+                "CACHE step=library.scan_fingerprint_write files=%s rows=%s",
+                final_snapshot.get("file_count", 0),
+                len(items),
+            )
+        return items
+
+    def scan_library_when_free(self, cancel_event: threading.Event | None = None) -> bool:
+        """A rescan the person asked for while other heavy work held the lease: wait for the
+        lease at user priority (ahead of background work), then scan. False if cancelled."""
+        lease = self.work_scheduler.acquire_heavy(
+            "library-scan",
+            blocking=True,
+            foreground_sensitive=True,
+            wait_for_foreground=True,
+            cancel_event=cancel_event,
+            poll_seconds=2.0,
+            priority=WorkPriority.USER,
+            resource="cpu",
+        )
+        if lease is None:
+            self.logger.info("SKIP step=library.scan_queued reason=cancelled")
+            return False
+        with lease:
+            items = self._scan_library_under_lease()
+        self.logger.info("RESULT step=library.scan_queued rows=%s", len(items))
+        return True
 
     @_reusing_db_connection
-    def _scan_library_uncached(self) -> list[LibraryEpisode]:
+    def _scan_library_uncached(self, report: dict[str, Any] | None = None) -> list[LibraryEpisode]:
+        """Scan every library root. ``report`` (optional) receives ``resolver_incomplete``:
+        True when AniList failed or the lookup budget ran out, so "no match" is not final."""
         self._repair_legacy_library_episode_paths()
         incomplete = self.incomplete_download_paths()
         ignored = self._library_scan_ignore_roots()
@@ -1693,14 +3109,28 @@ class AnimeManager:
         # or recheck does not erase them prematurely. A missing file is
         # forgotten only when its drive is there and it stayed missing.
         missing_local: list[Path] = []
+        scan_roots = self._library_scan_roots()
+        finished_torrent = self._finished_torrent_check()
         for item in self.db.episodes():
             if self._path_within(item.video_path, incomplete):
+                if item.state == "watched" or item.watched_at or float(item.playback_position or 0.0) > 0.0:
+                    # A finished torrent its client checks again (Force recheck, its disk
+                    # plugged back in) is unfinished until the check ends: its rows keep the
+                    # watched mark, place and deletion date instead of coming back unwatched.
+                    continue
                 self.db.delete_episode_record(item.video_path)
-            elif not item.video_path.is_file() and not item.torrent_hash:
-                missing_local.append(item.video_path)
+            elif not item.video_path.is_file():
+                if not item.torrent_hash:
+                    missing_local.append(item.video_path)
+            elif self.unfinished_library_video(item.video_path, roots=scan_roots, finished=finished_torrent):
+                # An empty file, or one whose aria2 control file is still there (and no
+                # finished download's), is no episode (left over by a removed race candidate).
+                self.db.delete_episode_record(item.video_path)
+                self.logger.info("SKIP step=library.unfinished_video video=%r", str(item.video_path))
         for value in sorted(self._forgettable_missing_videos(missing_local)):
             self.db.delete_episode_record(Path(value))
             self.logger.info("REPAIR step=library.missing_local_video video=%r", value)
+        self._library_scan_forget_due_at = self._missing_video_due_at
         items = scan_library(
             self.config.library.root_dir,
             self.db,
@@ -1711,6 +3141,7 @@ class AnimeManager:
             pipeline_cache_config=self.config,
             media_episode_resolver=lambda anime, release: self._media_episode_from_release(anime, release),
             file_episode_resolver=self._scoped_file_media_episode,
+            finished_torrent=finished_torrent,
         )
 
         # Additional watched folders (Downloads, an external drive, etc.) are
@@ -1719,7 +3150,7 @@ class AnimeManager:
         # public AniList anime entry.
         main_root = self.config.library.root_dir.expanduser().resolve()
         extra_roots: list[Path] = []
-        for configured in self.config.paths.download_dirs:
+        for configured in self._watched_media_folders():
             root = configured.expanduser()
             if not root.is_dir():
                 continue
@@ -1739,7 +3170,12 @@ class AnimeManager:
         # are known, remove only unresolved external rows that are no longer
         # inside any managed root. Ready/watched/manual-progress rows and
         # torrent-managed files are deliberately preserved.
-        active_media_roots = (main_root, *extra_roots)
+        # A single dropped video is remembered by itself (not its folder: that
+        # would make all of ~/Downloads a watched root) and stays in the library.
+        dropped_files = tuple(
+            value.expanduser().resolve() for value in self.dropped_media_files() if value.is_file()
+        )
+        active_media_roots = (main_root, *extra_roots, *dropped_files)
         for stale in list(self.db.episodes()):
             if self._path_within(stale.video_path, ignored):
                 continue
@@ -1856,7 +3292,9 @@ class AnimeManager:
                 seasons = [
                     value for value in (_season_number(name) for name in names if name) if value is not None
                 ]
-                if (seasons[0] if seasons else 1) != int(identity.season or 1):
+                # "Cyberpunk - Edgerunners 2 - 01": the 2 belongs to the title, as in the entry's.
+                file_season = identity.season or _season_number(str(identity.title or "")) or 1
+                if (seasons[0] if seasons else 1) != int(file_season):
                     return None
             if identity.year and anime.season_year and abs(int(identity.year) - int(anime.season_year)) > 1:
                 return None
@@ -1961,10 +3399,12 @@ class AnimeManager:
                     matches = client.search(replace(identity, episode=None, year=None))
                 except AniListError as exc:
                     resolver_had_error = True
-                    if isinstance(exc, AniListHTTPError) and exc.status_code == 429:
+                    if isinstance(exc, AniListHTTPError) and exc.status_code in {403, 429}:
+                        # Rate limited or refused: every further search this scan would fail too.
                         resolver_rate_limited = True
                         self.logger.warning(
-                            "BACKOFF step=library.external_match reason=anilist_429 remaining_files_skipped=1 title=%r",
+                            "BACKOFF step=library.external_match reason=anilist_%s remaining_files_skipped=1 title=%r",
+                            exc.status_code,
                             identity.title,
                         )
                     else:
@@ -2061,10 +3501,13 @@ class AnimeManager:
                     ),
                     file_episode_resolver=self._scoped_file_media_episode,
                     require_anime_match=True,
+                    finished_torrent=finished_torrent,
                 )
                 items.extend(external_items)
                 matched_external_paths.update(item.video_path.resolve() for item in external_items)
 
+            if report is not None:
+                report["resolver_incomplete"] = bool(resolver_had_error or resolver_budget_exhausted)
             if resolver_network_queries or resolver_budget_exhausted:
                 self.logger.info(
                     "RESULT step=library.external_match_budget queries=%s network_ms=%.1f elapsed_ms=%.1f "
@@ -2123,13 +3566,43 @@ class AnimeManager:
                 repaired_completed,
             )
 
+        # A special or OVA the scan split into its own entry: its cover and AniList page
+        # now, not after the next AniList refresh (Baccano! Bangai-hen).
+        try:
+            self.refresh_off_list_entry_metadata(cache_covers=True)
+        except Exception as exc:  # noqa: BLE001 - covers never fail a scan
+            self.logger.warning("FAIL step=anime.off_list_metadata error=%r", str(exc)[:200])
+
         self.db.set_state("library_scanned_at", str(time.time()))
         self.log(f"Library: videos found: {len(items)}")
         return items
 
+    # Feed clients outlive a Settings change: they read the address on use.
+    def _weekly_rss_url(self) -> str:
+        return load_sources(self.config).weekly_rss
+
+    def _release_feed_url(self) -> str:
+        return load_sources(self.config).release_feed
+
+    def _recommendations_url(self) -> str:
+        return load_sources(self.config).recommendations
+
+    def _release_feeds_configured(self) -> bool:
+        """A weekly or public release feed can still find releases without a search source."""
+        return any(
+            bool(getattr(client, "configured", True))
+            for client in (getattr(self, "_subsplease_client", None), getattr(self, "_shana_client", None))
+            if client is not None
+        )
+
+    def _log_no_release_source(self, step: str) -> None:
+        self.logger.info("SKIP step=%s reason=no_release_source", step)
+
     def nyaa_client(self, *, timeout: float = 20.0) -> NyaaClient:
+        sources = load_sources(self.config)
         return NyaaClient(
-            self.config.nyaa.base_url,
+            sources.release_search,
+            mirrors=sources.mirrors,
             proxy_mode=self.config.nyaa.proxy_mode,
             proxy_url=self.config.nyaa.proxy_url,
             pre_search_command=self.config.nyaa.pre_search_command,
@@ -2223,6 +3696,7 @@ class AnimeManager:
         with lock:
             client = self.__dict__.get("_shared_qbt")
             if client is not None and self.__dict__.get("_shared_qbt_key") == key:
+                client.category_save_path = self.config.library.root_dir
                 return client
             previous = client
             client = QBittorrentClient(
@@ -2237,6 +3711,7 @@ class AnimeManager:
             try:
                 client._shared = True
                 client.start_policy = self._torrent_app_start_allowed
+                client.category_save_path = self.config.library.root_dir
             except AttributeError:
                 return client  # a replacement client class keeps per-call instances
             self._shared_qbt, self._shared_qbt_key = client, key
@@ -2427,10 +3902,112 @@ class AnimeManager:
         number = self._media_episode_from_release(
             anime, release_number, requested_media_episode=requested, release_name=str(path)
         )
+        if number is None and requested is not None and span_end is None:
+            number = self._download_name_media_episode(anime, item, release_number, path, requested)
         if span_end is not None and number is not None and item.media_episode is not None:
             if not int(item.media_episode) <= int(number) <= int(span_end):
                 return None
         return number
+
+    def _download_name_media_episode(
+        self, anime: LibraryAnime | None, item: Any, release_number: int | None, path: Path, requested: int
+    ) -> int | None:
+        """Map a single-episode download's file through its torrent name.
+
+        A file inside a single-episode torrent often drops what the torrent name
+        carries: "Show.S06E07...-Group.mkv" has no storyline title and no
+        bracketed uploader, while the torrent name the search matched
+        ("[Group] Show S06E07 (Storyline)") maps absolute 7 to local 6. When the
+        file carries the same season/episode as the torrent name, the torrent
+        name's mapping (still validated against the requested episode) is the file's.
+        """
+        name = str(getattr(item, "name", "") or "").strip()
+        if anime is None or not name or release_number is None or getattr(item, "is_batch", False):
+            return None
+        file_release = parse_release_name(path.name)
+        torrent_release = parse_release_name(name)
+        if (
+            file_release.unsafe_single_episode
+            or torrent_release.unsafe_single_episode
+            or not torrent_release.explicit_episode
+            or torrent_release.episode is None
+            or int(torrent_release.episode) != int(release_number)
+            or (file_release.episode is not None and int(file_release.episode) != int(release_number))
+            or (file_release.season is not None and file_release.season != torrent_release.season)
+        ):
+            return None
+        number = shared_media_episode_from_release(
+            anime,
+            int(release_number),
+            self.config,
+            self.logger,
+            requested_media_episode=int(requested),
+            db=self.db,
+            allow_network=False,
+            release_name=name,
+        )
+        source = "torrent_name"
+        if number is None and self._saved_numbering_episode(
+            anime, item, int(release_number), int(requested), release_name=name
+        ):
+            number, source = int(requested), "saved_release_numbering"
+        if number is not None and int(number) == int(requested):
+            self.logger.debug(
+                "RESULT step=download.file_episode media_id=%s release=%s episode=%s source=%s",
+                getattr(item, "media_id", None),
+                release_number,
+                number,
+                source,
+            )
+            return int(number)
+        return None
+
+    def _saved_numbering_episode(
+        self,
+        anime: LibraryAnime | None,
+        item: Any,
+        release_number: int | None,
+        requested: int | None,
+        *,
+        release_name: str,
+    ) -> bool:
+        """The download's own resolved numbering still stands when today's is unknown.
+
+        Offline split-stage numbering needs the AniList offset cache (7-day TTL)
+        or a stored relation graph. Without either, release 7 of a later stage
+        maps to nothing: that is "unknown", not a contradiction. The numbering
+        resolved when the release was chosen (saved on the download) then keeps
+        the single-episode download linked. A current mapping to another local
+        episode still wins (returns False).
+        """
+        raw = getattr(item, "raw", None) or {}
+        saved = raw.get("_release_numbering") if isinstance(raw, dict) else None
+        if (
+            anime is None
+            or getattr(item, "is_batch", False)
+            or release_number is None
+            or requested is None
+            or not isinstance(saved, dict)
+            or str(saved.get("numbering_status") or "") != "resolved"
+        ):
+            return False
+        try:
+            if int(saved.get("mapped_media_episode")) != int(requested) or int(
+                saved.get("raw_release_episode")
+            ) != int(release_number):
+                return False
+        except (TypeError, ValueError):
+            return False
+        current = shared_media_episode_from_release(
+            anime,
+            int(release_number),
+            self.config,
+            self.logger,
+            db=self.db,
+            allow_network=False,
+            release_name=release_name,
+        )
+        return current is None or int(current) == int(requested)
 
     def _scoped_file_media_episode(
         self, anime: LibraryAnime, path: Path, requested: int | None
@@ -2464,6 +4041,9 @@ class AnimeManager:
         """Cheaply retain short RSS windows so release discovery survives feed rotation."""
         if os.getenv("PYTEST_CURRENT_TEST"):
             return 0
+        if not self._release_feeds_configured():
+            self._log_no_release_source("release_feeds.poll")
+            return 0
         saved = 0
         try:
             saved += len(self._subsplease_client.releases(self.config.nyaa.preferred_resolution))
@@ -2476,11 +4056,137 @@ class AnimeManager:
         return saved
 
     def run_intro_detection(self) -> int:
-        """One background OP/ED detection step (analysis lives in intro_skipper)."""
+        """One background OP/ED detection step (analysis lives in intro_skipper).
+
+        Part of the maintenance pass (inside the maintenance lock): it waits for the whole
+        foreground session, a paused player too. See ``run_paused_intro_detection``.
+        """
+        return int(self._intro_detection_pass(paused_ok=False).get("analysed") or 0)
+
+    INTRO_REQUEST_RETRY_SECONDS = 30.0
+    INTRO_REQUEST_MAX_SECONDS = 30 * 60.0
+
+    def _remember_completed_for_intro(self, paths: Iterable[Path]) -> None:
+        """New downloads go first in the next OP/ED pass, whichever process runs it."""
+        paths = tuple(paths)
+        if not paths:
+            return
+        from .intro_skipper import detection_enabled, request_analysis
+
+        if not detection_enabled(self.config):
+            return
+        try:
+            request_analysis(self.config.paths.cache_dir, paths)
+        except OSError as exc:
+            self.logger.warning("FAIL step=intro_skipper.request error=%r", str(exc)[:200])
+
+    def request_intro_detection(self, paths: Iterable[Path], *, reason: str = "download_complete") -> bool:
+        """OP/ED detection for just completed videos, soon, on a background thread.
+
+        Never blocks the caller (the foreground poll). The step itself keeps every rule of
+        the background pass (foreground, power, the heavy-work lease, the low-RAM worker);
+        a deferred step is retried every ``INTRO_REQUEST_RETRY_SECONDS`` for a while, and
+        the maintenance pass still picks the files up first later on.
+        """
+        from .intro_skipper import detection_enabled
+
+        wanted = tuple(Path(path) for path in paths if str(path or "").strip())
+        if not wanted or not detection_enabled(self.config):
+            return False
+        self._remember_completed_for_intro(wanted)
+        with self._intro_request_lock:
+            for path in wanted:
+                self._intro_requested[path] = None
+            thread = self._intro_request_thread
+            if thread is not None and thread.is_alive():
+                return True
+            thread = threading.Thread(
+                target=self._intro_request_loop, name="pudge-intro-new-episodes", daemon=True
+            )
+            self._intro_request_thread = thread
+        self.logger.info("QUEUE step=intro_skipper.new_episodes videos=%s reason=%s", len(wanted), reason)
+        thread.start()
+        return True
+
+    def _intro_request_loop(self) -> None:
+        from .intro_skipper import analysed
+
+        started = time.monotonic()
+        final = {"disabled", "tool_missing", "idle", "error"}
+        try:
+            while True:
+                with self._intro_request_lock:
+                    pending = [
+                        path
+                        for path in self._intro_requested
+                        if path.is_file() and not analysed(self.config.paths.cache_dir, path)
+                    ]
+                    self._intro_requested = dict.fromkeys(pending)
+                    if not pending:
+                        return
+                status = "deferred"
+                # Cheap check first: no worker process is started while the pass would wait.
+                if self.work_scheduler.background_wait_reason() is None:
+                    result = self._intro_detection_pass(paused_ok=False, prefer_paths=pending)
+                    status = str(result.get("status") or "error")
+                    self.logger.info(
+                        "DONE step=intro_skipper.new_episodes status=%s analysed=%s videos=%s",
+                        status,
+                        result.get("analysed", 0),
+                        len(pending),
+                    )
+                if status in final or time.monotonic() - started >= self.INTRO_REQUEST_MAX_SECONDS:
+                    with self._intro_request_lock:
+                        for path in pending:
+                            self._intro_requested.pop(path, None)
+                    continue  # anything requested meanwhile still gets its step
+                time.sleep(1.0 if status == "ran" else self.INTRO_REQUEST_RETRY_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - optional feature must not break the window
+            self.logger.warning("FAIL step=intro_skipper.new_episodes error=%r", str(exc)[:300])
+        finally:
+            with self._intro_request_lock:
+                if self._intro_request_thread is threading.current_thread():
+                    self._intro_request_thread = None
+
+    def run_paused_intro_detection(self) -> dict[str, Any]:
+        """The agent's own step beside a paused video mpv, after the maintenance lock is gone.
+
+        Holds only the heavy-work lease; never part of an interactive or startup refresh.
+        Without a foreground player there is nothing to do here (the maintenance pass runs).
+        """
+        if self.work_scheduler.foreground_video() is None:
+            return {"status": "no_player"}
+        return self._intro_detection_pass(paused_ok=True)
+
+    INTRO_WORKER_TIMEOUT_SECONDS = 1800.0
+
+    def _intro_detection_pass(self, *, paused_ok: bool, prefer_paths: Iterable[Path] = ()) -> dict[str, Any]:
         from .intro_skipper import run_background_pass
 
+        prefer = [Path(path) for path in prefer_paths]
+
+        if not paused_ok:
+            from . import low_ram
+
+            if low_ram.worker_allowed(self.config):
+                # Both modes: numpy and the audio fingerprints load in a worker that
+                # exits after the step, not in the window for the rest of the run.
+                answer = low_ram.worker_or_inline(
+                    "intro_pass",
+                    {
+                        "config_path": str(self.config.config_path),
+                        "incomplete_paths": [str(path) for path in self.incomplete_download_paths()],
+                        "prefer_paths": [str(path) for path in prefer],
+                    },
+                    lambda: None,
+                    use_worker=True,
+                    logger=self.logger,
+                    timeout=self.INTRO_WORKER_TIMEOUT_SECONDS,
+                )
+                if isinstance(answer, dict):
+                    return answer
         try:
-            report = run_background_pass(
+            return run_background_pass(
                 db=self.db,
                 cache_dir=self.config.paths.cache_dir,
                 ffmpeg=self.config.tools.ffmpeg,
@@ -2490,11 +4196,12 @@ class AnimeManager:
                 incomplete_paths=self.incomplete_download_paths(),
                 # Detection only feeds the skip button: off with the button.
                 enabled=bool(getattr(self.config.playback, "skip_segments_enabled", True)),
+                paused_ok=paused_ok,
+                **({"prefer_paths": prefer} if prefer else {}),
             )
         except Exception as exc:  # noqa: BLE001 - optional feature must not break the agent
             self.logger.warning("FAIL step=intro_skipper.pass error=%r", str(exc)[:300])
-            return 0
-        return int(report.get("analysed") or 0)
+            return {"status": "error"}
 
     def _seadex_for_search(self, media_id: int, *, automatic: bool) -> SeaDexRecommendation | None:
         """One SeaDex lookup per title search (never per candidate/alias).
@@ -2515,9 +4222,12 @@ class AnimeManager:
 
             client = self._seadex_client = SeaDexClient(
                 self.config.paths.cache_dir,
+                base_url=self._recommendations_url,
                 found_ttl_seconds=max(1.0, float(getattr(self.config.nyaa, "seadex_cache_hours", 24.0)))
                 * 3600,
             )
+        if not getattr(client, "configured", True):
+            return None  # no recommendations address in Settings → Sources
         try:
             with timed_step(self.logger, "seadex.lookup", media_id=media_id, automatic=automatic):
                 rec = client.recommendations(
@@ -2539,6 +4249,7 @@ class AnimeManager:
         )
         return rec if rec.usable else None
 
+    @with_title_memo
     def search_releases(
         self,
         media_id: int,
@@ -2548,11 +4259,13 @@ class AnimeManager:
         automatic: bool = False,
         allow_anilist_network: bool = True,
     ) -> list[NyaaRelease]:
+        _RELEASE_SEARCH_OUTCOME.unavailable = None
         anime = self.db.get_anime(media_id)
         if anime is None:
             raise ManagerError(err("manager.animeNotInLocalDb", mediaId=media_id))
         if not self.config.nyaa.enabled:
             raise ManagerError(err("manager.releaseSearchDisabled"))
+        anime = self._with_chain_season(anime)
         if automatic and not batch and episode is not None and self._redownload_blocked(media_id, episode):
             return []
 
@@ -2569,7 +4282,9 @@ class AnimeManager:
             )
             alternative_episodes, alternative_titles = context.aliases, context.prequel_titles
         else:
-            alternative_episodes, alternative_titles = self._release_episode_context(anime, episode)
+            # A failed numbering lookup is not repeated by automatic searches for a while.
+            with automatic_numbering_lookups(automatic):
+                alternative_episodes, alternative_titles = self._release_episode_context(anime, episode)
         numbering_context = (
             resolve_episode_numbering(
                 anime, int(episode), self.config, self.logger, db=self.db, allow_network=False
@@ -2612,6 +4327,11 @@ class AnimeManager:
                     batch=batch,
                     title=anime.title,
                 ):
+                    cancellable = (
+                        {"should_continue": lambda: not self._release_search_cancelled()}
+                        if callable(getattr(_RELEASE_SEARCH_CANCEL, "check", None))
+                        else {}
+                    )
                     return search_ranked(
                         client,
                         anime,
@@ -2620,8 +4340,16 @@ class AnimeManager:
                         # refresh bounded without silently dropping aliases 4-5.
                         max_queries=5,
                         query_budget_seconds=18.0 if automatic else None,
+                        **cancellable,
                         **common_kwargs,
                     ), None
+            except NoReleaseSourceError as exc:
+                self.logger.info(
+                    "SKIP step=nyaa.search media_id=%s episode=%s reason=no_release_source",
+                    media_id,
+                    episode,
+                )
+                return [], exc
             except NyaaError as exc:
                 self.logger.warning(
                     "FALLBACK step=nyaa.search media_id=%s episode=%s reason=nyaa_error error=%r",
@@ -2658,6 +4386,7 @@ class AnimeManager:
                     subsplease_client = getattr(self, "_subsplease_client", None)
                     if subsplease_client is None:
                         subsplease_client = SubsPleaseClient(
+                            base_url=self._weekly_rss_url,
                             timeout=8.0,
                             cache_ttl=300.0,
                             history_path=self.config.paths.cache_dir / "release-feeds" / "subsplease.json",
@@ -2707,6 +4436,7 @@ class AnimeManager:
                     shana_client = getattr(self, "_shana_client", None)
                     if shana_client is None:
                         shana_client = ShanaProjectClient(
+                            feed_url=self._release_feed_url,
                             timeout=8.0,
                             cache_ttl=600.0,
                             history_path=self.config.paths.cache_dir / "release-feeds" / "shana.json",
@@ -2766,22 +4496,75 @@ class AnimeManager:
         seadex_wants_nyaa = bool(not automatic and seadex is not None and seadex.usable)
         if seadex_wants_nyaa and suitable_rss:
             self.logger.info("SOURCE step=release.search media_id=%s reason=seadex_entry_nyaa_too", media_id)
-        if not suitable_rss or seadex_wants_nyaa:
+        elif not automatic and suitable_rss:
+            # Find episode (the user's own search) always lists Nyaa too: the user may want
+            # another group or source than the feed's release.
+            self.logger.info("SOURCE step=release.search media_id=%s reason=manual_search_nyaa_too", media_id)
+        if (not suitable_rss or not automatic) and self._release_search_cancelled():
+            self._log_release_search_cancelled("nyaa.search", media_id=media_id, episode=episode)
+        elif not suitable_rss or not automatic:
             nyaa_releases, nyaa_error = search_nyaa_source()
             releases = merge_releases(releases, nyaa_releases)
             suitable_nyaa = any(self._release_is_allowed_for_auto(item) for item in nyaa_releases)
-            if not suitable_nyaa:
+            if not suitable_nyaa and not self._release_search_cancelled():
                 shana_releases, shana_error = search_shana_source(reason="subsplease_and_nyaa_empty")
                 releases = merge_releases(releases, shana_releases)
+        if isinstance(nyaa_error, ReleaseSearchUnavailableError):
+            _RELEASE_SEARCH_OUTCOME.unavailable = nyaa_error
+        if batch and not automatic and seadex is not None:
+            # SeaDex knew the season's preferred releases, but they only added a
+            # bonus to search results: with the release search down (or not
+            # listing them) the pack was never offered. Offer them as candidates;
+            # scoring and the batch safety checks decide as for any other.
+            candidate_kwargs = {
+                key: value
+                for key, value in common_kwargs.items()
+                if key not in {"episode", "batch", "seadex", "numbering_context"}
+            }
+            seadex_releases = seadex_batch_candidates(seadex, anime, **candidate_kwargs)
+            if seadex_releases:
+                self.logger.info(
+                    "SOURCE step=seadex.candidates media_id=%s offered=%s best_score=%.1f",
+                    media_id,
+                    len(seadex_releases),
+                    max(item.score for item in seadex_releases),
+                )
+                releases = merge_releases(releases, seadex_releases)
+        if (
+            not releases
+            and isinstance(nyaa_error, NoReleaseSourceError)
+            # An automatic pass still uses the release feeds when only they are set.
+            and (not automatic or not self._release_feeds_configured())
+        ):
+            raise nyaa_error
+        # Every source failing keeps the "release search unavailable" kind.
+        failed_type = (
+            ReleaseSearchUnavailableError
+            if isinstance(nyaa_error, ReleaseSearchUnavailableError)
+            else NyaaError
+        )
         if (
             not releases
             and subsplease_error is not None
             and nyaa_error is not None
             and shana_error is not None
         ):
-            raise NyaaError(f"{subsplease_error}; {nyaa_error}; {shana_error}") from shana_error
+            raise failed_type(f"{subsplease_error}; {nyaa_error}; {shana_error}") from shana_error
         if not releases and nyaa_error is not None and subsplease_error is not None:
-            raise NyaaError(f"{subsplease_error}; {nyaa_error}") from nyaa_error
+            raise failed_type(f"{subsplease_error}; {nyaa_error}") from nyaa_error
+
+        if not self.config.nyaa.allow_camrips:
+            # Cinema recordings were offered and scored like any release
+            # (Planning discovery accepted a movie CAMRIP). Off = never used.
+            kept = [item for item in releases if not is_camrip_release(item.title)]
+            if len(kept) != len(releases):
+                self.logger.info(
+                    "SKIP step=release.search media_id=%s episode=%s reason=camrip dropped=%s",
+                    media_id,
+                    episode,
+                    len(releases) - len(kept),
+                )
+            releases = kept
 
         # Every candidate of one search was scored with the same inputs.
         score_context = score_context_key(common_kwargs)
@@ -2875,6 +4658,147 @@ class AnimeManager:
             numbering_revision=match.rule_revision,
         )
 
+    def _queued_release_store(self) -> QueuedReleaseStore:
+        store = getattr(self, "queued_releases", None)
+        if store is None:
+            store = QueuedReleaseStore(self.db)
+            self.queued_releases = store
+        return store
+
+    def queue_release(
+        self,
+        media_id: int,
+        release: NyaaRelease,
+        *,
+        episode: int | None,
+        batch: bool,
+    ) -> dict[str, Any]:
+        """Keep a release chosen while Torrents are off; start_queued_releases adds it later."""
+        anime = self.db.get_anime(media_id)
+        if anime is None:
+            raise ManagerError(err("manager.animeNotInDb", mediaId=media_id))
+        wanted = str(release.info_hash or "").strip().casefold()
+        if wanted and any(
+            str(getattr(item, "torrent_hash", "") or "").casefold() == wanted for item in self.db.downloads()
+        ):
+            return {"queued": False, "already_downloading": True, "entry": None}
+        entry, duplicate = self._queued_release_store().add(
+            int(media_id), episode, bool(batch), asdict(release), anime_title=str(anime.title or "")
+        )
+        self.logger.info(
+            "WAIT step=release.queued media_id=%s episode=%s batch=%s duplicate=%s title=%r",
+            media_id,
+            episode,
+            bool(batch),
+            duplicate,
+            release.title,
+        )
+        return {"queued": True, "already_queued": duplicate, "already_downloading": False, "entry": entry}
+
+    def _queued_release_covered(self, entry: dict[str, Any]) -> bool:
+        """The queued episode (or title) got a download or a file meanwhile (picked by hand)."""
+        media_id = int(entry.get("media_id") or 0)
+        episode = entry.get("episode")
+        batch = bool(entry.get("batch"))
+        for item in self.db.downloads():
+            if item.media_id is None or int(item.media_id) != media_id:
+                continue
+            if batch:
+                if bool(item.is_batch):
+                    return True
+                continue
+            number = item.media_episode if item.media_episode is not None else item.episode
+            if episode is not None and number is not None and int(number) == int(episode):
+                return True
+        if not batch and episode is not None:
+            has_episode = getattr(self.db, "has_episode", None)
+            if callable(has_episode) and has_episode(media_id, int(episode)):
+                return True
+        return False
+
+    def _queued_store_call(self, action: str, *args: Any, **kwargs: Any) -> None:
+        try:
+            getattr(self._queued_release_store(), action)(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - a locked database must not end the pass
+            self.logger.warning("RETRY step=release.queue_%s error=%r", action, str(exc)[:200])
+
+    def start_queued_releases(self) -> int:
+        """Add the releases chosen while Torrents were off, through the normal add path.
+
+        One entry is claimed at a time: an add can take a minute, and a claim held
+        longer than CLAIM_STALE_SECONDS would be taken over by the other process.
+        """
+        if not self.downloads_enabled():
+            return 0
+        store = self._queued_release_store()
+        started = 0
+        tried: set[str] = set()
+        allowed = set(NyaaRelease.__dataclass_fields__)
+        while True:
+            claimed = store.claim(limit=1, skip=tried)
+            if not claimed:
+                break
+            entry = claimed[0]
+            entry_id = str(entry["id"])
+            tried.add(entry_id)
+            payload = {
+                key: value for key, value in dict(entry.get("release") or {}).items() if key in allowed
+            }
+            episode = entry.get("episode")
+            batch = bool(entry.get("batch"))
+            media_id = int(entry["media_id"])
+            try:
+                if self.db.get_anime(media_id) is None:
+                    # The title left the library: its queued release never starts.
+                    self.logger.info("SKIP step=release.queued media_id=%s reason=anime_removed", media_id)
+                    self._queued_store_call("finish", entry)
+                    continue
+                if self._queued_release_covered(entry):
+                    self.logger.info(
+                        "SKIP step=release.queued media_id=%s episode=%s batch=%s reason=already_present",
+                        media_id,
+                        episode,
+                        batch,
+                    )
+                    self._queued_store_call("finish", entry)
+                    continue
+                self.add_release(
+                    media_id,
+                    NyaaRelease(**payload),
+                    episode=int(episode) if episode is not None else None,
+                    batch=batch,
+                    manual=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - one failed entry never blocks the others
+                off = not self.downloads_enabled()
+                self._queued_store_call(
+                    "unclaim", entry_id, error="" if off else str(exc), count_attempt=not off
+                )
+                self.logger.warning(
+                    "FAIL step=release.queued_start media_id=%s episode=%s batch=%s error=%r",
+                    media_id,
+                    episode,
+                    batch,
+                    str(exc)[:300],
+                )
+                if off:
+                    break  # Turned off again meanwhile: the rest waits for the next On.
+                continue
+            self._queued_store_call("finish", entry)
+            started += 1
+            self.logger.info(
+                "EVENT step=release.queued_started media_id=%s episode=%s batch=%s title=%r",
+                media_id,
+                episode,
+                batch,
+                payload.get("title"),
+            )
+        return started
+
+    def forget_queued_release(self, media_id: int, episode: int | None, batch: bool) -> None:
+        """A release for this episode was added directly: the queued one must not start too."""
+        self._queued_store_call("remove", QueuedReleaseStore.entry_id(media_id, episode, batch))
+
     @_torrent_app_may_start
     def add_release(
         self,
@@ -2913,6 +4837,7 @@ class AnimeManager:
         # become an unrelated movie on the next Library scan.
         try:
             (target / ".anilist.id").write_text(str(anime.media_id), encoding="utf-8")
+            self._remember_pudge_sidecar(target, anime.media_id)
         except OSError as exc:
             self.logger.warning(
                 "WARN step=library.anilist_sidecar media_id=%s path=%r error=%r",
@@ -2967,6 +4892,12 @@ class AnimeManager:
                     ("paused", "stopped")
                 ):
                     self._torrent_network_start(candidate_client, "start", existing_any.torrent_hash)
+                self._reselect_wanted_files(
+                    candidate_client,
+                    existing_any.torrent_hash,
+                    (episode, selected_release_episode),
+                    batch=batch,
+                )
                 self._record_duplicate_block(media_id, episode, batch, existing_any, backend_name)
                 self.log(f"{backend_name}: {anime.title} is already downloading: {existing_any.name}")
                 return False
@@ -3042,6 +4973,9 @@ class AnimeManager:
                         media_id,
                         episode,
                     )
+                self._reselect_wanted_files(
+                    client, existing.torrent_hash, (episode, selected_release_episode), batch=batch
+                )
                 self._record_duplicate_block(media_id, episode, batch, existing, add_backend)
                 self.log(
                     f"{self.torrent_backend_name()}: {anime.title} is already downloading: {existing.name}"
@@ -3127,6 +5061,10 @@ class AnimeManager:
             self._allow_redownload(media_id, None if batch else episode)
             if hash_only and not batch and episode is not None:
                 self._record_manual_replacement(media_id, int(episode), release)
+            # A release the user picked is never swapped by the stall fallback.
+            intents = getattr(self, "download_intents", None)
+            if intents is not None:
+                intents.drop_stall_fallback(media_id, episode, batch)
         return True
 
     def _record_duplicate_block(
@@ -3207,6 +5145,8 @@ class AnimeManager:
         """A download the user asked for lifts the deleted-episode block."""
         allow = getattr(self.db, "allow_redownload", None)
         lifted = allow(int(media_id), episode) if callable(allow) else 0
+        # The user asked for it: older misses of these episodes no longer slow their search.
+        self._reset_auto_search_backoff(media_id, episode)
         if lifted:
             self.logger.info(
                 "EVENT step=anime.redownload_allowed media_id=%s episode=%s lifted=%s reason=manual_download",
@@ -3215,9 +5155,16 @@ class AnimeManager:
                 lifted,
             )
 
+    def _remember_pudge_sidecar(self, folder: Path, media_id: int) -> None:
+        """Pudge's own folder marker, not the person's pin (the library's season-0 rule)."""
+        try:
+            self.db.set_state(extra_files.pudge_sidecar_state_key(folder), str(int(media_id)))
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never blocks a download
+            self.logger.warning("WARN step=library.anilist_sidecar_record error=%r", str(exc)[:200])
+
     @staticmethod
     def _safe_dir_name(value: str) -> str:
-        return "".join("_" if char in '/\\:*?"<>|' else char for char in value).strip() or "Anime"
+        return extra_files.title_folder_name(value)
 
     @staticmethod
     def _safe_qbt_tag(value: str) -> str:
@@ -3271,6 +5218,9 @@ class AnimeManager:
                 item.release_episode = history_release_episode
             item.raw["_release_score_history"] = history_score
         if item.media_id is not None:
+            # Derived on every resolve: a flag persisted in raw_json by an
+            # earlier pass must not block this download forever.
+            item.raw.pop("_identity_conflict", None)
             anime = self.db.get_anime(item.media_id)
             if anime is not None and is_split_stage(anime) and not item.is_batch:
                 mapped = self._media_episode_from_release(
@@ -3279,7 +5229,13 @@ class AnimeManager:
                     requested_media_episode=item.media_episode,
                     release_name=item.name,
                 )
-                if mapped is None:
+                if mapped is None and not self._saved_numbering_episode(
+                    anime,
+                    item,
+                    item.release_episode,
+                    item.media_episode,
+                    release_name=Path(str(item.name or "")).name,
+                ):
                     item.raw["_identity_conflict"] = "Saved release identity contradicts current numbering"
             item.raw.setdefault("_media_id_source", "tag")
             return
@@ -3560,7 +5516,10 @@ class AnimeManager:
         elif item.episode is not None:
             kind = f"episode:{int(item.episode)}"
         elif item.is_batch or any(tag.casefold() in {"batch", "series pack"} for tag in tags):
-            kind = "batch"
+            # Two packs of one entry ("01-12" and "13-24") are not duplicates: the second one
+            # (with its files) was deleted as the "loser" of the first.
+            span = release_episode_range(str(item.name or ""))
+            kind = "batch" if span is None else f"batch:{int(span[0])}-{int(span[1])}"
         else:
             return None
         return anime_key, kind
@@ -3675,6 +5634,33 @@ class AnimeManager:
             if item.torrent_hash != loser.torrent_hash
         )
 
+    def _duplicate_loser_holds_library_files(self, client: Any, loser: DownloadItem) -> bool:
+        """Finished files of the torrent on disk, or Library episodes inside its content."""
+        if self._torrent_files_kept_on_disk(
+            client,
+            loser.torrent_hash,
+            loser,
+            set(),
+            self._torrent_snapshot(client, loser.torrent_hash),
+            complete_only=True,
+        ):
+            return True
+        content = str(loser.content_path or "").strip()
+        if not content:
+            return False
+        content_forms = self._path_forms(content)
+        for row in self.db.episodes():
+            video_forms = self._path_forms(row.video_path)
+            for base in content_forms:
+                if any(value == base or value.startswith(base.rstrip("/") + "/") for value in video_forms):
+                    self.logger.info(
+                        "KEEP step=qbittorrent.duplicate_cleanup reason=library_episode_inside hash=%s video=%r",
+                        loser.torrent_hash,
+                        str(row.video_path),
+                    )
+                    return True
+        return False
+
     def _metadata_tags_for_download(self, item: DownloadItem, score: float | None) -> list[str]:
         anime = self.db.get_anime(item.media_id) if item.media_id is not None else None
         if anime is None:
@@ -3698,6 +5684,9 @@ class AnimeManager:
         """
         if not self.downloads_enabled():
             return 0
+        upgrade_hashes = {
+            str(job["new_info_hash"] or "").strip().lower() for job in self.db.pending_upgrades()
+        }
         client = self.qbt_client()
         removed = 0
         try:
@@ -3748,7 +5737,22 @@ class AnimeManager:
                 for loser in losers:
                     if self._download_is_complete(loser):
                         continue
+                    if loser.torrent_hash.lower() in upgrade_hashes:
+                        # An upgrade or a manual replacement downloads next to
+                        # the completed copy with the same tags. Deleting it
+                        # lost the download and left its upgrade job blocking
+                        # new upgrade checks.
+                        self.logger.info(
+                            "SKIP step=qbittorrent.duplicate_cleanup identity=%s hash=%s reason=pending_upgrade",
+                            identity,
+                            loser.torrent_hash,
+                        )
+                        continue
                     delete_files = self._can_delete_duplicate_files(loser, preserved)
+                    if delete_files and self._duplicate_loser_holds_library_files(client, loser):
+                        # An unfinished batch can hold finished, imported episodes: the
+                        # torrent goes, its files stay.
+                        delete_files = False
                     try:
                         client.delete(loser.torrent_hash, delete_files=delete_files)
                     except QBittorrentError as exc:
@@ -3775,6 +5779,20 @@ class AnimeManager:
             client.close()
         return removed
 
+    # aria2 tries candidates one at a time. A magnet often needs well over ten
+    # seconds just for its metadata, and metadata plus a peer connection is not
+    # data yet: a 6-second window dropped a healthy 9-seed batch and then "won"
+    # with a 2-seed pack whose peers never sent a byte, stuck at 0 % for good.
+    ARIA2_RACE_METADATA_SECONDS = 40.0
+    ARIA2_RACE_STARTING_SECONDS = 20.0
+    # aria2 runs 3 downloads at once and queues the rest ("waiting": no peers can
+    # be asked yet). A candidate still queued after this is kept as the choice
+    # with its fallbacks recorded instead of being judged dead.
+    ARIA2_RACE_QUEUED_SECONDS = 5.0
+    # A chosen aria2 release that has not received one byte for this long is
+    # swapped for the next candidate its race recorded.
+    ARIA2_STALL_REPLACE_SECONDS = 600.0
+
     @staticmethod
     def _torrent_race_is_alive(snapshot: dict[str, Any] | None) -> bool:
         if not snapshot:
@@ -3783,13 +5801,51 @@ class AnimeManager:
             speed = int(snapshot.get("dlspeed") or snapshot.get("download_speed") or 0)
             downloaded = int(snapshot.get("downloaded") or 0)
             progress = float(snapshot.get("progress") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        # Only data actually flowing proves a live swarm. Metadata plus a
+        # connection used to count too (see _torrent_race_is_starting).
+        return bool(speed > 0 or downloaded >= 256 * 1024 or progress > 0.001)
+
+    @staticmethod
+    def _torrent_race_is_starting(snapshot: dict[str, Any] | None) -> bool:
+        """Metadata and a peer connection but no data yet: maybe alive, not proven."""
+        if not snapshot:
+            return False
+        try:
             total = int(snapshot.get("total_size") or snapshot.get("totalLength") or 0)
             connections = int(snapshot.get("connections") or snapshot.get("num_connections") or 0)
         except (TypeError, ValueError):
             return False
-        return bool(
-            speed > 0 or downloaded >= 256 * 1024 or progress > 0.001 or (total > 0 and connections > 0)
-        )
+        return total > 0 and connections > 0
+
+    @staticmethod
+    def _release_record(release: NyaaRelease) -> dict[str, Any]:
+        return asdict(release)
+
+    @staticmethod
+    def _release_from_record(record: Any) -> NyaaRelease | None:
+        if not isinstance(record, dict):
+            return None
+        allowed = set(NyaaRelease.__dataclass_fields__)
+        try:
+            return NyaaRelease(**{key: value for key, value in record.items() if key in allowed})
+        except TypeError:
+            return None
+
+    @staticmethod
+    def _race_pool(candidates: list[NyaaRelease], *, batch: bool) -> list[NyaaRelease]:
+        """The best three, and for a season pack up to two well-seeded ones after them.
+
+        Baccano!: the three best packs (an old 1080p one and two DVDs) gave no data, the
+        1080p pack with 171 seeders was fifth and never tried, and a dead DVD was kept.
+        """
+        pool = list(candidates[:3])
+        if batch:
+            known = [int(item.seeders or 0) for item in pool if getattr(item, "seeders_known", True)]
+            floor = max(10, 2 * max(known, default=0))
+            pool.extend([item for item in candidates[3:] if int(item.seeders or 0) >= floor][:2])
+        return pool
 
     def _race_add_candidates_aria2(
         self,
@@ -3801,29 +5857,136 @@ class AnimeManager:
         fast_seconds: float = 10.0,
         poll_seconds: float = 1.0,
         intent_revision: int | None = None,
+        stalled_hashes: Iterable[str] = (),
     ) -> NyaaRelease | None:
         """Try aria2 candidates sequentially so they never write the same target concurrently."""
 
-        pool = list(candidates[:3])
-        for index, release in enumerate(pool):
+        stalled = {str(value or "").casefold() for value in stalled_hashes if value}
+        # A release that already stalled for this request is tried last.
+        pool = sorted(
+            self._race_pool(candidates, batch=batch),
+            key=lambda item: str(item.info_hash or "").casefold() in stalled,
+        )
+        metadata_window = max(1.0, float(fast_seconds), self.ARIA2_RACE_METADATA_SECONDS)
+        starting_window = max(1.0, float(fast_seconds), self.ARIA2_RACE_STARTING_SECONDS)
+        # Hashes that showed neither data nor a peer in their window.
+        dead: set[str] = set()
+        # Metadata and peers but no data: removed to free the shared target,
+        # the best one comes back when nothing proved alive.
+        starting: list[NyaaRelease] = []
+        candidate_started = time.monotonic()
+        race_anime = self.db.get_anime(media_id)
+        race_target = self.config.library.root_dir / self._safe_dir_name(
+            race_anime.title if race_anime is not None else str(media_id)
+        )
+
+        def fail(
+            detail: str,
+            release: NyaaRelease | None = None,
+            *,
+            reason: str = "status_error",
+            candidate: NyaaRelease | None = None,
+        ) -> None:
+            # Every exit of the race says why. A removal that aria2 did not
+            # confirm used to end it without a line, and Planning then went on
+            # with one search per episode as if no pack existed.
+            tried = candidate or release
+            self.logger.warning(
+                "FAIL step=nyaa.race backend=aria2 media_id=%s episode=%s candidate=%s reason=%s "
+                "title=%r error=%r",
+                media_id,
+                episode,
+                pool.index(tried) + 1 if tried in pool else "-",
+                reason,
+                tried.title if tried is not None else "",
+                detail,
+            )
+            self.download_intents.update(
+                media_id,
+                episode,
+                batch,
+                state="recovery_required",
+                selected=release,
+                backend="aria2" if release is not None else None,
+                detail=detail,
+                expected_revision=intent_revision,
+            )
+
+        def fallback(chosen: NyaaRelease) -> dict[str, Any]:
+            # The other candidates that are not proven dead, in ranked order: a
+            # stall of the chosen one later moves on to them.
+            chosen_hash = str(chosen.info_hash or "").casefold()
+            others = [
+                self._release_record(item)
+                for item in pool
+                if str(item.info_hash or "").casefold() not in {"", chosen_hash, *dead, *stalled}
+            ]
+            return {"selected": self._release_record(chosen), "candidates": others} if others else {}
+
+        def best_starting() -> NyaaRelease:
+            # Most listed seeders; one that already stalled only when it is the
+            # only one with peers. max() keeps the higher-ranked one on ties.
+            return max(
+                starting,
+                key=lambda item: (
+                    str(item.info_hash or "").casefold() not in stalled,
+                    int(item.seeders or 0),
+                ),
+            )
+
+        def select(
+            release: NyaaRelease,
+            snapshot: dict[str, Any] | None,
+            *,
+            outcome: str = "winner",
+            detail: str = "",
+        ) -> NyaaRelease:
+            self.release_telemetry.record(
+                release,
+                media_id=media_id,
+                media_episode=episode,
+                provider="aria2",
+                outcome=outcome,
+                snapshot=snapshot,
+                elapsed_seconds=time.monotonic() - candidate_started,
+            )
+            self.download_intents.update(
+                media_id,
+                episode,
+                batch,
+                state="downloading",
+                selected=release,
+                backend="aria2",
+                detail=detail,
+                expected_revision=intent_revision,
+                owned_candidates=[],
+                stall_fallback=fallback(release),
+            )
+            return release
+
+        def add(index: int, release: NyaaRelease) -> tuple[bool, NyaaRelease | None]:
+            """Add one candidate: (True, None) to watch it, else (False, the race result)."""
+            nonlocal candidate_started
             probe_client = self.qbt_client()
             try:
+                if probe_client.backend_name == "aria2":
+                    # The status probe below is read-only and refuses a stopped
+                    # aria2; the add after it would start it, but the probe failed
+                    # first and the episode was never added (aria2 gone after sleep
+                    # or a crash, without the idle marker). Adding is a write, so
+                    # starting the sidecar here is what the user asked for.
+                    probe_client.ensure_running()
                 existing = probe_client.torrent_status(release.info_hash) if release.info_hash else None
             except QBittorrentError as exc:
-                self.download_intents.update(
-                    media_id,
-                    episode,
-                    batch,
-                    state="recovery_required",
-                    detail=str(exc),
-                    expected_revision=intent_revision,
-                )
-                return None
+                fail(str(exc), candidate=release)
+                return False, None
             finally:
                 probe_client.close()
             owned = []
             if release.info_hash and existing is None:
                 anime = self.db.get_anime(media_id)
+                if anime is None:  # removed meanwhile: a ManagerError the pass handles, not AttributeError
+                    raise ManagerError(err("manager.animeNotInDb", mediaId=media_id))
                 target = self.config.library.root_dir / self._safe_dir_name(anime.title)
                 owned = [
                     {
@@ -3872,26 +6035,19 @@ class AnimeManager:
                 owned_candidates=owned,
             )
             if updated is None:
-                return None
-            try:
-                added = self.add_release(media_id, release, episode=episode, batch=batch)
-            except (QBittorrentError, ManagerError) as exc:
-                self.logger.warning(
-                    "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s candidate=%s error=%r",
+                self.logger.info(
+                    "SKIP step=nyaa.race backend=aria2 media_id=%s episode=%s candidate=%s "
+                    "reason=intent_superseded",
                     media_id,
                     episode,
                     index + 1,
-                    str(exc),
                 )
-                self.download_intents.update(
-                    media_id,
-                    episode,
-                    batch,
-                    state="recovery_required",
-                    detail=str(exc),
-                    expected_revision=intent_revision,
-                )
-                return None
+                return False, None
+            try:
+                added = self.add_release(media_id, release, episode=episode, batch=batch)
+            except (QBittorrentError, ManagerError) as exc:
+                fail(str(exc), reason="add_failed", candidate=release)
+                return False, None
             blocker = self._duplicate_block(media_id, episode, batch) if added is False else None
             if blocker is not None:
                 # Another torrent already covers this request; every other candidate
@@ -3917,7 +6073,7 @@ class AnimeManager:
                     index + 1,
                     blocker_hash,
                 )
-                return None
+                return False, None
 
             if not release.info_hash:
                 self.download_intents.update(
@@ -3929,7 +6085,21 @@ class AnimeManager:
                     backend="aria2",
                     expected_revision=intent_revision,
                 )
-                return release
+                self.logger.info(
+                    "DONE step=nyaa.race backend=aria2 media_id=%s episode=%s winner=%r candidate=%s "
+                    "reason=no_info_hash",
+                    media_id,
+                    episode,
+                    release.title,
+                    index + 1,
+                )
+                return False, release
+            return True, None
+
+        for index, release in enumerate(pool):
+            watch, result = add(index, release)
+            if not watch:
+                return result
 
             client = self.qbt_client()
             try:
@@ -3940,89 +6110,59 @@ class AnimeManager:
                     except QBittorrentError:
                         pass
 
-                deadline = time.monotonic() + max(1.0, float(fast_seconds))
+                # Without metadata the candidate gets the long window; once the
+                # metadata is there, only whether peers send data is left.
+                started = time.monotonic()
+                deadline = started + metadata_window
+                queued_since: float | None = None
                 snapshot: dict[str, Any] | None = None
-                while time.monotonic() < deadline:
+                while True:
                     try:
                         snapshot = client.torrent_status(release.info_hash)
                     except QBittorrentError as exc:
-                        self.download_intents.update(
-                            media_id,
-                            episode,
-                            batch,
-                            state="recovery_required",
-                            selected=release,
-                            backend="aria2",
-                            detail=str(exc),
-                            expected_revision=intent_revision,
-                        )
+                        fail(str(exc), release)
                         return None
                     if snapshot and self._torrent_race_is_alive(snapshot):
-                        self.release_telemetry.record(
-                            release,
-                            media_id=media_id,
-                            media_episode=episode,
-                            provider="aria2",
-                            outcome="winner",
-                            snapshot=snapshot,
-                            elapsed_seconds=time.monotonic() - candidate_started,
-                        )
-                        self.download_intents.update(
-                            media_id,
-                            episode,
-                            batch,
-                            state="downloading",
-                            selected=release,
-                            backend="aria2",
-                            expected_revision=intent_revision,
-                            owned_candidates=[],
-                        )
                         self.logger.info(
                             "DONE step=nyaa.race backend=aria2 media_id=%s episode=%s "
-                            "winner=%r candidate=%s fast=true",
+                            "winner=%r candidate=%s elapsed=%.1f",
                             media_id,
                             episode,
                             release.title,
                             index + 1,
+                            time.monotonic() - started,
                         )
-                        return release
+                        return select(release, snapshot)
+                    if snapshot and str(snapshot.get("status") or "").casefold() == "waiting":
+                        # Queued behind aria2's active downloads: its window does not
+                        # run, and every other candidate would queue the same way.
+                        now_queued = time.monotonic()
+                        queued_since = now_queued if queued_since is None else queued_since
+                        if now_queued - queued_since >= self.ARIA2_RACE_QUEUED_SECONDS:
+                            self.logger.info(
+                                "FALLBACK step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                                "kept=%r candidate=%s reason=queued",
+                                media_id,
+                                episode,
+                                release.title,
+                                index + 1,
+                            )
+                            return select(
+                                release,
+                                snapshot,
+                                outcome="queued",
+                                detail="Queued behind other downloads",
+                            )
+                        started = now_queued
+                        deadline = started + metadata_window
+                        time.sleep(max(0.1, float(poll_seconds)))
+                        continue
+                    queued_since = None
+                    if snapshot and int(snapshot.get("total_size") or snapshot.get("totalLength") or 0) > 0:
+                        deadline = min(deadline, started + starting_window)
+                    if time.monotonic() >= deadline:
+                        break
                     time.sleep(max(0.1, float(poll_seconds)))
-
-                try:
-                    snapshot = client.torrent_status(release.info_hash)
-                except QBittorrentError as exc:
-                    self.download_intents.update(
-                        media_id,
-                        episode,
-                        batch,
-                        state="recovery_required",
-                        selected=release,
-                        backend="aria2",
-                        detail=str(exc),
-                        expected_revision=intent_revision,
-                    )
-                    return None
-                if snapshot and self._torrent_race_is_alive(snapshot):
-                    self.release_telemetry.record(
-                        release,
-                        media_id=media_id,
-                        media_episode=episode,
-                        provider="aria2",
-                        outcome="winner",
-                        snapshot=snapshot,
-                        elapsed_seconds=time.monotonic() - candidate_started,
-                    )
-                    self.download_intents.update(
-                        media_id,
-                        episode,
-                        batch,
-                        state="downloading",
-                        selected=release,
-                        backend="aria2",
-                        expected_revision=intent_revision,
-                        owned_candidates=[],
-                    )
-                    return release
 
                 downloaded = int((snapshot or {}).get("downloaded") or 0)
                 progress = float((snapshot or {}).get("progress") or 0.0)
@@ -4037,24 +6177,51 @@ class AnimeManager:
                         backend="aria2",
                         detail="candidate has partial data",
                         expected_revision=intent_revision,
+                        stall_fallback=fallback(release),
+                    )
+                    self.logger.info(
+                        "DONE step=nyaa.race backend=aria2 media_id=%s episode=%s winner=%r candidate=%s "
+                        "reason=partial_data downloaded=%s",
+                        media_id,
+                        episode,
+                        release.title,
+                        index + 1,
+                        downloaded,
                     )
                     return release
 
+                peers_without_data = self._torrent_race_is_starting(snapshot)
+                if peers_without_data:
+                    starting.append(release)
+                    if index == len(pool) - 1 and best_starting() is release:
+                        # Nothing proved alive and the last try is the best one
+                        # with peers: keep it instead of removing and re-adding.
+                        self.logger.info(
+                            "FALLBACK step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                            "kept=%r candidate=%s reason=peers_without_data",
+                            media_id,
+                            episode,
+                            release.title,
+                            index + 1,
+                        )
+                        return select(
+                            release,
+                            snapshot,
+                            outcome="kept_without_data",
+                            detail="Peers found, no data yet",
+                        )
+                else:
+                    dead.add(release.info_hash.casefold())
+
+                # Read before the removal: what aria2 created for it (0 bytes so far).
+                created = self._aria2_candidate_files(client, release.info_hash)
                 try:
                     self._delete_confirmed_torrent(client, release.info_hash, delete_files=False)
                 except (QBittorrentError, ManagerError) as exc:
-                    self.download_intents.update(
-                        media_id,
-                        episode,
-                        batch,
-                        state="recovery_required",
-                        selected=release,
-                        backend="aria2",
-                        detail=str(exc),
-                        expected_revision=intent_revision,
-                    )
+                    fail(str(exc), release, reason="removal_failed")
                     return None
                 self.db.delete_torrent_records(release.info_hash)
+                self._remove_empty_candidate_files(release.info_hash, created, race_target)
                 self.download_intents.update(
                     media_id,
                     episode,
@@ -4073,14 +6240,32 @@ class AnimeManager:
                     elapsed_seconds=time.monotonic() - candidate_started,
                 )
                 self.logger.info(
-                    "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s "
-                    "candidate=%s reason=no_progress",
+                    "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s candidate=%s reason=%s",
                     media_id,
                     episode,
                     index + 1,
+                    "peers_without_data" if peers_without_data else "no_progress",
                 )
             finally:
                 client.close()
+
+        if starting:
+            # No candidate sent data, but some had metadata and peers. Ending
+            # with nothing left the request without any download; keep the one
+            # with the most listed seeders (a stall moves on to the others).
+            best = best_starting()
+            watch, result = add(pool.index(best), best)
+            if not watch:
+                return result
+            self.logger.info(
+                "FALLBACK step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                "kept=%r candidate=%s reason=peers_without_data",
+                media_id,
+                episode,
+                best.title,
+                pool.index(best) + 1,
+            )
+            return select(best, None, outcome="kept_without_data", detail="Peers found, no data yet")
 
         self.download_intents.update(
             media_id,
@@ -4091,7 +6276,631 @@ class AnimeManager:
             detail="No candidate started downloading",
             expected_revision=intent_revision,
         )
+        self.logger.info(
+            "FAIL step=nyaa.race backend=aria2 media_id=%s episode=%s reason=no_candidate_started candidates=%s",
+            media_id,
+            episode,
+            len(pool),
+        )
         return None
+
+    @staticmethod
+    def _aria2_candidate_files(client: Any, torrent_hash: str) -> list[Path]:
+        """The files aria2 created for a torrent (absolute paths), read before it is removed."""
+        lister = getattr(client, "files", None)
+        if not callable(lister) or str(getattr(client, "backend_name", "") or "") != "aria2":
+            return []
+        try:
+            rows = lister(torrent_hash) or []
+        except QBittorrentError:
+            return []
+        paths: list[Path] = []
+        for row in rows:
+            name = str((row or {}).get("name") or "") if isinstance(row, dict) else ""
+            if name and not name.startswith("[METADATA]") and Path(name).is_absolute():
+                paths.append(Path(name))
+        return paths
+
+    def _remove_empty_candidate_files(self, torrent_hash: str, files: list[Path], save_path: Path) -> int:
+        """Remove what aria2 created for a removed torrent that never received a byte.
+
+        Its empty files, control file and saved "<infohash>.torrent" stayed in
+        the library and every scan listed the files as episodes. Only that
+        torrent's own paths inside its save folder, and nothing at all once
+        one of its files holds data.
+        """
+        if not files or not str(save_path or ""):
+            return 0
+        try:
+            root = Path(save_path).expanduser().resolve()
+            resolved = [path.expanduser().resolve() for path in files]
+        except (OSError, RuntimeError):
+            return 0
+        if any(root not in path.parents for path in resolved):
+            return 0
+        try:
+            if any(path.is_file() and path.stat().st_size > 0 for path in resolved):
+                return 0
+        except OSError:
+            return 0
+        tops = {root / path.relative_to(root).parts[0] for path in resolved}
+        targets = [
+            *resolved,
+            *(path.with_name(path.name + ".aria2") for path in resolved),
+            *(top.with_name(top.name + ".aria2") for top in tops),
+            root / f"{str(torrent_hash or '').strip().lower()}.torrent",
+        ]
+        removed = 0
+        deleted_videos: list[Path] = []
+        for path in dict.fromkeys(targets):
+            try:
+                if path.is_file() and (
+                    path.suffix.casefold() in {".aria2", ".torrent"} or path.stat().st_size == 0
+                ):
+                    path.unlink()
+                    removed += 1
+                    if path.suffix.casefold() in VIDEO_EXTENSIONS:
+                        deleted_videos.append(path)
+            except OSError:
+                continue
+        self._forget_deleted_videos(deleted_videos)
+        folders = {parent for path in resolved for parent in path.parents if root in parent.parents}
+        for folder in sorted(folders, key=lambda value: len(value.parts), reverse=True):
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+        self.logger.info(
+            "CLEANUP step=aria2.empty_candidate hash=%s files=%s removed=%s",
+            torrent_hash,
+            len(resolved),
+            removed,
+        )
+        return removed
+
+    def _video_state_keys(self, video: Path) -> list[str]:
+        """The ``state`` rows kept per video file (subtitle choices, upgrade checks, markers)."""
+        from .subtitle_delay import state_key as subtitle_delay_key
+
+        forms = [video]
+        try:
+            resolved = video.expanduser().resolve()
+        except (OSError, RuntimeError):
+            resolved = video
+        forms.append(resolved)
+        keys: list[str] = []
+        for value in dict.fromkeys(forms):
+            keys += [
+                self._subtitle_upgrade_state_key(value),
+                self._subtitle_upgrade_checked_key(value),
+                self._subtitle_upgrade_attempts_key(value),
+                self._manual_subtitle_state_key(value),
+                self._debug_force_subtitle_state_key(value),
+                self._subtitle_candidate_fingerprint_state_key(value),
+                self._subtitle_failure_streak_state_key(value),
+                self._subtitle_force_rebuild_state_key(value),
+                self._extra_file_kept_state_key(value),
+                extra_files.set_aside_state_key(value),
+                subtitle_delay_key(value),
+                f"ready_notification:file:{hashlib.sha256(str(value).encode()).hexdigest()}",
+                f"double_episode_part_one:{value}",
+                self._embedded_subtitle_probe_state_key(value),
+                *subtitle_migrations.video_marker_keys(value),
+            ]
+        return list(dict.fromkeys(keys))
+
+    def _forget_video_state(self, videos: Iterable[Path]) -> int:
+        """Drop the per-video state rows of videos Pudge itself deleted (DB-9).
+
+        Only ``playback_save`` markers were ever pruned: every other per-video key
+        stayed forever after the episode was watched and deleted. Only files that
+        are really gone count (a kept file keeps its choices).
+        """
+        deleter = getattr(self.db, "delete_states", None)
+        if not callable(deleter):
+            return 0
+        keys: list[str] = []
+        for video in videos:
+            try:
+                if video.exists():
+                    continue
+            except OSError:
+                continue
+            keys += self._video_state_keys(video)
+        if not keys:
+            return 0
+        try:
+            return int(deleter(keys) or 0)
+        except sqlite3.Error as exc:
+            self.logger.warning("SKIP step=state.forget_video reason=%r", str(exc)[:200])
+            return 0
+
+    def _forget_deleted_videos(self, videos: list[Path]) -> int:
+        """Drop the library rows and subtitle jobs of videos Pudge itself just deleted.
+
+        They used to wait out the missing-file delay like a file deleted in
+        Finder, so the episode list showed every episode twice (the deleted
+        copy "waiting for subtitles") and Home took the gone copy as the next
+        episode. The next scan walks the library again.
+        """
+        forgotten = 0
+        for video in videos:
+            try:
+                resolved = video.expanduser().resolve()
+            except (OSError, RuntimeError):
+                resolved = video
+            for value in dict.fromkeys((video, resolved)):
+                row = self.db.episode_by_path(value)
+                self.db.delete_episode_record(value)
+                if row is None:
+                    continue
+                forgotten += 1
+                self.logger.info(
+                    "CLEANUP step=library.deleted_video_row media_id=%s episode=%s video=%r",
+                    row.media_id,
+                    row.episode,
+                    str(value),
+                )
+        if videos:
+            self._forget_video_state(videos)
+            self.db.delete_state(self._LIBRARY_SCAN_CACHE_KEY)
+            self.invalidate_storage_snapshot()
+        return forgotten
+
+    def _known_client_torrents(self, step: str) -> tuple[list[Path], set[str]] | None:
+        """Paths and info hashes of every torrent the clients list, or None when one cannot be asked.
+
+        None means nothing may be removed: aria2 may simply be stopped.
+        """
+        clients = self.torrent_clients()
+        if not clients:
+            return None
+        known_paths: list[Path] = []
+        known_hashes: set[str] = set()
+        try:
+            for name, client in clients:
+                try:
+                    listing = list(client.torrents(category=""))
+                except Exception as exc:  # noqa: BLE001 - unknown torrents: try again later
+                    self.logger.info(
+                        "SKIP step=%s reason=client_unavailable backend=%s error=%r",
+                        step,
+                        name,
+                        str(exc)[:200],
+                    )
+                    return None
+                for item in listing:
+                    raw = item.raw or {}
+                    known_hashes.update(
+                        str(value or "").strip().casefold()
+                        for value in (item.torrent_hash, raw.get("infohash_v1"), raw.get("infohash_v2"))
+                        if value
+                    )
+                    for value in (item.content_path, item.save_path if not item.content_path else ""):
+                        if str(value or "").strip():
+                            try:
+                                known_paths.append(Path(str(value)).expanduser().resolve())
+                            except (OSError, RuntimeError):
+                                continue
+        finally:
+            for _name, client in clients:
+                client.close()
+        return known_paths, known_hashes
+
+    _ARIA2_LEFTOVER_CLEANUP_KEY = "aria2_leftover_cleanup_v1"
+    # aria2 rewrites the control file of a task it runs about every minute.
+    _ARIA2_LEFTOVER_MIN_AGE_SECONDS = 10 * 60
+
+    def cleanup_aria2_leftovers(self, *, now: float | None = None) -> int:
+        """Once: remove the empty files that removed race candidates left in the library.
+
+        Only a video of 0 bytes that no torrent of the client lists and that has
+        an aria2 control file next to it (or next to its folder) is deleted, then
+        that control file and folders left empty, and "<infohash>.torrent" files
+        of torrents the client no longer has. A file with data is never touched.
+        Runs when the client can be asked; the done-marker is set afterwards.
+        """
+        cleaned_at = self.db.get_state(self._ARIA2_LEFTOVER_CLEANUP_KEY, "")
+        if cleaned_at:
+            self._forget_aria2_leftover_rows_once(cleaned_at)
+        if not self.config.aria2.enabled or cleaned_at:
+            return 0
+        root = self.config.library.root_dir.expanduser()
+        known = self._known_client_torrents("library.aria2_leftovers")
+        if known is None:
+            return 0
+        known_paths, known_hashes = known
+        current = float(now if now is not None else time.time())
+        removed = 0
+        controls: set[Path] = set()
+        deleted_videos: list[Path] = []
+        videos: list[Path] = []
+        torrents: list[Path] = []
+        if root.is_dir():
+            for path in root.rglob("*"):
+                suffix = path.suffix.casefold()
+                if suffix in VIDEO_EXTENSIONS:
+                    videos.append(path)
+                elif suffix == ".torrent":
+                    torrents.append(path)
+        for path in videos:
+            try:
+                if not path.is_file() or path.stat().st_size != 0:
+                    continue
+                resolved = path.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if self._path_within(resolved, tuple(known_paths)):
+                continue
+            control = aria2_control_file(path, root)
+            try:
+                if (
+                    control is None
+                    or current - control.stat().st_mtime < self._ARIA2_LEFTOVER_MIN_AGE_SECONDS
+                ):
+                    continue
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+            deleted_videos.append(path)
+            controls.add(control)
+            self.logger.info(
+                "CLEANUP step=library.aria2_leftover video=%r control=%r", str(path), str(control)
+            )
+        for control in controls:
+            target = control.with_name(control.name[: -len(".aria2")])
+            if target.is_dir():
+                folders = sorted(
+                    (item for item in target.rglob("*") if item.is_dir()),
+                    key=lambda value: len(value.parts),
+                    reverse=True,
+                )
+                for folder in [*folders, target]:
+                    try:
+                        folder.rmdir()
+                    except OSError:
+                        pass
+            if target.exists():
+                continue  # files with data (or others) are still there: keep it
+            try:
+                control.unlink()
+            except OSError:
+                continue
+            self.logger.info("CLEANUP step=library.aria2_leftover control=%r", str(control))
+        for path in torrents:
+            stem = path.stem.casefold()
+            if not re.fullmatch(r"[0-9a-f]{40}", stem) or stem in known_hashes:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+            self.logger.info("CLEANUP step=library.aria2_leftover torrent=%r", str(path))
+        self._forget_deleted_videos(deleted_videos)
+        self.db.set_state(self._ARIA2_LEFTOVER_CLEANUP_KEY, str(int(current)))
+        # This cleanup forgets its rows itself: nothing to repair afterwards.
+        self.db.set_state(self._ARIA2_LEFTOVER_ROWS_REPAIR_KEY, str(int(current)))
+        self.logger.info("DONE step=library.aria2_leftovers removed=%s", removed)
+        return removed
+
+    _ARIA2_ORPHAN_CONTROL_KEY = "aria2_orphan_controls_checked_at"
+    _ARIA2_ORPHAN_CONTROL_INTERVAL_SECONDS = 6 * 60 * 60
+
+    def cleanup_orphan_aria2_controls(self, *, now: float | None = None) -> int:
+        """Remove aria2 control files left by torrents that are gone, a few times a day.
+
+        A race candidate removed before it wrote anything can leave its
+        "<name>.aria2" with no "<name>" beside it (seen: a 229-byte control of a
+        21 GiB BD pack next to the batch that won). Only a control file that is
+        older than ten minutes, names a torrent no client lists and has no data
+        (its file or folder is missing, or the folder holds no file) goes, with
+        that empty folder. Unreadable control files are kept.
+        """
+        if not self.config.aria2.enabled:
+            return 0
+        current = float(now if now is not None else time.time())
+        try:
+            checked = float(self.db.get_state(self._ARIA2_ORPHAN_CONTROL_KEY, "") or 0.0)
+        except (TypeError, ValueError):
+            checked = 0.0
+        if 0.0 < current - checked < self._ARIA2_ORPHAN_CONTROL_INTERVAL_SECONDS:
+            return 0
+        root = self.config.library.root_dir.expanduser()
+        if not root.is_dir():
+            return 0
+        known = self._known_client_torrents("library.aria2_orphan_controls")
+        if known is None:
+            return 0
+        _known_paths, known_hashes = known
+        # A download Pudge still tracks keeps its control file even if the client lost it.
+        known_hashes = known_hashes | {
+            str(item.torrent_hash or "").strip().casefold() for item in self.db.downloads()
+        }
+        removed = 0
+        for control in root.rglob("*.aria2"):
+            try:
+                if (
+                    not control.is_file()
+                    or current - control.stat().st_mtime < self._ARIA2_LEFTOVER_MIN_AGE_SECONDS
+                ):
+                    continue
+            except OSError:
+                continue
+            info_hash = aria2_control_infohash(control)
+            if not info_hash or info_hash in known_hashes:
+                continue
+            target = control.with_name(control.name[: -len(".aria2")])
+            folders: list[Path] = []
+            try:
+                if target.is_dir():
+                    if any(item.is_file() or item.is_symlink() for item in target.rglob("*")):
+                        continue  # data is there: not an orphan
+                    folders = sorted(
+                        (item for item in target.rglob("*") if item.is_dir()),
+                        key=lambda value: len(value.parts),
+                        reverse=True,
+                    )
+                    folders.append(target)
+                elif target.exists() or target.is_symlink():
+                    continue
+                for folder in folders:
+                    folder.rmdir()
+                control.unlink()
+            except OSError:
+                continue
+            removed += 1
+            self.logger.info(
+                "CLEANUP step=library.aria2_orphan_control control=%r hash=%s empty_folder=%s",
+                str(control),
+                info_hash,
+                bool(folders),
+            )
+        self.db.set_state(self._ARIA2_ORPHAN_CONTROL_KEY, str(int(current)))
+        if removed:
+            self.logger.info("DONE step=library.aria2_orphan_controls removed=%s", removed)
+        return removed
+
+    _ARIA2_LEFTOVER_ROWS_REPAIR_KEY = "aria2_leftover_rows_repair_v1"
+
+    def _forget_aria2_leftover_rows_once(self, cleaned_at: str) -> int:
+        """Once: forget the rows that the first leftover cleanup left behind.
+
+        It deleted the empty files of removed race candidates but kept their
+        rows for the missing-file wait, so every episode was listed twice for
+        hours. A row of a file that went missing since that cleanup goes unless
+        it holds viewing history (watched, played, deletion planned), its drive
+        is away or the client still has its torrent.
+        """
+        if self.db.get_state(self._ARIA2_LEFTOVER_ROWS_REPAIR_KEY, ""):
+            return 0
+        try:
+            since_cleanup = float(cleaned_at) - 60.0
+        except (TypeError, ValueError):
+            since_cleanup = 0.0
+        try:
+            stored = json.loads(self.db.get_state(self._MISSING_VIDEO_STATE, "") or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        missing_since = stored if isinstance(stored, dict) else {}
+        active = {str(item.torrent_hash or "").strip().casefold() for item in self.db.downloads()}
+        active.discard("")
+        incomplete = self.incomplete_download_paths()
+        rows: dict[str, LibraryEpisode] = {}
+        for item in self.db.episodes():
+            key = str(item.video_path)
+            if item.video_path.is_file() or self._path_within(item.video_path, incomplete):
+                continue
+            if str(item.torrent_hash or "").strip().casefold() in active:
+                continue
+            if (
+                item.watched_at
+                or str(item.state or "") == "watched"
+                or float(item.playback_position or 0.0) > 0.0
+                or item.delete_after
+            ):
+                continue
+            try:
+                since = float(missing_since[key]) if key in missing_since else None
+            except (TypeError, ValueError):
+                since = None
+            if since is not None and since < since_cleanup:
+                continue  # missing since before the cleanup: not its leftover
+            rows[key] = item
+        forgotten = 0
+        for value in sorted(self._forgettable_missing_videos([Path(key) for key in rows], immediate=True)):
+            row = rows.get(value)
+            self.db.delete_episode_record(Path(value))
+            forgotten += 1
+            self.logger.info(
+                "REPAIR step=library.aria2_leftover_row media_id=%s episode=%s state=%s video=%r",
+                row.media_id if row else None,
+                row.episode if row else None,
+                row.state if row else "",
+                value,
+            )
+        self.db.set_state(self._ARIA2_LEFTOVER_ROWS_REPAIR_KEY, str(int(time.time())))
+        self.logger.info("DONE step=library.aria2_leftover_rows forgotten=%s", forgotten)
+        return forgotten
+
+    def replace_stalled_aria2_downloads(self, *, now: float | None = None) -> int:
+        """Swap a chosen aria2 release that never received data for the next recorded candidate.
+
+        The race keeps a candidate with peers but no data when nothing better
+        moved, and aria2's own stall recovery only reconnects that same torrent.
+        Only a download still at 0 bytes is replaced, and only one that its race
+        chose (a manual choice drops the recorded candidates).
+        """
+        intents = getattr(self, "download_intents", None)
+        listing = getattr(intents, "stall_fallbacks", None)
+        if not callable(listing) or not self.config.aria2.enabled or self.config.qbittorrent.enabled:
+            return 0
+        pending = listing()
+        if not pending or not self.downloads_enabled() or self.torrent_paused_on_add():
+            return 0
+        current = float(now if now is not None else time.time())
+        active = getattr(self, "_active_acquisition_keys", set())
+        replaced = 0
+        client = self.qbt_client()
+        try:
+            try:
+                items = {
+                    str(item.torrent_hash or "").casefold(): item
+                    for item in client.torrents(category=self.config.qbittorrent.category)
+                }
+            except QBittorrentError as exc:
+                self.logger.warning("RETRY step=aria2.stall_replace error=%r", str(exc))
+                return 0
+            for intent in pending:
+                media_id, episode, batch = (
+                    int(intent["media_id"]),
+                    intent.get("episode"),
+                    bool(intent.get("batch")),
+                )
+                if intents.key(media_id, episode, batch) in active:
+                    continue
+                if str(intent.get("backend") or "") != "aria2":
+                    continue
+                selected_hash = str(intent.get("selected_hash") or "").casefold()
+                item = items.get(selected_hash)
+                if item is None:
+                    continue
+                raw = item.raw or {}
+                if str(item.state or "").casefold() == "waiting":
+                    # Queued behind aria2's active downloads: no peer was asked yet,
+                    # so the stall clock starts only once it runs.
+                    restart = getattr(intents, "restart_stall_clock", None)
+                    if callable(restart):
+                        restart(media_id, episode, batch, now=current)
+                    continue
+                if (
+                    str(item.state or "").casefold() != "active"
+                    or bool(raw.get("verifying"))
+                    or int(raw.get("downloaded") or 0) > 0
+                    or float(item.progress or 0.0) > 0
+                    or int(raw.get("download_speed") or 0) > 0
+                ):
+                    continue
+                details = intent.get("stall_fallback") or {}
+                since = max(float(details.get("since") or 0.0), float(item.added_on or 0))
+                stalled_for = current - since
+                if since <= 0 or stalled_for < self.ARIA2_STALL_REPLACE_SECONDS:
+                    continue
+                fallbacks = [
+                    release
+                    for release in map(self._release_from_record, details.get("candidates") or [])
+                    if release is not None and release.info_hash
+                ]
+                previous = self._release_from_record(details.get("selected"))
+                record = self.db.download_by_hash(item.torrent_hash)
+                if not fallbacks or (
+                    record is not None and (record.media_id != media_id or record.episode != episode)
+                ):
+                    continue
+                try:
+                    snapshot = client.torrent_status(item.torrent_hash)
+                except QBittorrentError as exc:
+                    self.logger.warning(
+                        "RETRY step=aria2.stall_replace hash=%s error=%r", item.torrent_hash, str(exc)
+                    )
+                    continue
+                # Same rule as the race: never switch once a byte exists.
+                if (
+                    snapshot is None
+                    or int(snapshot.get("downloaded") or 0) > 0
+                    or float(snapshot.get("progress") or 0.0) > 0
+                    or int(snapshot.get("dlspeed") or 0) > 0
+                ):
+                    continue
+                self.logger.info(
+                    "RETRY step=aria2.stall_replace media_id=%s episode=%s batch=%s hash=%s "
+                    "stalled_s=%.0f candidates=%s title=%r",
+                    media_id,
+                    episode,
+                    batch,
+                    item.torrent_hash,
+                    stalled_for,
+                    len(fallbacks),
+                    item.name,
+                )
+                created = self._aria2_candidate_files(client, item.torrent_hash)
+                try:
+                    self._delete_confirmed_torrent(client, item.torrent_hash, delete_files=False)
+                except (QBittorrentError, ManagerError) as exc:
+                    self.logger.warning(
+                        "RETRY step=aria2.stall_replace hash=%s error=%r", item.torrent_hash, str(exc)
+                    )
+                    continue
+                self.db.delete_torrent_records(item.torrent_hash)
+                self._remove_empty_candidate_files(item.torrent_hash, created, Path(item.save_path or ""))
+                # The stalled release goes last: it comes back only when every
+                # other candidate is dead, and it is never recorded again.
+                pool = [*fallbacks, *([previous] if previous is not None else [])]
+                try:
+                    winner = self._race_add_candidates(
+                        media_id,
+                        pool,
+                        episode=episode,
+                        batch=batch,
+                        stalled_hashes=frozenset({selected_hash}),
+                    )
+                except (UnconfirmedCandidatesError, QBittorrentError, ManagerError) as exc:
+                    self.logger.warning(
+                        "FAIL step=aria2.stall_replace media_id=%s episode=%s error=%r",
+                        media_id,
+                        episode,
+                        str(exc),
+                    )
+                    self._stall_replace_left_nothing(media_id, episode, batch, selected_hash, str(exc))
+                    continue
+                if winner is None:
+                    self._stall_replace_left_nothing(
+                        media_id, episode, batch, selected_hash, "no_candidate_started"
+                    )
+                self.logger.info(
+                    "REPLACE step=aria2.stall_replace media_id=%s episode=%s batch=%s old_hash=%s "
+                    "new_hash=%s title=%r",
+                    media_id,
+                    episode,
+                    batch,
+                    item.torrent_hash,
+                    winner.info_hash if winner is not None else "",
+                    winner.title if winner is not None else "",
+                )
+                if winner is not None and str(winner.info_hash or "").casefold() != selected_hash:
+                    replaced += 1
+        finally:
+            client.close()
+        return replaced
+
+    def _stall_replace_left_nothing(
+        self, media_id: int, episode: int | None, batch: bool, removed_hash: str, reason: str
+    ) -> None:
+        """The stalled torrent is gone and no replacement started: the request still said
+        "downloading" the removed hash, which nothing ever looked at again (a Planning pack
+        stayed "downloading" with no torrent). It waits again instead."""
+        intents = getattr(self, "download_intents", None)
+        if intents is None:
+            return
+        try:
+            intent = intents.get(media_id, episode, batch) or {}
+            if str(intent.get("selected_hash") or "").casefold() != removed_hash:
+                return  # a replacement (or something else) owns it now
+            intents.update(
+                media_id,
+                episode,
+                batch,
+                state="waiting",
+                backend=str(intent.get("backend") or "aria2"),
+                detail=f"Stalled download removed; no replacement started ({reason[:120]})",
+            )
+        except Exception as exc:  # noqa: BLE001 - the replacement pass goes on
+            self.logger.warning("FAIL step=aria2.stall_replace_waiting error=%r", str(exc)[:200])
+            return
+        self.logger.info(
+            "WAIT step=aria2.stall_replace media_id=%s episode=%s reason=%s", media_id, episode, reason[:120]
+        )
 
     @_torrent_app_may_start
     def recover_acquisition_attempts(self) -> int:
@@ -4139,6 +6948,7 @@ class AnimeManager:
                             )
                             continue
                         if snapshot is not None and not self.downloads_enabled():
+                            self.note_torrents_paused_by_pudge([hash_], reason="torrents_off")
                             client.pause(hash_)
                             continue
                         if snapshot is not None:
@@ -4321,6 +7131,8 @@ class AnimeManager:
     ) -> NyaaRelease | None:
         """Journal a normal target before an add with an uncertain acknowledgement."""
         anime = self.db.get_anime(media_id)
+        if anime is None:  # removed meanwhile: a ManagerError the pass handles, not AttributeError
+            raise ManagerError(err("manager.animeNotInDb", mediaId=media_id))
         target = self.config.library.root_dir / self._safe_dir_name(anime.title)
         try:
             if not release.info_hash:
@@ -4409,6 +7221,14 @@ class AnimeManager:
                 expected_revision=intent_revision,
                 detail=str(exc),
             )
+            self.logger.warning(
+                "FAIL step=nyaa.race backend=%s media_id=%s episode=%s reason=add_failed title=%r error=%r",
+                backend,
+                media_id,
+                episode,
+                release.title,
+                str(exc),
+            )
             return None
 
     def _race_add_candidates(
@@ -4417,7 +7237,9 @@ class AnimeManager:
         if not hasattr(self, "download_intents"):
             self.download_intents = DownloadIntentStore(self.db)
         if candidates:
-            self._ensure_download_space(max(int(release.size_bytes or 0) for release in candidates[:3]))
+            self._ensure_download_space(
+                max(int(release.size_bytes or 0) for release in self._race_pool(candidates, batch=batch))
+            )
         anime = self.db.get_anime(media_id)
         validated = []
         for release in candidates:
@@ -4428,26 +7250,44 @@ class AnimeManager:
                     "SKIP step=torrent.candidate_identity hash=%s reason=%s", release.info_hash, str(exc)
                 )
         if not validated:
+            self.logger.info(
+                "SKIP step=nyaa.race media_id=%s episode=%s reason=no_valid_candidate candidates=%s",
+                media_id,
+                episode,
+                len(candidates),
+            )
             return None
         intent = self.download_intents.get(media_id, episode, batch)
         if intent and intent.get("owned_candidates"):
             self.recover_acquisition_attempts()
             intent = self.download_intents.get(media_id, episode, batch)
             if intent and intent.get("owned_candidates"):
+                self.logger.info(
+                    "SKIP step=nyaa.race media_id=%s episode=%s reason=unconfirmed_candidates",
+                    media_id,
+                    episode,
+                )
                 return None
         key = self.download_intents.key(media_id, episode, batch)
-        active = getattr(self, "_active_acquisition_keys", None)
-        if active is None:
-            self._active_acquisition_keys = active = set()
-        if key in active:
+        with self._acquisition_keys_lock:
+            active = getattr(self, "_active_acquisition_keys", None)
+            if active is None:
+                self._active_acquisition_keys = active = set()
+            running = key in active
+            if not running:
+                active.add(key)
+        if running:
+            self.logger.info(
+                "SKIP step=nyaa.race media_id=%s episode=%s reason=already_running", media_id, episode
+            )
             return None
-        active.add(key)
         try:
             winner = self._race_add_candidates_impl(
                 media_id, validated, episode=episode, batch=batch, **kwargs
             )
         finally:
-            active.discard(key)
+            with self._acquisition_keys_lock:
+                active.discard(key)
         if winner is not None:
             self._note_storage_admission(winner.info_hash, winner.size_bytes)
         return winner
@@ -4463,9 +7303,12 @@ class AnimeManager:
         fast_seconds: float = 10.0,
         total_seconds: float = 120.0,
         poll_seconds: float = 2.0,
+        stalled_hashes: Iterable[str] = (),
     ) -> NyaaRelease | None:
         """Race up to three qBittorrent candidates and keep the best one that moves."""
-        pool = list(candidates[:3])
+        sequential = bool(self.config.aria2.enabled and not self.config.qbittorrent.enabled)
+        # aria2 tries one after another: a season pack may try two well-seeded extras.
+        pool = self._race_pool(candidates, batch=batch) if sequential else list(candidates[:3])
         if not pool:
             return None
         if not hasattr(self, "download_intents"):
@@ -4497,6 +7340,7 @@ class AnimeManager:
                 fast_seconds=fast_seconds,
                 poll_seconds=poll_seconds,
                 intent_revision=intent_revision,
+                stalled_hashes=stalled_hashes,
             )
         if not self.config.qbittorrent.enabled or len(pool) == 1 or self.torrent_paused_on_add():
             return self._add_journaled_single_candidate(
@@ -4516,6 +7360,7 @@ class AnimeManager:
         target.mkdir(parents=True, exist_ok=True)
         try:
             (target / ".anilist.id").write_text(str(anime.media_id), encoding="utf-8")
+            self._remember_pudge_sidecar(target, anime.media_id)
         except OSError as exc:
             self.logger.warning(
                 "WARN step=torrent.race_sidecar media_id=%s path=%r error=%r",
@@ -4900,6 +7745,11 @@ class AnimeManager:
                     detail="No candidate could be added",
                     expected_revision=intent_revision,
                 )
+                self.logger.info(
+                    "FAIL step=nyaa.race backend=qbittorrent media_id=%s episode=%s reason=no_candidate_added",
+                    media_id,
+                    episode,
+                )
                 return None
 
             race_deadline = started_at + max(float(total_seconds), float(fast_seconds))
@@ -4977,15 +7827,52 @@ class AnimeManager:
         require_score: float | None = None,
         automatic: bool = False,
         require_explicit_batch: bool = False,
+        raise_when_unavailable: bool = False,
     ) -> NyaaRelease | None:
+        """Search and add the best release; ``None`` when none qualifies.
+
+        With ``raise_when_unavailable`` a search whose release search could not
+        be reached at all raises ReleaseSearchUnavailableError instead of
+        returning ``None`` ("nothing found") when nothing was added.
+        """
+        eligible = self.release_candidates(
+            media_id,
+            episode=episode,
+            batch=batch,
+            require_score=require_score,
+            automatic=automatic,
+            require_explicit_batch=require_explicit_batch,
+            raise_when_unavailable=raise_when_unavailable,
+        )
+        if not eligible:
+            return None
+        return self.add_release_candidates(media_id, eligible, episode=episode, batch=batch)
+
+    def release_candidates(
+        self,
+        media_id: int,
+        *,
+        episode: int | None,
+        batch: bool,
+        require_score: float | None = None,
+        automatic: bool = False,
+        require_explicit_batch: bool = False,
+        raise_when_unavailable: bool = False,
+    ) -> list[NyaaRelease]:
+        """The releases search_and_add_best would race, best first; nothing is added.
+
+        Planning searches every episode first and adds them only when all were found.
+        """
         if not automatic:
             self._allow_redownload(media_id, None if batch else episode)
+        _RELEASE_SEARCH_OUTCOME.unavailable = None
         releases = self.search_releases(
             media_id,
             episode=episode,
             batch=batch,
             automatic=bool(automatic),
         )
+        unavailable = getattr(_RELEASE_SEARCH_OUTCOME, "unavailable", None)
         threshold = self.config.nyaa.min_release_score if require_score is None else require_score
         eligible = [
             item
@@ -4995,18 +7882,31 @@ class AnimeManager:
             and (not require_explicit_batch or self._release_is_safe_batch_candidate(media_id, item))
             and (batch or episode is None or self._release_has_safe_episode_identity(item))
         ]
-        best = eligible[0] if eligible else None
         record_video_selection_debug(
             self.config.paths.cache_dir,
             media_id=media_id,
             episode=episode,
             mode="manual_best",
             releases=releases,
-            selected=best,
+            selected=eligible[0] if eligible else None,
             threshold=float(threshold),
         )
-        if best is None:
+        if not eligible and raise_when_unavailable and unavailable is not None:
+            raise unavailable
+        return eligible
+
+    def add_release_candidates(
+        self,
+        media_id: int,
+        eligible: list[NyaaRelease],
+        *,
+        episode: int | None,
+        batch: bool,
+    ) -> NyaaRelease | None:
+        """Add the best of ``eligible`` (a race when there are several); the release added or None."""
+        if not eligible:
             return None
+        best = eligible[0]
         if self.downloads_enabled() and not self.torrent_paused_on_add() and len(eligible) > 1:
             return self._race_add_candidates(media_id, eligible, episode=episode, batch=batch)
         single_backend = "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
@@ -5024,6 +7924,44 @@ class AnimeManager:
         )
         return best
 
+    def planning_batch_status(self, media_id: int, *, since: float = 0.0) -> tuple[str, str]:
+        """After a season-pack step that reported no pack: (pack, failure).
+
+        ``pack`` names a season-pack torrent of this title that is still in the
+        client and not finished (the race kept or reused it but said nothing);
+        ``failure`` is the error that ended this step's race (state
+        ``recovery_required`` written after ``since``). Each is "" when absent.
+        """
+        anime = self.db.get_anime(int(media_id))
+        if anime is not None:
+            clients = self.torrent_clients()
+            try:
+                for name, client in clients:
+                    try:
+                        item = self._existing_download_for_request(client, anime, episode=None, batch=True)
+                    except (QBittorrentError, ManagerError, OSError) as exc:
+                        self.logger.warning(
+                            "SKIP step=planning_episode.batch_present backend=%s media_id=%s error=%r",
+                            name,
+                            media_id,
+                            str(exc),
+                        )
+                        continue
+                    if item is not None and not self._download_is_complete(item):
+                        return str(item.name or ""), ""
+            finally:
+                for _name, client in clients:
+                    client.close()
+        intents = getattr(self, "download_intents", None)
+        intent = intents.get(int(media_id), None, True) if intents is not None else None
+        if (
+            intent
+            and str(intent.get("state") or "") == "recovery_required"
+            and float(intent.get("updated_at") or 0.0) >= float(since)
+        ):
+            return "", str(intent.get("detail") or "")
+        return "", ""
+
     @staticmethod
     def _recently_finished(end_date: str | None, *, days: int = 60) -> bool:
         raw = str(end_date or "").strip()
@@ -5038,7 +7976,196 @@ class AnimeManager:
             return False
         return 0 <= (datetime.date.today() - finished).days <= days
 
+    ANILIST_STALE_SYNC_SECONDS = 24 * 3600.0
+
+    def _anilist_sync_stale(self, *, now: float | None = None) -> bool:
+        """AniList has not answered a list refresh for a day (an outage, a block)."""
+        if not self.config.anilist.enabled or not self.config.anilist.access_token.strip():
+            return False
+        try:
+            synced = float(self.db.get_state("anilist_synced_at", "0") or 0)
+        except ValueError:
+            synced = 0.0
+        moment = time.time() if now is None else float(now)
+        return synced > 0 and moment - synced > self.ANILIST_STALE_SYNC_SECONDS
+
+    @staticmethod
+    def _released_episodes_for_search(
+        anime: LibraryAnime, *, stale_sync: bool, now: float | None = None
+    ) -> int | None:
+        """``released_episodes``, estimated forward weekly while the AniList data is stale.
+
+        The cached next airing episode stops moving when AniList cannot be
+        reached, which used to freeze a weekly show after one more episode.
+        Only during such an outage: one episode a week since the cached airing
+        time, never beyond the episode count. Searching for an episode that has
+        not aired (a break week) costs only a search.
+        """
+        released = anime.released_episodes
+        if (
+            not stale_sync
+            or released is None
+            or str(anime.media_status or "").upper() != "RELEASING"
+            or not anime.next_airing_episode
+            or not anime.next_airing_at
+        ):
+            return released
+        moment = time.time() if now is None else float(now)
+        weeks = int(max(0.0, moment - float(anime.next_airing_at)) // (7 * 86400))
+        if weeks <= 0:
+            return released
+        estimate = released + weeks
+        if anime.episodes:
+            estimate = min(estimate, int(anime.episodes))
+        return max(released, estimate)
+
+    @contextmanager
+    def release_search_cancellable(self, should_continue: Callable[[], bool]) -> Iterator[None]:
+        """Release searches in this thread stop between requests once ``should_continue()``
+        is False (cooperative cancel: nothing is added after that)."""
+        previous = getattr(_RELEASE_SEARCH_CANCEL, "check", None)
+        _RELEASE_SEARCH_CANCEL.check = should_continue
+        try:
+            yield
+        finally:
+            _RELEASE_SEARCH_CANCEL.check = previous
+
+    @staticmethod
+    def _release_search_cancelled() -> bool:
+        check = getattr(_RELEASE_SEARCH_CANCEL, "check", None)
+        if not callable(check):
+            return False
+        try:
+            return not check()
+        except Exception:  # noqa: BLE001 - a broken check never cancels
+            return False
+
+    def _log_release_search_cancelled(self, step: str, **fields: Any) -> None:
+        self.logger.info(
+            "SKIP step=%s reason=cancelled %s",
+            step,
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+
+    # An older aired episode that no release search found keeps being searched every pass for
+    # its first misses, then waits 20 min, 40, 80 ... up to 3 h between searches. The newest
+    # aired episode is searched every pass (a fresh release may appear any minute).
+    AUTO_SEARCH_MISS_PREFIX = "auto_search_miss:"
+    AUTO_SEARCH_BACKOFF_AFTER_MISSES = 6
+    AUTO_SEARCH_BACKOFF_BASE_SECONDS = 20 * 60.0
+    AUTO_SEARCH_BACKOFF_MAX_SECONDS = 3 * 3600.0
+
+    @contextmanager
+    def ignore_auto_search_backoff(self) -> Iterator[None]:
+        """Automatic searches in this thread search every missing episode (a user's request)."""
+        previous = bool(getattr(_AUTO_SEARCH_BYPASS, "active", False))
+        _AUTO_SEARCH_BYPASS.active = True
+        try:
+            yield
+        finally:
+            _AUTO_SEARCH_BYPASS.active = previous
+
+    @classmethod
+    def _auto_search_miss_key(cls, media_id: int, episode: int) -> str:
+        return f"{cls.AUTO_SEARCH_MISS_PREFIX}{int(media_id)}:{int(episode)}"
+
+    def _auto_search_misses(self) -> dict[str, dict[str, Any]]:
+        """Every remembered miss (one query a pass): key -> {"misses", "next_at", ...}."""
+        try:
+            with self.db.connect() as conn:
+                rows = conn.execute(
+                    f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}",
+                    state_prefix_bounds(self.AUTO_SEARCH_MISS_PREFIX),
+                ).fetchall()
+        except (AttributeError, sqlite3.Error) as exc:
+            self.logger.warning("SKIP step=nyaa.auto_search_backoff reason=unreadable error=%r", str(exc))
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                value = json.loads(str(row["value"] or "{}"))
+            except (TypeError, ValueError):
+                value = {}
+            result[str(row["key"])] = value if isinstance(value, dict) else {}
+        return result
+
+    def _note_auto_search_miss(
+        self, misses: dict[str, dict[str, Any]], media_id: int, episode: int, *, now: float
+    ) -> None:
+        key = self._auto_search_miss_key(media_id, episode)
+        try:
+            count = int((misses.get(key) or {}).get("misses") or 0) + 1
+        except (TypeError, ValueError):
+            count = 1
+        entry: dict[str, Any] = {"misses": count, "last_miss_at": round(now, 3)}
+        over = count - self.AUTO_SEARCH_BACKOFF_AFTER_MISSES
+        if over >= 0:
+            delay = min(
+                self.AUTO_SEARCH_BACKOFF_MAX_SECONDS,
+                self.AUTO_SEARCH_BACKOFF_BASE_SECONDS * 2 ** min(over, 16),
+            )
+            entry["next_at"] = round(now + delay, 3)
+            if over == 0:
+                self.logger.info(
+                    "RESULT step=nyaa.auto_search_backoff media_id=%s episode=%s misses=%s retry_in_s=%.0f "
+                    "reason=no_suitable_release",
+                    media_id,
+                    episode,
+                    count,
+                    delay,
+                )
+        misses[key] = entry
+        try:
+            self.db.set_state(key, json.dumps(entry, separators=(",", ":")))
+        except sqlite3.Error as exc:
+            self.logger.warning("SKIP step=nyaa.auto_search_backoff key=%s error=%r", key, str(exc))
+
+    def _forget_auto_search_misses(self, keys: Iterable[str]) -> None:
+        wanted = [key for key in dict.fromkeys(keys) if key]
+        if not wanted:
+            return
+        try:
+            self.db.delete_states(wanted)
+        except sqlite3.Error as exc:
+            self.logger.warning("SKIP step=nyaa.auto_search_backoff_reset error=%r", str(exc))
+
+    def _reset_auto_search_backoff(self, media_id: int, episode: int | None = None) -> None:
+        """Forget the misses of one episode (``None``: of every episode of the title)."""
+        try:
+            if episode is not None:
+                self.db.delete_state(self._auto_search_miss_key(media_id, int(episode)))
+                return
+            with self.db.connect() as conn:
+                conn.execute(
+                    f"DELETE FROM state WHERE {STATE_PREFIX_SQL}",
+                    state_prefix_bounds(f"{self.AUTO_SEARCH_MISS_PREFIX}{int(media_id)}:"),
+                )
+        except (AttributeError, sqlite3.Error) as exc:
+            self.logger.warning(
+                "SKIP step=nyaa.auto_search_backoff_reset media_id=%s error=%r", media_id, str(exc)
+            )
+
     def auto_search_current(self) -> int:
+        # Every periodic pass runs this, also with automatic downloads off: a
+        # Planning season pack stuck at 0 bytes moves on to its next candidate.
+        try:
+            self.replace_stalled_aria2_downloads()
+        except Exception as exc:  # noqa: BLE001 - never block the release search
+            self.logger.warning("FAIL step=aria2.stall_replace error=%r", str(exc)[:200])
+        try:
+            self.cleanup_aria2_leftovers()
+        except Exception as exc:  # noqa: BLE001 - never block the release search
+            self.logger.warning("FAIL step=library.aria2_leftovers error=%r", str(exc)[:200])
+        try:
+            self.cleanup_orphan_aria2_controls()
+        except Exception as exc:  # noqa: BLE001 - never block the release search
+            self.logger.warning("FAIL step=library.aria2_orphan_controls error=%r", str(exc)[:200])
+        try:
+            # Releases the user chose while Torrents were off: before the automatic
+            # search, so it finds them downloading instead of picking another copy.
+            self.start_queued_releases()
+        except Exception as exc:  # noqa: BLE001 - never block the release search
+            self.logger.warning("FAIL step=release.queued_start error=%r", str(exc)[:200])
         if not (
             self.config.nyaa.enabled
             and self.config.nyaa.auto_download_current
@@ -5050,6 +8177,15 @@ class AnimeManager:
             self._log_storage_pause()
             return 0
         count = 0
+        stale_sync = self._anilist_sync_stale()
+        misses = self._auto_search_misses()
+        backoff_bypassed = bool(getattr(_AUTO_SEARCH_BYPASS, "active", False))
+        pass_started = time.time()
+        # Where each title's search starts this pass (misses below it are stale), and
+        # titles whose released count is unknown (their misses are kept as they are).
+        search_starts: dict[int, int] = {}
+        keep_misses_of: set[int] = set()
+        stale_misses: set[str] = set()
         # CURRENT is the normal case.  Also keep following a RELEASING title in
         # PLANNING once it already has local video: progress=0 must not freeze
         # an airing download chain merely because the user has not watched the
@@ -5079,13 +8215,17 @@ class AnimeManager:
             candidates.append(anime)
 
         for anime in candidates:
+            if self._release_search_cancelled():
+                self._log_release_search_cancelled("nyaa.auto_search", started=count)
+                return count
             tail_start = planning_tail_start.get(int(anime.media_id))
             if anime.media_status != "RELEASING" and anime.status == "PLANNING" and tail_start is None:
                 continue
             start = anime.progress + 1
             if tail_start is not None:
                 start = max(start, tail_start)
-            released = anime.released_episodes
+            released = self._released_episodes_for_search(anime, stale_sync=stale_sync)
+            search_starts[int(anime.media_id)] = start
 
             # Never guess an episode beyond the locally cached release boundary.
             # A completed/up-to-date title must not trigger Nyaa requests. The
@@ -5093,7 +8233,8 @@ class AnimeManager:
             # actually airs, and the next lightweight refresh/agent pass can then
             # search for it.
             if released is None:
-                self.log(f"{anime.title}: Nyaa skip — released episode count is unknown")
+                keep_misses_of.add(int(anime.media_id))
+                self.log(f"{anime.title}: release search skipped — released episode count is unknown")
                 self.logger.info(
                     "SKIP step=nyaa.auto_search media_id=%s title=%r reason=released_unknown progress=%s",
                     anime.media_id,
@@ -5102,7 +8243,9 @@ class AnimeManager:
                 )
                 continue
             if start > released:
-                self.log(f"{anime.title}: Nyaa skip — progress {anime.progress} >= released {released}")
+                self.log(
+                    f"{anime.title}: release search skipped — progress {anime.progress} >= released {released}"
+                )
                 self.logger.info(
                     "SKIP step=nyaa.auto_search media_id=%s title=%r reason=up_to_date progress=%s released=%s",
                     anime.media_id,
@@ -5123,21 +8266,49 @@ class AnimeManager:
             covered_by_double: set[int] = set()
             blocked = self._redownload_block(anime.media_id)
             for episode in range(start, released + 1):
+                miss_key = self._auto_search_miss_key(anime.media_id, episode)
                 if episode in covered_by_double or self.db.has_episode(anime.media_id, episode):
+                    if miss_key in misses:
+                        stale_misses.add(miss_key)  # it is here now: its misses are over
                     continue
                 if episode in blocked:
                     # Deleted from the anime menu: not fetched again automatically.
                     continue
-                if searched_missing >= search_budget:
-                    break
+                if not backoff_bypassed and episode < released:
+                    try:
+                        next_at = float((misses.get(miss_key) or {}).get("next_at") or 0.0)
+                    except (TypeError, ValueError):
+                        next_at = 0.0
+                    if next_at > pass_started:
+                        # Missed many times: searched again later, without using the budget.
+                        self.logger.debug(
+                            "SKIP step=nyaa.auto_search media_id=%s episode=%s reason=miss_backoff retry_in_s=%.0f",
+                            anime.media_id,
+                            episode,
+                            next_at - pass_started,
+                        )
+                        continue
+                if searched_missing >= search_budget and episode < released:
+                    # The budget is for older episodes: the newest aired one is searched every
+                    # pass, also when older ones that keep missing used the budget up.
+                    continue
                 if self._auto_search_intent_unconfirmed(anime.media_id, episode):
                     continue
+                if self._release_search_cancelled():
+                    self._log_release_search_cancelled("nyaa.auto_search", started=count)
+                    return count
                 searched_missing += 1
                 self._duplicate_block(anime.media_id, episode, False, take=True)
                 try:
                     releases = self.search_releases(
                         anime.media_id, episode=episode, batch=False, automatic=True
                     )
+                    if self._release_search_cancelled():
+                        # Torrent Off while this search ran: nothing is added any more.
+                        self._log_release_search_cancelled(
+                            "nyaa.auto_search", media_id=anime.media_id, episode=episode, started=count
+                        )
+                        return count
                     storage_rejections = int(getattr(self, "_storage_rejections", 0))
                     eligible = self.automatic_release_candidates(releases)
                     eligible = self._prefer_single_episode_releases(anime, episode, eligible)
@@ -5211,7 +8382,24 @@ class AnimeManager:
                     # whole pass (and the subtitles after it) for one title.
                     self._log_intent_unconfirmed(anime.media_id, episode)
                     continue
+                except NoReleaseSourceError:
+                    # No source in Settings → Sources: one quiet line, no error per title.
+                    self._log_no_release_source("nyaa.auto_search")
+                    return count
                 except (NyaaError, QBittorrentError, ManagerError) as exc:
+                    self.log(f"{anime.title} #{episode}: {exc}")
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one title never ends the pass
+                    # A folder that cannot be made (the library disk away), a locked database
+                    # or a bug for one release used to leave this loop and the rest of the
+                    # maintenance pass: no other title was searched, nothing was cleaned up,
+                    # every pass again.
+                    self.logger.warning(
+                        "FAIL step=nyaa.auto_search media_id=%s episode=%s error=%r",
+                        anime.media_id,
+                        episode,
+                        f"{type(exc).__name__}: {exc}"[:300],
+                    )
                     self.log(f"{anime.title} #{episode}: {exc}")
                     continue
                 if best is None:
@@ -5222,14 +8410,92 @@ class AnimeManager:
                         continue
                     blocker = self._duplicate_block(anime.media_id, episode, False, take=True)
                     if blocker is not None:
+                        if miss_key in misses:
+                            stale_misses.add(miss_key)
                         self.log(
                             f"{anime.title} #{episode}: not downloaded, an existing torrent covers it: {blocker[1]}"
                         )
                         continue
                     self.log(f"{anime.title} #{episode}: no suitable release found automatically yet")
+                    if episode < released:
+                        self._note_auto_search_miss(misses, anime.media_id, episode, now=time.time())
                     continue
+                if miss_key in misses:
+                    stale_misses.add(miss_key)
                 count += 1
+        for key in misses:
+            # Titles no longer followed, and episodes now below the title's progress.
+            try:
+                media_text, _, episode_text = key[len(self.AUTO_SEARCH_MISS_PREFIX) :].partition(":")
+                media_id, episode = int(media_text), int(episode_text)
+            except ValueError:
+                stale_misses.add(key)
+                continue
+            if media_id in keep_misses_of:
+                continue
+            if media_id not in search_starts or episode < search_starts[media_id]:
+                stale_misses.add(key)
+        self._forget_auto_search_misses(stale_misses)
+        try:
+            self.prioritize_nearest_episodes()
+        except Exception as exc:  # noqa: BLE001 - queue order never blocks the release search
+            self.logger.warning("FAIL step=downloads.nearest_first error=%r", str(exc)[:200])
         return count
+
+    def prioritize_nearest_episodes(self) -> int:
+        """Several episodes of one anime downloading: the one nearest to the next to watch goes
+        first in the torrent client's queue (and takes a slot from a farther one in aria2)."""
+        groups: dict[int, list[DownloadItem]] = {}
+        for item in self.db.downloads():
+            if (
+                item.media_id is None
+                or item.episode is None
+                or item.is_batch
+                or float(item.progress or 0) >= 1.0
+            ):
+                continue
+            groups.setdefault(int(item.media_id), []).append(item)
+        ordered: dict[str, list[list[str]]] = {}
+        preferred = "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
+        for media_id, items in groups.items():
+            if len(items) < 2:
+                continue
+            anime = self.db.get_anime(media_id)
+            order = download_order(items, getattr(anime, "progress", None) if anime is not None else None)
+            by_backend: dict[str, list[str]] = {}
+            for item in order:
+                backend = str(item.raw.get("backend") or preferred).casefold()
+                by_backend.setdefault(backend, []).append(item.torrent_hash)
+            for backend, hashes in by_backend.items():
+                if len(hashes) > 1:
+                    ordered.setdefault(backend, []).append(hashes)
+        if not ordered:
+            return 0
+        changed = 0
+        for backend_name, client in self.torrent_clients():
+            try:
+                arrange = getattr(client, "prioritize_queue", None)
+                if not callable(arrange):
+                    continue
+                for hashes in ordered.get(backend_name, []):
+                    try:
+                        if arrange(hashes):
+                            changed += 1
+                            self.logger.info(
+                                "DONE step=downloads.nearest_first backend=%s first=%s count=%s",
+                                backend_name,
+                                hashes[0],
+                                len(hashes),
+                            )
+                    except (QBittorrentError, ManagerError) as exc:
+                        self.logger.warning(
+                            "WARN step=downloads.nearest_first backend=%s error=%r",
+                            backend_name,
+                            str(exc)[:200],
+                        )
+            finally:
+                client.close()
+        return changed
 
     def _log_intent_unconfirmed(self, media_id: int, episode: int | None) -> None:
         self.logger.info(
@@ -5287,6 +8553,44 @@ class AnimeManager:
             and any(reason.startswith("relative-ep=") for reason in reasons)
         )
 
+    def _with_chain_season(self, anime: LibraryAnime) -> LibraryAnime:
+        """The anime with its place in the chain of seasons, for release identity.
+
+        Only for a sequel whose titles carry no season number, from the cached
+        relation graph (no AniList call): "Shouwa Genroku Rakugo Shinjuu:
+        Sukeroku Futatabi-hen" follows one season, so packs named "... S2" or
+        "... Season 2" are this entry. Anything unresolved leaves it as it is.
+        """
+        # Planning rows often carry no relations: the resolver's cached graph decides.
+        memo = self.__dict__.setdefault("_chain_season_memo", {})
+        key = int(anime.media_id)
+        cached = memo.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 120.0:
+            season, titles = cached[1], cached[2]
+        else:
+            season, titles = 0, []
+            try:
+                context = resolve_episode_numbering(
+                    anime, 1, self.config, self.logger, db=self.db, allow_network=False
+                )
+                chain = tuple(int(value) for value in context.chain or ())
+                found = [str(value) for value in context.prequel_titles or () if str(value or "").strip()]
+                if context.status == "resolved" and len(chain) >= 2 and chain[-1] == key and found:
+                    season, titles = len(chain), found
+            except Exception as exc:  # noqa: BLE001 - search goes on without it
+                self.logger.debug("SKIP step=release.chain_season media_id=%s error=%r", key, str(exc))
+            memo[key] = (time.monotonic(), season, titles)
+            if season:
+                self.logger.info(
+                    "RESULT step=release.chain_season media_id=%s season=%s titles=%r",
+                    key,
+                    season,
+                    titles[:3],
+                )
+        if not season:
+            return anime
+        return replace(anime, chain_season=season, chain_titles=list(titles))
+
     def _release_is_safe_batch_candidate(
         self,
         media_id: int,
@@ -5294,6 +8598,8 @@ class AnimeManager:
     ) -> bool:
         """Use the shared Nyaa identity contract for one-entry batch downloads."""
         anime = self.db.get_anime(int(media_id))
+        if anime is not None:
+            anime = self._with_chain_season(anime)
         if anime is None:
             # Defensive fallback for transient/legacy callers. Real manager flows
             # normally have the AniList row, but batch safety must still reject
@@ -5445,6 +8751,9 @@ class AnimeManager:
         }
         if blocked_reasons.intersection(item.reasons):
             return False
+        # Also for releases that did not come through search_releases.
+        if not self.config.nyaa.allow_camrips and is_camrip_release(item.title):
+            return False
 
         absolute_alias = self._release_uses_absolute_episode_alias(item)
         season_mismatch = "season-not-specified" in item.reasons or any(
@@ -5509,13 +8818,34 @@ class AnimeManager:
         root = self.config.library.root_dir.expanduser()
         if not root.exists():
             return 0
+        # An unfinished download's file can already have its full size (sparse,
+        # or aria2 after the tail piece) while its remaining bytes count as
+        # pending too: count what it really wrote instead.
+        unfinished: dict[Path, int] = {}
+        downloads = getattr(getattr(self, "db", None), "downloads", None)
+        for item in downloads() if callable(downloads) else ():
+            if self._download_is_complete(item):
+                continue
+            path = self._download_content_path(item)
+            if path is not None:
+                unfinished[path] = unfinished.get(path, 0) + _download_written_bytes(item)
+        roots = tuple(unfinished)
         total = 0
         for path in root.rglob("*"):
             try:
                 if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS:
+                    if roots and self._path_within(path, roots):
+                        continue
                     total += path.stat().st_size
             except OSError:
                 continue
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            return total
+        for path, written in unfinished.items():
+            if path == resolved_root or resolved_root in path.parents:
+                total += written
         return total
 
     STORAGE_USAGE_TTL_SECONDS = 60.0
@@ -5656,10 +8986,13 @@ class AnimeManager:
             size_bytes,
             reserve,
         )
-        raise ManagerError(
+        # "139.5 GB free" alone read as plenty: unfinished downloads take their share first.
+        raise NotEnoughDiskSpaceError(
             err(
                 "manager.notEnoughDiskSpace",
+                size=f"{needed / 1024**3:.1f}",
                 free=f"{free / 1024**3:.1f}",
+                pending=f"{pending / 1024**3:.1f}",
                 reserve=f"{reserve / 1024**3:.1f}",
             )
         )
@@ -5689,6 +9022,7 @@ class AnimeManager:
                 f"({status['committed_gb']} / {status['limit_gb']} GB)"
             )
 
+    @_reusing_db_connection
     def enforce_disk_limit(self) -> int:
         """Delete the oldest watched, managed single episodes until under cap.
 
@@ -5711,11 +9045,21 @@ class AnimeManager:
             )
 
         downloads = {item.torrent_hash.lower(): item for item in self.db.downloads()}
+        # The personal schedules are read once for the pass, not twice per episode.
+        retained = self.db.personal_release_retained_items()
+        candidates = []
         for item in self.db.episodes():
+            if item.state != "watched" or not item.video_path.is_file():
+                continue
+            if not self._inside_library_root(item.video_path):
+                # Only files in the library count toward the limit (_library_usage_bytes):
+                # a watched file in a watched folder or on another drive went every pass,
+                # early and without bringing the library under the limit.
+                continue
             if (
-                item.state == "watched"
-                and item.video_path.is_file()
-                and self.db.personal_release_item_retained(item.media_id, item.episode)
+                item.media_id is not None
+                and item.episode is not None
+                and (int(item.media_id), int(item.episode)) in retained
             ):
                 self.logger.info(
                     "SKIP step=storage.limit_delete reason=personal_schedule_retention media_id=%s episode=%s video=%r",
@@ -5723,65 +9067,75 @@ class AnimeManager:
                     item.episode,
                     str(item.video_path),
                 )
-        candidates = sorted(
-            (
-                item
-                for item in self.db.episodes()
-                if item.state == "watched"
-                and item.video_path.is_file()
-                and not self.db.personal_release_item_retained(item.media_id, item.episode)
-            ),
-            key=lambda item: (item.watched_at or 0.0, str(item.video_path)),
-        )
+                continue
+            candidates.append(item)
+        candidates.sort(key=lambda item: (item.watched_at or 0.0, str(item.video_path)))
         deleted = 0
-        client: QBittorrentClient | None = None
-        try:
-            for item in candidates:
-                if used_bytes <= limit_bytes:
-                    break
-                try:
-                    item_size = item.video_path.stat().st_size
-                except OSError:
-                    item_size = 0
-                torrent_hash = item.torrent_hash.lower().strip()
-                if self._identity_repair_protected(torrent_hash, item.video_path):
-                    self.logger.info(
-                        "SKIP step=storage.limit_delete reason=identity_repair_protection video=%r",
-                        str(item.video_path),
-                    )
-                    continue
-                if self.config.agent.delete_only_managed_files and not torrent_hash:
-                    continue
-                download = downloads.get(torrent_hash) if torrent_hash else None
-                if download is not None and download.is_batch:
-                    continue
+        for item in candidates:
+            if used_bytes <= limit_bytes:
+                break
+            try:
+                item_size = item.video_path.stat().st_size
+            except OSError:
+                item_size = 0
+            torrent_hash = item.torrent_hash.lower().strip()
+            if self._identity_repair_protected(torrent_hash, item.video_path):
+                self.logger.info(
+                    "SKIP step=storage.limit_delete reason=identity_repair_protection video=%r",
+                    str(item.video_path),
+                )
+                continue
+            if self.config.agent.delete_only_managed_files and not torrent_hash:
+                continue
+            download = downloads.get(torrent_hash) if torrent_hash else None
+            if download is not None and download.is_batch:
+                continue
+            try:
                 if torrent_hash:
                     if not self.downloads_enabled():
                         continue
                     if self.db.episode_count_for_torrent(torrent_hash) != 1:
                         continue
-                    if client is None:
-                        client = self.qbt_client()
-                    client.delete(torrent_hash, delete_files=True)
-                    self.db.delete_torrent_records(torrent_hash)
+                    # Same as cleanup(): remove the torrent from the client that
+                    # owns it, then the file itself. Only qbt_client() was asked
+                    # before, and aria2 forgets completed tasks, so the file
+                    # often stayed on disk while its row (and watched mark) was
+                    # dropped; a later scan imported it again as unwatched.
+                    removed = self._delete_owned_torrent(torrent_hash, download, deleting=[item.video_path])
+                    item.video_path.unlink(missing_ok=True)
+                    if item.subtitle_path:
+                        item.subtitle_path.unlink(missing_ok=True)
+                    if removed:
+                        self.db.delete_torrent_records(torrent_hash)
+                    else:
+                        # The batch stays in the client: its row would keep the deleted
+                        # episode "on disk" (an active torrent protects it) for good.
+                        self.db.delete_episode_record(item.video_path)
                 else:
                     item.video_path.unlink(missing_ok=True)
                     if item.subtitle_path:
                         item.subtitle_path.unlink(missing_ok=True)
                     self.db.delete_episode_record(item.video_path)
-                deleted += 1
-                used_bytes = max(0, used_bytes - item_size)
-                self.logger.info(
-                    "DONE step=storage.limit_delete video=%r torrent_hash=%s watched_at=%s",
+            except (OSError, QBittorrentError, ManagerError) as exc:
+                # The next oldest watched file is tried: one locked file or a torrent
+                # client refusing used to end the whole pass with the disk still full.
+                self.logger.warning(
+                    "FAIL step=storage.limit_delete video=%r torrent_hash=%s error=%r",
                     str(item.video_path),
                     torrent_hash,
-                    item.watched_at,
+                    str(exc)[:300],
                 )
-        except (OSError, QBittorrentError) as exc:
-            self.log(f"Disk limit: could not delete an old watched file: {exc}")
-        finally:
-            if client is not None:
-                client.close()
+                self.log(f"Disk limit: could not delete an old watched file: {exc}")
+                continue
+            self._forget_video_state([item.video_path])
+            deleted += 1
+            used_bytes = max(0, used_bytes - item_size)
+            self.logger.info(
+                "DONE step=storage.limit_delete video=%r torrent_hash=%s watched_at=%s",
+                str(item.video_path),
+                torrent_hash,
+                item.watched_at,
+            )
 
         if deleted:
             self.invalidate_storage_snapshot()
@@ -5816,6 +9170,17 @@ class AnimeManager:
         )
         return removed
 
+    def maintain_database_storage(self) -> int:
+        """Compress the Jiten caches in short batches, then hourly give free pages back."""
+        try:
+            result = maintain_database_storage(
+                Path(self.config.library.database_path).expanduser(), logger=self.logger
+            )
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            self.logger.warning("FAIL step=database.storage error=%r", str(exc)[:200])
+            return 0
+        return int(result.get("compacted") or 0)
+
     def purge_episode_derived_files(self, video_path: Path) -> int:
         """Delete the derived cache files of a deleted episode (call after its row is gone)."""
         try:
@@ -5829,6 +9194,7 @@ class AnimeManager:
             self.logger.info("DONE step=cache.episode_purge video=%r files=%s", str(video_path), removed)
         return removed
 
+    @_reusing_db_connection
     def auto_upgrade_downloaded(self, *, force: bool = False, limit: int | None = None) -> int:
         """Check managed, unwatched episodes only after missing episodes were handled.
 
@@ -5883,8 +9249,21 @@ class AnimeManager:
                     releases = self.search_releases(
                         anime.media_id, episode=episode, batch=False, automatic=True
                     )
+                except NoReleaseSourceError:
+                    # Not "checked": the episode is checked once a source is added.
+                    self._log_no_release_source("nyaa.upgrade")
+                    return scheduled
                 except NyaaError as exc:
                     self.log(f"{anime.title} #{episode}: upgrade check failed: {exc}")
+                    self.db.set_state(state_key, str(time.time()))
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one episode never ends the pass
+                    self.logger.warning(
+                        "FAIL step=nyaa.upgrade media_id=%s episode=%s error=%r",
+                        anime.media_id,
+                        episode,
+                        f"{type(exc).__name__}: {exc}"[:300],
+                    )
                     self.db.set_state(state_key, str(time.time()))
                     continue
                 self.db.set_state(state_key, str(time.time()))
@@ -5901,6 +9280,30 @@ class AnimeManager:
                     None,
                 )
                 if best is None:
+                    continue
+                listed = next(
+                    (item for item in releases if item.info_hash and item.info_hash.lower() == current_hash),
+                    None,
+                )
+                current_title = (
+                    listed.title if listed is not None else str(download.name or current.video_path.name)
+                )
+                try:
+                    current_size = (
+                        listed.size_bytes
+                        if listed is not None and listed.size_bytes > 0
+                        else current.video_path.stat().st_size
+                    )
+                except OSError:
+                    current_size = 0
+                if same_web_encode(current_title, current_size, best.title, best.size_bytes):
+                    self.logger.info(
+                        "SKIP step=nyaa.upgrade media_id=%s episode=%s reason=same_web_encode current=%r best=%r",
+                        anime.media_id,
+                        episode,
+                        current_title,
+                        best.title,
+                    )
                     continue
                 current_score, basis = self._upgrade_current_score(
                     anime.media_id, episode, current_hash, releases, best
@@ -5930,6 +9333,18 @@ class AnimeManager:
                 try:
                     added = self.add_release(anime.media_id, best, episode=episode, batch=False, upgrade=True)
                 except (QBittorrentError, ManagerError) as exc:
+                    self.log(f"{anime.title} #{episode}: upgrade add failed: {exc}")
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one episode never ends the pass
+                    # The title folder cannot be made (the library disk away), a locked
+                    # database: as in auto_search_current, the rest of the pass still runs
+                    # (upgrades finished, cleanup, the disk limit).
+                    self.logger.warning(
+                        "FAIL step=nyaa.upgrade_add media_id=%s episode=%s error=%r",
+                        anime.media_id,
+                        episode,
+                        f"{type(exc).__name__}: {exc}"[:300],
+                    )
                     self.log(f"{anime.title} #{episode}: upgrade add failed: {exc}")
                     continue
                 if not added:
@@ -6024,13 +9439,35 @@ class AnimeManager:
             return True
         return bool(item.subtitle_path is not None and item.subtitle_path.is_file())
 
+    def _upgrade_may_replace(
+        self, new_episode: LibraryEpisode | None, old_episode: LibraryEpisode | None
+    ) -> bool:
+        """The replacement is Ready, or the current copy is not Ready either.
+
+        Kusuriya no Hitorigoto S3 #3: neither copy had Japanese subtitles yet (Jimaku had
+        none), so the old one was "kept until the upgrade has subtitles" and both stayed on
+        disk. A current copy without subtitles loses nothing to a complete better release.
+        """
+        if self._upgrade_replacement_ready(new_episode):
+            return True
+        if new_episode is None or not new_episode.video_path.is_file():
+            return False
+        if new_episode.state not in {"waiting_subtitles", "local"}:
+            return False
+        if self.unfinished_library_video(new_episode.video_path):
+            return False
+        download = self.db.download_by_hash(new_episode.torrent_hash) if new_episode.torrent_hash else None
+        if download is None or not download_complete(download):
+            return False
+        return old_episode is None or old_episode.state not in {"ready", "watched"}
+
     def finalize_ready_upgrades(self) -> int:
         """Replace old managed files only after the new episode is fully ready."""
         jobs = self.db.pending_upgrades()
         if not jobs or not self.downloads_enabled():
             return 0
         replaced = 0
-        client = self.qbt_client()
+        clients = self._replacement_clients()
         try:
             for job in jobs:
                 new_hash = str(job["new_info_hash"] or "").lower()
@@ -6038,36 +9475,66 @@ class AnimeManager:
                 media_id = int(job["media_id"])
                 episode = int(job["episode"])
                 new_episode = self.db.episode_for_torrent(media_id, episode, new_hash)
-                if not self._upgrade_replacement_ready(new_episode):
-                    continue
                 old_episode = self.db.episode_for_torrent(media_id, episode, old_hash)
+                if not self._upgrade_may_replace(new_episode, old_episode):
+                    continue
+                old_video = (
+                    old_episode.video_path
+                    if old_episode is not None and old_episode.video_path != new_episode.video_path
+                    else None
+                )
                 try:
-                    client.delete(old_hash, delete_files=True)
-                except QBittorrentError as exc:
+                    # A batch's old copy: only that file goes, never the batch's other
+                    # episodes with the torrent (Ansatsu Kyoushitsu).
+                    removed = self._retire_torrent_file(
+                        clients, old_hash, old_video, self.db.download_by_hash(old_hash)
+                    )
+                except (QBittorrentError, ManagerError) as exc:
                     self.log(
                         f"Upgrade #{episode}: replacement ready, but old torrent could not be removed: {exc}"
                     )
                     continue
 
-                if old_episode is not None:
-                    if old_episode.subtitle_path and old_episode.subtitle_path != new_episode.subtitle_path:
-                        old_episode.subtitle_path.unlink(missing_ok=True)
-                    if old_episode.video_path != new_episode.video_path:
-                        old_episode.video_path.unlink(missing_ok=True)
-                self.db.delete_torrent_records(old_hash)
+                try:
+                    if old_episode is not None:
+                        if (
+                            old_episode.subtitle_path
+                            and old_episode.subtitle_path != new_episode.subtitle_path
+                        ):
+                            old_episode.subtitle_path.unlink(missing_ok=True)
+                        if old_video is not None:
+                            old_video.unlink(missing_ok=True)
+                            if not removed:
+                                self.db.delete_episode_record(old_video)
+                except OSError as exc:
+                    # A locked or read-only old file: this job waits for the next pass. Raised,
+                    # it ended every maintenance pass here (no cleanup, no disk limit).
+                    self.logger.warning(
+                        "FAIL step=nyaa.upgrade_replace media_id=%s episode=%s video=%r error=%r",
+                        media_id,
+                        episode,
+                        str(old_video or ""),
+                        str(exc)[:300],
+                    )
+                    self.log(f"Upgrade #{episode}: the old file could not be deleted: {exc}")
+                    continue
+                if removed:
+                    self.db.delete_torrent_records(old_hash)
                 self.db.complete_upgrade(new_hash)
                 self.logger.info(
-                    "DONE step=nyaa.upgrade_replace media_id=%s episode=%s old_hash=%s new_hash=%s old_score=%.1f new_score=%.1f",
+                    "DONE step=nyaa.upgrade_replace media_id=%s episode=%s old_hash=%s new_hash=%s old_score=%.1f new_score=%.1f old_torrent_removed=%s",
                     media_id,
                     episode,
                     old_hash,
                     new_hash,
                     float(job["old_score"]),
                     float(job["new_score"]),
+                    removed,
                 )
                 replaced += 1
         finally:
-            client.close()
+            for client in clients:
+                client.close()
         return replaced
 
     @_reusing_db_connection
@@ -6105,8 +9572,9 @@ class AnimeManager:
                     (item for item in items if item.torrent_hash.lower() == pending_hash),
                     None,
                 )
-                if winner is not None and not self._upgrade_replacement_ready(winner):
-                    # Same rule as finalize_ready_upgrades: keep the current
+                current = next((item for item in items if item is not winner), None)
+                if winner is not None and not self._upgrade_may_replace(winner, current):
+                    # Same rule as finalize_ready_upgrades: keep the current Ready
                     # copy until the replacement has Japanese subtitles.
                     continue
 
@@ -6132,6 +9600,11 @@ class AnimeManager:
                 continue
 
             losers = [item for item in items if item.torrent_hash.lower() != winner.torrent_hash.lower()]
+            if winner.state not in {"ready", "watched"}:
+                # finalize_ready_upgrades' rule for every copy: one without subtitles yet never
+                # replaces a Ready copy whose subtitles play. An upgrade given up after a week
+                # keeps both copies, and the better-scored one then deleted the Ready episode.
+                losers = [item for item in losers if not self._upgrade_replacement_ready(item)]
             safe_losers: list[LibraryEpisode] = []
             for loser in losers:
                 if self.db.episode_count_for_torrent(loser.torrent_hash) != 1:
@@ -6147,33 +9620,55 @@ class AnimeManager:
             return 0
 
         removed = 0
-        client = self.qbt_client()
+        clients = self._replacement_clients()
         try:
             for winner, losers in plans:
                 for loser in losers:
                     old_hash = loser.torrent_hash.lower()
+                    old_video = loser.video_path if loser.video_path != winner.video_path else None
                     try:
-                        client.delete(old_hash, delete_files=True)
-                    except QBittorrentError as exc:
+                        # A loser that is part of a batch the rows under-count: only its
+                        # file goes (deselected first), the torrent and its other files stay.
+                        torrent_removed = self._retire_torrent_file(
+                            clients, old_hash, old_video, self.db.download_by_hash(old_hash)
+                        )
+                    except (QBittorrentError, ManagerError) as exc:
                         self.log(f"Duplicate #{winner.episode}: old torrent could not be removed: {exc}")
                         continue
 
-                    if loser.subtitle_path and loser.subtitle_path != winner.subtitle_path:
-                        loser.subtitle_path.unlink(missing_ok=True)
-                    if loser.video_path != winner.video_path:
-                        loser.video_path.unlink(missing_ok=True)
-                    self.db.delete_torrent_records(old_hash)
+                    try:
+                        if loser.subtitle_path and loser.subtitle_path != winner.subtitle_path:
+                            loser.subtitle_path.unlink(missing_ok=True)
+                        if old_video is not None:
+                            old_video.unlink(missing_ok=True)
+                    except OSError as exc:
+                        # As in finalize_ready_upgrades: retried next pass, the pass goes on.
+                        self.logger.warning(
+                            "FAIL step=nyaa.duplicate_replace media_id=%s episode=%s video=%r error=%r",
+                            winner.media_id,
+                            winner.episode,
+                            str(old_video or ""),
+                            str(exc)[:300],
+                        )
+                        self.log(f"Duplicate #{winner.episode}: the old file could not be deleted: {exc}")
+                        continue
+                    if torrent_removed:
+                        self.db.delete_torrent_records(old_hash)
+                    elif old_video is not None:
+                        self.db.delete_episode_record(old_video)
                     self.logger.info(
-                        "DONE step=nyaa.duplicate_replace media_id=%s episode=%s old_hash=%s new_hash=%s",
+                        "DONE step=nyaa.duplicate_replace media_id=%s episode=%s old_hash=%s new_hash=%s old_torrent_removed=%s",
                         winner.media_id,
                         winner.episode,
                         old_hash,
                         winner.torrent_hash.lower(),
+                        torrent_removed,
                     )
                     removed += 1
                 self.db.complete_upgrade(winner.torrent_hash)
         finally:
-            client.close()
+            for client in clients:
+                client.close()
         return removed
 
     def _remove_missing_episode_rows(self, active_hashes: set[str]) -> int:
@@ -6239,6 +9734,19 @@ class AnimeManager:
                 return "root_unavailable"
         return ""
 
+    def _missing_video_roots(self) -> list[Any]:
+        """(root, resolved root, present) of the library and watched folders, for
+        ``_missing_video_unreachable``."""
+        roots: list[Any] = []
+        for configured in (self.config.library.root_dir, *self._watched_media_folders()):
+            root = configured.expanduser()
+            try:
+                resolved_root = root.resolve()
+            except (OSError, RuntimeError):
+                resolved_root = root
+            roots.append((root, resolved_root, root.is_dir()))
+        return roots
+
     def _forgettable_missing_videos(self, videos: list[Path], *, immediate: bool = False) -> set[str]:
         """The missing videos whose library rows may be forgotten now.
 
@@ -6266,14 +9774,11 @@ class AnimeManager:
         unreachable: dict[str, int] = {}
         volumes: dict[Path, bool] = {}
         roots: list[Any] = []
+        # When the first of the videos still waiting may be forgotten (the
+        # library scan must not be skipped as "unchanged" past it).
+        self._missing_video_due_at: float | None = None
         if videos:
-            for configured in (self.config.library.root_dir, *self.config.paths.download_dirs):
-                root = configured.expanduser()
-                try:
-                    resolved_root = root.resolve()
-                except (OSError, RuntimeError):
-                    resolved_root = root
-                roots.append((root, resolved_root, root.is_dir()))
+            roots = self._missing_video_roots()
         for video in videos:
             key = str(video)
             reason = self._missing_video_unreachable(video, volumes, roots)
@@ -6285,13 +9790,17 @@ class AnimeManager:
             if immediate or missing_for >= wait:
                 forget.add(key)
                 since_by_path.pop(key, None)
-            elif since is None:
-                since_by_path[key] = now
-                self.logger.info(
-                    "DEFER step=library.missing_video video=%r forget_after_seconds=%.0f",
-                    key,
-                    wait,
-                )
+            else:
+                if since is None:
+                    since = since_by_path[key] = now
+                    self.logger.info(
+                        "DEFER step=library.missing_video video=%r forget_after_seconds=%.0f",
+                        key,
+                        wait,
+                    )
+                due = since + wait
+                if self._missing_video_due_at is None or due < self._missing_video_due_at:
+                    self._missing_video_due_at = due
         if unreachable != getattr(self, "_last_unreachable_missing_videos", {}):
             self._last_unreachable_missing_videos = dict(unreachable)
             if unreachable:
@@ -6389,6 +9898,15 @@ class AnimeManager:
             anime = (
                 get_anime(int(item.media_id)) if item.media_id is not None and callable(get_anime) else None
             )
+            unnumbered = episode is None
+            if (
+                unnumbered
+                and not item.is_batch
+                and anime is not None
+                and single_unit_title(anime.format, anime.episodes)
+            ):
+                # A movie's shell has no episode number: it is episode 1 of its title.
+                episode = 1
             watched = bool(
                 anime is not None
                 and watched_by_anilist_progress(
@@ -6398,6 +9916,13 @@ class AnimeManager:
                     media_format=anime.format,
                 )
             )
+            note_progress = getattr(self.db, "note_anilist_progress", None)
+            if watched and episode is not None and int(item.added_on or 0) > 0 and callable(note_progress):
+                # Added after the list already counted the episode (a rewatch): not a leftover.
+                reached_at = Database.anilist_progress_reached_at(
+                    note_progress(int(item.media_id), int(anime.progress or 0)), int(episode)
+                )
+                watched = reached_at is None or float(item.added_on) < reached_at
             stale = bool(
                 not item.is_batch
                 and item.media_id is not None
@@ -6423,6 +9948,9 @@ class AnimeManager:
             self.db.delete_torrent_records(item.torrent_hash)
             try:
                 self.download_intents.clear(int(item.media_id), int(episode), False)
+                if unnumbered:
+                    # A whole-title request (the movie's search ran as a batch).
+                    self.download_intents.clear(int(item.media_id), None, True)
             except (AttributeError, TypeError, ValueError):
                 pass
             self.logger.info(
@@ -6578,7 +10106,16 @@ class AnimeManager:
 
     @_reusing_db_connection
     def sync_downloads(self) -> int:
+        # The Download Center refresh, the foreground worker and actions all sync:
+        # one at a time in this process (the agent is covered by the row age below).
+        lock = self.__dict__.setdefault("_sync_downloads_lock", threading.RLock())
+        with lock:
+            return self._sync_downloads_locked()
+
+    def _sync_downloads_locked(self) -> int:
         self._last_missing_episode_rows = 0
+        # Rows written after this (a release just added) are not in the listings below.
+        listing_started = time.time()
         completed_paths: list[Path] = []
         if not self.downloads_configured():
             self._last_completed_video_paths = ()
@@ -6586,6 +10123,7 @@ class AnimeManager:
         self.recover_acquisition_attempts()
         traffic_enabled = self.downloads_enabled()
         items: list[DownloadItem] = []
+        offline_items: list[DownloadItem] = []
         backend_errors: list[str] = []
         backend_snapshots: dict[str, set[str]] = {}
         configured_backends: set[str] = set()
@@ -6696,6 +10234,11 @@ class AnimeManager:
                 }
                 items.extend(backend_items)
             except Exception as exc:
+                if backend == "aria2":
+                    # Torrents off or stopped while idle: a task that finished
+                    # just before aria2 stopped is gone from its session, its
+                    # row stuck short of 100% (Rakugo Shinjuu S2, 2026-10-18).
+                    offline_items.extend(self._aria2_completed_while_stopped(client))
                 if backend == "aria2" and self._aria2_idle_stopped(client):
                     # Deliberately stopped while idle: its rows are kept as
                     # unknown, and the next add or resume starts it again.
@@ -6704,7 +10247,20 @@ class AnimeManager:
                 self.logger.warning("FAIL step=torrent.sync_backend backend=%s error=%r", backend, str(exc))
             finally:
                 client.close()
+        for item in offline_items:
+            self._resolve_download_media(item)
+            self.db.upsert_download(item)
+            registered = self._register_completed_download(item, completed_paths=completed_paths)
+            self.logger.info(
+                "REPAIR step=aria2.completed_while_stopped hash=%s media_id=%s registered=%s path=%r",
+                item.torrent_hash,
+                item.media_id,
+                registered,
+                item.content_path,
+            )
         if backend_errors and not items:
+            self._last_completed_video_paths = tuple(dict.fromkeys(completed_paths))
+            self._remember_completed_for_intro(self._last_completed_video_paths)
             raise ManagerError("; ".join(backend_errors))
 
         # A torrent may exist in both clients. Keep a single database/UI row,
@@ -6783,8 +10339,10 @@ class AnimeManager:
                 if local_path is not None and local_path.is_file():
                     active_hashes.add(torrent_hash)
 
+        active_hashes |= self.db.download_hashes_written_since(listing_started)
         self._last_missing_episode_rows = self._remove_missing_episode_rows(active_hashes)
-        self.db.prune_downloads(active_hashes)
+        self.db.prune_downloads(active_hashes, written_before=listing_started)
+        finished: list[DownloadItem] = []
         for item in items:
             stored = self.db.download_by_hash(item.torrent_hash) if item.torrent_hash else None
             if self._stale_aria2_row_shadowed_by_completed_local(item, stored):
@@ -6825,14 +10383,38 @@ class AnimeManager:
             self.db.upsert_download(item)
             if not self._download_is_complete(item):
                 continue
+            finished.append(item)
+        # Which titles the completed downloads claim each file for, read once after every
+        # row above is stored: each registration read every download row again and walked
+        # every completed download's files (n² per sync, on every 15-60 s poll).
+        claims = self._completed_download_claims() if finished else {}
+        for item in finished:
             completed += self._register_completed_download(
                 item,
                 completed_paths=completed_paths,
+                claims=claims,
             )
         self._last_completed_video_paths = tuple(dict.fromkeys(completed_paths))
+        self._remember_completed_for_intro(self._last_completed_video_paths)
         self._repair_stale_completed_current_download_intents(items)
         self.db.set_state("downloads_synced_at", str(time.time()))
         return completed
+
+    def _aria2_completed_while_stopped(self, client: Any) -> list[DownloadItem]:
+        """Managed aria2 torrents finished on disk while aria2 cannot be asked."""
+        recover = getattr(client, "completed_on_disk", None)
+        if not callable(recover):
+            return []
+        try:
+            done = {
+                str(row.torrent_hash).strip().casefold()
+                for row in self.db.downloads()
+                if str(row.torrent_hash or "").strip() and self._download_is_complete(row)
+            }
+            return list(recover(skip_hashes=done))
+        except Exception as exc:  # noqa: BLE001 - a local check never fails the sync
+            self.logger.info("SKIP step=aria2.completed_while_stopped reason=%r", str(exc))
+            return []
 
     def _discard_completed_aria2_recovery_tasks(self, client: Any, items: list[DownloadItem]) -> int:
         """Drop metadata-only recovery tasks after the exact torrent is already local."""
@@ -6873,7 +10455,7 @@ class AnimeManager:
                     str(exc),
                 )
                 continue
-            self.db.set_state(f"aria2_stall:{torrent_hash}", "")
+            self.db.delete_state(f"aria2_stall:{torrent_hash}")
             self.logger.info(
                 "REPAIR step=aria2.recovery_shell_cleanup hash=%s "
                 "reason=exact_library_file_exists delete_files=false",
@@ -6931,7 +10513,8 @@ class AnimeManager:
                 and not stale_zero_local_with_control
             ):
                 if self.db.get_state(key, ""):
-                    self.db.set_state(key, "")
+                    # Deleted, not emptied: an empty row per torrent ever stalled stayed forever.
+                    self.db.delete_state(key)
                 continue
             try:
                 marker = json.loads(self.db.get_state(key, "") or "{}")
@@ -7073,9 +10656,38 @@ class AnimeManager:
         item,
         *,
         completed_paths: list[Path] | None = None,
+        claims: dict[Path, set[int]] | None = None,
     ) -> int:
+        """``claims``: ``_completed_download_claims()`` of the current download rows when the
+        caller has it already (read here otherwise)."""
         discovered_files = self._completed_download_video_files(item)
         files = [path for path in discovered_files if not self._library_path_is_ignored(path)]
+        if files:
+            # A file aria2 has not finished is no episode yet (preparation would drop it).
+            roots = self._library_scan_roots()
+            known_finished = self._finished_torrent_check()
+            own_hash = str(getattr(item, "torrent_hash", "") or "").strip().casefold()
+
+            def finished(info_hash: str) -> bool:
+                # The download registered here is complete, whether or not its row says so yet
+                # (its seeding control file stays while the pack seeds).
+                if own_hash and str(info_hash or "").casefold() == own_hash:
+                    return True
+                return known_finished(info_hash)
+
+            unfinished = [
+                path for path in files if self.unfinished_library_video(path, roots=roots, finished=finished)
+            ]
+            if unfinished and len(unfinished) == len(files):
+                # Still being written (another torrent's control file): registered by a later
+                # pass, not completed now as if every file were excluded by an ignore marker.
+                self.logger.info(
+                    "WAIT step=download.completed_registration reason=unfinished_video hash=%s files=%s",
+                    own_hash,
+                    len(unfinished),
+                )
+                return 0
+            files = [path for path in files if path not in unfinished]
         if discovered_files and not files:
             self.logger.info(
                 "SKIP step=download.completed_registration reason=library_ignore_marker hash=%s files=%s",
@@ -7086,16 +10698,41 @@ class AnimeManager:
             return 0
         count = 0
         new_paths: list[Path] = []
-        claims = self._completed_download_claims()
+        if claims is None:
+            claims = self._completed_download_claims()
         anime = self.db.get_anime(item.media_id) if item.media_id else None
         for path in files:
             resolved = path.resolve()
             if self._completed_download_owner_conflict(item, resolved, claims):
                 continue
+            if self._extra_file_kept(resolved) or self._special_set_aside(resolved):
+                continue  # an extra file the person kept (or a special set aside): unchanged
             identity = parse_anime_filename(path)
             release_number = identity.episode or item.release_episode
             media_number = self._download_file_media_episode(anime, item, release_number, path)
+            extra_kind = self._extra_file_kind(anime, path.name) if item.is_batch else ""
+            if extra_kind:
+                # "Show - OVA 02" in a TV batch is not episode 2 of the series.
+                release_number = media_number = None
             existing = self.db.episode_by_path(resolved)
+            other_hash = str(existing.torrent_hash or "").strip() if existing is not None else ""
+            if (
+                item.is_batch
+                and other_hash
+                and other_hash.casefold() != str(item.torrent_hash or "").casefold()
+                and self.db.download_by_hash(other_hash) is not None
+            ):
+                # A batch whose content path is the series folder lists every
+                # video in it. A file another torrent still in the client
+                # downloaded was re-pointed to the batch, and cleanup of the
+                # batch later deleted it.
+                self.logger.info(
+                    "SKIP step=download.completed_registration reason=owned_by_other_torrent hash=%s owner=%s video=%r",
+                    item.torrent_hash,
+                    other_hash,
+                    str(resolved),
+                )
+                continue
             expected_episode = int(media_number) if media_number is not None else None
             expected_media = int(item.media_id) if item.media_id is not None else None
             existing_episode = (
@@ -7121,18 +10758,7 @@ class AnimeManager:
             if existing is not None and existing.state in {"ready", "watched"} and identity_matches:
                 continue
             is_new_completion = not identity_matches
-            subtitle_source, subtitle_path = japanese_subtitle_source(
-                path,
-                ffprobe=self.config.tools.ffprobe,
-                ffmpeg=self.config.tools.ffmpeg,
-            )
-            embedded_subtitle_id = None
-            if subtitle_source in {"embedded", "embedded_bitmap"}:
-                _source, _path, embedded_subtitle_id = japanese_subtitle_details(
-                    path,
-                    ffprobe=self.config.tools.ffprobe,
-                    ffmpeg=self.config.tools.ffmpeg,
-                )
+            subtitle_source, subtitle_path, embedded_subtitle_id = self._completed_subtitle_details(path)
             library_episode = LibraryEpisode(
                 media_id=item.media_id,
                 title=anime.title if anime else identity.title,
@@ -7150,7 +10776,9 @@ class AnimeManager:
                     else ""
                 ),
                 state=(
-                    "ready"
+                    "waiting_subtitles"
+                    if extra_kind  # not Ready under the series before the person decides
+                    else "ready"
                     if subtitle_source in {"external", "embedded"}
                     else "waiting_text_subtitles"
                     if subtitle_source in {"external_bitmap", "embedded_bitmap"}
@@ -7167,6 +10795,16 @@ class AnimeManager:
                 source="completed_download",
                 provenance={"subtitle_source": subtitle_source},
             )
+            if extra_kind:
+                # Home asks about it right away (Action required), not after the queue.
+                self.db.ensure_subtitle_job(resolved, item.media_id, None)
+                self.db.mark_subtitle_job_needs_action(
+                    resolved, err("jobs.extraDownloadFile", kind=extra_kind), self.EXTRA_FILE_REVIEW
+                )
+                if is_new_completion:
+                    count += 1
+                    new_paths.append(resolved)
+                continue
             if subtitle_source in {"none", "external_bitmap", "embedded_bitmap"}:
                 if is_new_completion:
                     self.db.queue_subtitle_job(
@@ -7192,6 +10830,36 @@ class AnimeManager:
         if completed_paths is not None:
             completed_paths.extend(new_paths)
         return count
+
+    def _completed_subtitle_details(self, video: Path) -> tuple[str, Path | None, int | None]:
+        """Japanese subtitles of a completed download's file: (source, file, embedded track).
+
+        Every download check registers each completed download again, and a file still
+        waiting for subtitles ran ffprobe on every check (twice with an embedded track). A
+        subtitle file beside the video is looked for each time (a folder listing); the
+        embedded-track probe is reused while the video's size and modification time stay.
+        """
+        sidecar = sidecar_subtitle(video)
+        if sidecar is not None:
+            kind = "external_bitmap" if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS else "external"
+            return kind, sidecar.resolve(), None
+        try:
+            return self._cached_embedded_subtitle_details(video)
+        except Exception:  # noqa: BLE001 - a failed probe is never cached: checked as before
+            pass
+        source, path = japanese_subtitle_source(
+            video,
+            ffprobe=self.config.tools.ffprobe,
+            ffmpeg=self.config.tools.ffmpeg,
+        )
+        embedded_id = None
+        if source in {"embedded", "embedded_bitmap"}:
+            _source, _path, embedded_id = japanese_subtitle_details(
+                video,
+                ffprobe=self.config.tools.ffprobe,
+                ffmpeg=self.config.tools.ffmpeg,
+            )
+        return source, path, embedded_id
 
     @property
     def last_completed_video_paths(self) -> tuple[Path, ...]:
@@ -7363,12 +11031,31 @@ class AnimeManager:
             changed.append(video)
         return changed
 
+    def _subtitle_upgrade_marker_keys(self) -> set[str] | None:
+        """State keys of the upgrade checks and rebuilds that hold a request, in one query
+        (None when they could not be read: the caller asks per episode as before).
+
+        Every maintenance pass resolved each library video and read its marker row, twice,
+        while usually no check was waiting at all."""
+        try:
+            with self.db.connect() as conn:
+                rows = conn.execute(
+                    f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}",
+                    state_prefix_bounds("subtitle_upgrade:"),
+                ).fetchall()
+        except (AttributeError, TypeError, sqlite3.Error):
+            return None
+        return {str(row["key"]) for row in rows if str(row["value"] or "").strip()}
+
     @_reusing_db_connection
     def _active_subtitle_upgrade_paths(self) -> set[str]:
         paths: set[str] = set()
+        markers = self._subtitle_upgrade_marker_keys()
+        if markers is not None and not markers:
+            return paths
         for item in self.db.episodes():
             key = self._subtitle_upgrade_state_key(item.video_path)
-            if self.db.get_state(key, "").strip():
+            if (key in markers) if markers is not None else self.db.get_state(key, "").strip():
                 paths.add(str(item.video_path))
         return paths
 
@@ -7382,10 +11069,22 @@ class AnimeManager:
         and keep/recreate the upgrade job so checking remains transparent.
         """
         restored = 0
+        markers = self._subtitle_upgrade_marker_keys()
+        if markers is not None and not markers:
+            return restored
+        jobs = {str(row["video_path"]): row for row in self.db.subtitle_jobs()}
         for item in self.db.episodes():
             key = self._subtitle_upgrade_state_key(item.video_path)
+            if markers is not None and key not in markers:
+                continue
             raw = self.db.get_state(key, "").strip()
             if not raw:
+                continue
+            job = jobs.get(str(item.video_path))
+            job_state = str(job["state"] or "") if job is not None else ""
+            if job_state == "processing":
+                # A worker is running this check: resetting the job to pending
+                # took it away from that worker.
                 continue
             try:
                 request = json.loads(raw)
@@ -7416,12 +11115,17 @@ class AnimeManager:
                         item.episode,
                         str(item.video_path),
                     )
+            if job is not None:
+                # It has its job (pending, postponed or waiting for the user): its delay,
+                # priority and reason stay. Queueing it again for "now" ran a failing
+                # check on every tick and put rebuilds ahead of new downloads.
+                continue
             self.db.queue_subtitle_job(
                 item.video_path,
                 item.media_id,
                 item.episode,
-                priority=120,
-                error=err("jobs.checkingUpgrade"),
+                priority=_upgrade_request_priority(request, 0 if request.get("rebuild_rule") else 120),
+                error=str(request.get("requeue_reason") or err("jobs.checkingUpgrade")),
             )
         return restored
 
@@ -7554,18 +11258,29 @@ class AnimeManager:
                     item.media_id,
                     item.episode,
                 )
-        # ``state`` rows have no UI trigger, so explicitly invalidate the WebView.
-        try:
-            version = int(self.db.get_state("ui_state_version", "0") or 0)
-        except ValueError:
-            version = 0
-        self.db.set_state("ui_state_version", str(version + 1))
+        # ``state`` rows have no UI trigger, so explicitly invalidate the WebView
+        # (in one statement: a read-then-set lost concurrent bumps, DB-8).
+        bump = getattr(self.db, "bump_ui_state_version", None)
+        if callable(bump):
+            bump()
+        else:
+            try:
+                version = int(self.db.get_state("ui_state_version", "0") or 0)
+            except ValueError:
+                version = 0
+            self.db.set_state("ui_state_version", str(version + 1))
         self.logger.info(
             "EVENT subtitle.requirement media_id=%s required=%s",
             media_id,
             required,
         )
         return required
+
+    @staticmethod
+    def _embedded_subtitle_probe_state_key(video: Path) -> str:
+        """The cached same-container subtitle probe of a (resolved) video path."""
+        digest = hashlib.sha1(str(video).encode("utf-8", errors="replace")).hexdigest()[:24]
+        return f"embedded_subtitle_probe:v1:{digest}"
 
     def _cached_embedded_subtitle_details(
         self,
@@ -7580,8 +11295,7 @@ class AnimeManager:
         """
         resolved = Path(video).expanduser().resolve()
         stat = resolved.stat()
-        digest = hashlib.sha1(str(resolved).encode("utf-8", errors="replace")).hexdigest()[:24]
-        key = f"embedded_subtitle_probe:v1:{digest}"
+        key = self._embedded_subtitle_probe_state_key(resolved)
         if not refresh:
             raw = self.db.get_state(key, "").strip()
             if raw:
@@ -7629,6 +11343,7 @@ class AnimeManager:
         )
         return source, None, sid
 
+    @_reusing_db_connection
     def schedule_subtitle_upgrades(
         self,
         *,
@@ -7771,6 +11486,8 @@ class AnimeManager:
                 "previous_origin": item.subtitle_origin,
                 "requested_at": now,
                 "forced": bool(force),
+                "requeue_priority": 180 if force else 120,
+                "requeue_reason": err("jobs.checkingUpgrade"),
             }
             self.db.set_state(upgrade_key, json.dumps(request, ensure_ascii=False))
             self.db.set_state(checked_key, str(now))
@@ -7871,13 +11588,77 @@ class AnimeManager:
                 pass
         return True
 
+    def _keep_subtitles_during_rebuild(
+        self,
+        item: LibraryEpisode,
+        *,
+        fresh: bool,
+        priority: int | None = None,
+        reason: str = "",
+        rebuild_rule: bool = False,
+    ) -> bool:
+        """Keep a Ready selection playable while its subtitles are prepared again.
+
+        Uses the upgrade check: the new result replaces the old one once it is ready;
+        a failed or interrupted run puts the old one back. ``fresh`` takes any ready
+        result (the user asked for a rebuild, a score comparison does not apply).
+        ``priority`` and ``reason`` are what its job is queued with again (after a
+        pause or an interrupted run); ``rebuild_rule`` marks a rebuild rule's request.
+        """
+        if item.state not in {"ready", "watched"}:
+            return False
+        subtitle = item.subtitle_path
+        has_file = False
+        if subtitle is not None:
+            try:
+                has_file = subtitle.is_file() and subtitle.stat().st_size > 0
+            except OSError:
+                has_file = False
+        if not has_file and item.embedded_subtitle_id is None:
+            return False
+        latest = self.db.latest_selected_subtitle(item.video_path)
+        request = {
+            "previous_subtitle_path": str(subtitle or "") if has_file else "",
+            "previous_embedded_sid": item.embedded_subtitle_id,
+            "previous_state": item.state,
+            "previous_score": latest.get("score") if latest else None,
+            "previous_quality": (
+                latest.get("details", {}).get("quality")
+                if latest and isinstance(latest.get("details"), dict)
+                else None
+            ),
+            "previous_source": latest.get("source") if latest else "legacy",
+            "previous_origin": item.subtitle_origin,
+            "requested_at": time.time(),
+            "forced": True,
+            "manual_retry": True,
+            "fresh_rebuild": bool(fresh),
+        }
+        if priority is not None:
+            request["requeue_priority"] = max(0, int(priority))
+        if reason:
+            request["requeue_reason"] = str(reason)
+        if rebuild_rule:
+            request["rebuild_rule"] = True
+        self.db.set_state(
+            self._subtitle_upgrade_state_key(item.video_path),
+            json.dumps(request, ensure_ascii=False),
+        )
+        return True
+
     def force_fresh_subtitle_selection(self, video: Path) -> dict[str, Any]:
         video = video.expanduser().resolve()
         item = self.db.episode_by_path(video)
         if item is None:
             raise ManagerError(err("manager.episodeNotInLibrary"))
+        # FX Senshi Kurumi-chan E03: the rebuild dropped the working subtitles first, Jimaku
+        # timed out, and the episode played without any. The current subtitles stay until
+        # the rebuild has new ones; if it fails they are kept (as for a manual retry).
+        kept = self._keep_subtitles_during_rebuild(
+            item, fresh=True, priority=260, reason=err("jobs.debugFreshSelection")
+        )
         subtitle = item.subtitle_path
-        if subtitle is not None:
+        if subtitle is not None and not kept:
             try:
                 cache_root = self.config.paths.cache_dir.expanduser().resolve()
                 resolved = subtitle.expanduser().resolve()
@@ -7890,7 +11671,8 @@ class AnimeManager:
         self.db.delete_state(self._manual_subtitle_state_key(video))
         self.db.set_state(self._subtitle_force_rebuild_state_key(video), "1")
         self.db.delete_state(self._subtitle_candidate_fingerprint_state_key(video))
-        self.db.clear_subtitle_selection(video)
+        if not kept:
+            self.db.clear_subtitle_selection(video)
         self.db.set_state(self._debug_force_subtitle_state_key(video), "1")
         self.db.queue_subtitle_job(
             video, item.media_id, item.episode, priority=260, error=err("jobs.debugFreshSelection")
@@ -7903,14 +11685,16 @@ class AnimeManager:
         )
         return {"ok": True, "video_path": str(video), "media_id": item.media_id, "episode": item.episode}
 
-    def set_manual_subtitle(self, video: Path, subtitle: Path) -> Path:
-        video = video.expanduser().resolve()
-        subtitle = subtitle.expanduser().resolve()
+    def _copy_manual_subtitle(
+        self, video: Path, subtitle: Path, *, allowed: set[str] | frozenset[str]
+    ) -> Path:
+        """A private copy of a user-chosen subtitle (the original may be deleted later)."""
         if not video.is_file():
             raise ManagerError(err("manager.videoMissing", path=video))
-        allowed = TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
-        if subtitle.suffix.casefold() not in allowed:
+        if subtitle.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}:
             raise ManagerError(err("manager.unsupportedSubtitle", suffix=subtitle.suffix))
+        if subtitle.suffix.casefold() not in allowed:
+            raise ManagerError(err("manager.subtitleAsIsNeedsText"))
         if not subtitle.is_file():
             raise ManagerError(err("manager.subtitleMissing", path=subtitle))
         digest = hashlib.sha1(
@@ -7920,6 +11704,58 @@ class AnimeManager:
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / f"{video.stem}.manual.ja{subtitle.suffix.casefold()}"
         target.write_bytes(subtitle.read_bytes())
+        return target
+
+    def use_manual_subtitle_as_is(self, video: Path, subtitle: Path) -> Path:
+        """Play a user-chosen text subtitle exactly as it is: no alignment job.
+
+        "Choose subtitle" re-aligns the file, which can shift a hand-fixed or
+        already synced one, or reject it. This keeps its timing; like any manual
+        choice, automatic upgrades leave it alone.
+        """
+        video = video.expanduser().resolve()
+        subtitle = subtitle.expanduser().resolve()
+        # What mpv shows as is (not VobSub .sub index pairs or plain .txt).
+        target = self._copy_manual_subtitle(
+            video, subtitle, allowed=frozenset({".srt", ".ass", ".ssa", ".vtt"})
+        )
+        episode = self.db.episode_by_path(video)
+        if episode is None:
+            raise ManagerError(err("manager.episodeNotInLibrary"))
+        # An older prepared result must not come back through the fast path.
+        invalidate_final_pipeline_result(video, self.config)
+        self.db.set_subtitle_ready(
+            video,
+            target,
+            None,
+            origin="manual",
+            clear_state_keys=(
+                self._manual_subtitle_state_key(video),
+                self._subtitle_force_rebuild_state_key(video),
+                self._debug_force_subtitle_state_key(video),
+                self._subtitle_upgrade_state_key(video),
+            ),
+        )
+        self.db.record_subtitle_history(
+            video_path=video,
+            media_id=episode.media_id,
+            episode=episode.episode,
+            source="manual",
+            candidate_name=subtitle.name,
+            candidate_path=target,
+            score=None,
+            status="manual",
+            reason=err("jobs.userSelectedSubtitleAsIs"),
+            details={"original_path": str(subtitle), "final_path": str(target), "as_is": True},
+        )
+        self.logger.info("EVENT subtitle.manual_as_is video=%r subtitle=%r", str(video), str(target))
+        return target
+
+    def set_manual_subtitle(self, video: Path, subtitle: Path) -> Path:
+        video = video.expanduser().resolve()
+        subtitle = subtitle.expanduser().resolve()
+        allowed = TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
+        target = self._copy_manual_subtitle(video, subtitle, allowed=allowed)
         self.db.set_state(self._manual_subtitle_state_key(video), str(target))
         self.db.delete_state(self._subtitle_force_rebuild_state_key(video))
         episode = self.db.episode_by_path(video)
@@ -7974,7 +11810,11 @@ class AnimeManager:
         if changed:
             self.db.set_state("subtitle_inbox_signature", signature)
             if rows:
-                requeued = self.db.force_requeue_unresolved_subtitle_jobs()
+                # New subtitle files may be what a failing job lacked: only the extra
+                # files of a download keep waiting for the person's answer.
+                requeued = self.db.force_requeue_unresolved_subtitle_jobs(
+                    keep_action_codes=EXTRA_FILE_ACTION_CODES
+                )
             self.logger.info(
                 "EVENT subtitle_inbox.changed files=%s requeued=%s initial=%s",
                 len(rows),
@@ -8154,6 +11994,72 @@ class AnimeManager:
                 self._reported_download_owner_conflicts = reported
         return True
 
+    def _row_owned_by_other_title(self, item, path: Path) -> bool:
+        row = self.db.episode_by_path(path.resolve())
+        return bool(row is not None and row.media_id is not None and row.media_id != item.media_id)
+
+    _RECONCILE_POLL_MAX_AGE_SECONDS = 300.0
+
+    def _completed_downloads_poll_signature(self) -> tuple[Any, ...] | None:
+        """What the poll's reconcile depends on: completed downloads, their entries on disk,
+        and (through ui_state_version) the episode rows."""
+        try:
+            rows = []
+            for item in self.db.downloads():
+                if item.media_id is None or not self._download_is_complete(item):
+                    continue
+                content = self._download_content_path(item)
+                try:
+                    stat = content.stat() if content is not None else None
+                except OSError:
+                    stat = None
+                raw = item.raw or {}
+                rows.append(
+                    (
+                        item.torrent_hash,
+                        item.media_id,
+                        item.media_episode,
+                        item.release_episode,
+                        bool(item.is_batch),
+                        str(content),
+                        stat.st_mtime_ns if stat is not None else -1,
+                        bool(raw.get("_identity_conflict") or raw.get("_race_id")),
+                    )
+                )
+            return (self.db.get_state("ui_state_version", ""), tuple(rows))
+        except (sqlite3.Error, OSError, RuntimeError):
+            return None
+
+    def reconcile_completed_download_rows_from_poll(self) -> int:
+        """The foreground poll's reconcile (WEBFLOW-8): nothing to do while nothing changed.
+
+        The poll runs every second while subtitle jobs are due; it rebuilt ownership
+        claims for all completed downloads and walked the folder of any with a missing
+        entry each time (0.2 s for 150 downloads, ~10 s with many missing entries).
+        Now it reruns only when a completed download, its entry on disk or an episode
+        row changed (or every 5 minutes), and never walks a save folder.
+        """
+        signature = self._completed_downloads_poll_signature()
+        now = time.monotonic()
+        last = getattr(self, "_reconcile_poll_last", None)
+        if (
+            signature is not None
+            and last is not None
+            and last[0] == signature
+            and now - last[1] < self._RECONCILE_POLL_MAX_AGE_SECONDS
+        ):
+            return 0
+        token = _RECONCILE_FROM_POLL.set(True)
+        try:
+            repaired = int(self.reconcile_completed_download_rows() or 0)
+        finally:
+            _RECONCILE_FROM_POLL.reset(token)
+        # The signature read before the run: a completion recorded while it ran (sync in
+        # another thread, the agent) changes the next poll's signature and is filed then.
+        # The run's own repairs cost one more (empty) run.
+        self._reconcile_poll_last = (signature, now)
+        return repaired
+
     @_reusing_db_connection
     def reconcile_completed_download_rows(
         self,
@@ -8172,7 +12078,12 @@ class AnimeManager:
         wanted_episode = int(episode) if episode is not None else None
         downloads = self.db.downloads()
         files_by_hash = {}
-        claims = self._completed_download_claims(downloads, files_by_hash)
+        from_poll = bool(_RECONCILE_FROM_POLL.get())
+        # The poll changes no established owner (below), so it needs no ownership claims:
+        # they walked every completed download's folder on each poll (WEBFLOW-8).
+        claims = {} if from_poll else self._completed_download_claims(downloads, files_by_hash)
+        scan_roots: tuple[Path, ...] | None = None
+        finished_torrent = self._finished_torrent_check()
         for item in downloads:
             self._resolve_download_media(item)
             if item.raw.get("_identity_conflict") or item.raw.get("_race_id"):
@@ -8194,12 +12105,28 @@ class AnimeManager:
                 continue
             candidate_files = files_by_hash.get(item.torrent_hash)
             if candidate_files is None:
-                candidate_files = self._completed_download_video_files(item)
+                candidate_files = self._completed_download_video_files(item, walk_save_path=not from_poll)
+            if scan_roots is None:
+                scan_roots = self._library_scan_roots()
+            # Preparation drops the row of a file aria2 has not finished: restoring it
+            # here repaired the same rows on every poll (REPAIR ... rows=2 each second).
             candidate_files = [
                 path
                 for path in candidate_files
-                if not self._completed_download_owner_conflict(item, path, claims)
+                if not self.unfinished_library_video(path, roots=scan_roots, finished=finished_torrent)
             ]
+            if from_poll:
+                # A file filed under another title waits for the full reconcile (after a
+                # library scan), which weighs every download's claim on it.
+                candidate_files = [
+                    path for path in candidate_files if not self._row_owned_by_other_title(item, path)
+                ]
+            else:
+                candidate_files = [
+                    path
+                    for path in candidate_files
+                    if not self._completed_download_owner_conflict(item, path, claims)
+                ]
             if not candidate_files:
                 continue
             if candidate_files and all(self._library_path_is_ignored(path) for path in candidate_files):
@@ -8214,14 +12141,19 @@ class AnimeManager:
                 row = self.db.episode_by_path(path.resolve())
                 if row is None:
                     return False
+                if (
+                    self._extra_file_kept(path.resolve())
+                    or self._special_set_aside(path.resolve())
+                    or user_episode_identity(self.db, path.resolve())
+                ):
+                    # Keep or Identify… gave it its own identity (or it waits for the person)
+                    return True
                 identity = parse_anime_filename(path)
                 release_number = identity.episode or item.release_episode
-                expected = self._download_file_media_episode(
-                    self.db.get_anime(item.media_id) if item.media_id else None,
-                    item,
-                    release_number,
-                    path,
-                )
+                download_anime = self.db.get_anime(item.media_id) if item.media_id else None
+                expected = self._download_file_media_episode(download_anime, item, release_number, path)
+                if item.is_batch and self._extra_file_kind(download_anime, path.name):
+                    release_number = expected = None  # as registered (an extra file)
                 actual = row.media_episode if row.media_episode is not None else row.episode
                 return bool(
                     row.media_id == item.media_id
@@ -8258,7 +12190,8 @@ class AnimeManager:
                 for row in self.db.episodes()
                 if row.video_path.is_file()
             }
-            self._register_completed_download(item)
+            # The claims read above (the poll reads none: registration reads them itself).
+            self._register_completed_download(item, claims=None if from_poll else claims)
 
             # A completed managed single-episode download is authoritative.
             # If the normal registration path did not materialize the expected
@@ -8341,7 +12274,11 @@ class AnimeManager:
             ),
             torrent_hash="",
         )
-        self.db.upsert_episode(item, downloaded_at=time.time())
+        # No downloaded_at: that marks a file Pudge downloaded (and may delete
+        # after watching). A dropped video is the user's own file, wherever it is;
+        # an upsert without it keeps the value of a row Pudge did download.
+        self.db.upsert_episode(item)
+        self._remember_dropped_media_file(video)
         self._record_media_identity(item, source="manual_import")
         if subtitle_source in {"none", "external_bitmap", "embedded_bitmap"}:
             self.db.ensure_subtitle_job(video, item.media_id, media_number)
@@ -8548,6 +12485,7 @@ class AnimeManager:
             "ready": subtitle_ready,
             "video_path": str(selected.video_path) if selected else "",
             "state": selected.state if selected else "missing",
+            "identify_allowed": self.identify_allowed(selected),
             "watched_on_anilist": watched_externally,
             "presentation": presentation,
             "checks": checks,
@@ -8776,14 +12714,14 @@ class AnimeManager:
             except Exception as exc:
                 self.logger.warning("FAIL step=repair.sync_downloads error=%r", str(exc))
         missing: list[Path] = []
+        # Read once: every missing row read all download rows again (each library row when
+        # the library disk is unplugged).
+        download_hashes = {str(d.torrent_hash or "").casefold() for d in self.db.downloads()}
         for item in list(self.db.episodes()):
             if item.video_path.is_file():
                 continue
-            active = (
-                any(d.torrent_hash == item.torrent_hash for d in self.db.downloads())
-                if item.torrent_hash
-                else False
-            )
+            # Case-blind, as cleanup(): a row's hash can be in another case than the client's.
+            active = bool(item.torrent_hash) and str(item.torrent_hash).casefold() in download_hashes
             if not active:
                 missing.append(item.video_path)
         # Never for a file on an unplugged drive; the automatic pass also waits
@@ -8792,8 +12730,11 @@ class AnimeManager:
             self.db.delete_episode_record(Path(value))
             result["missing_episode_rows"] += 1
         result["bitmap_rows"] = self.db.repair_bitmap_ready_rows()
-        result["spurious_jobs"] = self.db.repair_spurious_ready_subtitle_jobs()
-        result["stale_subtitles"] = self.db.repair_stale_subtitle_selections()
+        # Upgrade checks and rebuilds that keep their subtitles own their jobs (priority,
+        # throttle marker): only jobs of other Ready rows are spurious.
+        upgrade_paths = self._active_subtitle_upgrade_paths()
+        result["spurious_jobs"] = self.db.repair_spurious_ready_subtitle_jobs(preserve_paths=upgrade_paths)
+        result["stale_subtitles"] = self.db.repair_stale_subtitle_selections(preserve_paths=upgrade_paths)
         result["library_rows"] = len(self.scan_library()) if scan else len(self.db.episodes())
         for item in self.db.episodes():
             if item.state in {"local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
@@ -8963,6 +12904,78 @@ class AnimeManager:
             runnable_jobs.append(queued)
         return runnable_jobs
 
+    @classmethod
+    def _subtitle_failure_streak_state_key(cls, video: Path) -> str:
+        return cls._subtitle_candidate_fingerprint_state_key(video) + ":failure_streak"
+
+    def _count_subtitle_failure(
+        self,
+        video: Path,
+        signature: str,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> int:
+        """Count this failure; return how many identical ones came in a row."""
+        key = self._subtitle_failure_streak_state_key(video)
+        try:
+            previous = json.loads(self.db.get_state(key, "") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            previous = {}
+        if not isinstance(previous, dict) or previous.get("signature") != signature:
+            previous = {}
+        try:
+            streak = max(0, int(previous.get("count") or 0)) + 1
+        except (TypeError, ValueError):
+            streak = 1
+        self.db.set_state_if_subtitle_job_owned(
+            key,
+            json.dumps({"signature": signature, "count": streak}),
+            video_path=video,
+            generation=generation,
+            owner_token=owner_token,
+        )
+        return streak
+
+    def _retry_unfinished_subtitle_run(
+        self,
+        video: Path,
+        detail: str,
+        *,
+        signature: str,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> None:
+        """A run that ended without a verdict (20-minute timeout, the worker failed to start).
+
+        The episode keeps its playable fallback. Each identical failure in a row doubles
+        the wait; after ``SUBTITLE_FAILURE_STREAK_CAP`` of them the job waits for the
+        person (Action required) instead of burning another 20 minutes.
+        """
+        owner_kwargs = {"generation": generation, "owner_token": owner_token}
+        streak = self._count_subtitle_failure(video, signature, **owner_kwargs)
+        delay = _subtitle_failure_backoff_seconds(
+            poll_minutes=self.config.agent.subtitle_poll_minutes, streak=streak
+        )
+        exhausted = streak >= SUBTITLE_FAILURE_STREAK_CAP
+        self.db.reschedule_subtitle_job(
+            video,
+            detail,
+            delay,
+            count_attempt=True,
+            action_code=SUBTITLE_RETRY_EXHAUSTED if exhausted else "",
+            **owner_kwargs,
+        )
+        self.logger.info(
+            "RETRY step=subtitle.prepare reason=%s video=%s streak=%s delay_s=%s exhausted=%s detail=%r",
+            signature,
+            video.name,
+            streak,
+            0 if exhausted else int(delay),
+            exhausted,
+            str(detail)[-300:],
+        )
+
     def process_subtitle_jobs(
         self,
         limit: int = 4,
@@ -9000,15 +13013,20 @@ class AnimeManager:
             }.get(str(reason), err("jobs.backgroundDeferred"))
 
         def requeue_unstarted(start_index: int, reason: str = "foreground") -> None:
+            # Never tried: no attempt is counted and the priority stays.
             for queued in jobs[start_index:]:
                 queued_video = Path(str(queued["video_path"]))
-                self.db.postpone_subtitle_job(
+                self.db.reschedule_subtitle_job(
                     queued_video,
                     scheduler_wait_detail(reason),
                     60,
                     generation=int(queued["generation"] or 0),
                     owner_token=str(queued["owner_token"] or ""),
                 )
+
+        # A job someone waits for ("fresh subtitles", a retry) runs at USER priority:
+        # only playback in the foreground stops it, not energy saving.
+        job_priority = WorkPriority.USER if wait_for_slot else WorkPriority.BACKGROUND
 
         for job_index, job in enumerate(jobs):
             video = Path(str(job["video_path"]))
@@ -9036,7 +13054,7 @@ class AnimeManager:
             if not wait_for_slot:
                 block_reason = self.work_scheduler.background_wait_reason()
                 if block_reason is not None:
-                    self.db.postpone_subtitle_job(
+                    self.db.reschedule_subtitle_job(
                         video, scheduler_wait_detail(block_reason), 60, **owner_kwargs
                     )
                     self.logger.info(
@@ -9048,6 +13066,16 @@ class AnimeManager:
                     )
                     requeue_unstarted(job_index + 1, block_reason)
                     break
+            if not video.is_file() and self._missing_video_was_watched(video, media_id, episode):
+                # Cleanup deleted a watched episode: nothing will ever need its subtitles.
+                self.db.delete_subtitle_job(video, **owner_kwargs)
+                self.logger.info(
+                    "SKIP step=subtitle.prepare reason=watched_video_gone media_id=%s episode=%s video=%s",
+                    media_id,
+                    episode,
+                    video.name,
+                )
+                continue
             if not video.is_file():
                 self.logger.info(
                     "RETRY step=subtitle.prepare reason=video_missing media_id=%s episode=%s video=%s delay_s=%s",
@@ -9069,6 +13097,45 @@ class AnimeManager:
                     job["episode"],
                     video.name,
                     15 * 60,
+                )
+                continue
+            if self.unfinished_library_video(video):
+                # A removed candidate's empty file: no episode, nothing to retry for a day.
+                self.db.delete_episode_record(video)
+                self.logger.info(
+                    "SKIP step=subtitle.prepare reason=unfinished_video media_id=%s episode=%s video=%s",
+                    job["media_id"],
+                    job["episode"],
+                    video.name,
+                )
+                continue
+            if episode is None and self._own_extra_file(video):
+                # An NCOP/NCED/PV of the person's own folder: it stays in the Library and
+                # never waits for subtitles.
+                self.db.mark_subtitle_job_needs_action(
+                    video, err("jobs.extraFileKept"), self.EXTRA_FILE_KEPT, **owner_kwargs
+                )
+                self.logger.info(
+                    "SKIP step=subtitle.prepare reason=own_extra_file media_id=%s video=%s",
+                    media_id,
+                    video.name,
+                )
+                continue
+            extra_kind = self._downloaded_extra_file_kind(video, media_id, episode)
+            if extra_kind:
+                kept = bool(self.db.get_state(self._extra_file_kept_state_key(video), ""))
+                self.db.mark_subtitle_job_needs_action(
+                    video,
+                    err("jobs.extraFileKept") if kept else err("jobs.extraDownloadFile", kind=extra_kind),
+                    self.EXTRA_FILE_KEPT if kept else self.EXTRA_FILE_REVIEW,
+                    **owner_kwargs,
+                )
+                self.logger.info(
+                    "SKIP step=subtitle.prepare reason=extra_download_file kind=%s kept=%s media_id=%s video=%s",
+                    extra_kind,
+                    kept,
+                    media_id,
+                    video.name,
                 )
                 continue
             probe = None
@@ -9150,9 +13217,10 @@ class AnimeManager:
                     )
                     shutil.copy2(previous_path, previous_backup)
 
-            def restore_upgrade_selection(reason: str) -> bool:
+            def restore_upgrade_selection(reason: str, *, paused: bool = False) -> bool:
                 if upgrade_request is None:
                     return False
+                fresh_rebuild = bool(upgrade_request.get("fresh_rebuild"))
                 previous_value = str(upgrade_request.get("previous_subtitle_path") or "").strip()
                 previous_path = Path(previous_value) if previous_value else None
                 previous_sid_raw = upgrade_request.get("previous_embedded_sid")
@@ -9165,10 +13233,34 @@ class AnimeManager:
                     previous_path,
                     previous_sid,
                     origin=str(upgrade_request.get("previous_origin") or ""),
-                    clear_state_keys=(upgrade_key,),
+                    clear_state_keys=(
+                        (upgrade_key, self._subtitle_force_rebuild_state_key(video))
+                        if fresh_rebuild and not paused
+                        else (upgrade_key,)
+                    ),
                     **owner_kwargs,
                 ):
                     return False
+                if fresh_rebuild and paused:
+                    # Paused (playback, energy): the rebuild goes on later, at its own
+                    # priority. A rebuild rule's job keeps its reason (and the throttle
+                    # marker of a sync update) and stays below new downloads and the
+                    # checks the person asked for.
+                    rule_rebuild = bool(upgrade_request.get("rebuild_rule"))
+                    self.db.set_state(upgrade_key, json.dumps(upgrade_request, ensure_ascii=False))
+                    self.db.queue_subtitle_job(
+                        video,
+                        media_id,
+                        int(job["episode"]) if job["episode"] is not None else None,
+                        delay_seconds=60,
+                        priority=_upgrade_request_priority(upgrade_request, 0 if rule_rebuild else 260),
+                        error=(
+                            str(upgrade_request.get("requeue_reason") or reason) if rule_rebuild else reason
+                        ),
+                    )
+                    if previous_backup is not None:
+                        previous_backup.unlink(missing_ok=True)
+                    return True
                 self.db.record_subtitle_history(
                     video_path=video,
                     media_id=media_id,
@@ -9185,7 +13277,65 @@ class AnimeManager:
                     previous_backup.unlink(missing_ok=True)
                 return True
 
+            def retry_rule_rebuild_later(detail: str, signature: str) -> bool:
+                """A rebuild rule's run that failed for a passing reason runs again later.
+
+                Jimaku unreachable or rate limited, a lookup cut short by a Jimaku error,
+                the 20-minute timeout, a worker that did not start: the old subtitles
+                stay, and so do the request and the forced rebuild. Each identical
+                failure doubles the wait; the ``SUBTITLE_FAILURE_STREAK_CAP``-th ends the
+                rebuild like a definitive failure (False: the caller ends it).
+                """
+                if upgrade_request is None or not upgrade_request.get("rebuild_rule"):
+                    return False
+                streak = self._count_subtitle_failure(video, signature, **owner_kwargs)
+                if streak >= SUBTITLE_FAILURE_STREAK_CAP:
+                    self.logger.info(
+                        "SKIP step=subtitle.rebuild reason=retries_exhausted video=%s signature=%s streak=%s",
+                        video.name,
+                        signature,
+                        streak,
+                    )
+                    return False
+                previous_value = str(upgrade_request.get("previous_subtitle_path") or "").strip()
+                previous_path = Path(previous_value) if previous_value else None
+                if previous_backup is not None and previous_path is not None and previous_backup.is_file():
+                    previous_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(previous_backup, previous_path)
+                delay = _subtitle_failure_backoff_seconds(
+                    poll_minutes=self.config.agent.subtitle_poll_minutes, streak=streak
+                )
+                self.db.reschedule_subtitle_job(
+                    video,
+                    str(upgrade_request.get("requeue_reason") or detail),
+                    delay,
+                    count_attempt=True,
+                    keep_priority=True,
+                    **owner_kwargs,
+                )
+                if previous_backup is not None:
+                    previous_backup.unlink(missing_ok=True)
+                self.logger.info(
+                    "RETRY step=subtitle.rebuild reason=transient video=%s signature=%s streak=%s "
+                    "delay_s=%s detail=%r",
+                    video.name,
+                    signature,
+                    streak,
+                    int(delay),
+                    str(detail)[-300:],
+                )
+                return True
+
             anime = self.db.get_anime(media_id) if media_id is not None else None
+            # No AniList title (an OVA of the person's own folder, an unmatched file),
+            # or no episode of a multi-episode title: retrying every half hour finds
+            # nothing new. A matched movie or one-episode special has no episode either.
+            unidentified = media_id is None or (
+                episode is None
+                and anime is not None
+                and int(anime.episodes or 0) > 1
+                and str(anime.format or "").upper() != "MOVIE"
+            )
             if anime is not None:
                 command.extend(
                     [
@@ -9203,6 +13353,8 @@ class AnimeManager:
                     command.extend(["--media-episodes", str(anime.episodes)])
                 if anime.format:
                     command.extend(["--media-format", anime.format])
+                if anime.media_status:
+                    command.extend(["--media-status", anime.media_status])
                 # The manager already has an authoritative AniList ID. Avoid a
                 # second GraphQL lookup here; Jimaku can search by ID directly.
                 command.append("--skip-airing-lookup")
@@ -9367,9 +13519,24 @@ class AnimeManager:
                 priority=WorkPriority.USER if wait_for_slot else WorkPriority.BACKGROUND,
             )
             if heavy_lease is None:
-                self.db.postpone_subtitle_job(video, err("jobs.heavyWorkBusy"), 60, **owner_kwargs)
+                self.db.reschedule_subtitle_job(video, err("jobs.heavyWorkBusy"), 60, **owner_kwargs)
                 requeue_unstarted(job_index + 1, "heavy_busy")
                 break
+            # Several jobs share one 25-minute claim and each child may run for
+            # 20 minutes, so a later job's lease could expire and another worker
+            # claim it before its turn here. Renew it right before the child
+            # starts, or leave the job to its new owner.
+            if not self.db.update_subtitle_job_stage(video, "discovering", **owner_kwargs):
+                heavy_lease.release()
+                self.logger.info(
+                    "SKIP step=subtitle.prepare_stale_owner media_id=%s episode=%s video=%s generation=%s owner=%s phase=start",
+                    media_id,
+                    episode,
+                    video.name,
+                    job_generation,
+                    job_owner_token[:12],
+                )
+                continue
             try:
                 with timed_step(
                     self.logger,
@@ -9379,98 +13546,128 @@ class AnimeManager:
                     video=video.name,
                 ):
                     stdout_handle = stdout_path.open("w", encoding="utf-8")
-                    stderr_handle = stderr_path.open("w", encoding="utf-8")
+                    stderr_handle = None
+                    process = None
                     try:
+                        stderr_handle = stderr_path.open("w", encoding="utf-8")
+                        # Its own process group: a cancel stops ffmpeg, alass and the
+                        # candidate pool it started, not only the worker.
                         process = subprocess.Popen(
                             command,
                             text=True,
                             stdout=stdout_handle,
                             stderr=stderr_handle,
                             env=env,
+                            start_new_session=True,
                         )
-                    except BaseException:
-                        stdout_handle.close()
-                        stderr_handle.close()
-                        raise
-                    deadline = time.monotonic() + 20 * 60
-                    cancelled_for_policy: str | None = None
-                    memory_guard_triggered = False
-                    memory_guard_limit_mb = 4096.0
-                    next_memory_check = time.monotonic() + 5.0
-                    last_report_stage = ""
-                    while process.poll() is None:
-                        report = read_job_report(status_path)
-                        if report is not None:
-                            report_stage = str(report.get("stage") or "")
-                            if report_stage and report_stage != last_report_stage:
-                                details = report.get("details")
-                                self.db.update_subtitle_job_stage(
-                                    video,
-                                    report_stage,
-                                    progress=details if isinstance(details, dict) else {},
-                                    **owner_kwargs,
-                                )
-                                try:
-                                    sample = energy_probe.sample()
-                                except Exception:
-                                    sample = {}
-                                append_debug_trace(
-                                    debug_paths["trace"],
-                                    {
-                                        "kind": "energy",
-                                        "stage": report_stage,
-                                        "updated_at": time.time(),
-                                        "sample": sample,
-                                    },
-                                )
-                                last_report_stage = report_stage
-                        now_monotonic = time.monotonic()
-                        if (
-                            prepared_bitmap is not None
-                            and self.config.matching.ocr_image_subtitles
-                            and now_monotonic >= next_memory_check
-                        ):
-                            next_memory_check = now_monotonic + 5.0
-                            rss_mb = _process_rss_mb(process.pid)
-                            if rss_mb is not None and rss_mb > memory_guard_limit_mb:
-                                memory_guard_triggered = True
-                                self.logger.warning(
-                                    "STOP step=subtitle.prepare reason=ocr_memory_guard "
-                                    "media_id=%s episode=%s video=%s rss_mb=%.1f limit_mb=%.1f",
-                                    job["media_id"],
-                                    job["episode"],
+                        deadline = time.monotonic() + 20 * 60
+                        cancelled_for_policy: str | None = None
+                        memory_guard_triggered = False
+                        memory_guard_limit_mb = 4096.0
+                        next_memory_check = time.monotonic() + 5.0
+                        next_owner_check = time.monotonic() + 15.0
+                        lost_ownership = False
+                        last_report_stage = ""
+                        while process.poll() is None:
+                            report = read_job_report(status_path)
+                            if report is not None:
+                                report_stage = str(report.get("stage") or "")
+                                if report_stage and report_stage != last_report_stage:
+                                    details = report.get("details")
+                                    if not self.db.update_subtitle_job_stage(
+                                        video,
+                                        report_stage,
+                                        progress=details if isinstance(details, dict) else {},
+                                        **owner_kwargs,
+                                    ):
+                                        lost_ownership = True
+                                    try:
+                                        sample = energy_probe.sample()
+                                    except Exception:
+                                        sample = {}
+                                    append_debug_trace(
+                                        debug_paths["trace"],
+                                        {
+                                            "kind": "energy",
+                                            "stage": report_stage,
+                                            "updated_at": time.time(),
+                                            "sample": sample,
+                                        },
+                                    )
+                                    last_report_stage = report_stage
+                            now_monotonic = time.monotonic()
+                            if (
+                                prepared_bitmap is not None
+                                and self.config.matching.ocr_image_subtitles
+                                and now_monotonic >= next_memory_check
+                            ):
+                                next_memory_check = now_monotonic + 5.0
+                                rss_mb = _process_rss_mb(process.pid)
+                                if rss_mb is not None and rss_mb > memory_guard_limit_mb:
+                                    memory_guard_triggered = True
+                                    self.logger.warning(
+                                        "STOP step=subtitle.prepare reason=ocr_memory_guard "
+                                        "media_id=%s episode=%s video=%s rss_mb=%.1f limit_mb=%.1f",
+                                        job["media_id"],
+                                        job["episode"],
+                                        video.name,
+                                        rss_mb,
+                                        memory_guard_limit_mb,
+                                    )
+                                    _stop_prepare_child(process)
+                                    break
+                            if not lost_ownership and now_monotonic >= next_owner_check:
+                                next_owner_check = now_monotonic + 15.0
+                                lost_ownership = not job_still_owned()
+                            if lost_ownership:
+                                # Another worker took the job over (its lease ran out, a
+                                # recovery): this run's result would be thrown away.
+                                self.logger.info(
+                                    "STOP step=subtitle.prepare reason=lost_ownership media_id=%s episode=%s "
+                                    "video=%s generation=%s owner=%s",
+                                    media_id,
+                                    episode,
                                     video.name,
-                                    rss_mb,
-                                    memory_guard_limit_mb,
+                                    job_generation,
+                                    job_owner_token[:12],
                                 )
-                                process.terminate()
+                                _stop_prepare_child(process)
+                                break
+                            policy_reason = self.work_scheduler.background_wait_reason(priority=job_priority)
+                            if policy_reason is not None:
+                                cancelled_for_policy = policy_reason
+                                _stop_prepare_child(process)
+                                break
+                            if time.monotonic() >= deadline:
+                                _signal_prepare_child(process, signal.SIGKILL)
+                                process.wait(timeout=5)
+                                raise subprocess.TimeoutExpired(command, 20 * 60)
+                            # Quick feedback while the worker starts, then one wake-up a second
+                            # (status file, foreground marker and power policy per tick).
+                            time.sleep(0.25 if time.monotonic() - (deadline - 20 * 60) < 5 else 1.0)
+                        if process.poll() is None:
+                            process.wait(timeout=5)
+                    finally:
+                        # The 20-minute timeout raised inside the loop before the handles
+                        # were closed, and any other error there (a locked database while
+                        # saving the stage) left the child running with nobody waiting.
+                        # The agent's SIGTERM at quit ends here as SystemExit: the worker's
+                        # whole group gets SIGTERM (its cleanup runs), SIGKILL after 5 s.
+                        if process is not None and process.poll() is None:
+                            if isinstance(sys.exc_info()[1], (SystemExit, KeyboardInterrupt)):
+                                try:
+                                    _stop_prepare_child(process)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                            else:
+                                _signal_prepare_child(process, signal.SIGKILL)
                                 try:
                                     process.wait(timeout=5)
                                 except subprocess.TimeoutExpired:
-                                    process.kill()
-                                    process.wait(timeout=5)
-                                break
-                        policy_reason = self.work_scheduler.background_wait_reason()
-                        if policy_reason is not None:
-                            cancelled_for_policy = policy_reason
-                            process.terminate()
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait(timeout=5)
-                            break
-                        if time.monotonic() >= deadline:
-                            process.kill()
-                            process.wait(timeout=5)
-                            raise subprocess.TimeoutExpired(command, 20 * 60)
-                        # Quick feedback while the worker starts, then one wake-up a second
-                        # (status file, foreground marker and power policy per tick).
-                        time.sleep(0.25 if time.monotonic() - (deadline - 20 * 60) < 5 else 1.0)
-                    if process.poll() is None:
-                        process.wait(timeout=5)
-                    stdout_handle.close()
-                    stderr_handle.close()
+                                    pass
+                        stdout_handle.close()
+                        if stderr_handle is not None:
+                            stderr_handle.close()
                     # Real subprocesses write directly to files, avoiding PIPE backpressure.
                     # Some lightweight test/process adapters still return captured text from
                     # communicate(); keep that as a compatibility fallback only.
@@ -9543,14 +13740,10 @@ class AnimeManager:
                             cancelled_for_policy,
                             err("jobs.paused", reason=cancelled_for_policy),
                         )
-                        if not restore_upgrade_selection(wait_message):
-                            self.db.clear_subtitle_selection(video, **owner_kwargs)
-                            self.db.postpone_subtitle_job(
-                                video,
-                                wait_message,
-                                60,
-                                **owner_kwargs,
-                            )
+                        if not restore_upgrade_selection(wait_message, paused=True):
+                            # Paused, not judged: the episode keeps its fallback (OCR,
+                            # raw unsynced, the bitmap source) and the job its count.
+                            self.db.reschedule_subtitle_job(video, wait_message, 60, **owner_kwargs)
                         self.logger.info(
                             "RETRY step=subtitle.prepare reason=%s media_id=%s episode=%s video=%s delay_s=60",
                             cancelled_for_policy,
@@ -9561,12 +13754,18 @@ class AnimeManager:
                         requeue_unstarted(job_index + 1, cancelled_for_policy)
                         break
             except (OSError, subprocess.TimeoutExpired) as exc:
+                unfinished_signature = (
+                    "timeout"
+                    if isinstance(exc, subprocess.TimeoutExpired)
+                    else _subtitle_failure_signature(f"{type(exc).__name__}: {exc}")
+                )
+                if retry_rule_rebuild_later(str(exc), unfinished_signature):
+                    continue
                 if not restore_upgrade_selection(str(exc)):
-                    self.db.clear_subtitle_selection(video, **owner_kwargs)
-                    self.db.postpone_subtitle_job(
+                    self._retry_unfinished_subtitle_run(
                         video,
                         str(exc),
-                        self.config.agent.subtitle_poll_minutes * 60,
+                        signature=unfinished_signature,
                         **owner_kwargs,
                     )
                 continue
@@ -9733,6 +13932,30 @@ class AnimeManager:
                     previous_candidate_fingerprint[:12],
                     candidate_fingerprint[:12],
                 )
+            prepare_detail = "\n".join(
+                part for part in (completed.stdout.strip()[-5000:], completed.stderr.strip()[-1500:]) if part
+            )
+            # A fresh rebuild whose Jimaku lookup stopped on an error has only part of the
+            # candidates: its result is no verdict on the episode (and ends no failure run).
+            rebuild_cut_short = bool(
+                upgrade_request is not None
+                and upgrade_request.get("fresh_rebuild")
+                and _jimaku_lookup_incomplete(prepare_detail)
+            )
+            failure_streak_key = self._subtitle_failure_streak_state_key(video)
+            if (
+                not rebuild_cut_short
+                and (
+                    candidate_set_changed
+                    or prepare_status
+                    in {"ready", "couldnt_sync", "waiting_text_subtitles", "waiting_verification"}
+                )
+                and self.db.get_state(failure_streak_key, "")
+            ):
+                # Another verdict or other candidates: the run of identical failures ended.
+                self.db.delete_state_if_subtitle_job_owned(
+                    failure_streak_key, video_path=video, **owner_kwargs
+                )
             from .subtitles.verification import verification_failure
 
             verification = verification_failure(subtitle_meta)
@@ -9753,12 +13976,31 @@ class AnimeManager:
                 candidate_outcome_key, candidate_outcome, video_path=video, **owner_kwargs
             ):
                 continue
-            if prepare_status == "waiting_verification":
+            # Speech-verification failures in a row. The job's attempts also count every
+            # earlier "no subtitles yet" retry of an airing episode, which made the first
+            # STT failure of such an episode "Action required" at once.
+            verification_failures_key = candidate_fingerprint_key + ":verification_failures"
+            verification_failures = self.db.get_state(verification_failures_key, "").strip()
+            if prepare_status != "waiting_verification" and verification_failures:
+                self.db.delete_state_if_subtitle_job_owned(
+                    verification_failures_key, video_path=video, **owner_kwargs
+                )
+            # An upgrade check ends in the upgrade branch below, which restores
+            # the previous Ready subtitle unless a better one was accepted.
+            # Handled here, a failed speech verification left the episode
+            # waiting with the upgrade marker kept, and the restore pass
+            # re-queued the check (and its STT run) on every tick.
+            if prepare_status == "waiting_verification" and upgrade_request is None:
                 reason = str((verification or {}).get("reason") or "stt_reference_unavailable")
-                exhausted = int(job["attempts"] or 0) >= 2
+                failures = (int(verification_failures) if verification_failures.isdigit() else 0) + 1
+                exhausted = failures >= 3
                 if (verification and not verification["retryable"]) or exhausted:
                     self.db.set_state_if_subtitle_job_owned(
                         candidate_outcome_key, "terminal", video_path=video, **owner_kwargs
+                    )
+                    # A retry the user starts from "Action required" gets three tries again.
+                    self.db.delete_state_if_subtitle_job_owned(
+                        verification_failures_key, video_path=video, **owner_kwargs
                     )
                     self.db.mark_subtitle_job_needs_action(
                         video, reason, "configure_speech_verification", **owner_kwargs
@@ -9766,6 +14008,9 @@ class AnimeManager:
                 else:
                     # Count operational verification attempts too: deferral
                     # without counting made a timeout retry forever.
+                    self.db.set_state_if_subtitle_job_owned(
+                        verification_failures_key, str(failures), video_path=video, **owner_kwargs
+                    )
                     self.db.postpone_subtitle_job(
                         video,
                         reason,
@@ -9780,14 +14025,14 @@ class AnimeManager:
                     exhausted,
                 )
                 continue
-            if prepare_status == "waiting_unchanged_candidates":
+            if prepare_status == "waiting_unchanged_candidates" and upgrade_request is None:
                 # An unchanged provider candidate set is not a reason to demote
                 # a still-usable prepared selection.  Previously defer_subtitle_job()
                 # forced Ready -> Waiting, while the next reconcile pass restored
                 # the same history SRT -> Ready, producing a visible Preparation /
-                # Ready loop.  Explicit debug-force and upgrade checks still keep
-                # their observational retry semantics.
-                if not debug_force and upgrade_request is None:
+                # Ready loop.  Explicit debug-force checks still keep their
+                # observational retry semantics.
+                if not debug_force:
                     current = self.db.episode_by_path(video)
                     current_external: Path | None = None
                     if current is not None and current.subtitle_path is not None:
@@ -9851,6 +14096,9 @@ class AnimeManager:
                     poll_minutes=self.config.agent.subtitle_poll_minutes,
                     media_status=(anime.media_status if anime is not None else None),
                 )
+                if unidentified:
+                    # Nothing new for a file without a title or episode: once a day.
+                    delay = max(delay, 24 * 3600.0)
                 self.db.defer_subtitle_job(
                     video,
                     err("jobs.candidatesUnchanged"),
@@ -9937,14 +14185,29 @@ class AnimeManager:
                     minimum_gain=float(self.config.matching.subtitle_upgrade_min_score_gain),
                 )
                 manual_retry = bool(upgrade_request.get("manual_retry"))
+                fresh_rebuild = bool(upgrade_request.get("fresh_rebuild"))
                 accepted_upgrade = bool(
                     completed.returncode == 0
                     and prepare_status == "ready"
                     and not image_subtitle
                     and (subtitle is not None or embedded_subtitle_id is not None)
-                    and new_score is not None
-                    and (quality_better or manual_retry)
+                    and (fresh_rebuild or (new_score is not None and (quality_better or manual_retry)))
+                    # A fresh rebuild never takes a result from a lookup cut short.
+                    and not rebuild_cut_short
                 )
+                rebuild_transient = bool(
+                    not accepted_upgrade
+                    and fresh_rebuild
+                    and (rebuild_cut_short or _subtitle_retry_is_network_error(prepare_detail))
+                )
+                if (
+                    rebuild_transient
+                    and job_still_owned()
+                    and retry_rule_rebuild_later(
+                        prepare_detail, _subtitle_failure_signature(prepare_detail, prepare_status)
+                    )
+                ):
+                    continue
                 if accepted_upgrade:
                     if not self.db.set_subtitle_ready(
                         video,
@@ -9983,18 +14246,21 @@ class AnimeManager:
                         ),
                         candidate_path=str(subtitle_meta.get("candidate_path") or subtitle or ""),
                         score=new_score,
-                        status="upgraded",
-                        reason=(quality_reason),
+                        status="selected" if fresh_rebuild else "upgraded",
+                        reason=err("jobs.preparationCompleted") if fresh_rebuild else quality_reason,
                         details=subtitle_meta,
                     )
-                    self.log(
-                        f"Subtitle upgrade ready: {video.name} "
-                        + (
-                            f"({old_score:.1f} → {new_score:.1f})"
-                            if old_score is not None
-                            else f"(score={new_score:.1f})"
+                    if fresh_rebuild or new_score is None:
+                        self.log(f"Subtitles ready: {video.name}")
+                    else:
+                        self.log(
+                            f"Subtitle upgrade ready: {video.name} "
+                            + (
+                                f"({old_score:.1f} → {new_score:.1f})"
+                                if old_score is not None
+                                else f"(score={new_score:.1f})"
+                            )
                         )
-                    )
                     ready += 1
                 else:
                     if (
@@ -10009,7 +14275,13 @@ class AnimeManager:
                         previous_path,
                         previous_sid,
                         origin=str(upgrade_request.get("previous_origin") or ""),
-                        clear_state_keys=(upgrade_key,),
+                        # A failed rebuild keeps the old subtitles and ends; the next
+                        # check must not be a forced rebuild again.
+                        clear_state_keys=(
+                            (upgrade_key, self._subtitle_force_rebuild_state_key(video))
+                            if fresh_rebuild
+                            else (upgrade_key,)
+                        ),
                         **owner_kwargs,
                     ):
                         self.logger.info(
@@ -10153,7 +14425,7 @@ class AnimeManager:
                             or ("embedded" if embedded_subtitle_id is not None else "external")
                         )
                     ),
-                    clear_state_keys=(self._subtitle_force_rebuild_state_key(video),),
+                    clear_state_keys=(self._subtitle_force_rebuild_state_key(video), failure_streak_key),
                     **owner_kwargs,
                 ):
                     self.logger.info(
@@ -10191,14 +14463,6 @@ class AnimeManager:
                     )
                 ready += 1
             else:
-                # A failed validation must never leave an older generated cache
-                # path playable. This matters after validation rules become
-                # stricter: a cache file can still exist while the current run
-                # explicitly rejects it.
-                if ocr_fallback_path is not None and ocr_fallback_path.is_file():
-                    self._set_ocr_timing_uncertain(video, ocr_fallback_path, **owner_kwargs)
-                else:
-                    self.db.clear_subtitle_selection(video, **owner_kwargs)
                 # ffsubsync writes ordinary INFO lines to stderr. Using stderr
                 # alone hid the actual deterministic validation failure printed
                 # to stdout and reduced a 6h backoff to the normal 10m retry.
@@ -10206,6 +14470,20 @@ class AnimeManager:
                 stderr_detail = completed.stderr.strip()[-1500:]
                 detail = "\n".join(part for part in (stdout_detail, stderr_detail) if part)
                 rate_limited = _subtitle_retry_is_rate_limit(detail)
+                network_backoff = _subtitle_retry_is_network_error(detail)
+                # A network error or a 429 says nothing about the subtitles: the episode
+                # keeps what it can play (OCR, raw unsynced, the bitmap source).
+                transient = rate_limited or network_backoff
+                if transient:
+                    pass
+                # A failed validation must never leave an older generated cache
+                # path playable. This matters after validation rules become
+                # stricter: a cache file can still exist while the current run
+                # explicitly rejects it.
+                elif ocr_fallback_path is not None and ocr_fallback_path.is_file():
+                    self._set_ocr_timing_uncertain(video, ocr_fallback_path, **owner_kwargs)
+                else:
+                    self.db.clear_subtitle_selection(video, **owner_kwargs)
                 base_attempts = 0 if candidate_set_changed else int(job["attempts"] or 0)
                 attempts = base_attempts + (0 if rate_limited else 1)
                 delay = _subtitle_retry_delay_seconds(
@@ -10213,8 +14491,9 @@ class AnimeManager:
                     attempts=attempts,
                     detail=detail,
                 )
-                network_backoff = _subtitle_retry_is_network_error(detail)
-                if not network_backoff and not rate_limited:
+                failure_streak = 0
+                failure_signature = ""
+                if not transient:
                     delay = max(
                         delay,
                         _subtitle_source_retry_delay_seconds(
@@ -10222,8 +14501,26 @@ class AnimeManager:
                             media_status=(anime.media_status if anime is not None else None),
                         ),
                     )
+                    failure_signature = _subtitle_failure_signature(detail, prepare_status)
+                    failure_streak = self._count_subtitle_failure(video, failure_signature, **owner_kwargs)
+                    if failure_signature != "not_found":
+                        # The same error again: wait twice as long each time.
+                        delay = max(
+                            delay,
+                            _subtitle_failure_backoff_seconds(
+                                poll_minutes=self.config.agent.subtitle_poll_minutes,
+                                streak=failure_streak,
+                            ),
+                        )
+                    if unidentified and attempts >= 2:
+                        # A file without a title or episode: Jimaku has nothing new for it
+                        # every half hour, once a day is enough.
+                        delay = max(delay, 24 * 3600.0)
+                retries_exhausted = bool(
+                    failure_signature != "not_found" and failure_streak >= SUBTITLE_FAILURE_STREAK_CAP
+                )
                 self.logger.info(
-                    "RETRY step=subtitle.prepare media_id=%s episode=%s video=%s attempts=%s delay_s=%s network_backoff=%s rate_limited=%s reason=%r",
+                    "RETRY step=subtitle.prepare media_id=%s episode=%s video=%s attempts=%s delay_s=%s network_backoff=%s rate_limited=%s streak=%s exhausted=%s reason=%r",
                     job["media_id"],
                     job["episode"],
                     video.name,
@@ -10231,6 +14528,8 @@ class AnimeManager:
                     delay,
                     network_backoff,
                     rate_limited,
+                    failure_streak,
+                    retries_exhausted,
                     detail or "Subtitles not found yet",
                 )
                 permission_error = any(
@@ -10262,8 +14561,27 @@ class AnimeManager:
                         video, detail or err("jobs.jimakuKeyRequired"), "configure_jimaku", **owner_kwargs
                     )
                 elif rate_limited:
-                    self.db.defer_subtitle_job(
-                        video, detail or err("jobs.jimakuRateLimited"), delay, **owner_kwargs
+                    self.db.reschedule_subtitle_job(
+                        video,
+                        detail or err("jobs.jimakuRateLimited"),
+                        delay,
+                        keep_priority=False,
+                        **owner_kwargs,
+                    )
+                elif network_backoff:
+                    self.db.reschedule_subtitle_job(
+                        video,
+                        detail or err("jobs.subtitlesNotFoundYet"),
+                        delay,
+                        count_attempt=True,
+                        **owner_kwargs,
+                    )
+                elif retries_exhausted:
+                    self.db.mark_subtitle_job_needs_action(
+                        video,
+                        detail or err("jobs.subtitlesNotFoundYet"),
+                        SUBTITLE_RETRY_EXHAUSTED,
+                        **owner_kwargs,
                     )
                 else:
                     self.db.postpone_subtitle_job(
@@ -10469,13 +14787,30 @@ class AnimeManager:
             current = current.parent
         return None
 
+    def _inside_library_root(self, video: Path) -> bool:
+        try:
+            root = self.config.library.root_dir.expanduser().resolve()
+            return root in video.expanduser().resolve(strict=False).parents
+        except OSError:
+            return False
+
+    def _downloaded_row_owned(self, row: Any) -> bool:
+        """A hash-less row Pudge recorded as downloaded, and its file is in the library root.
+
+        Earlier versions also set ``downloaded_at`` for a video dropped on the
+        window (the user's own file, e.g. in ~/Downloads): that alone is no proof.
+        """
+        if "downloaded_at" not in row.keys() or float(row["downloaded_at"] or 0) <= 0:
+            return False
+        return self._inside_library_root(Path(str(row["video_path"])))
+
     def _cleanup_row_managed(self, row: Any) -> bool:
         """Whether a due row is Pudge's to delete under ``delete_only_managed_files``."""
         if not self.config.agent.delete_only_managed_files:
             return True
         if str(row["torrent_hash"] or "").strip():
             return True
-        if "downloaded_at" in row.keys() and float(row["downloaded_at"] or 0) > 0:
+        if self._downloaded_row_owned(row):
             return True
         media_id = row["media_id"]
         return media_id is not None and self._library_folder_owner(Path(str(row["video_path"]))) == int(
@@ -10490,7 +14825,9 @@ class AnimeManager:
         cleaned up. A Completed title, or progress covering the episode, makes
         it watched for cleanup with the usual delay. Never for Repeating,
         Planning or Dropped titles, rewatch schedules, recently played
-        episodes, or files Pudge does not own.
+        episodes, or files Pudge does not own. Never for a file Pudge downloaded
+        after the list already counted its episode (a rewatch, a better release):
+        it stays until it is watched.
         """
         now = time.time()
         delay_seconds = max(
@@ -10523,10 +14860,30 @@ class AnimeManager:
                 (recently_played,),
             ).fetchall()
         changed = 0
+        marks_by_media: dict[int, list[list[float]]] = {}
         for row in rows:
+            media_id = int(row["media_id"])
+            if media_id not in marks_by_media:
+                marks_by_media[media_id] = self.db.note_anilist_progress(
+                    media_id, int(row["list_progress"] or 0), now=now
+                )
+            reached_at = self.db.anilist_progress_reached_at(
+                marks_by_media[media_id], int(row["last_episode"])
+            )
+            downloaded_at = row["downloaded_at"]
+            if reached_at is not None and downloaded_at is not None and float(downloaded_at) >= reached_at:
+                self.logger.debug(
+                    "SKIP step=cleanup.anilist_covered reason=downloaded_after_counted media_id=%s episode=%s video=%r downloaded_at=%.0f counted_at=%.0f",
+                    media_id,
+                    row["last_episode"],
+                    str(row["video_path"]),
+                    float(downloaded_at),
+                    reached_at,
+                )
+                continue
             owned = (
                 str(row["torrent_hash"] or "").strip()
-                or float(row["downloaded_at"] or 0) > 0
+                or self._downloaded_row_owned(row)
                 or self._library_folder_owner(Path(str(row["video_path"]))) == int(row["media_id"])
             )
             if not owned:
@@ -10574,7 +14931,261 @@ class AnimeManager:
         if not callable(status) or status(torrent_hash) is not None:
             raise ManagerError(err("manager.torrentRemovalUnconfirmed", hash=torrent_hash))
 
-    def _delete_owned_torrent(self, torrent_hash: str, download: DownloadItem | None) -> None:
+    # Returned when a torrent's own file list could not be read: every caller keeps it.
+    _TORRENT_FILES_UNKNOWN = Path("<torrent file list unavailable>")
+
+    @staticmethod
+    def _path_forms(path: Path | str) -> set[str]:
+        """The path as given and resolved (/var vs /private/var, a NAS link)."""
+        value = Path(str(path)).expanduser()
+        forms = {str(value)}
+        try:
+            forms.add(str(value.resolve()))
+        except (OSError, RuntimeError):
+            pass
+        return forms
+
+    def _torrent_file_rows(
+        self,
+        client: Any,
+        torrent_hash: str,
+        download: DownloadItem | None,
+        snapshot: dict[str, Any] | None,
+    ) -> list[tuple[dict[str, Any], list[Path]]] | None:
+        """Each file of the torrent with the places it can be on disk; None: list unknown."""
+        try:
+            rows = list(client.files(torrent_hash) or [])
+        except Exception:  # noqa: BLE001 - unknown means keep, never delete with files
+            return None
+        bases: list[Path] = []
+        for value in (
+            getattr(download, "save_path", "") if download is not None else "",
+            (snapshot or {}).get("save_path"),
+            (snapshot or {}).get("dir"),
+        ):
+            if value and str(value).strip() and Path(str(value)) not in bases:
+                bases.append(Path(str(value)))
+        content_values = [
+            getattr(download, "content_path", "") if download is not None else "",
+            (snapshot or {}).get("content_path"),
+        ]
+        for value in content_values:
+            # A single file or the torrent's own top folder: its parent holds the names.
+            if value and str(value).strip() and Path(str(value)).parent not in bases:
+                bases.append(Path(str(value)).parent)
+        result: list[tuple[dict[str, Any], list[Path]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = Path(str(row.get("name") or ""))
+            if not str(name) or str(name) == ".":
+                continue
+            places = [name] if name.is_absolute() else [base / name for base in bases]
+            result.append((row, places))
+        return result
+
+    def _torrent_files_kept_on_disk(
+        self,
+        client: Any,
+        torrent_hash: str,
+        download: DownloadItem | None,
+        deleting: set[str],
+        snapshot: dict[str, Any] | None = None,
+        *,
+        complete_only: bool = False,
+    ) -> list[Path]:
+        """Wanted video files of the torrent on disk that are not being deleted now.
+
+        Removing a torrent "with files" deletes every file of it. Pudge's rows can
+        under-count a batch (no download row, the other episodes' rows without the hash),
+        and Ansatsu Kyoushitsu lost its unwatched episodes 8-22 with its folder. The
+        torrent's own file list decides, not the rows; a list that cannot be read keeps
+        the torrent (``_TORRENT_FILES_UNKNOWN``). Deselected files (priority 0: aria2 may
+        leave stubs of them) do not count; ``complete_only``: only finished files count.
+        """
+        doomed: set[str] = set()
+        for value in deleting:
+            doomed |= self._path_forms(value)
+        names = {Path(value).name for value in deleting}
+        listed = self._torrent_file_rows(client, torrent_hash, download, snapshot)
+        if listed is None:
+            return [self._TORRENT_FILES_UNKNOWN]
+        kept: dict[str, Path] = {}
+        for row, places in listed:
+            name = Path(str(row.get("name") or ""))
+            if name.suffix.casefold() not in VIDEO_EXTENSIONS:
+                continue
+            if row.get("priority") is not None and int(row.get("priority") or 0) == 0:
+                continue
+            if complete_only and row.get("progress") is not None and float(row.get("progress") or 0) < 0.999:
+                continue
+            if not places:
+                if name.name not in names:
+                    kept[str(name)] = name  # nowhere to look: another file of the torrent counts
+                continue
+            if any(self._path_forms(place) & doomed for place in places):
+                continue
+            for place in places:
+                if place.is_file():
+                    kept[str(place)] = place
+                    break
+        return sorted(kept.values())
+
+    @staticmethod
+    def _torrent_snapshot(client: Any, torrent_hash: str) -> dict[str, Any] | None:
+        try:
+            snapshot = client.torrent_status(torrent_hash)
+        except Exception:  # noqa: BLE001 - the download row may still name the folder
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def _deselect_deleted_files(
+        self,
+        client: Any,
+        torrent_hash: str,
+        deleting: set[str],
+        download: DownloadItem | None = None,
+        snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        """A batch keeps seeding its other files: the deleted ones are not fetched again.
+
+        Matched by full path (S1/01.mkv is not S2/01.mkv). Raises ManagerError when the
+        client did not take it: the caller then keeps the file for a later pass.
+        """
+        doomed: set[str] = set()
+        for value in deleting:
+            doomed |= self._path_forms(value)
+        names = {Path(value).name for value in deleting}
+        listed = self._torrent_file_rows(client, torrent_hash, download, snapshot)
+        if listed is None:
+            raise ManagerError(err("manager.torrentRemovalUnconfirmed", hash=torrent_hash))
+        indices: list[int] = []
+        for row, places in listed:
+            if row.get("index") is None:
+                continue
+            if places:
+                hit = any(self._path_forms(place) & doomed for place in places)
+            else:
+                hit = Path(str(row.get("name") or "")).name in names
+            if hit and int(row.get("priority", 1) or 0) != 0:
+                indices.append(int(row["index"]))
+        if not indices:
+            return
+        try:
+            client.set_file_priority(torrent_hash, indices, 0)
+        except Exception as exc:  # noqa: BLE001 - keep the file, try again later
+            self.logger.warning(
+                "FAIL step=cleanup.deselect hash=%s files=%s error=%r", torrent_hash, indices, str(exc)[:200]
+            )
+            raise ManagerError(err("manager.torrentRemovalUnconfirmed", hash=torrent_hash)) from exc
+        self.logger.info("DONE step=cleanup.deselect hash=%s files=%s", torrent_hash, indices)
+
+    def _reselect_wanted_files(
+        self, client: Any, torrent_hash: str, episodes: Iterable[int | None], *, batch: bool
+    ) -> None:
+        """Asked again for an episode Pudge deselected in this torrent: fetch it again."""
+        wanted = {int(value) for value in episodes if value is not None}
+        try:
+            rows = list(client.files(torrent_hash) or [])
+        except Exception:  # noqa: BLE001 - nothing to turn back on
+            return
+        indices = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("index") is None:
+                continue
+            if row.get("priority") is None or int(row.get("priority") or 0) != 0:
+                continue
+            name = Path(str(row.get("name") or ""))
+            if name.suffix.casefold() not in VIDEO_EXTENSIONS:
+                continue
+            if batch or parse_anime_filename(name).episode in wanted:
+                indices.append(int(row["index"]))
+        if not indices:
+            return
+        try:
+            client.set_file_priority(torrent_hash, indices, 1)
+            self.logger.info("REPAIR step=torrent.reselect hash=%s files=%s", torrent_hash, indices)
+        except Exception as exc:  # noqa: BLE001 - the existing download still blocks a duplicate
+            self.logger.warning("FAIL step=torrent.reselect hash=%s error=%r", torrent_hash, str(exc)[:200])
+
+    def _deselect_owned_files(
+        self, torrent_hash: str, download: DownloadItem | None, videos: list[Path]
+    ) -> None:
+        """Deselect ``videos`` in every client holding the torrent; raises when one failed."""
+        doomed = {str(video) for video in videos}
+        clients = self.torrent_clients()
+        try:
+            for _name, client in clients:
+                try:
+                    snapshot = self._torrent_snapshot(client, torrent_hash)
+                except Exception:  # noqa: BLE001
+                    snapshot = None
+                if snapshot is None:
+                    continue  # not in this client (or it is stopped): nothing to fetch again
+                self._deselect_deleted_files(client, torrent_hash, doomed, download, snapshot)
+        finally:
+            for _name, client in clients:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _replacement_clients(self) -> list[Any]:
+        """The add client, plus aria2 when both backends are on (upgrades of its torrents)."""
+        clients = [self.qbt_client()]
+        if self.config.qbittorrent.enabled and self.config.aria2.enabled:
+            clients.extend(client for name, client in self.torrent_clients() if name == "aria2")
+        return clients
+
+    def _retire_torrent_file(
+        self, clients: list[Any], torrent_hash: str, video: Path | None, download: DownloadItem | None
+    ) -> bool:
+        """Remove a replaced torrent with its files, or only ``video`` of a batch.
+
+        True: the torrent is gone; False: it holds other files and only ``video`` was
+        deselected (the caller deletes the file). Raises when the client failed.
+        """
+        doomed = {str(video)} if video is not None else set()
+        holders = [client for client in clients if self._torrent_snapshot(client, torrent_hash) is not None]
+        removed = True
+        for client in holders or clients[:1]:
+            snapshot = self._torrent_snapshot(client, torrent_hash)
+            kept = (
+                self._torrent_files_kept_on_disk(client, torrent_hash, download, doomed, snapshot)
+                if holders
+                else []
+            )
+            if kept == [self._TORRENT_FILES_UNKNOWN]:
+                # File list unreadable: never "with files"; the caller deletes ``video``.
+                client.delete(torrent_hash, delete_files=False)
+                continue
+            if kept:
+                self._deselect_deleted_files(client, torrent_hash, doomed, download, snapshot)
+                removed = False
+                continue
+            client.delete(torrent_hash, delete_files=True)
+        return removed
+
+    def _delete_owned_torrent(
+        self,
+        torrent_hash: str,
+        download: DownloadItem | None,
+        *,
+        deleting: Iterable[Path | str] | None = None,
+    ) -> bool:
+        """Remove the torrent with its files; False when it holds other files on disk.
+
+        ``deleting``: the files the caller deletes now. A torrent with any other video
+        file on disk stays (its deleted files deselected): only those files go.
+        """
+        doomed: set[str] = set()
+        for value in deleting or ():
+            doomed.add(str(value))
+            try:
+                doomed.add(str(Path(value).expanduser().resolve()))
+            except (OSError, RuntimeError):
+                pass
+        removed = True
         raw = download.raw if download is not None else {}
         owners = {str(value) for value in raw.get("_backends", []) if value}
         if raw.get("backend"):
@@ -10604,6 +15215,45 @@ class AnimeManager:
                     started.append(client)
                 snapshot = client.torrent_status(torrent_hash)
                 if snapshot is not None or name in owners:
+                    if deleting is not None:
+                        kept = self._torrent_files_kept_on_disk(
+                            client,
+                            torrent_hash,
+                            download,
+                            doomed,
+                            snapshot if isinstance(snapshot, dict) else None,
+                        )
+                        if kept == [self._TORRENT_FILES_UNKNOWN]:
+                            # Its file list could not be read: the torrent goes, its files
+                            # stay (the caller deletes only the due ones itself).
+                            self.logger.warning(
+                                "KEEP step=cleanup.torrent_files reason=file_list_unknown backend=%s hash=%s",
+                                name,
+                                torrent_hash,
+                            )
+                            self._delete_confirmed_torrent(client, torrent_hash, delete_files=False)
+                            continue
+                        if kept:
+                            self.logger.warning(
+                                "KEEP step=cleanup.torrent reason=other_files_on_disk backend=%s hash=%s "
+                                "deleting=%s kept=%s first_kept=%r",
+                                name,
+                                torrent_hash,
+                                len({Path(value).name for value in doomed}),
+                                len(kept),
+                                str(kept[0]),
+                            )
+                            # Raises when the client did not deselect them: the files stay
+                            # for the next pass instead of being fetched again.
+                            self._deselect_deleted_files(
+                                client,
+                                torrent_hash,
+                                doomed,
+                                download,
+                                snapshot if isinstance(snapshot, dict) else None,
+                            )
+                            removed = False
+                            continue
                     self._delete_confirmed_torrent(client, torrent_hash, delete_files=True)
         finally:
             for client in started:
@@ -10614,6 +15264,7 @@ class AnimeManager:
                     self.logger.warning("SKIP step=cleanup.aria2_idle_stop error=%r", str(exc))
             for _name, client in clients:
                 client.close()
+        return removed
 
     def _identity_repair_protected(
         self, torrent_hash: str, video: Path | str, *, now: float | None = None
@@ -10690,6 +15341,12 @@ class AnimeManager:
             return f"identity_repair_protection video={str(video)!r}"
         if not self._cleanup_row_managed(row):
             return f"unmanaged_no_hash video={str(video)!r}"
+        out_of_reach = self._cleanup_out_of_reach(video)
+        if out_of_reach:
+            # Its disk is unplugged or its library folder renamed: the file was not
+            # deleted. Removing the torrent and the row lost the watched mark, and the
+            # file came back as a new unwatched episode once the disk was there again.
+            return f"{out_of_reach} video={str(video)!r}"
         retry_at = retry_after.get(str(video), 0.0)
         if retry_at > now:
             return f"retry_later retry_at={retry_at:.0f} video={str(video)!r}"
@@ -10701,6 +15358,10 @@ class AnimeManager:
             download = downloads.get(torrent_hash)
             shared_episode_count = self.db.episode_count_for_torrent(torrent_hash)
             if (download and download.is_batch) or shared_episode_count > 1:
+                if self._pack_seeding_state(torrent_hash, download) == "ended":
+                    # Its seeding is over: the pack leaves the client (files kept) and
+                    # its watched episodes go one by one, each after its own delay.
+                    return None
                 anime = self.db.get_anime(int(row["media_id"])) if row["media_id"] else None
                 if not self._batch_title_finished(anime):
                     return (
@@ -10717,6 +15378,267 @@ class AnimeManager:
                         f"shared_episodes={shared_episode_count} video={str(video)!r}"
                     )
         return None
+
+    def _cleanup_out_of_reach(self, video: Path) -> str:
+        """Why a due file that is not there may only be out of reach ("" when it is there,
+        or its drive and folder are and the file itself is gone). Mount checks are kept for
+        the cleanup pass (``_cleanup_reach``)."""
+        try:
+            if video.exists():
+                return ""
+        except OSError:
+            pass
+        reach = getattr(self, "_cleanup_reach", None)
+        if reach is None:
+            reach = self._cleanup_reach = ({}, self._missing_video_roots())
+        volumes, roots = reach
+        return self._missing_video_unreachable(video, volumes, roots)
+
+    # A complete torrent that no longer uploads: its ratio/seeding-time goal was
+    # reached, or it was stopped (qBittorrent "state", aria2 "status").
+    _QBT_SEEDING_ENDED_STATES = frozenset({"pausedup", "stoppedup"})
+    _ARIA2_SEEDING_ENDED_STATUSES = frozenset({"complete", "paused"})
+
+    @classmethod
+    def _snapshot_seeding_ended(cls, snapshot: Any) -> bool:
+        """Whether a client's torrent snapshot is complete and no longer seeding."""
+        if not isinstance(snapshot, dict):
+            return False
+        try:
+            progress = float(snapshot.get("progress") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if progress < 0.999:
+            return False
+        if "state" in snapshot:
+            return str(snapshot.get("state") or "").casefold() in cls._QBT_SEEDING_ENDED_STATES
+        if "status" in snapshot:
+            return str(snapshot.get("status") or "").casefold() in cls._ARIA2_SEEDING_ENDED_STATUSES
+        return False  # no state reported: it may still seed
+
+    @staticmethod
+    def _strict_torrent_status(client: Any, torrent_hash: str) -> Any:
+        """The torrent's snapshot or None (the client has none); raises when it could not be asked."""
+        lookup = getattr(client, "lookup_torrent", None)
+        if callable(lookup):
+            return lookup(torrent_hash)
+        return client.torrent_status(torrent_hash)
+
+    @staticmethod
+    def _download_owners(download: DownloadItem | None) -> set[str]:
+        raw = download.raw if download is not None else {}
+        owners = {str(value) for value in raw.get("_backends", []) if value}
+        if raw.get("backend"):
+            owners.add(str(raw["backend"]))
+        return owners
+
+    def _pack_seeding_state(self, torrent_hash: str, download: DownloadItem | None) -> str:
+        """ "ended" when no client seeds this multi-file torrent any more (asked once per cleanup).
+
+        Anything else (the reason) keeps the pack whole: deleting files under a torrent
+        that still seeds would break it.
+        """
+        cache = getattr(self, "_pack_seeding_cache", None)
+        if cache is None:
+            cache = self._pack_seeding_cache = {}
+        if torrent_hash not in cache:
+            cache[torrent_hash] = self._read_pack_seeding_state(torrent_hash, download)
+            self.logger.info(
+                "RESULT step=cleanup.pack_seeding torrent_hash=%s state=%s", torrent_hash, cache[torrent_hash]
+            )
+        return "ended" if cache[torrent_hash] in {"ended", "detached"} else cache[torrent_hash]
+
+    # A torrent Pudge itself stopped (Torrent Off, background quiet, Stop all, the
+    # window's Pause): a temporary stop, never "seeding ended". Cleared when Pudge
+    # starts it again. One state row per hash, so processes never overwrite each other.
+    _PUDGE_PAUSED_PREFIX = "torrent_paused_by_pudge:"
+
+    def note_torrents_paused_by_pudge(self, hashes: Iterable[str], *, reason: str) -> None:
+        for value in hashes:
+            key = str(value or "").strip().casefold()
+            if key:
+                self.db.set_state(self._PUDGE_PAUSED_PREFIX + key, f"{reason}|{time.time():.0f}")
+
+    def note_torrents_resumed_by_pudge(self, hashes: Iterable[str]) -> None:
+        keys = [str(value or "").strip().casefold() for value in hashes]
+        self.db.delete_states(self._PUDGE_PAUSED_PREFIX + key for key in keys if key)
+
+    # Stops Torrent On undoes: Torrent Off, the startup/background quiet and the
+    # add-time pause while torrents are off. The window's Pause and Stop all are the
+    # user's own choice and stay paused.
+    _TEMPORARY_PUDGE_PAUSES = ("quiet_", "torrents_off")
+
+    def torrents_paused_by_pudge_temporarily(self) -> list[str]:
+        """Hashes Pudge stopped only while torrents were off (Torrent On resumes them)."""
+        prefix = self._PUDGE_PAUSED_PREFIX
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(prefix)
+            ).fetchall()
+        result = []
+        for row in rows:
+            reason = str(row["value"] or "").split("|", 1)[0]
+            if reason.startswith(self._TEMPORARY_PUDGE_PAUSES):
+                result.append(str(row["key"])[len(prefix) :])
+        return sorted(result)
+
+    def torrent_paused_by_pudge(self, torrent_hash: str) -> str:
+        """Why Pudge stopped this torrent ("" when it did not)."""
+        key = str(torrent_hash or "").strip().casefold()
+        return self.db.get_state(self._PUDGE_PAUSED_PREFIX + key, "") if key else ""
+
+    def _read_pack_seeding_state(self, torrent_hash: str, download: DownloadItem | None) -> str:
+        if not self.downloads_enabled():
+            return "torrents_off"
+        paused_by = self.torrent_paused_by_pudge(torrent_hash)
+        if paused_by:
+            return "paused_by_pudge_" + paused_by.split("|", 1)[0]
+        if download is not None and float(download.progress or 0.0) < 0.999:
+            return "downloading"
+        owners = self._download_owners(download)
+        clients = self.torrent_clients()
+        try:
+            if owners - {name for name, _client in clients}:
+                return "owner_unavailable"
+            for name, client in clients:
+                if name == "aria2" and self._aria2_idle_stopped(client):
+                    continue  # the sidecar stopped itself: nothing in it downloads or seeds
+                try:
+                    snapshot = self._strict_torrent_status(client, torrent_hash)
+                except Exception:  # noqa: BLE001 - "could not ask" is never "not seeding"
+                    return f"unknown_{name}"
+                if snapshot is None:
+                    continue
+                if not self._snapshot_seeding_ended(snapshot):
+                    state = (
+                        snapshot.get("state", snapshot.get("status")) if isinstance(snapshot, dict) else None
+                    )
+                    return f"seeding_{name}_{state}"
+            return "ended"
+        finally:
+            for _name, client in clients:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _detach_finished_pack(self, torrent_hash: str, download: DownloadItem | None) -> None:
+        """Remove a pack whose seeding ended from every client, keeping all of its files.
+
+        Its episode rows (and split-out OVA/special rows sharing the hash) stay tracked;
+        each watched file is then deleted on its own schedule. Raises when a client
+        still seeds it or did not confirm the removal: nothing is deleted this pass.
+        """
+        cache = getattr(self, "_pack_seeding_cache", None)
+        if cache is None:
+            cache = self._pack_seeding_cache = {}
+        if cache.get(torrent_hash) == "detached":
+            return
+        owners = self._download_owners(download)
+        clients = self.torrent_clients()
+        started: list[Any] = []
+        removed_from: list[str] = []
+        try:
+            if owners - {name for name, _client in clients}:
+                raise ManagerError(
+                    err(
+                        "manager.torrentOwnerUnavailable",
+                        backends=", ".join(sorted(owners - {name for name, _client in clients})),
+                    )
+                )
+            for name, client in clients:
+                if name == "aria2" and self._aria2_idle_stopped(client):
+                    known = getattr(client, "known_offline", None)
+                    if not (callable(known) and known(torrent_hash)):
+                        continue
+                    # Its session still holds the torrent: start it for the removal.
+                    self._torrent_network_start(client, "ensure_running")
+                    started.append(client)
+                snapshot = self._strict_torrent_status(client, torrent_hash)
+                if snapshot is None:
+                    continue
+                if not self._snapshot_seeding_ended(snapshot) or self.torrent_paused_by_pudge(torrent_hash):
+                    cache[torrent_hash] = "seeding"
+                    raise ManagerError(err("manager.packStillSeeding", hash=torrent_hash))
+                self._delete_confirmed_torrent(client, torrent_hash, delete_files=False)
+                removed_from.append(name)
+        finally:
+            for client in started:
+                try:
+                    client.stop_when_idle()
+                except Exception as exc:  # noqa: BLE001 - the regular idle stop retries
+                    self.logger.warning("SKIP step=cleanup.aria2_idle_stop error=%r", str(exc))
+            for _name, client in clients:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self.db.delete_download_record(torrent_hash)
+        cache[torrent_hash] = "detached"
+        self.logger.info(
+            "DONE step=cleanup.pack_detach torrent_hash=%s backends=%s files_kept=true",
+            torrent_hash,
+            removed_from,
+        )
+
+    def _remove_pack_leftovers(self, torrent_hash: str, videos: list[Path]) -> None:
+        """Leftovers of a torrent removed from its client once its last file in a folder is gone.
+
+        Only the deleted files' aria2 control files, the pack folder's control file and
+        the pack's own ``<infohash>.torrent``; a folder that still holds any other
+        file (an OVA kept as its own entry, an unwatched episode) keeps everything.
+        """
+        roots: list[Path] = []
+        for value in (self.config.library.root_dir, *self.config.paths.download_dirs):
+            try:
+                roots.append(Path(value).expanduser().resolve())
+            except OSError:
+                continue
+
+        def allowed(path: Path) -> bool:
+            try:
+                resolved = path.resolve(strict=False)
+            except OSError:
+                return False
+            return any(root in resolved.parents for root in roots)
+
+        def unlink(path: Path) -> None:
+            try:
+                if allowed(path) and path.is_file() and not path.is_symlink():
+                    path.unlink()
+                    self.logger.info("DONE step=cleanup.pack_leftover path=%r", str(path))
+            except OSError as exc:
+                self.logger.info("SKIP step=cleanup.pack_leftover path=%r error=%r", str(path), exc)
+
+        metadata_name = f"{torrent_hash.casefold()}.torrent"
+        for video in videos:
+            unlink(video.with_name(video.name + ".aria2"))
+        for folder in sorted(
+            {video.parent for video in videos}, key=lambda path: len(path.parts), reverse=True
+        ):
+            try:
+                rest = [path for path in folder.iterdir()] if folder.is_dir() else []
+            except OSError:
+                continue
+            if any(
+                path.is_dir()
+                or not (
+                    path.name.casefold() == metadata_name
+                    or path.name == ".DS_Store"
+                    or (
+                        path.name.endswith(".aria2")
+                        and not path.with_name(path.name[: -len(".aria2")]).exists()
+                    )
+                )
+                for path in rest
+            ):
+                continue  # other files stay in this folder: so do its leftovers
+            for path in rest:
+                unlink(path)
+            self._remove_empty_episode_parent(folder / "removed")
+            if not folder.exists():
+                unlink(folder.with_name(folder.name + ".aria2"))
+                unlink(folder.parent / metadata_name)
 
     def _torrent_episode_rows(self, torrent_hash: str) -> list[Any]:
         with self.db.connect() as conn:
@@ -10743,8 +15665,11 @@ class AnimeManager:
         dropped = str(row["state"] or "") == "dropped"
         return dropped or download is None or float(download.progress or 0.0) >= 0.999
 
+    @_reusing_db_connection
     def cleanup(self) -> int:
-        repaired = self.db.repair_missing_cleanup_schedule(self.config.agent.delete_after_watched_hours)
+        repaired = self.db.repair_missing_cleanup_schedule(
+            self.config.agent.delete_after_watched_hours, library_root=self.config.library.root_dir
+        )
         if repaired:
             self.logger.info(
                 "REPAIR step=cleanup.schedule_missing rows=%s delete_after_hours=%s",
@@ -10763,6 +15688,8 @@ class AnimeManager:
                 "REPAIR step=cleanup.anilist_progress rows=%s",
                 progress_repairs,
             )
+        self._pack_seeding_cache = {}
+        self._cleanup_reach = None
         now = time.time()
         for item in self.db.episodes():
             if (
@@ -10793,11 +15720,11 @@ class AnimeManager:
             # CLEANUP_RETRY_SECONDS before asking again.
             failure: Any = None
             try:
-                self.sync_anilist()
+                verified = self.sync_anilist()
             except Exception as exc:
                 failure = exc
             else:
-                if self._last_anilist_used_cache:
+                if getattr(verified, "used_cache", False):
                     # AniList was not reached: the list is the local cache.
                     failure = "anilist_unreachable_cached_list"
             if failure is not None:
@@ -10859,9 +15786,26 @@ class AnimeManager:
             download = downloads.get(torrent_hash) if torrent_hash else None
             targets = [row]
             remove_torrent = False
+            pack_detach = False
             if torrent_hash and self.downloads_enabled():
                 shared = self._torrent_episode_rows(torrent_hash)
-                remove_torrent = self._cleanup_removes_whole_torrent(row, shared, download, deletable_paths)
+                pack_detach = bool(
+                    ((download is not None and download.is_batch) or len(shared) > 1)
+                    and self._pack_seeding_state(torrent_hash, download) == "ended"
+                )
+                if pack_detach:
+                    # Seeding is over: the torrent leaves the client with its files kept,
+                    # and only this due episode goes (the others wait for their own delay).
+                    self.logger.info(
+                        "EVENT step=cleanup.pack_episode torrent_hash=%s rows=%s video=%r",
+                        torrent_hash,
+                        len(shared),
+                        str(video),
+                    )
+                else:
+                    remove_torrent = self._cleanup_removes_whole_torrent(
+                        row, shared, download, deletable_paths
+                    )
                 if remove_torrent:
                     # Every episode row of this torrent is due now: remove the
                     # torrent and all of their files at once.
@@ -10875,8 +15819,26 @@ class AnimeManager:
                         str(video),
                     )
             try:
-                if remove_torrent:
-                    self._delete_owned_torrent(torrent_hash, download)
+                if pack_detach:
+                    self._detach_finished_pack(torrent_hash, download)
+                elif remove_torrent:
+                    # The torrent's own file list has the last word: a batch the rows
+                    # under-count keeps its torrent and its other episodes.
+                    remove_torrent = self._delete_owned_torrent(
+                        torrent_hash,
+                        download,
+                        deleting=[Path(str(target["video_path"])) for target in targets],
+                    )
+                    if not remove_torrent:
+                        targets = [
+                            target for target in targets if str(target["video_path"]) in deletable_paths
+                        ] or [row]
+                elif torrent_hash and self.downloads_enabled() and not pack_detach:
+                    # The batch keeps its torrent: the due files are deselected first, so
+                    # the client does not fetch them again (a failure keeps them for later).
+                    self._deselect_owned_files(
+                        torrent_hash, download, [Path(str(target["video_path"])) for target in targets]
+                    )
                 # qBittorrent can acknowledge deletion before the file is
                 # physically removed, or retain it after a stale content-path
                 # mapping, and aria2 forgets completed tasks on restart. A due,
@@ -10891,6 +15853,12 @@ class AnimeManager:
                     deleted_torrents.add(torrent_hash)
                 for target in targets:
                     self.db.delete_episode_record(Path(str(target["video_path"])))
+                self._forget_video_state(Path(str(target["video_path"])) for target in targets)
+                if pack_detach or remove_torrent:
+                    # The torrent is gone: its control files and saved metadata go with the last file.
+                    self._remove_pack_leftovers(
+                        torrent_hash, [Path(str(target["video_path"])) for target in targets]
+                    )
                 for target in targets:
                     target_video = Path(str(target["video_path"]))
                     if target["media_id"] is not None:
@@ -11054,17 +16022,259 @@ class AnimeManager:
             refresh_after = 6.5 * 86400 + (anime.media_id % 86400)
             if age < refresh_after:
                 return path
+        if anilist_refusal() is not None:
+            # AniList refuses this Mac (403 cool-down): its image server is not asked either.
+            return path if path.is_file() and path.stat().st_size > 0 else None
         try:
-            response = httpx.get(anime.cover_url, timeout=20, follow_redirects=True)
+            response = httpx.get(
+                anime.cover_url,
+                timeout=20,
+                follow_redirects=True,
+                headers={"User-Agent": ANILIST_USER_AGENT},
+            )
             response.raise_for_status()
             # Atomic: the window may be loading this file while it is refreshed;
             # a truncated read left the card on its placeholder.
-            temporary = path.with_name(path.name + ".tmp")
-            temporary.write_bytes(response.content)
-            temporary.replace(path)
+            atomic_write_bytes(path, response.content)
             return path
         except (httpx.HTTPError, OSError):
             return path if path.is_file() and path.stat().st_size > 0 else None
+
+    _PLACEHOLDER_METADATA_FIELDS = (
+        "synonyms",
+        "cover_url",
+        "site_url",
+        "episodes",
+        "format",
+        "season_year",
+        "start_date",
+        "studio",
+        "media_status",
+        "end_date",
+        "mean_score",
+        "duration",
+        "next_airing_episode",
+        "next_airing_at",
+    )
+
+    def _fill_placeholder_metadata(
+        self, local: LibraryAnime, metadata: LibraryAnime, *, source: str
+    ) -> LibraryAnime:
+        """Title, titles and media fields of AniList's answer into a placeholder row.
+
+        The list fields stay local (status, progress, score, add time, relations):
+        the list sync owns them. Returns the stored row.
+        """
+        previous = local.title
+        local.title = metadata.title
+        local.titles = list(metadata.titles)
+        for name in self._PLACEHOLDER_METADATA_FIELDS:
+            value = getattr(metadata, name)
+            if value not in (None, "", []):
+                setattr(local, name, value)
+        self.db.upsert_anime(local)
+        self.logger.info(
+            "RESULT step=anime.placeholder_metadata media_id=%s source=%s title=%r previous=%r",
+            local.media_id,
+            source,
+            local.title,
+            previous,
+        )
+        return self.db.get_anime(int(local.media_id)) or local
+
+    _PLACEHOLDER_METADATA_MISSING_KEY = "anime_placeholder_metadata_missing_v1"
+    PLACEHOLDER_METADATA_LIMIT = 25
+
+    def repair_placeholder_anime_titles(
+        self, *, fetch: bool = True, limit: int | None = None
+    ) -> dict[str, int]:
+        """Rows that carry a release or file name as their title, and rows without AniList metadata.
+
+        Older versions created the parent row of an episode, download, release choice or
+        torrent observation with the release or file name as its title
+        ("[HorribleSubs] Youjo Senki - 03 [1080p].mkv"); nothing filled it later when the
+        title was outside Watching/Planning, so Completed, search and relations showed the
+        file name. At once and without network: the series title parsed from the name.
+        Then (``fetch``) AniList's metadata by id, through the paced client, at most
+        ``limit`` rows per run; an id AniList does not know is not asked again. Idempotent:
+        a row with AniList titles is never touched. Rows are never deleted.
+        """
+        result = {"renamed": 0, "fetched": 0, "missing": 0, "pending": 0}
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT media_id,title FROM anime WHERE COALESCE(titles_json,'') IN ('','[]') "
+                # Titles on the list first: they show in Completed and search.
+                "ORDER BY COALESCE(status,'')='', media_id"
+            ).fetchall()
+            for row in rows:
+                title = str(row["title"] or "")
+                if not looks_like_release_name(title):
+                    continue
+                cleaned = release_name_display_title(title, int(row["media_id"]))
+                conn.execute(
+                    "UPDATE anime SET title=?,updated_at=? WHERE media_id=?",
+                    (cleaned, time.time(), int(row["media_id"])),
+                )
+                result["renamed"] += 1
+                self.logger.info(
+                    "RESULT step=anime.release_name_title media_id=%s title=%r previous=%r",
+                    row["media_id"],
+                    cleaned,
+                    title,
+                )
+        try:
+            missing = {
+                int(value)
+                for value in json.loads(
+                    self.db.get_state(self._PLACEHOLDER_METADATA_MISSING_KEY, "[]") or "[]"
+                )
+            }
+        except (TypeError, ValueError):
+            missing = set()
+        pending = [int(row["media_id"]) for row in rows if int(row["media_id"]) not in missing]
+        result["pending"] = len(pending)
+        if (
+            not fetch
+            or not pending
+            or not self.config.anilist.enabled
+            or not str(self.config.anilist.access_token or "").strip()
+            or anilist_refusal() is not None
+        ):
+            if pending:
+                self.logger.info(
+                    "SKIP step=anime.placeholder_metadata pending=%s reason=%s",
+                    len(pending),
+                    "no_fetch" if not fetch else "anilist_unavailable",
+                )
+            return result
+        client = AniListClient(self.config.anilist.endpoint, access_token=self.config.anilist.access_token)
+        try:
+            with bulk_requests():
+                for media_id in pending[: max(1, int(limit or self.PLACEHOLDER_METADATA_LIMIT))]:
+                    local = self.db.get_anime(media_id)
+                    if local is None or local.titles:
+                        continue
+                    try:
+                        metadata = client.library_anime(media_id)
+                    except (AniListNotFoundError, AniListHTTPError) as exc:
+                        if isinstance(exc, AniListHTTPError) and exc.status_code != 404:
+                            # Rate limit, refusal, server error: the next launch goes on.
+                            self.logger.warning(
+                                "RETRY step=anime.placeholder_metadata media_id=%s error=%r",
+                                media_id,
+                                str(exc)[:200],
+                            )
+                            break
+                        missing.add(media_id)
+                        result["missing"] += 1
+                        self.logger.info(
+                            "SKIP step=anime.placeholder_metadata media_id=%s reason=not_found", media_id
+                        )
+                        continue
+                    except AniListError as exc:
+                        # Rate limit, network, refusal: the next launch or refresh goes on.
+                        self.logger.warning(
+                            "RETRY step=anime.placeholder_metadata media_id=%s error=%r",
+                            media_id,
+                            str(exc)[:200],
+                        )
+                        break
+                    if not metadata.titles:
+                        continue
+                    self._fill_placeholder_metadata(local, metadata, source="anilist.media")
+                    result["fetched"] += 1
+        finally:
+            client.close()
+            self.db.set_state(self._PLACEHOLDER_METADATA_MISSING_KEY, json.dumps(sorted(missing)))
+        self.logger.info(
+            "RESULT step=anime.placeholder_titles renamed=%s fetched=%s missing=%s pending=%s",
+            result["renamed"],
+            result["fetched"],
+            result["missing"],
+            max(0, result["pending"] - result["fetched"] - result["missing"]),
+        )
+        return result
+
+    def refresh_off_list_entry_metadata(self, *, cache_covers: bool = False) -> int:
+        """Bring rows Pudge made off the AniList list up to date from the cached relation graphs.
+
+        An S00 special or OVA split from its series gets a row of its own (extra_files.
+        own_title_anime) that the list sync never touches: rows made before it copied the
+        cover kept none, so Home showed the "Cover" placeholder for days. The relation graph
+        of the series is refreshed regularly and carries the entry's cover, title and
+        episodes; without an AniList cover the series' cover stands in. No network but the
+        cover image: it runs at launch, after a library scan and after an AniList refresh.
+        ``cache_covers``: also fetch the cover file of an off-list entry with local episodes
+        that has none yet (once per entry and launch). Returns rows changed.
+        """
+        changed = 0
+        tried: set[int] = self.__dict__.setdefault("_off_list_cover_tried", set())
+        for anime in self.db.anime_list():
+            if str(anime.status or "").strip():
+                continue  # on the list: the list sync keeps it up to date
+            cached = self.db.relation_graph_for_media(int(anime.media_id))
+            graph = cached.get("graph") if isinstance(cached, dict) else None
+            node = None
+            parent: LibraryAnime | None = None
+            if isinstance(graph, dict):
+                nodes = {
+                    int(item["media_id"]): item
+                    for item in graph.get("nodes") or []
+                    if isinstance(item, dict) and item.get("media_id") is not None
+                }
+                node = nodes.get(int(anime.media_id))
+                neighbours: list[LibraryAnime] = []
+                for edge in graph.get("edges") or []:
+                    if not isinstance(edge, dict):
+                        continue
+                    ends = {edge.get("source"), edge.get("target")}
+                    if int(anime.media_id) not in ends:
+                        continue
+                    other = next((value for value in ends if value != int(anime.media_id)), None)
+                    row = self.db.get_anime(int(other)) if other is not None else None
+                    if row is not None and row.cover_url:
+                        neighbours.append(row)
+                # The series a special belongs to: a TV neighbour first.
+                neighbours.sort(key=lambda row: str(row.format or "").upper() != "TV")
+                parent = neighbours[0] if neighbours else None
+            repaired = node is not None and extra_files.refresh_own_title_metadata(anime, node, parent)
+            if repaired:
+                self.db.upsert_anime(anime)
+                changed += 1
+            fetch = bool(
+                anime.cover_url
+                and self.cached_cover_path(anime) is None
+                and (
+                    repaired
+                    or (
+                        cache_covers
+                        and int(anime.media_id) not in tried
+                        and self.db.episodes(int(anime.media_id))
+                    )
+                )
+            )
+            cover_file = None
+            if fetch:
+                tried.add(int(anime.media_id))
+                cover_file = self.cover_path(anime)  # the card's own file (and the iPhone's)
+            if repaired or fetch:
+                source = (
+                    "none"
+                    if not anime.cover_url
+                    else "series"
+                    if parent is not None and anime.cover_url == parent.cover_url
+                    else "own"
+                )
+                self.logger.info(
+                    "RESULT step=anime.off_list_metadata media_id=%s title=%r repaired=%s cover=%s "
+                    "cover_file=%s",
+                    anime.media_id,
+                    anime.title,
+                    repaired,
+                    source,
+                    "cached" if (cover_file or self.cached_cover_path(anime)) else "missing",
+                )
+        return changed
 
     def prefetch_covers(self, statuses: tuple[str, ...] = ("CURRENT", "PLANNING"), limit: int = 0) -> int:
         items = self.db.anime_list(statuses)
@@ -11291,642 +16501,190 @@ class AnimeManager:
 
             # The DB selection is not the only fast path. prepare-only can also
             # return an old final-pipeline manifest, so invalidate both layers.
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueSyncUpdate"),
-            )
-            if previous_generation == "16":
-                self.db.set_state(self._debug_force_subtitle_state_key(item.video_path), "1")
+            if not self._requeue_rebuild(
+                item, err("jobs.requeueSyncUpdate"), debug_force=previous_generation == "16"
+            ):
+                continue
             queued += 1
         self.db.set_state("subtitle_validation_generation", generation)
         if queued:
             self.log(f"Subtitles: rechecking previously prepared files: {queued}")
         return queued
 
+    def _requeue_rebuild(
+        self, item: LibraryEpisode, error: str, *, priority: int = 0, debug_force: bool = False
+    ) -> bool:
+        """Prepare an episode's subtitles again after an aligner fix (the rebuild rules).
+
+        A Ready or Watched episode keeps playing its subtitles while they are prepared
+        again: the upgrade check takes any ready result and puts the old subtitles back
+        when the rebuild fails or is interrupted. Its state does not change, so a Watched
+        episode stays watched. Only an episode with nothing playable to keep loses its
+        selection; a Dropped one is left alone. False when nothing was queued.
+        """
+        state = str(getattr(item, "state", "") or "")
+        if state == "dropped":
+            return False
+        video = item.video_path
+        kept = False
+        if state in {"ready", "watched"}:
+            upgrade_key = self._subtitle_upgrade_state_key(video)
+            raw = self.db.get_state(upgrade_key, "").strip()
+            try:
+                request = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                request = None
+            if isinstance(request, dict):
+                if request.get("fresh_rebuild"):
+                    return False  # already being prepared again from scratch
+                # A pending upgrade check becomes the rebuild: any ready result replaces.
+                request.update(
+                    forced=True,
+                    manual_retry=True,
+                    fresh_rebuild=True,
+                    rebuild_rule=True,
+                    requeue_priority=max(priority, _upgrade_request_priority(request, 0)),
+                    requeue_reason=error,
+                )
+                self.db.set_state(upgrade_key, json.dumps(request, ensure_ascii=False))
+                kept = True
+            else:
+                kept = self._keep_subtitles_during_rebuild(
+                    item, fresh=True, priority=priority, reason=error, rebuild_rule=True
+                )
+        invalidate_final_pipeline_result(video, self.config)
+        if kept:
+            # A new job generation: a check already running for it no longer commits.
+            self.db.invalidate_subtitle(
+                video, item.media_id, item.episode, error, keep_selection=True, priority=priority
+            )
+        else:
+            self.db.invalidate_subtitle(video, item.media_id, item.episode, error)
+            if priority:
+                self.db.queue_subtitle_job(video, item.media_id, item.episode, priority=priority, error=error)
+        if debug_force:
+            self.db.set_state(self._debug_force_subtitle_state_key(video), "1")
+        return True
+
+    @_reusing_db_connection
+    def _run_subtitle_rebuild_rules(self) -> dict[str, int]:
+        """The rebuild rules that have work, in one pass (see ``subtitle_migrations``)."""
+        return subtitle_migrations.run_pending_rules(self)
+
+    # One method per rebuild rule (pudge/subtitle_migrations.py): each runs that rule
+    # over every prepared episode now.
+
     @_reusing_db_connection
     def _requeue_false_positive_tail_clocks(self) -> int:
-        """Rebuild old Jimaku selections with an unsupported large late clock jump.
-
-        v6.14 could accept a one/two-window positive tail transition after a
-        strongly established clock. The migration is intentionally data-driven:
-        it only matches the exact structural signature observed in stale history,
-        rather than any anime title or episode number.
-        """
-
-        generation = "1"
-        key = "subtitle_tail_clock_guard_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            segments = alignment.get("timeline_segments")
-            if not isinstance(segments, list) or len(segments) < 2:
-                continue
-            left = segments[-2] if isinstance(segments[-2], dict) else {}
-            right = segments[-1] if isinstance(segments[-1], dict) else {}
-            tail_guard = (
-                alignment.get("timeline_weak_tail_guard")
-                if isinstance(alignment.get("timeline_weak_tail_guard"), dict)
-                else {}
-            )
-            try:
-                left_offset = float(left.get("offset_seconds") or 0.0)
-                right_offset = float(right.get("offset_seconds") or 0.0)
-                left_support = int(left.get("support") or 0)
-                right_support = int(right.get("support") or 0)
-                boundary_ratio = float(tail_guard.get("boundary_ratio") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            stale_false_tail_shape = bool(
-                right_offset > left_offset
-                and abs(right_offset - left_offset) >= 15.0
-                and left_support >= 6
-                and 1 <= right_support <= 2
-                and boundary_ratio >= 0.80
-            )
-            if not stale_false_tail_shape:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueLateJump"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking suspicious late timing jumps: {queued}")
-        return queued
+        """Rebuild Jimaku selections with an unsupported large late clock jump (once)."""
+        return subtitle_migrations.run_rule(self, "tail_clock")
 
     @_reusing_db_connection
     def _requeue_shared_opening_timeline_upgrade(self) -> int:
-        """Rebuild stale v6.19 fits that retained a weak post-opening clock.
+        """Rebuild v6.19 fits that retained a weak post-opening clock (and unwatched older
+        ones whose later clock already fit the minute after the opening better)."""
+        return subtitle_migrations.run_rule(self, "shared_opening") + subtitle_migrations.run_rule(
+            self, "shared_opening_before_v6_19"
+        )
 
-        Use the old diagnostic signature, rather than a title/episode match.
-        The new aligner will check unique shared text before changing the map.
-        """
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest:
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            if (
-                alignment.get("engine") != "embedded-reference+timeline"
-                or alignment.get("timeline_algorithm") != "timeline-v6.19-edge-zones-audio-verify"
-            ):
-                continue
-            gap = alignment.get("timeline_opening_gap_reacquire")
-            if (
-                not isinstance(gap, dict)
-                or gap.get("applied")
-                or gap.get("reason") != "later_clock_not_clearly_better"
-            ):
-                continue
-            try:
-                eligible = (
-                    float(gap.get("gap_seconds") or 0) >= 45.0
-                    and int(gap.get("candidate_support") or 0) >= 8
-                    and abs(float(gap["candidate_offset_seconds"]) - float(gap["current_offset_seconds"]))
-                    >= 4.0
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not eligible:
-                continue
-            key = (
-                "subtitle_shared_opening_v17:"
-                + hashlib.sha256(str(item.video_path).encode()).hexdigest()[:24]
-            )
-            marker = str(latest.get("id") or "legacy")
-            if self.db.get_state(key, "") == marker:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path, item.media_id, item.episode, err("jobs.requeueOpeningAnchors")
-            )
-            self.db.set_state(key, marker)
-            queued += 1
-        return queued
+    @_reusing_db_connection
+    def _requeue_early_crossover_timeline_upgrade(self) -> int:
+        """Rebuild pre-v6.21 fits whose clock change came from the first local crossover."""
+        return subtitle_migrations.run_rule(self, "early_crossover")
+
+    @_reusing_db_connection
+    def _requeue_bridged_singleton_tail_timeline_upgrade(self) -> int:
+        """Rebuild pre-v6.22 fits whose last clock was one window reached through a bridge."""
+        return subtitle_migrations.run_rule(self, "bridged_singleton_tail")
+
+    @_reusing_db_connection
+    def _requeue_speech_maps_without_late_cut(self) -> int:
+        """Prepare again speech-verified fits that dropped a late cut of the timeline."""
+        return subtitle_migrations.run_rule(self, "speech_late_cut")
 
     @_reusing_db_connection
     def _requeue_unverified_timeline_edits(self) -> int:
-        from .subtitles.stt import japanese_stt_available
-        from .subtitles.validation import unverified_timeline_edit
-
-        sync = getattr(self.config, "sync", None)
-        if not japanese_stt_available(enabled=bool(sync and sync.japanese_stt_fallback)):
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest:
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            if not unverified_timeline_edit(alignment):
-                continue
-            key = (
-                "subtitle_unverified_timeline_v16:"
-                + hashlib.sha256(str(item.video_path).encode()).hexdigest()[:24]
-            )
-            marker = str(latest.get("id") or "legacy")
-            if self.db.get_state(key, "") == marker:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path, item.media_id, item.episode, err("jobs.requeueTimelineUnverified")
-            )
-            self.db.set_state(key, marker)
-            queued += 1
-        return queued
+        """Rebuild unverified timeline edits once Japanese STT can verify them."""
+        return subtitle_migrations.run_rule(self, "unverified_timeline_edit")
 
     @_reusing_db_connection
     def _requeue_local_edge_timeline_upgrade(self) -> int:
-        """Rebuild v6.17 timelines with a large unverified opening-edge mismatch.
-
-        v6.17 allowed both edge hints to influence every timeline window and
-        required a literal long subtitle gap before escalating an opening clock
-        disagreement to Japanese speech. Requeue only the narrow stale signature
-        fixed by v6.19.
-        """
-
-        generation = "1"
-        key = "subtitle_local_edge_timeline_upgrade_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            if str(alignment.get("timeline_algorithm") or "") != "timeline-v6.17-decreasing-gap-anchor":
-                continue
-            risk = alignment.get("timeline_early_edit_audio_verification")
-            if not isinstance(risk, dict) or bool(risk.get("required")):
-                continue
-            try:
-                cold_delta = abs(float(risk.get("cold_start_delta_seconds") or 0.0))
-            except (TypeError, ValueError):
-                continue
-            if not 4.0 <= cold_delta <= 15.0:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueEdgeHints"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking the opening clock against the Japanese audio: {queued}")
-        return queued
+        """Rebuild pre-v6.19 timelines with a large unverified opening-edge mismatch (once)."""
+        return subtitle_migrations.run_rule(self, "local_edge")
 
     @_reusing_db_connection
     def _requeue_decreasing_gap_timeline_upgrade(self) -> int:
-        """Rebuild old timelines whose monotonic repair dragged a clock switch forward.
-
-        timeline-v6.16 could resolve a real negative clock jump by extending the
-        old clock through many following cues.  Only requeue the narrow stale
-        signature: an early decreasing boundary moved forward by >=8 seconds by
-        repeated monotonic stabilization.  The rule is data-driven and does not
-        depend on a title or episode number.
-        """
-
-        generation = "1"
-        key = "subtitle_decreasing_gap_timeline_upgrade_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            algorithm = str(alignment.get("timeline_algorithm") or "")
-            if algorithm != "timeline-v6.16-tail-clock-duration-anchors":
-                continue
-            refinements = alignment.get("timeline_monotonic_refinements")
-            if not isinstance(refinements, list):
-                continue
-            groups: dict[int, list[dict[str, object]]] = {}
-            for row in refinements:
-                if not isinstance(row, dict) or not bool(row.get("applied")):
-                    continue
-                if str(row.get("reason") or "") != "decreasing_boundary_extended_for_monotonicity":
-                    continue
-                try:
-                    index = int(row.get("boundary_index") or 0)
-                except (TypeError, ValueError):
-                    continue
-                groups.setdefault(index, []).append(row)
-            risky = False
-            for rows in groups.values():
-                if not rows:
-                    continue
-                try:
-                    first_old = float(rows[0].get("old_source_time") or 0.0)
-                    last_new = float(rows[-1].get("new_source_time") or first_old)
-                    left_offset = float(rows[0].get("left_offset_seconds") or 0.0)
-                    right_offset = float(rows[0].get("right_offset_seconds") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    0.0 < first_old <= 300.0
-                    and left_offset - right_offset >= 4.0
-                    and last_new - first_old >= 8.0
-                ):
-                    risky = True
-                    break
-            if not risky:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueEditBoundary"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rebuilding stretched edit boundaries: {queued}")
-        return queued
+        """Rebuild pre-v6.17 timelines whose monotonic repair dragged a clock switch (once)."""
+        return subtitle_migrations.run_rule(self, "decreasing_gap")
 
     @_reusing_db_connection
     def _requeue_stt_timeline_clock_conflicts(self) -> int:
-        """Rebuild selections where STT beat a strong same-video timeline clock."""
-
-        generation = "2"
-        key = "subtitle_stt_timeline_conflict_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            scaffold = (
-                alignment.get("embedded_opening_clock_scaffold")
-                if isinstance(alignment.get("embedded_opening_clock_scaffold"), dict)
-                else {}
-            )
-            old_conflict = (
-                str(scaffold.get("reason_detail") or "") == "speech_clock_disagrees_with_post_plateau"
-            )
-            embedded = (
-                alignment.get("embedded_timeline_attempt")
-                if isinstance(alignment.get("embedded_timeline_attempt"), dict)
-                else {}
-            )
-            reacquire = (
-                embedded.get("timeline_opening_gap_reacquire")
-                if isinstance(embedded.get("timeline_opening_gap_reacquire"), dict)
-                else {}
-            )
-            new_conflict = bool(
-                str(alignment.get("selection_reason") or "") == "early_edit_japanese_speech_verification"
-                and reacquire.get("applied")
-                and str(reacquire.get("reason") or "") == "dominant_clock_reacquired_after_opening_gap"
-            )
-            if not old_conflict and not new_conflict:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueSttTimeline"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking the STT/timeline choice: {queued}")
-        return queued
+        """Rebuild selections where STT beat a strong same-video timeline clock (once)."""
+        return subtitle_migrations.run_rule(self, "stt_timeline_conflict")
 
     @_reusing_db_connection
     def _requeue_stt_opening_plateau_semantic_upgrade(self) -> int:
-        """Rebuild old STT opening plateaus that had onset-only local clocks."""
-
-        generation = "1"
-        key = "subtitle_stt_plateau_semantic_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            engine = str(alignment.get("engine") or "")
-            plateau = (
-                alignment.get("stt_opening_plateau_refinement")
-                if isinstance(alignment.get("stt_opening_plateau_refinement"), dict)
-                else {}
-            )
-            try:
-                gap_seconds = float(plateau.get("gap_seconds") or 0.0)
-            except (TypeError, ValueError):
-                gap_seconds = 0.0
-            old_onset_only = bool(
-                engine.startswith("japanese-stt+alass+opening-plateau")
-                and plateau.get("applied")
-                and gap_seconds >= 45.0
-                and "pre_semantic" not in plateau
-                and "post_semantic" not in plateau
-            )
-            if not old_onset_only:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueSttOpening"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking STT timing around the opening: {queued}")
-        return queued
+        """Rebuild old STT opening plateaus that had onset-only local clocks (once)."""
+        return subtitle_migrations.run_rule(self, "stt_opening_plateau")
 
     @_reusing_db_connection
     def _requeue_double_opening_scaffold(self) -> int:
-        """Rebuild cold opens shifted twice: by ALASS at the OP and again by the scaffold."""
-
-        from .subtitles.validation import alass_transition_matching_timeline_boundary
-
-        generation = "1"
-        key = "subtitle_double_opening_scaffold_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            scaffold = alignment.get("embedded_opening_clock_scaffold")
-            embedded = alignment.get("embedded_timeline_attempt")
-            safety = alignment.get("stt_alass_transition_safety")
-            if not isinstance(scaffold, dict) or not scaffold.get("applied"):
-                continue
-            if scaffold.get("opening_alass_transition") is not None:
-                continue
-            if not isinstance(embedded, dict) or not isinstance(safety, dict):
-                continue
-            if (
-                alass_transition_matching_timeline_boundary(
-                    safety.get("transitions"),
-                    embedded.get("timeline_boundaries"),
-                )
-                is None
-            ):
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueOpeningScaffold"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking cold-open timing before the opening: {queued}")
-        return queued
+        """Rebuild cold opens shifted twice: by ALASS at the OP and by the scaffold (once)."""
+        return subtitle_migrations.run_rule(self, "double_opening_scaffold")
 
     @_reusing_db_connection
     def _requeue_unsafe_stt_transition_maps(self) -> int:
-        """Rebuild cached STT selections containing a large unsupported clock jump."""
-
-        generation = "1"
-        key = "subtitle_stt_transition_safety_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            engine = str(alignment.get("engine") or "")
-            if not engine.startswith("japanese-stt+alass"):
-                continue
-            safety = (
-                alignment.get("stt_alass_transition_safety")
-                if isinstance(alignment.get("stt_alass_transition_safety"), dict)
-                else {}
-            )
-            if not safety or bool(safety.get("accepted")):
-                continue
-            largest_unsupported_jump = 0.0
-            transitions = safety.get("transitions")
-            if isinstance(transitions, list):
-                for row in transitions:
-                    if not isinstance(row, dict) or bool(row.get("gap_supported")):
-                        continue
-                    try:
-                        largest_unsupported_jump = max(
-                            largest_unsupported_jump,
-                            abs(float(row.get("jump_seconds") or 0.0)),
-                        )
-                    except (TypeError, ValueError):
-                        continue
-            if largest_unsupported_jump < 20.0:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueSttTransition"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rechecking unsafe STT transitions: {queued}")
-        return queued
+        """Rebuild STT selections containing a large unsupported clock jump (once)."""
+        return subtitle_migrations.run_rule(self, "unsafe_stt_transition")
 
     @_reusing_db_connection
     def _requeue_opening_gap_timeline_upgrade(self) -> int:
-        """Rebuild risky v5.9 opening-gap maps with the cut-aware clock reacquire."""
-
-        generation = "1"
-        key = "subtitle_opening_gap_timeline_upgrade_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            algorithm = str(alignment.get("timeline_algorithm") or "")
-            risk = (
-                alignment.get("timeline_early_edit_audio_verification")
-                if isinstance(alignment.get("timeline_early_edit_audio_verification"), dict)
-                else {}
-            )
-            reasons = risk.get("reasons") if isinstance(risk.get("reasons"), list) else []
-            if not algorithm.startswith("timeline-v5.9"):
-                continue
-            if "opening_gap_clock_ambiguity" not in {str(value) for value in reasons}:
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueOpeningTiming"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rebuilding timing around the opening: {queued}")
-        return queued
+        """Rebuild risky v5.9 opening-gap maps with the cut-aware clock reacquire (once)."""
+        return subtitle_migrations.run_rule(self, "opening_gap")
 
     @_reusing_db_connection
     def _requeue_large_cold_open_subtitles(self) -> int:
-        """Rebuild subtitles affected by cold-open or sparse-gap timeline fixes."""
-
-        generation = "4"
-        key = "subtitle_large_cold_open_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            subtitle = item.subtitle_path
-            if subtitle is None:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() == "manual":
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            cold_start = (
-                alignment.get("timeline_cold_start")
-                if isinstance(alignment.get("timeline_cold_start"), dict)
-                else {}
-            )
-            try:
-                cold_delta = abs(float(cold_start.get("delta_seconds") or 0.0))
-            except (TypeError, ValueError):
-                cold_delta = 0.0
-            algorithm = str(alignment.get("timeline_algorithm") or "")
-            boundaries = (
-                alignment.get("timeline_boundaries")
-                if isinstance(alignment.get("timeline_boundaries"), list)
-                else []
-            )
-            old_large_cold_start = bool(
-                str(cold_start.get("reason") or "") == "edge_hint_not_local" and 15.0 < cold_delta <= 20.0
-            )
-            reverted_v62_cold_start = bool(
-                algorithm == "timeline-v6.2-cold-start-20s"
-                and bool(cold_start.get("applied"))
-                and 15.0 < cold_delta <= 20.0
-            )
-            large_silence_boundary = any(
-                isinstance(row, dict)
-                and abs(float(row.get("jump_seconds") or 0.0)) >= 4.0
-                and isinstance(row.get("refinement"), dict)
-                and str(row["refinement"].get("method") or "") == "fixed_offset_crossover_across_silence"
-                for row in boundaries
-            )
-            if not (old_large_cold_start or reverted_v62_cold_start or large_silence_boundary):
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueSubtitleBoundary"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: rebuilding timing edit boundaries: {queued}")
-        return queued
+        """Rebuild subtitles affected by cold-open or sparse-gap timeline fixes (once)."""
+        return subtitle_migrations.run_rule(self, "large_cold_open")
 
     @_reusing_db_connection
     def _requeue_known_source_repairs(self) -> int:
-        """Rebuild selected subtitles covered by newly added narrow source repairs."""
+        """Rebuild selected subtitles covered by newly added narrow source repairs (once)."""
+        return subtitle_migrations.run_rule(self, "known_source_repair")
 
-        generation = "1"
-        key = "subtitle_known_source_repair_generation"
-        if self.db.get_state(key, "") == generation:
-            return 0
-        queued = 0
-        for item in self.db.episodes():
-            if item.subtitle_path is None or item.media_id != 185874 or item.episode != 5:
-                continue
-            latest = self.db.latest_selected_subtitle(item.video_path)
-            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
-                continue
-            candidate_name = str(latest.get("candidate_name") or "").casefold()
-            if "nanakoraws] bleach sennen kessen-hen s01e45" not in candidate_name:
-                continue
-            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
-            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
-            source_repair = (
-                alignment.get("source_repair") if isinstance(alignment.get("source_repair"), dict) else {}
-            )
-            if bool(source_repair.get("applied")):
-                continue
-            invalidate_final_pipeline_result(item.video_path, self.config)
-            self.db.invalidate_subtitle(
-                item.video_path,
-                item.media_id,
-                item.episode,
-                err("jobs.requeueIncompleteSource"),
-            )
-            queued += 1
-        self.db.set_state(key, generation)
-        if queued:
-            self.log(f"Subtitles: restoring incomplete sources: {queued}")
-        return queued
+    @_reusing_db_connection
+    def _requeue_late_audio_tracks(self) -> int:
+        """Prepare again unwatched episodes whose audio track starts after the file start (once)."""
+        return subtitle_migrations.run_rule(self, "late_audio_track")
+
+    @_reusing_db_connection
+    def _requeue_audio_gap_tracks(self) -> int:
+        """Prepare again unwatched episodes whose audio track has a timestamp gap inside (once)."""
+        return subtitle_migrations.run_rule(self, "audio_gap_track")
+
+    @_reusing_db_connection
+    def _requeue_imprecise_timeline_clocks(self) -> int:
+        """Prepare again unwatched Jimaku episodes timed on the window grid or with a
+        Japanese+English/Chinese file (once; manual selections are left alone)."""
+        return subtitle_migrations.run_rule(self, "precise_clocks")
+
+    @_reusing_db_connection
+    def _requeue_non_dialogue_text(self) -> int:
+        """Prepare again unwatched episodes whose subtitles show ASS drawings or release
+        credits as text (once; manual selections are left alone)."""
+        return subtitle_migrations.run_rule(self, "non_dialogue_text")
+
+    @_reusing_db_connection
+    def _requeue_small_cuts(self) -> int:
+        """Prepare again unwatched episodes timed to an English (or other non-Japanese) track
+        on clocks a few seconds apart, before the small-cut step (once)."""
+        return subtitle_migrations.run_rule(self, "small_cuts")
+
+    @_reusing_db_connection
+    def _requeue_staircase_speech(self) -> int:
+        """Prepare again unwatched episodes timed to an English (or other non-Japanese) track
+        on clocks a few seconds apart, before the Japanese speech check of such maps (once)."""
+        return subtitle_migrations.run_rule(self, "staircase_speech")
 
     @_reusing_db_connection
     def _requeue_after_resolver_upgrade(self) -> int:
@@ -11966,10 +16724,16 @@ class AnimeManager:
         }
 
     def _sync_downloads_for_stats(self, stats: dict[str, int]) -> None:
-        try:
-            with timed_step(self.logger, "qbittorrent.sync"):
+        # The error is caught inside the timed step: raised through it, a stopped torrent
+        # client wrote an ERROR line with a full traceback on every maintenance run.
+        unavailable: QBittorrentError | ManagerError | None = None
+        with timed_step(self.logger, "qbittorrent.sync"):
+            try:
                 stats["downloads"] = self.sync_downloads()
-        except (QBittorrentError, ManagerError) as exc:
+            except (QBittorrentError, ManagerError) as exc:
+                unavailable = exc
+        if unavailable is not None:
+            exc = unavailable
             # Backend observation is advisory for maintenance. A temporarily
             # unavailable torrent client must not abort release-feed polling,
             # subtitle work, or the later automatic release search.
@@ -12010,17 +16774,18 @@ class AnimeManager:
             return self._run_startup_once_unlocked()
 
     def _run_startup_once_unlocked(self) -> dict[str, int]:
-        """Run the same full maintenance pipeline as a manual Refresh.
+        """Run the full maintenance pipeline at launch, releases first.
 
         Startup used to skip the normal subtitle backlog whenever the background
-        agent was enabled. That made opening the app much weaker than pressing
-        Refresh: delayed/missing subtitle jobs could remain untouched until the
-        next agent tick. A launch is now an explicit refresh point, so force the
-        same subtitle retry/search work immediately.
+        agent was enabled; it runs the whole pass now, and due subtitle jobs are
+        left to the window's worker. It is a normal pass, not a forced Refresh:
+        each launch made every waiting job due at once and dropped the Jimaku
+        answers, so dozens of titles without Jimaku subtitles were prepared again
+        on every launch, past their 6 h and daily backoffs.
         """
         self.logger.info("START step=maintenance.total mode=startup-fast-refresh")
         stats = self._run_once_unlocked(
-            force_subtitle_retry=True,
+            force_subtitle_retry=False,
             prioritize_release_search=True,
             defer_subtitle_processing=True,
         )
@@ -12070,23 +16835,32 @@ class AnimeManager:
             forced_jobs,
             remaining,
         )
-        with timed_step(self.logger, "nyaa.auto_search", priority="interactive_concurrent"):
+        with (
+            timed_step(self.logger, "nyaa.auto_search", priority="interactive_concurrent"),
+            self.ignore_auto_search_backoff(),
+        ):
             stats["auto"] = self.auto_search_current()
         return stats
 
     def _clear_jimaku_api_cache(self) -> int:
-        """Remove short-lived API responses so a manual refresh is truly fresh."""
+        """Expire short-lived API responses so a manual refresh is truly fresh.
+
+        The responses stay as the offline copy the client falls back to when Jimaku
+        does not answer (deleted, a timeout after a fresh rebuild left nothing).
+        """
         cache_dir = self.config.paths.cache_dir / "jimaku-api"
-        removed = 0
+        expired = 0
         if not cache_dir.is_dir():
             return 0
         for path in cache_dir.glob("*.json"):
+            if not re.fullmatch(r"[0-9a-f]{32}\.json", path.name):
+                continue  # rate-limit, request-budget and key-rejection notes are not responses
             try:
-                path.unlink()
-                removed += 1
+                os.utime(path, (0, 0))
+                expired += 1
             except OSError:
                 continue
-        return removed
+        return expired
 
     def run_once(
         self,
@@ -12113,7 +16887,7 @@ class AnimeManager:
     HISTORY_KEEP_SECONDS = 5 * 86400
 
     def prune_history_if_due(self, *, now: float | None = None) -> dict[str, int]:
-        """Once a day: drop 5-day-old history rows, debug JSONL and old migration backups."""
+        """Once a day: drop 5-day-old history rows, debug JSONL and 14-day-old one-off library copies."""
         current = time.time() if now is None else float(now)
         if not callable(getattr(self.db, "get_state", None)) or not callable(
             getattr(self.db, "prune_history", None)
@@ -12145,20 +16919,12 @@ class AnimeManager:
         except OSError:
             pass
         removed["subtitle_debug_files"] = removed_files
-        database_path = Path(self.config.library.database_path)
-        backups = sorted(
-            database_path.parent.glob(f"{database_path.name}.pre-v*.backup"),
-            key=lambda item: item.stat().st_mtime if item.exists() else 0,
-            reverse=True,
+        # The two newest pre-v<N> copies used to stay forever and identity-repair
+        # copies were never removed: ~1 GB each beside a library that is mostly
+        # cache. They now go after 14 days (backup.prune_one_off_copies).
+        removed["one_off_backups"] = len(
+            prune_one_off_copies(Path(self.config.library.database_path), now=current)
         )
-        removed_backups = 0
-        for old in backups[2:]:
-            try:
-                old.unlink()
-                removed_backups += 1
-            except OSError:
-                continue
-        removed["migration_backups"] = removed_backups
         self.logger.info(
             "RESULT step=history.prune %s",
             " ".join(f"{key}={value}" for key, value in sorted(removed.items())),
@@ -12177,6 +16943,9 @@ class AnimeManager:
         except Exception as exc:  # noqa: BLE001 - optional metadata must never break maintenance
             self.logger.warning("FAIL step=anime_mappings.kick error=%r", str(exc)[:200])
 
+    # One SQLite connection for the whole pass (DB-7): its per-episode loops made a
+    # fresh connection (~90x the query) for every small call.
+    @_reusing_db_connection
     def _run_once_unlocked(
         self,
         *,
@@ -12235,31 +17004,11 @@ class AnimeManager:
                     self.invalidate_disabled_ocr_subtitles()
                 else:
                     self._reconcile_ocr_readiness_policy()
-                with self.db.connect() as conn:
-                    fingerprint = str(
-                        tuple(conn.execute("SELECT COUNT(*),MAX(updated_at) FROM episodes").fetchone())
-                    )
-                legacy_key = "legacy_subtitle_repair:v29"
-                if force_subtitle_retry or self.db.get_state(legacy_key, "") != fingerprint:
-                    self._requeue_legacy_generated_subtitles()
-                    self._requeue_false_positive_tail_clocks()
-                    self._requeue_decreasing_gap_timeline_upgrade()
-                    self._requeue_local_edge_timeline_upgrade()
-                    self._requeue_shared_opening_timeline_upgrade()
-                    self._requeue_unverified_timeline_edits()
-                    self._requeue_stt_timeline_clock_conflicts()
-                    self._requeue_stt_opening_plateau_semantic_upgrade()
-                    self._requeue_double_opening_scaffold()
-                    self._requeue_unsafe_stt_transition_maps()
-                    self._requeue_opening_gap_timeline_upgrade()
-                    self._requeue_large_cold_open_subtitles()
-                    self._requeue_known_source_repairs()
-                    self._requeue_after_resolver_upgrade()
-                    with self.db.connect() as conn:
-                        fingerprint = str(
-                            tuple(conn.execute("SELECT COUNT(*),MAX(updated_at) FROM episodes").fetchone())
-                        )
-                    self.db.set_state(legacy_key, fingerprint)
+                # Rebuild rules: each records when it is done (and the newest selection it
+                # has seen), so a pass with nothing new reads a few state rows only.
+                self._requeue_legacy_generated_subtitles()
+                self._run_subtitle_rebuild_rules()
+                self._requeue_after_resolver_upgrade()
             self._sync_downloads_for_stats(stats)
             with timed_step(self.logger, "qbittorrent.duplicate_cleanup"):
                 try:
@@ -12292,8 +17041,6 @@ class AnimeManager:
                     priority=200 if defer_subtitle_processing else 20
                 )
                 subtitle_limit = max(8, min(forced_jobs, 32))
-                if defer_subtitle_processing:
-                    stats["subtitle_check_queued"] = self.db.priority_subtitle_job_count(min_priority=200)
                 self.logger.info(
                     "REQUEUE step=subtitle.manual_refresh jobs=%s limit=%s jimaku_cache_cleared=%s",
                     forced_jobs,
@@ -12305,10 +17052,15 @@ class AnimeManager:
             # (which can take minutes for a movie) so Nyaa is never hidden behind
             # a long ALASS/LLM job. Periodic agent runs keep subtitles-first.
             if prioritize_release_search:
-                with timed_step(self.logger, "nyaa.auto_search", priority="manual_before_subtitles"):
+                with (
+                    timed_step(self.logger, "nyaa.auto_search", priority="manual_before_subtitles"),
+                    # Refresh is the user's request: episodes that keep missing are searched too.
+                    self.ignore_auto_search_backoff() if force_subtitle_retry else nullcontext(),
+                ):
                     stats["auto"] = self.auto_search_current()
             if defer_subtitle_processing:
                 stats["subs"] = 0
+                stats["subtitle_check_queued"] = self.db.priority_subtitle_job_count(min_priority=200)
                 self.logger.info(
                     "QUEUE step=subtitle.process deferred=true limit=%s reason=interactive_refresh",
                     subtitle_limit,
@@ -12336,6 +17088,8 @@ class AnimeManager:
                 stats["disk_deleted"] = self.enforce_disk_limit()
             with timed_step(self.logger, "cache.derived"):
                 stats["cache_deleted"] = self.enforce_derived_caches()
+            with timed_step(self.logger, "database.storage"):
+                stats["db_compacted"] = self.maintain_database_storage()
             with timed_step(self.logger, "qbittorrent.tag_cleanup"):
                 try:
                     stats.update(self.cleanup_qbittorrent_tags())

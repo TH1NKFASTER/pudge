@@ -19,7 +19,7 @@
   const NOTICE_MS = 700;     // "Last chapter" stays this long after release
   const EDGE = 2;
   const ARROWS = {bottom: '↓', top: '↑', left: '←', right: '→'};
-  const swipe = {dir: 0, acc: 0, target: null, side: '', armedDir: 0, lastWheelAt: -Infinity, idleTimer: null, hideTimer: null, busy: false, samples: [], swallow: false, swallowDir: 0, lastDir: 0, lastMag: 0};
+  const swipe = {dir: 0, acc: 0, target: null, side: '', armedDir: 0, lastWheelAt: -Infinity, idleTimer: null, hideTimer: null, busy: false, samples: [], swallow: false, swallowDir: 0, lastDir: 0, lastMag: 0, rises: 0, floor: 0};
 
   const scroller = () => document.getElementById('lnReaderScroll');
   const reader = () => document.getElementById('lnReader');
@@ -208,11 +208,19 @@
     const el = scroller();
     const delta = el ? forwardDelta(event, el) : 0, dir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
     // Momentum never changes direction and only slows down: a scroll the other way, or one
-    // that suddenly speeds up, is a new gesture even without a pause (no click needed).
+    // that suddenly speeds up, is a new gesture even without a pause (no click needed). So is
+    // a scroll that grows again twice in a row above the slowest point of the fling: fingers
+    // back on the trackpad. The reader pulls at the end of the chapter right away instead of
+    // waiting seconds for the fling's tail to stop.
+    const mag = Math.abs(delta), same = dir !== 0 && dir === swipe.lastDir;
     const reversed = dir !== 0 && swipe.lastDir !== 0 && dir !== swipe.lastDir;
-    const rising = dir !== 0 && dir === swipe.lastDir && Math.abs(delta) > 2 * swipe.lastMag + 6;
-    if (dir) { swipe.lastDir = dir; swipe.lastMag = Math.abs(delta); }
-    let fresh = gap > FRESH_GAP_MS || reversed;
+    swipe.rises = same && mag > swipe.lastMag ? swipe.rises + 1 : 0;
+    const regrowing = swipe.rises >= 2 && mag >= swipe.floor + 2;
+    const rising = same && (mag > 2 * swipe.lastMag + 6 || regrowing);
+    if (dir) { swipe.lastDir = dir; swipe.lastMag = mag; }
+    let fresh = gap > FRESH_GAP_MS || reversed || rising;
+    if (fresh || !same) { swipe.floor = mag; swipe.rises = 0; }
+    else swipe.floor = Math.min(swipe.floor, mag);
     if (swipe.swallow) {
       const theFling = dir === 0 || dir === swipe.swallowDir;
       if (swipe.busy || (theFling && gap <= FRESH_GAP_MS && !rising)) { event.preventDefault(); return; }

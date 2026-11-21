@@ -19,7 +19,8 @@ def _stored(service, book_id: int) -> tuple[set[str], list[Path]]:
             str(row["region_key"])
             for row in conn.execute("SELECT region_key FROM manga_ocr_cache WHERE book_id=?", (book_id,))
         }
-    return keys, sorted((service.cache_dir / "manga-ocr" / "artifacts").glob("*.json"))
+    # Written as .json.gz (older Pudge: .json).
+    return keys, sorted((service.cache_dir / "manga-ocr" / "artifacts").glob("*.json*"))
 
 
 def test_page_ocr_is_stored_and_reused_after_a_restart(tmp_path: Path, monkeypatch) -> None:
@@ -51,7 +52,9 @@ def test_ocr_of_a_previous_cache_generation_is_not_reused(tmp_path: Path, monkey
             (f"pudge-manga-regions-{previous}", book_id),
         )
     artifact.rename(
-        artifact.with_name(re.sub(r"-regions-[^.]+\.json$", f"-regions-{previous}.json", artifact.name))
+        artifact.with_name(
+            re.sub(r"-regions-[^.]+\.json(\.gz)?$", rf"-regions-{previous}.json\1", artifact.name)
+        )
     )
 
     page = service.text_regions(book_id, 0, cached_only=True)

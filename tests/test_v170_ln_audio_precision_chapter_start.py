@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ def test_precision_chapter_start_stt_is_cached_and_shifted(tmp_path: Path, monke
     service.cache_dir = tmp_path / "cache"
     service.stt_model = "mlx-community/whisper-tiny"
     service.python = "/usr/bin/python3"
+    service._closed_event = threading.Event()
 
     extract_calls: list[tuple[float, float]] = []
 
@@ -66,9 +68,9 @@ def test_precision_chapter_start_stt_is_cached_and_shifted(tmp_path: Path, monke
                         {
                             "start": 1.0,
                             "end": 2.0,
-                            "text": "小高い丘が続く",
+                            "text": "白い砂浜が続く",
                             "words": [
-                                {"start": 1.0, "end": 1.4, "word": "小高い丘"},
+                                {"start": 1.0, "end": 1.4, "word": "白い砂浜"},
                                 {"start": 1.4, "end": 2.0, "word": "が続く"},
                             ],
                         }
@@ -78,9 +80,10 @@ def test_precision_chapter_start_stt_is_cached_and_shifted(tmp_path: Path, monke
             ),
             encoding="utf-8",
         )
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0)
 
-    monkeypatch.setattr(audiobooks.subprocess, "run", fake_run)
+    # The chapter-start worker runs as a registered (cancellable) child process.
+    monkeypatch.setattr(audiobooks.subprocess, "Popen", fake_run)
 
     output = tmp_path / "alignment" / "abc.json"
     output.parent.mkdir(parents=True)
@@ -114,7 +117,7 @@ def test_precision_chapter_start_stt_is_cached_and_shifted(tmp_path: Path, monke
 
 def test_alignment_uses_precision_segments_only_for_chapter_start(monkeypatch) -> None:
     chapter_text = (
-        "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。"
         "風が乾いた地面をなで、遠くには低い山並みが見えている。"
         "旅人は静かな道を歩きながら、空の色を眺めていた。"
     ) * 4
@@ -152,8 +155,8 @@ def test_alignment_uses_precision_segments_only_for_chapter_start(monkeypatch) -
 
 def test_precision_window_recovers_real_wolf_spice_shape_after_tiny_prefix_failure() -> None:
     story = (
-        "小高い丘が延々と続く。岩ばかりが目立ち草も木も少ない。"
-        "道は丘と丘の間を縫って作られ旅人は静かに荷馬車を進めた。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り人も舟も少ない。"
+        "細い道は浜に沿って北へと伸び旅人は静かに荷馬車を進めた。"
     ) * 10
     broken_clock = [
         {"offset": 0, "time": 35.84},

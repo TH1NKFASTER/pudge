@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "PudgeCore",
-    platforms: [.iOS("18.0"), .macOS(.v13)],
+    platforms: [.iOS("17.0"), .macOS(.v13)],
     products: [.library(name: "PudgeCore", targets: ["PudgeCore"])],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3", providers: [.apt(["libsqlite3-dev"])]),

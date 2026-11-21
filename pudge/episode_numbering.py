@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import hashlib
 import logging
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Iterator
 
 from .config import AppConfig
 from .filename import normalize_title, title_similarity
+from .fsutil import atomic_write_json
 from .models import AniListAnime
 from .release_parser import double_episode_span, parse_release_name
 from .providers.anilist import AniListClient, AniListError
@@ -39,6 +42,13 @@ def release_series_identity(title: str) -> str:
 
 def is_split_stage(anime: Any) -> bool:
     return bool(_STAGE_SUFFIX_RE.search(_title(anime)))
+
+
+def season_zero_is_special(anime: Any) -> bool:
+    """Whether "S00Exx" is a special *beside* this entry's episodes: a TV series or a stage of
+    one. OVA/SPECIAL/ONA/TV_SHORT/MOVIE entries are often season 0 themselves (TVDB numbering:
+    "Re ZERO - S00E01 - Break Time 1"), so their S00 releases match by title as before."""
+    return anime is not None and (_format(anime) == "TV" or is_split_stage(anime))
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +121,10 @@ def match_release_episode(
     offset = 0
     group = str(parsed_release.group or "").casefold()
     season_key = "bare" if season is None else f"s{int(season)}"
-    if parsed_release.unsafe_single_episode or season == 0:
+    if season == 0 and not season_zero_is_special(anime):
+        # As before season 0 was parsed: a candidate for title matching, never "resolved".
+        mapped, status = None, "ambiguous"
+    elif parsed_release.unsafe_single_episode or season == 0:
         mapped, status = None, "rejected"
     elif raw is None or not parsed_release.explicit_episode:
         status = "ambiguous"
@@ -143,6 +156,15 @@ def match_release_episode(
                 for name in names
                 if len(release_series_identity(name)) >= 12
             )
+            # The release names this very stage ("... - 2nd & 3rd STAGE"), not only the
+            # storyline: its other numbering is this stage's continuation, as the
+            # relation graph says. Counts like "1st STAGE" alone stay a proposal.
+            names_this_stage = any(
+                _STAGE_SUFFIX_RE.search(name)
+                and len(normalize_title(name)) >= 12
+                and normalize_title(name) in release_text
+                for name in names
+            )
             scheme = (
                 "continuous-stage:"
                 + release_series_identity(_title(anime))
@@ -154,7 +176,7 @@ def match_release_episode(
             total = _episodes(anime)
             if not same_story:
                 mapped, status = None, "rejected"
-            elif learned is None and not (trusted_source and builtin_scope):
+            elif learned is None and not (names_this_stage or (trusted_source and builtin_scope)):
                 if mapped >= 1 and (not total or mapped <= total):
                     proposed = mapped
                 mapped, status = None, "ambiguous"
@@ -306,7 +328,7 @@ def _graph_from_db(
         if db is None:
             from .database import Database
 
-            db = Database(config.library.database_path)
+            db = Database(config.library.database_path, initialize=False)
         loader = getattr(db, "relation_graph_for_media", None)
         if not callable(loader):
             return None
@@ -469,6 +491,54 @@ def _cache_paths(config: AppConfig, media_id: int) -> tuple[Any, Any]:
     )
 
 
+# A failed live numbering lookup is not repeated by automatic searches for this
+# long (per title); a search the user started, a lookup that works or an
+# answered AniList list refresh clears it.
+_LOOKUP_FAILURE_SECONDS = 3 * 3600.0
+_AUTOMATIC: contextvars.ContextVar[bool] = contextvars.ContextVar("pudge_numbering_automatic", default=False)
+
+
+@contextmanager
+def automatic_lookups(enabled: bool = True) -> Iterator[None]:
+    """Numbering lookups made for an automatic (background) release search."""
+    token = _AUTOMATIC.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _AUTOMATIC.reset(token)
+
+
+def clear_lookup_failures(config: AppConfig) -> None:
+    """AniList answers again: forget every remembered numbering-lookup failure."""
+    try:
+        folder = config.paths.cache_dir / "anilist-numbering-failures"
+        for path in folder.glob("*.json"):
+            path.unlink(missing_ok=True)
+    except (OSError, TypeError, AttributeError):
+        pass
+
+
+def _lookup_failure_path(config: AppConfig, media_id: int) -> Any:
+    return config.paths.cache_dir / "anilist-numbering-failures" / f"{int(media_id)}.json"
+
+
+def _recent_lookup_failure(config: AppConfig, media_id: int) -> bool:
+    try:
+        path = _lookup_failure_path(config, media_id)
+        return path.is_file() and time.time() - path.stat().st_mtime < _LOOKUP_FAILURE_SECONDS
+    except (OSError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def _note_lookup_failure(config: AppConfig, media_id: int) -> None:
+    try:
+        path = _lookup_failure_path(config, media_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"media_id": int(media_id), "failed_at": time.time()}), encoding="utf-8")
+    except (OSError, TypeError, ValueError, AttributeError):
+        pass
+
+
 def _read_cache(path: Any, *, media_episode: int, allow_legacy: bool = True) -> EpisodeNumbering | None:
     try:
         if not path.is_file():
@@ -543,12 +613,7 @@ def _write_caches(
     for path in (release_path, jimaku_path):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temporary.replace(path)
+            atomic_write_json(path, payload, ensure_ascii=False, separators=(",", ":"))
         except OSError:
             continue
 
@@ -764,7 +829,21 @@ def _resolve_base(
             )
         return best
 
-    if allow_network and bool(config.anilist.enabled):
+    if (
+        allow_network
+        and bool(config.anilist.enabled)
+        and _AUTOMATIC.get()
+        and _recent_lookup_failure(config, media_id)
+    ):
+        # The live lookup failed a moment ago (AniList refusing, offline): the
+        # next maintenance pass must not ask again for every title.
+        if logger is not None:
+            logger.info(
+                "SKIP step=episode_numbering media_id=%s episode=%s reason=recent_failure",
+                media_id,
+                media_episode,
+            )
+    elif allow_network and bool(config.anilist.enabled):
         client = AniListClient(
             config.anilist.endpoint,
             access_token=config.anilist.access_token,
@@ -775,6 +854,7 @@ def _resolve_base(
                 media_episode,
             )
         except (AniListError, OSError, ValueError) as exc:
+            _note_lookup_failure(config, media_id)
             if logger is not None:
                 logger.info(
                     "SKIP step=episode_numbering media_id=%s episode=%s reason=%r",
@@ -783,6 +863,10 @@ def _resolve_base(
                     exc,
                 )
         else:
+            try:
+                _lookup_failure_path(config, media_id).unlink(missing_ok=True)
+            except (OSError, TypeError, AttributeError):
+                pass
             offset = max(0, int(absolute) - media_episode)
             stage_rule = ""
             if is_split_stage(anime):
@@ -926,6 +1010,8 @@ def media_episode_from_release(
     if release_name:
         parsed = parse_release_name(release_name)
         release_season = parsed.season
+        if release_season == 0 and not season_zero_is_special(anime):
+            release_season = None  # an OVA/SPECIAL entry's own "S00E02" is its episode 2
         if parsed.unsafe_single_episode:
             # Two consecutive episodes in one file ("01-02", audit 17А) map to
             # their first episode when both numbers map to consecutive local
@@ -963,16 +1049,20 @@ def media_episode_from_release(
         return value if requested_media_episode in (None, value) else None
     total = _episodes(anime)
     rules = _external_rules(anime, config, logger) if _format(anime) in _COUNTED_FORMATS else ()
-    basis = _resolve_base(anime, 1, config, logger, db=db, allow_network=allow_network)
-    if is_split_stage(anime) and release_name:
-        basis = _with_stage_scopes(basis, anime, config, db, logger)
-        match = match_release_episode(anime, parsed, requested_media_episode, basis, trusted_source=True)
-        return match.mapped_media_episode if match.status == "resolved" else None
-    if is_split_stage(anime) and basis.offset:
-        local = value - basis.offset
-        if local < 1 or (total and local > total) or requested_media_episode not in (None, local):
-            return None
-        return local
+    if is_split_stage(anime):
+        # Only a split-stage title needs the chain's numbering before the in-range answer
+        # below. It was resolved for every call: each file of a library scan read and
+        # walked the relation graph and rewrote two cache files for a number in range.
+        basis = _resolve_base(anime, 1, config, logger, db=db, allow_network=allow_network)
+        if release_name:
+            basis = _with_stage_scopes(basis, anime, config, db, logger)
+            match = match_release_episode(anime, parsed, requested_media_episode, basis, trusted_source=True)
+            return match.mapped_media_episode if match.status == "resolved" else None
+        if basis.offset:
+            local = value - basis.offset
+            if local < 1 or (total and local > total) or requested_media_episode not in (None, local):
+                return None
+            return local
     if release_season is not None and rules:
         if int(release_season) == 0:
             return None  # S00Exx is a special, never a regular episode

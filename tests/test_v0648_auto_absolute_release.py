@@ -28,8 +28,8 @@ def _release(*, score: float = 176.2, seeders: int = 482, reasons: list[str] | N
             "Bleach: Thousand-Year Blood War - The Calamity | "
             "Bleach: Sennen Kessen-hen - Kashin-tan"
         ),
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="a" * 40,
         size_text="1006.8 MiB",
         size_bytes=1007 * 1024 * 1024,

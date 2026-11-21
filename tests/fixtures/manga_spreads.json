@@ -1,0 +1,280 @@
+{
+ "about": "Manga two-page spreads: the cases both readers must agree on (pudge/manga_spreads.py, ios/PudgeCore MangaSpreads.spreads). Page indices from 0; wide = pages that are one picture over two pages; shift = 'Shift pairs by one page'.",
+ "cases": [
+  {
+   "name": "an empty volume",
+   "pageCount": 0,
+   "wide": [],
+   "shift": false,
+   "spreads": []
+  },
+  {
+   "name": "one page",
+   "pageCount": 1,
+   "wide": [],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ]
+   ]
+  },
+  {
+   "name": "the cover alone, then pairs",
+   "pageCount": 6,
+   "wide": [],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "name": "an odd last page alone",
+   "pageCount": 5,
+   "wide": [],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     4
+    ]
+   ]
+  },
+  {
+   "name": "a wide page alone, the page before it without a partner",
+   "pageCount": 9,
+   "wide": [
+    4
+   ],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     7,
+     8
+    ]
+   ]
+  },
+  {
+   "name": "pairs start again after a spread",
+   "pageCount": 8,
+   "wide": [
+    3
+   ],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     6,
+     7
+    ]
+   ]
+  },
+  {
+   "name": "a wide cover and two spreads in a row",
+   "pageCount": 5,
+   "wide": [
+    0,
+    1,
+    2
+   ],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    [
+     3,
+     4
+    ]
+   ]
+  },
+  {
+   "name": "a wide last page",
+   "pageCount": 6,
+   "wide": [
+    5
+   ],
+   "shift": false,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     5
+    ]
+   ]
+  },
+  {
+   "name": "shifted: the page after the cover alone too",
+   "pageCount": 7,
+   "wide": [],
+   "shift": true,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     6
+    ]
+   ]
+  },
+  {
+   "name": "shifted with a spread: pairs after it are as without the shift",
+   "pageCount": 10,
+   "wide": [
+    5
+   ],
+   "shift": true,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     4
+    ],
+    [
+     5
+    ],
+    [
+     6,
+     7
+    ],
+    [
+     8,
+     9
+    ]
+   ]
+  },
+  {
+   "name": "shifted, the page after the cover is wide",
+   "pageCount": 6,
+   "wide": [
+    1
+   ],
+   "shift": true,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     4,
+     5
+    ]
+   ]
+  },
+  {
+   "name": "shifted, two pages",
+   "pageCount": 2,
+   "wide": [],
+   "shift": true,
+   "spreads": [
+    [
+     0
+    ],
+    [
+     1
+    ]
+   ]
+  },
+  {
+   "name": "shifted, one page",
+   "pageCount": 1,
+   "wide": [],
+   "shift": true,
+   "spreads": [
+    [
+     0
+    ]
+   ]
+  }
+ ]
+}

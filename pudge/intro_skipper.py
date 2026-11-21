@@ -47,6 +47,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from . import audio_timeline
+from .fsutil import atomic_write_json
 from .audio_fingerprints import (
     ENGINE_VERSION,
     AudioFingerprint,
@@ -59,9 +61,15 @@ from .audio_fingerprints import (
     save_fingerprint,
 )
 from .intro_library import TitleLibrary, VariantRef, episodes_expected, match_variant, prune_libraries
+from .process_priority import BACKGROUND_NICE
 
-DETECTOR_VERSION = "intro-1"
+# intro-2: a stretch broken by a few seconds is one stretch; intro-3: a stretch is extended by
+# short clearly-matching pieces a few seconds before/after it (an ED found ~5-9 s late).
+DETECTOR_VERSION = "intro-3"
 ALGORITHM_VERSION = f"{ENGINE_VERSION}+{DETECTOR_VERSION}"
+# Results of these older detectors still serve playback until the background pass has
+# recomputed the file (a detector update must not take every Skip button away for hours).
+PLAYBACK_FALLBACK_VERSIONS = frozenset({f"{ENGINE_VERSION}+intro-2"})
 SOURCE = "local-fingerprint"
 HEAD_SECONDS = 6 * 60.0
 TAIL_SECONDS = 7 * 60.0
@@ -108,8 +116,14 @@ class AnalysisReport:
     found: int = 0
     empty: int = 0
     errors: int = 0
+    repaired: int = 0
     stopped: str = ""
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def progressed(self) -> bool:
+        """Did anything: fingerprinted, analysed, failed or repaired a file."""
+        return bool(self.fingerprinted or self.analysed or self.errors or self.repaired)
 
 
 def identity_of(path: Path) -> str:
@@ -144,10 +158,8 @@ class IntroSkipperCache:
     def write_result(self, identity: str, payload: dict[str, Any]) -> None:
         path = self.result_path(identity)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".result.", dir=str(path.parent))
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({**payload, "identity": identity}, handle, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp, path)
+        # A failed dump (a value json cannot write, a full disk) left a stray .result.* file.
+        atomic_write_json(path, {**payload, "identity": identity}, ensure_ascii=False, sort_keys=True)
         self.written.append(path)
 
 
@@ -155,7 +167,12 @@ def segments_for_video(cache_dir: Path, video: Path) -> list[MediaSegment]:
     """Ready segments of one file (cache only, cheap; for playback). Never analyses."""
     identity = identity_of(Path(video))
     data = IntroSkipperCache(cache_dir).read_result(identity)
-    if not data or data.get("status") != "found" or data.get("algorithm") != ALGORITHM_VERSION:
+    if data and data.get("status") == "error" and isinstance(data.get("fallback"), dict):
+        # A recompute failed (a busy file): the segments found before still skip meanwhile.
+        data = {**data["fallback"], "status": "found"}
+    if not data or data.get("status") != "found":
+        return []
+    if data.get("algorithm") != ALGORITHM_VERSION and data.get("algorithm") not in PLAYBACK_FALLBACK_VERSIONS:
         return []
     result: list[MediaSegment] = []
     for row in data.get("segments") or []:
@@ -178,43 +195,115 @@ def segments_for_video(cache_dir: Path, video: Path) -> list[MediaSegment]:
 SESSION_VERSION = 1
 
 
-def write_playback_session(cache_dir: Path, video: Path) -> Path | None:
+def _session_rows(segments: Sequence[MediaSegment]) -> list[dict[str, Any]]:
+    return [
+        {
+            "kind": segment.kind,
+            "start": segment.start_seconds,
+            "end": segment.end_seconds,
+            "confidence": segment.confidence,
+            "source": segment.source,
+        }
+        for segment in segments
+    ]
+
+
+def write_playback_session(cache_dir: Path, video: Path, *, pending: bool = False) -> Path | None:
     """Session JSON for the mpv skip script, from *ready* segments only.
 
-    Never analyses or waits.  Returns None when the file has no segments.
-    The caller deletes the file when mpv exits.
+    Never analyses or waits.  Returns None when the file has no segments, unless
+    ``pending``: then the session has no segments yet and ``"pending": true`` (the
+    skip script re-reads it until segments arrive or ``pending`` turns false; see
+    ``refresh_playback_session``). The caller deletes the file when mpv exits.
     """
     import secrets
 
     video = Path(video)
     segments = segments_for_video(cache_dir, video)
-    if not segments:
+    if not segments and not pending:
         return None
     session_id = secrets.token_hex(8)
-    payload = {
+    payload: dict[str, Any] = {
         "version": SESSION_VERSION,
         "session_id": session_id,
         "video": str(video),
         "video_absolute": str(video.expanduser().resolve()),
-        "fingerprint": segments[0].media_fingerprint,
-        "segments": [
-            {
-                "kind": segment.kind,
-                "start": segment.start_seconds,
-                "end": segment.end_seconds,
-                "confidence": segment.confidence,
-                "source": segment.source,
-            }
-            for segment in segments
-        ],
+        "fingerprint": segments[0].media_fingerprint if segments else identity_of(video),
+        "segments": _session_rows(segments),
     }
-    directory = Path(cache_dir).expanduser() / "intro-skipper" / "sessions"
+    if not segments:
+        payload["pending"] = True
+    directory = _sessions_dir(cache_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{session_id}.json"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False)
     return path
+
+
+def _sessions_dir(cache_dir: Path) -> Path:
+    return Path(cache_dir).expanduser() / "intro-skipper" / "sessions"
+
+
+def refresh_playback_session(cache_dir: Path, session: Path, *, final: bool = False) -> int | None:
+    """Put segments that became ready into a pending session (mpv picks them up).
+
+    Returns the number of segments in the session, or None when it is gone / not readable.
+    ``final``: detection for this playback is over; a session still without segments
+    stops being pending (the skip script stops re-reading it). Only ready segments are
+    written, as at launch; a session that is not pending is left as it is.
+    """
+    session = Path(session)
+    try:
+        data = json.loads(session.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        return None
+    if not data.get("pending"):
+        return len(data["segments"])
+    segments = segments_for_video(cache_dir, Path(str(data.get("video") or "")))
+    if not segments and not final:
+        return 0
+    payload = {**data, "segments": _session_rows(segments), "pending": False}
+    if segments:
+        payload["fingerprint"] = segments[0].media_fingerprint
+    if not session.exists():
+        return None  # mpv exited and its session was removed meanwhile: never recreate it
+    fd, tmp = tempfile.mkstemp(prefix=".session.", dir=str(session.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, session)
+    except OSError:
+        Path(tmp).unlink(missing_ok=True)
+        return None
+    return len(segments)
+
+
+SESSION_REFRESH_MAX_AGE_SECONDS = 12 * 3600.0
+
+
+def refresh_playback_sessions(cache_dir: Path, logger: logging.Logger | None = None) -> int:
+    """After a pass: feed every open pending session whose video now has segments."""
+    directory = _sessions_dir(cache_dir)
+    if not directory.is_dir():
+        return 0
+    updated = 0
+    now = time.time()
+    for path in directory.glob("*.json"):
+        try:
+            if now - path.stat().st_mtime > SESSION_REFRESH_MAX_AGE_SECONDS:
+                continue  # left by a player that crashed
+            pending = json.loads(path.read_text(encoding="utf-8")).get("pending")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if pending and refresh_playback_session(cache_dir, path):
+            updated += 1
+    if updated and logger is not None:
+        logger.info("EVENT step=intro_skipper.session_refresh sessions=%s", updated)
+    return updated
 
 
 # ---------------------------------------------------------------- probing ---
@@ -265,6 +354,77 @@ def cached_fingerprints(
     return None
 
 
+def _early_legacy_fingerprints(cache: IntroSkipperCache, item: EpisodeFile, ffprobe: str) -> bool:
+    """Fingerprints made before the playback timeline whose opening times are off.
+
+    A track that starts late made them early by its delay; audio that starts before
+    the video lost its lead in the opening region (a seek to the first keyframe).
+    A timestamp gap inside a fingerprinted region (timeline version 2) made what
+    followed it early by the gap.
+    Such a file is fingerprinted again and its old result dropped. Other files keep
+    theirs, marked as checked so that no later process probes them again.
+    """
+    meta_path = _meta_path(cache, item.identity)
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(meta, dict) or not Path(item.path).is_file():
+        return False
+    try:
+        version = int(meta.get("timeline") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= audio_timeline.VERSION:
+        return False
+    stream = meta.get("stream")
+    try:
+        index = int(stream) if stream is not None else None
+    except (TypeError, ValueError):
+        index = None
+    found = audio_timeline.timeline(item.path, ffprobe)
+    if found is None:
+        return False  # not probed (yet): nothing known, nothing stamped
+    moved = bool(version < 1 and (found.delay(index=index) or found.video_lead()))
+    if not moved:
+        try:
+            duration = float(meta.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        gaps = _gaps_of(item.path, ffprobe, found, index)
+        if gaps is None:
+            return False  # not scanned (yet): nothing stamped
+        moved = any(_gap_in_region(gaps, start, end) for start, end in _regions(duration or HEAD_SECONDS))
+    if not moved:
+        try:
+            meta_path.write_text(json.dumps({**meta, "timeline": audio_timeline.VERSION}), encoding="utf-8")
+        except OSError:
+            pass
+        return False
+    cache.result_path(item.identity).unlink(missing_ok=True)
+    return True
+
+
+def _gaps_of(
+    path: Path, ffprobe: str, found: audio_timeline.AudioTimeline, index: int | None
+) -> tuple[tuple[float, float], ...] | None:
+    """Timestamp gaps inside the track, at playback times."""
+    gaps = audio_timeline.inner_gaps(path, ffprobe, index=index)
+    if gaps is None:
+        return None
+    return tuple((at - found.format_start, length) for at, length in gaps)
+
+
+def _regions(duration: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    """The head and tail regions that are fingerprinted (playback times)."""
+    return (0.0, min(HEAD_SECONDS, duration)), (max(0.0, duration - TAIL_SECONDS), duration)
+
+
+def _gap_in_region(gaps: tuple[tuple[float, float], ...], start: float, end: float) -> bool:
+    # A region read with -ss starts at the right time: only a gap inside it collapses.
+    return any(start - 0.5 < at < end for at, _length in gaps)
+
+
 def _fingerprints_for(
     item: EpisodeFile,
     cache: IntroSkipperCache,
@@ -277,15 +437,33 @@ def _fingerprints_for(
     """Cached or new (head, tail, duration, computed); None when not cached and not allowed to compute."""
     meta_path = _meta_path(cache, item.identity)
     cached = cached_fingerprints(cache, item.identity)
-    if cached is not None:
+    if cached is not None and not _early_legacy_fingerprints(cache, item, ffprobe):
         return (*cached, False)
     if not allow_compute:
         return None
     duration, stream = probe_audio(item.path, ffprobe)
     if duration < MIN_FILE_SECONDS:
         raise FingerprintError(f"too short for OP/ED ({duration:.0f} s)")
-    head_len = min(HEAD_SECONDS, duration)
-    tail_start = max(0.0, duration - TAIL_SECONDS)
+    (_head_start, head_len), (tail_start, _end) = _regions(duration)
+    # Times are playback times (the mpv skip compares them with time-pos): a
+    # track that starts after the file start is decoded with that silence first.
+    # Audio that starts before the video: a region from 0 is read without a seek.
+    found = audio_timeline.timeline(item.path, ffprobe)
+    delay = found.delay(index=stream) if found is not None else 0.0  # no index: the first track
+    timeline_kwargs: dict[str, Any] = {}
+    if delay:
+        timeline_kwargs["leading_silence"] = delay
+    elif found is not None and found.video_lead():
+        timeline_kwargs["from_file_start"] = True
+    # A gap inside a region (a remux seam) is filled: that region is decoded from the
+    # file start (only such files pay for it).
+    gaps = _gaps_of(item.path, ffprobe, found, stream) if found is not None else None
+    head_kwargs = dict(timeline_kwargs)
+    tail_kwargs = dict(timeline_kwargs)
+    if gaps and _gap_in_region(gaps, 0.0, head_len):
+        head_kwargs["fill_gaps"] = True
+    if gaps and _gap_in_region(gaps, tail_start, duration):
+        tail_kwargs["fill_gaps"] = True
     head = fingerprint_samples(
         decode_region(
             item.path,
@@ -294,6 +472,8 @@ def _fingerprints_for(
             duration_seconds=head_len,
             stream_index=stream,
             cancel_check=cancel_check,
+            nice=BACKGROUND_NICE,
+            **head_kwargs,
         ),
         start_seconds=0.0,
     )
@@ -305,6 +485,8 @@ def _fingerprints_for(
             duration_seconds=duration - tail_start,
             stream_index=stream,
             cancel_check=cancel_check,
+            nice=BACKGROUND_NICE,
+            **tail_kwargs,
         ),
         start_seconds=tail_start,
     )
@@ -316,7 +498,13 @@ def _fingerprints_for(
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(
         json.dumps(
-            {"engine": ENGINE_VERSION, "stream": stream, "duration": duration, "identity": item.identity}
+            {
+                "engine": ENGINE_VERSION,
+                "stream": stream,
+                "duration": duration,
+                "identity": item.identity,
+                "timeline": audio_timeline.VERSION,
+            }
         ),
         encoding="utf-8",
     )
@@ -353,6 +541,7 @@ def _consensus(
 
 
 CONFIRMED_SUPPORT = 3  # a confirmed library variant counts like three agreeing partners
+VARIANT_EDGE_SLACK = 1.0  # seconds: partner consensus covering a variant match and reaching past it
 
 
 def _confidence(supporters: int, ber: float) -> float:
@@ -390,6 +579,26 @@ def _match_library(
     return best
 
 
+def _partner_consensus(
+    mine: AudioFingerprint,
+    index: int,
+    partners: Sequence[tuple[EpisodeFile, tuple[AudioFingerprint, AudioFingerprint, float]]],
+    settings: DetectorSettings,
+) -> tuple[float, float, int, float] | None:
+    candidates: list[tuple[float, float, float]] = []
+    for _partner, fps in partners:
+        run = best_shared_run(
+            mine,
+            fps[index],
+            min_seconds=settings.min_seconds,
+            max_seconds=settings.max_seconds,
+            max_bit_error=settings.max_bit_error,
+        )
+        if run is not None:
+            candidates.append((run.a_start, run.a_end, run.bit_error_rate))
+    return _consensus(candidates, settings.agree_seconds)
+
+
 def _detect(
     target: EpisodeFile,
     target_fp: tuple[AudioFingerprint, AudioFingerprint, float],
@@ -402,6 +611,28 @@ def _detect(
     found: list[tuple[MediaSegment, str | None]] = []
     for kind, mine, index in (("intro", head, 0), ("outro", tail, 1)):
         stored = _match_library(mine, variants.get(kind) or (), settings)
+        if stored is not None and partners:
+            shared = _partner_consensus(mine, index, partners, settings)
+            if shared is not None and shared[1] - shared[0] <= settings.max_seconds:
+                if (
+                    not stored[3].confirmed
+                    and shared[0] < stored[1]
+                    and stored[0] < shared[1]
+                    and (shared[1] - shared[0]) >= (stored[1] - stored[0]) + 5.0
+                ):
+                    # An unconfirmed variant can be a piece of the real OP (made before broken
+                    # pieces were joined: Assassination Classroom E08's 48 s "OP"). A longer
+                    # stretch the partners share over it wins.
+                    stored = None
+                elif (
+                    shared[0] <= stored[0] + VARIANT_EDGE_SLACK
+                    and shared[1] >= stored[1] - VARIANT_EDGE_SLACK
+                    and max(stored[0] - shared[0], shared[1] - stored[1]) >= VARIANT_EDGE_SLACK
+                ):
+                    # A variant cut from an older, shorter detection (an ED found a few seconds
+                    # late) is grown to what the partners share around it; ``observe`` then
+                    # re-cuts the variant, so later lone episodes get the full span too.
+                    stored = (min(stored[0], shared[0]), max(stored[1], shared[1]), stored[2], stored[3])
         if stored is not None:
             start, end, ber, ref = stored
             start, end = max(0.0, start), min(duration, end)
@@ -420,18 +651,7 @@ def _detect(
                 segments.append(segment)
                 found.append((segment, ref.id))
                 continue
-        candidates: list[tuple[float, float, float]] = []
-        for _partner, fps in partners:
-            run = best_shared_run(
-                mine,
-                fps[index],
-                min_seconds=settings.min_seconds,
-                max_seconds=settings.max_seconds,
-                max_bit_error=settings.max_bit_error,
-            )
-            if run is not None:
-                candidates.append((run.a_start, run.a_end, run.bit_error_rate))
-        agreed = _consensus(candidates, settings.agree_seconds)
+        agreed = _partner_consensus(mine, index, partners, settings)
         if agreed is None:
             continue
         start, end, supporters, ber = agreed
@@ -487,6 +707,29 @@ def _partner_ids(
     return ids | (library.variant_ids() if library is not None else set())
 
 
+def _in_error_backoff(result: dict[str, Any] | None, now: float) -> bool:
+    return bool(
+        result
+        and result.get("status") == "error"
+        and result.get("algorithm") == ALGORITHM_VERSION
+        and now < float(result.get("retry_after") or 0)
+    )
+
+
+def _library_copies(files: Sequence[EpisodeFile]) -> dict[int, str]:
+    """Episode -> identity of the one file per episode the title library keeps.
+
+    The library has one slot per episode. With two files of one episode number (an upgrade
+    kept both; Baccano's "S00E01 ... OVA 1" filed as episode 1 next to S01E01) it keeps the
+    last one by path, so ``title_needs_analysis`` and ``analyze_title`` agree on which copy
+    it must have observed. The other copies still get their own per-file results.
+    """
+    chosen: dict[int, str] = {}
+    for item in sorted(files, key=lambda item: (item.episode, str(item.path))):
+        chosen[item.episode] = item.identity
+    return chosen
+
+
 def title_needs_analysis(
     files: Sequence[EpisodeFile],
     cache: IntroSkipperCache,
@@ -496,20 +739,23 @@ def title_needs_analysis(
 ) -> bool:
     """Same partner choice as ``analyze_title``; files in an error back-off are left out."""
     results = {item.identity: cache.read_result(item.identity) for item in files}
-    usable = [
-        item
-        for item in files
-        if not (
-            results[item.identity]
-            and results[item.identity].get("status") == "error"
-            and results[item.identity].get("algorithm") == ALGORITHM_VERSION
-            and now < float(results[item.identity].get("retry_after") or 0)
-        )
-    ]
+    if any(_same_episode_twins(item, results[item.identity], cache) for item in files):
+        return True  # found together with another copy of the same episode: forget and redo
+    usable = [item for item in files if not _in_error_backoff(results[item.identity], now)]
+    copies = _library_copies(usable)
     has_library = library is not None and library.has_reference(item.episode for item in usable)
     if len(usable) < 2 and not (usable and has_library):
-        return False
-    if library is not None and any(not library.observed(item.episode, item.identity) for item in usable):
+        # A lone episode is still fingerprinted into the title's library, so the next one has
+        # a partner: a weekly show whose watched episode was deleted before the next one came
+        # never had two files at once, and never got an intro skip.
+        return bool(
+            library is not None
+            and usable
+            and any(not library.has_episode(item.episode, item.identity) for item in usable)
+        )
+    if library is not None and any(
+        not library.observed(episode, identity) for episode, identity in copies.items()
+    ):
         return True
     stored = library.stored_ids({i.episode for i in usable}) if library is not None else []
     pool = list(usable) + [EpisodeFile(path=Path(), episode=e, identity=i) for e, i in stored]
@@ -519,8 +765,68 @@ def title_needs_analysis(
     )
 
 
+def _same_episode_twins(
+    item: EpisodeFile, result: dict[str, Any] | None, cache: IntroSkipperCache
+) -> list[str]:
+    """Partners of a found result that were other copies of the same episode."""
+    if not result or result.get("status") != "found":
+        return []
+    twins = []
+    for partner in result.get("partners") or []:
+        if str(partner).startswith("variant:") or partner == item.identity:
+            continue
+        other = cache.read_result(str(partner))
+        if other is not None and other.get("episode") == item.episode:
+            twins.append(str(partner))
+    return twins
+
+
+def _forget_same_episode_pairs(
+    files: Sequence[EpisodeFile],
+    cache: IntroSkipperCache,
+    library: TitleLibrary | None,
+    log: logging.Logger,
+) -> int:
+    """Drop what two copies of one episode "found" together (before _nearest left them out).
+
+    The result goes (the file is analysed again with real partners), and so do the library
+    variants that analysis created: heard in that episode only and made at the same moment.
+    """
+    forgotten = 0
+    for item in files:
+        result = cache.read_result(item.identity)
+        if not result or result.get("status") != "found":
+            continue
+        twins = _same_episode_twins(item, result, cache)
+        if not twins:
+            continue
+        cache.result_path(item.identity).unlink(missing_ok=True)
+        dropped: list[str] = []
+        if library is not None:
+            checked = float(result.get("checked_at") or 0.0)
+            for variant_id, row in list(library.data.get("variants", {}).items()):
+                episodes = [int(value) for value in row.get("episodes") or []]
+                if (
+                    episodes == [int(item.episode)]
+                    and abs(float(row.get("created_at") or 0.0) - checked) <= 120.0
+                ):
+                    library._remove_variant(variant_id)
+                    dropped.append(variant_id)
+        forgotten += 1
+        log.info(
+            "REPAIR step=intro_skipper.same_episode_pair episode=%s path=%s twins=%s variants_dropped=%s",
+            item.episode,
+            item.path.name,
+            len(twins),
+            ",".join(dropped) or "-",
+        )
+    return forgotten
+
+
 def _nearest(items: Sequence[EpisodeFile], target: EpisodeFile, limit: int) -> list[EpisodeFile]:
-    others = [item for item in items if item.identity != target.identity]
+    # Another copy of the same episode (an upgrade kept both) shares all of its audio, not
+    # only the opening: Kusuriya no Hitorigoto S3 #3 got "the opening" at 4:05-6:00.
+    others = [item for item in items if item.identity != target.identity and item.episode != target.episode]
     others.sort(key=lambda item: (abs(item.episode - target.episode), item.episode))
     return others[:limit]
 
@@ -537,7 +843,10 @@ def analyze_title(
     logger: logging.Logger | None = None,
     now: Callable[[], float] = time.time,
     library: TitleLibrary | None = None,
+    prefer: Iterable[str] = (),
 ) -> AnalysisReport:
+    """``prefer``: identities fingerprinted first (a just downloaded or playing episode), so
+    the fingerprint budget is never spent on older files before them."""
     log = logger or logging.getLogger(__name__)
     report = AnalysisReport()
     try:
@@ -553,6 +862,7 @@ def analyze_title(
             log=log,
             stamp=now(),
             library=library,
+            prefer=frozenset(prefer),
         )
     finally:
         if library is not None:
@@ -573,6 +883,7 @@ def _analyze_title(
     log: logging.Logger,
     stamp: float,
     library: TitleLibrary | None,
+    prefer: frozenset[str] = frozenset(),
 ) -> AnalysisReport:
     ordered = sorted(files, key=lambda item: (item.episode, str(item.path)))
     fingerprints: dict[str, tuple[AudioFingerprint, AudioFingerprint, float]] = {}
@@ -581,14 +892,15 @@ def _analyze_title(
     def cancel() -> bool:
         return should_stop() is not None
 
-    for item in ordered:
+    usable: list[EpisodeFile] = []
+    # Preferred files first (stable: episode order otherwise).
+    for item in sorted(ordered, key=lambda item: item.identity not in prefer):
         reason = should_stop()
         if reason:
             report.stopped = reason
             return report
-        existing = cache.read_result(item.identity)
-        if existing and existing.get("status") == "error" and stamp < float(existing.get("retry_after") or 0):
-            continue
+        if _in_error_backoff(cache.read_result(item.identity), stamp):
+            continue  # as title_needs_analysis: an error of an older algorithm is retried
         try:
             fps = _fingerprints_for(
                 item, cache, ffmpeg=ffmpeg, ffprobe=ffprobe, allow_compute=budget > 0, cancel_check=cancel
@@ -599,6 +911,9 @@ def _analyze_title(
                 return report
             report.errors += 1
             log.info("FAIL step=intro_skipper.fingerprint path=%s error=%r", item.path.name, str(exc)[:200])
+            previous = cache.read_result(item.identity) or {}
+            if previous.get("status") == "error":
+                previous = previous.get("fallback") or {}
             cache.write_result(
                 item.identity,
                 {
@@ -610,9 +925,22 @@ def _analyze_title(
                     "segments": [],
                     "partners": [],
                     "path": str(item.path),
+                    # What playback used before this failed recompute (an earlier version's
+                    # "found"): kept for segments_for_video until a recompute succeeds.
+                    **(
+                        {
+                            "fallback": {
+                                "algorithm": previous.get("algorithm"),
+                                "segments": list(previous.get("segments") or []),
+                            }
+                        }
+                        if previous.get("status", "found") == "found" and previous.get("segments")
+                        else {}
+                    ),
                 },
             )
             continue
+        usable.append(item)  # what title_needs_analysis counts next time (no error back-off)
         if fps is None:
             continue
         if fps[3]:
@@ -621,9 +949,17 @@ def _analyze_title(
         fingerprints[item.identity] = fps[:3]
 
     ready = [item for item in ordered if item.identity in fingerprints]
+    report.repaired = _forget_same_episode_pairs(ready, cache, library, log)
+    # The files title_needs_analysis expects in the library (one per episode number).
+    copies = _library_copies(usable)
+
+    def in_library(item: EpisodeFile) -> bool:
+        return library is not None and copies.get(item.episode) == item.identity
+
     if library is not None:
         for item in ready:
-            library.add_episode(item.episode, item.identity, fingerprints[item.identity])
+            if in_library(item):
+                library.add_episode(item.episode, item.identity, fingerprints[item.identity])
     stored = _stored_files(library, {item.episode for item in ready})
     stored_fps = {partner.identity: fps for partner, fps in stored}
     pool = list(ready) + [partner for partner, _fps in stored]
@@ -643,7 +979,7 @@ def _analyze_title(
         partner_ids = _partner_ids(pool, item, settings, library)
         existing = cache.read_result(item.identity)
         if not _needs_analysis(existing, partner_ids, stamp):
-            if library is not None and not library.observed(item.episode, item.identity):
+            if in_library(item) and not library.observed(item.episode, item.identity):
                 library.observe(
                     item.episode,
                     item.identity,
@@ -660,7 +996,7 @@ def _analyze_title(
             variants,
         )
         segments = [segment for segment, _variant in found]
-        if library is not None:
+        if in_library(item):
             library.observe(
                 item.episode,
                 item.identity,
@@ -756,6 +1092,278 @@ def _resolve(tool: str) -> str:
     return str(candidate) if candidate.is_file() else (shutil.which(str(tool)) or str(tool))
 
 
+NO_PROGRESS_FILE = "no-progress.json"
+NO_PROGRESS_RECHECK_SECONDS = 24 * 3600.0
+DEFERRAL_LOG_SECONDS = 3600.0
+_deferral_logged: dict[str, float] = {}
+
+
+def _log_deferral(log: logging.Logger, reason: str) -> None:
+    """The pass waits (mpv open, heavy work): say why, at most once an hour per reason."""
+    now = time.monotonic()
+    last = _deferral_logged.get(reason)
+    if last is not None and now - last < DEFERRAL_LOG_SECONDS:
+        return
+    _deferral_logged[reason] = now
+    log.info(
+        "SKIP step=intro_skipper.pass reason=deferred wait=%s log_every_s=%d", reason, DEFERRAL_LOG_SECONDS
+    )
+
+
+def _title_signature(media_id: int, files: Sequence[EpisodeFile], cache: IntroSkipperCache) -> str:
+    """What one title's analysis starts from: its files, their results and its library."""
+    rows = []
+    for item in sorted(files, key=lambda item: (item.episode, item.identity, str(item.path))):
+        result = cache.read_result(item.identity) or {}
+        rows.append(
+            [
+                item.episode,
+                item.identity,
+                result.get("algorithm"),
+                result.get("status"),
+                result.get("checked_at"),
+                sorted(str(p) for p in result.get("partners") or []),
+            ]
+        )
+    library: Any = None
+    path = cache.root / "library" / str(int(media_id)) / "library.json"
+    try:
+        library = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        library = None
+    if isinstance(library, dict):
+        library = {key: value for key, value in library.items() if key != "updated_at"}
+    payload = json.dumps([ALGORITHM_VERSION, rows, library], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recheck_at(files: Sequence[EpisodeFile], cache: IntroSkipperCache, now: float) -> float:
+    """When a title that did nothing is looked at again although nothing changed: the next
+    retry time of one of its results, at the latest after a day."""
+    due = now + NO_PROGRESS_RECHECK_SECONDS
+    for item in files:
+        result = cache.read_result(item.identity) or {}
+        retry = float(result.get("retry_after") or 0)
+        if now < retry < due:
+            due = retry
+    return due
+
+
+def _load_no_progress(cache: IntroSkipperCache) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads((cache.root / NO_PROGRESS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    memo: dict[str, dict[str, Any]] = {}
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(value.get("until"), (int, float)):
+            memo[str(key)] = value
+    return memo
+
+
+def _save_no_progress(cache: IntroSkipperCache, memo: dict[str, dict[str, Any]], now: float) -> None:
+    kept = {key: value for key, value in memo.items() if float(value.get("until") or 0) > now}
+    path = cache.root / NO_PROGRESS_FILE
+    try:
+        if not kept:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, kept, sort_keys=True)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "FAIL step=intro_skipper.no_progress_save error=%r", str(exc)[:200]
+        )
+
+
+def _admission(scheduler: Any, paused_ok: bool) -> str | None:
+    """Why the pass waits, or None. ``paused_ok``: the agent's own step beside a paused video
+    mpv (never inside the maintenance lock); "paused_recently" is not waited out here."""
+    if paused_ok:
+        return scheduler.background_wait_reason(foreground_paused_ok=True)
+    return scheduler.background_wait_reason()
+
+
+def _open_title(db: Any, scheduler: Any) -> int | None:
+    """media_id of the video open in the (paused) foreground mpv, if it is in the library."""
+    probe = getattr(scheduler, "foreground_video", None)
+    video = probe() if callable(probe) else None
+    if video is None:
+        return None
+    return _title_of(db, Path(video))
+
+
+def _same_video(a: Path, b: Path) -> bool:
+    a, b = Path(a).expanduser(), Path(b).expanduser()
+    if a == b:
+        return True
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def _title_of(db: Any, video: Path) -> int | None:
+    """media_id of a library file, or None."""
+    video = Path(video).expanduser()
+    finder = getattr(db, "episode_by_path", None)
+    row = None
+    if callable(finder):
+        try:
+            row = finder(video)
+        except Exception:  # noqa: BLE001 - ordering is a nicety
+            row = None
+    if row is None:
+        wanted = {video, video.resolve()}
+        try:
+            row = next(
+                (
+                    item
+                    for item in db.episodes()
+                    if Path(str(item.video_path)).expanduser() in wanted
+                    or Path(str(item.video_path)).expanduser().resolve() in wanted
+                ),
+                None,
+            )
+        except Exception:  # noqa: BLE001 - ordering is a nicety
+            row = None
+    media_id = getattr(row, "media_id", None) if row is not None else None
+    return int(media_id) if media_id is not None else None
+
+
+PLAYBACK_MAX_NEW_FINGERPRINTS = 3  # the playing file and, at most, two partners
+
+
+def _playback_admission(scheduler: Any, video: Path) -> str | None:
+    """Why the step for a playing video waits, or None.
+
+    Its own video in the foreground does not block it (one file's head and tail, at
+    background priority, in a few seconds); another video does, and so do the power rules.
+    Without a foreground (mpv closed) the ordinary background rules apply.
+    """
+    probe = getattr(scheduler, "foreground_video", None)
+    current = probe() if callable(probe) else None
+    if current is None:
+        return _admission(scheduler, False)
+    if not _same_video(Path(current), video):
+        return "foreground"
+    policy = getattr(scheduler, "power_policy", None)
+    check = getattr(policy, "background_block_reason", None)
+    return check(resource="cpu") if callable(check) else None
+
+
+WANTED_FILE = "wanted.json"
+WANTED_MAX_AGE_SECONDS = 24 * 3600.0
+WANTED_MAX_ENTRIES = 64
+
+
+def _wanted_update(cache: IntroSkipperCache, change: Callable[[dict[str, float]], dict[str, float]]) -> None:
+    """Read-modify-write of the wanted list under a file lock (window, agent and workers)."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Pudge ships on macOS
+        fcntl = None  # type: ignore[assignment]
+    cache.root.mkdir(parents=True, exist_ok=True)
+    path = cache.root / WANTED_FILE
+    with open(cache.root / ".wanted.lock", "a+", encoding="utf-8") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            current = {
+                str(key): float(value)
+                for key, value in (data.items() if isinstance(data, dict) else ())
+                if isinstance(value, (int, float))
+            }
+            changed = change(dict(current))
+            if changed == current:
+                return
+            if not changed:
+                path.unlink(missing_ok=True)
+                return
+            atomic_write_json(path, changed, sort_keys=True)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def request_analysis(cache_dir: Path, paths: Iterable[Path], *, now: float | None = None) -> int:
+    """Remember files the next pass analyses first (a completed download).
+
+    Cheap (no numpy, no FFmpeg): safe on the window's poll thread. Entries go once the
+    file has a result, is gone, or after a day.
+    """
+    stamp = time.time() if now is None else float(now)
+    keys = [str(Path(path).expanduser()) for path in paths if str(path or "").strip()]
+    if not keys:
+        return 0
+
+    def add(current: dict[str, float]) -> dict[str, float]:
+        for key in keys:
+            current[key] = stamp
+        newest = sorted(current.items(), key=lambda row: row[1], reverse=True)[:WANTED_MAX_ENTRIES]
+        return dict(newest)
+
+    _wanted_update(IntroSkipperCache(cache_dir), add)
+    return len(keys)
+
+
+def _wanted_done(key: str, requested_at: float, cache: IntroSkipperCache, now: float) -> bool:
+    if now - requested_at > WANTED_MAX_AGE_SECONDS:
+        return True
+    path = Path(key)
+    if not path.is_file():
+        return True
+    return cache.read_result(identity_of(path)) is not None
+
+
+def _wanted_paths(cache: IntroSkipperCache, now: float) -> list[Path]:
+    try:
+        data = json.loads((cache.root / WANTED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    rows = [
+        (str(key), float(value))
+        for key, value in data.items()
+        if isinstance(value, (int, float)) and not _wanted_done(str(key), float(value), cache, now)
+    ]
+    return [Path(key) for key, _at in sorted(rows, key=lambda row: row[1], reverse=True)]
+
+
+def _forget_wanted(cache: IntroSkipperCache, now: float) -> None:
+    if not (cache.root / WANTED_FILE).exists():
+        return
+    try:
+        _wanted_update(
+            cache,
+            lambda current: {
+                key: value for key, value in current.items() if not _wanted_done(key, value, cache, now)
+            },
+        )
+    except OSError as exc:
+        logging.getLogger(__name__).warning("FAIL step=intro_skipper.wanted error=%r", str(exc)[:200])
+
+
+def analysed(cache_dir: Path, video: Path) -> bool:
+    """The file has a result of any status (found, empty or error) for its current identity."""
+    identity = identity_of(Path(video))
+    return bool(identity) and IntroSkipperCache(cache_dir).read_result(identity) is not None
+
+
+def detection_enabled(config: Any) -> bool:
+    """OP/ED detection is on: the skip button is on and PUDGE_INTRO_DETECTION is not 0."""
+    if os.environ.get("PUDGE_INTRO_DETECTION", "1").strip() == "0":
+        return False
+    return bool(getattr(getattr(config, "playback", None), "skip_segments_enabled", True))
+
+
 def run_background_pass(
     *,
     db: Any,
@@ -769,8 +1377,28 @@ def run_background_pass(
     cancel_check: Callable[[], bool] | None = None,
     max_new_fingerprints: int = 4,
     settings: DetectorSettings = DetectorSettings(),
+    paused_ok: bool = False,
+    prefer_paths: Iterable[Path] = (),
+    playback_video: Path | None = None,
 ) -> dict[str, Any]:
-    """One low-priority step: pick one title that needs analysis and work on it."""
+    """One low-priority step: work on the first title that needs analysis.
+
+    ``prefer_paths`` (and the files ``request_analysis`` remembered): their titles come
+    first and their files are fingerprinted first (a just downloaded episode is matched
+    against the season's cached fingerprints in seconds, not after other titles).
+
+    ``playback_video``: the step for a video that is playing without segments (see
+    ``PlaybackDetection``). Only its title is looked at; the step may run while that video
+    is the foreground (power rules still apply) and stops when another one is.
+
+    ``paused_ok`` (only the agent's separate step, see ``AnimeManager.run_paused_intro_detection``):
+    the pass may run while the video mpv is paused on AC power, the open title first, and
+    stops within ~2 s when playback resumes.
+
+    A title whose analysis did nothing (all of its files known, nothing to compare) does not
+    hold up the titles after it: the pass goes on to the next one, and the title is left
+    alone until its files, their results or its library change (or a retry is due).
+    """
     from .work_scheduler import WorkPriority
 
     log = logger or logging.getLogger(__name__)
@@ -786,84 +1414,168 @@ def run_background_pass(
     if missing:
         log.info("SKIP step=intro_skipper.pass reason=tool_missing tools=%s", ",".join(missing))
         return {"status": "tool_missing", "missing": missing}
-    reason = scheduler.background_wait_reason()
+    playing = Path(playback_video).expanduser() if playback_video is not None else None
+
+    def admission() -> str | None:
+        if playing is not None:
+            return _playback_admission(scheduler, playing)
+        return _admission(scheduler, paused_ok)
+
+    # The only background work that may run while the video mpv is paused (opt-in).
+    reason = admission()
     if reason is not None:
+        _log_deferral(log, str(reason))
         return {"status": "deferred", "reason": reason}
 
     incomplete = list(incomplete_paths)
     stamp = time.time()
-    chosen: tuple[int, list[EpisodeFile], TitleLibrary | None] | None = None
     animes = sorted(all_animes, key=lambda anime: (anime.status != "CURRENT", anime.title.casefold()))
+    open_media = _open_title(db, scheduler) if paused_ok else None
+    if open_media is not None:
+        # Running beside a paused mpv: the title open in it first, then the usual order.
+        animes.sort(key=lambda anime: int(anime.media_id) != open_media)
+    wanted = [Path(path) for path in prefer_paths]
+    if playing is not None:
+        wanted = [playing]
+    else:
+        wanted += _wanted_paths(cache, stamp)
+    preferred_media: set[int] = set()
+    for path in dict.fromkeys(wanted):
+        media = _title_of(db, path)
+        if media is not None:
+            preferred_media.add(media)
+    if playing is not None:
+        animes = [anime for anime in animes if int(anime.media_id) in preferred_media]
+    elif preferred_media:
+        # New episodes first: a lone new file of an analysed season needs one fingerprint.
+        animes.sort(key=lambda anime: int(anime.media_id) not in preferred_media)
+    prefer_ids = {identity_of(path) for path in wanted if Path(path).expanduser().is_file()}
+    prefer_ids.discard("")
     migration: dict[str, Any] = {}
-    for anime in animes:
-        files = _ready_files(db, anime.media_id, incomplete)
-        library = TitleLibrary(cache.root, int(anime.media_id)) if episodes_expected(anime) else None
-        if library is not None and not library.migrated:
-            try:
-                _migrate_title(db, int(anime.media_id), library, cache, files, migration, settings, log)
-            except Exception as exc:  # noqa: BLE001 - migration is best effort
-                log.warning(
-                    "FAIL step=intro_skipper.library_migrate media_id=%s error=%r",
-                    anime.media_id,
-                    str(exc)[:200],
-                )
-        if not files:
-            continue
-        if title_needs_analysis(files, cache, settings, stamp, library):
-            chosen = (int(anime.media_id), files, library)
-            break
-    if chosen is None:
-        return {"status": "idle"}
-
-    lease = scheduler.acquire_heavy(
-        "intro-skipper",
-        blocking=False,
-        foreground_sensitive=True,
-        priority=WorkPriority.BACKGROUND,
-        resource="cpu",
-    )
-    if lease is None:
-        return {"status": "deferred", "reason": "heavy_busy"}
+    memo = _load_no_progress(cache)
+    memo_changed = False
+    for entry in memo.values():
+        # A clock set back must not leave a title alone for longer than a day.
+        if float(entry.get("until") or 0) > stamp + NO_PROGRESS_RECHECK_SECONDS:
+            entry["until"] = stamp + NO_PROGRESS_RECHECK_SECONDS
+            memo_changed = True
+    lease: Any = None
+    outcome: AnalysisReport | None = None
+    no_progress: list[int] = []
 
     def should_stop() -> str | None:
         if callable(cancel_check) and cancel_check():
             return "cancelled"
-        wait = scheduler.background_wait_reason()
+        # Called every 50 ms while FFmpeg decodes: resumed playback kills it within ~2 s
+        # (one mpv answer is reused for 1.5 s); finished files keep their results.
+        wait = admission()
         if wait is not None:
             return str(wait)
         if scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND):
             return "higher_priority"
         return None
 
-    media_id, files, library = chosen
     try:
-        report = analyze_title(
-            files,
-            cache=cache,
-            ffmpeg=_resolve(ffmpeg),
-            ffprobe=_resolve(ffprobe),
-            settings=settings,
-            should_stop=should_stop,
-            max_new_fingerprints=max_new_fingerprints,
-            logger=log,
-            library=library,
-        )
+        for anime in animes:
+            media_id = int(anime.media_id)
+            files = _ready_files(db, media_id, incomplete)
+            library = TitleLibrary(cache.root, media_id) if episodes_expected(anime) else None
+            if library is not None and not library.migrated:
+                try:
+                    _migrate_title(db, media_id, library, cache, files, migration, settings, log)
+                except Exception as exc:  # noqa: BLE001 - migration is best effort
+                    log.warning(
+                        "FAIL step=intro_skipper.library_migrate media_id=%s error=%r",
+                        anime.media_id,
+                        str(exc)[:200],
+                    )
+            if not files or not title_needs_analysis(files, cache, settings, stamp, library):
+                continue
+            before = _title_signature(media_id, files, cache)
+            known = memo.get(str(media_id))
+            if known and known.get("signature") == before and stamp < float(known.get("until") or 0):
+                continue  # nothing changed since a pass that did nothing for it
+            if lease is None:
+                lease = scheduler.acquire_heavy(
+                    "intro-skipper-playback" if playing is not None else "intro-skipper",
+                    blocking=False,
+                    # The playback step did its own admission (its video is the foreground).
+                    foreground_sensitive=playing is None,
+                    priority=WorkPriority.BACKGROUND,
+                    resource="cpu",
+                    **({"foreground_paused_ok": True} if paused_ok else {}),
+                )
+                if lease is None:
+                    _log_deferral(log, "heavy_busy")
+                    return {"status": "deferred", "reason": "heavy_busy"}
+            try:
+                report = analyze_title(
+                    files,
+                    cache=cache,
+                    ffmpeg=_resolve(ffmpeg),
+                    ffprobe=_resolve(ffprobe),
+                    settings=settings,
+                    should_stop=should_stop,
+                    max_new_fingerprints=(
+                        min(max_new_fingerprints, PLAYBACK_MAX_NEW_FINGERPRINTS)
+                        if playing is not None
+                        else max_new_fingerprints
+                    ),
+                    logger=log,
+                    library=library,
+                    prefer=prefer_ids,
+                )
+            except Exception as exc:  # noqa: BLE001 - one title (a damaged library file) never ends every pass
+                # It came first again on every pass, and no title after it was ever analysed.
+                log.warning("FAIL step=intro_skipper.title media_id=%s error=%r", media_id, str(exc)[:200])
+                memo[str(media_id)] = {"signature": before, "until": stamp + NO_PROGRESS_RECHECK_SECONDS}
+                memo_changed = True
+                continue
+            report.media_id = media_id
+            outcome = report
+            log.info(
+                "DONE step=intro_skipper.pass media_id=%s files=%s fingerprinted=%s analysed=%s found=%s empty=%s errors=%s stopped=%s",
+                media_id,
+                len(files),
+                report.fingerprinted,
+                report.analysed,
+                report.found,
+                report.empty,
+                report.errors,
+                report.stopped or "-",
+            )
+            if report.stopped or report.progressed:
+                if memo.pop(str(media_id), None) is not None:
+                    memo_changed = True
+                break
+            no_progress.append(media_id)
+            if _title_signature(media_id, files, cache) == before:
+                # Analysing it again would do the same nothing: leave it until something changes.
+                memo[str(media_id)] = {"signature": before, "until": _recheck_at(files, cache, stamp)}
+                memo_changed = True
+                log.info(
+                    "SKIP step=intro_skipper.title media_id=%s reason=no_progress files=%s until_change=1",
+                    media_id,
+                    len(files),
+                )
     finally:
-        lease.release()
-    report.media_id = media_id
+        if lease is not None:
+            lease.release()
+        if memo_changed:
+            _save_no_progress(cache, memo, stamp)
+        _forget_wanted(cache, stamp)
+    if outcome is None:
+        return {"status": "idle"}
+    try:
+        # A player open on a file that had no segments shows the button from now on.
+        refresh_playback_sessions(cache_dir, log)
+    except Exception as exc:  # noqa: BLE001 - never breaks the pass
+        log.warning("FAIL step=intro_skipper.session_refresh error=%r", str(exc)[:200])
     _register_and_enforce(db, cache_dir, cache.written, log)
-    log.info(
-        "DONE step=intro_skipper.pass media_id=%s files=%s fingerprinted=%s analysed=%s found=%s empty=%s errors=%s stopped=%s",
-        media_id,
-        len(files),
-        report.fingerprinted,
-        report.analysed,
-        report.found,
-        report.empty,
-        report.errors,
-        report.stopped or "-",
-    )
-    return {"status": "stopped" if report.stopped else "ran", **asdict(report)}
+    result = {"status": "stopped" if outcome.stopped else "ran", **asdict(outcome)}
+    if no_progress:
+        result["no_progress"] = no_progress
+    return result
 
 
 def _results_index(cache: IntroSkipperCache) -> dict[str, dict[str, Any]]:
@@ -955,3 +1667,115 @@ def _register_and_enforce(db: Any, cache_dir: Path, written: Sequence[Path], log
         )
     except Exception as exc:  # noqa: BLE001 - cache bookkeeping never breaks the agent
         log.warning("FAIL step=intro_skipper.cache_registry error=%r", str(exc)[:200])
+
+
+# ------------------------------------------------------ playback pickup ---
+
+
+class PlaybackDetection:
+    """Detection for a video that started playing without segments (a fresh download).
+
+    Runs ``run_pass`` (one ``run_background_pass(playback_video=...)``, normally in the
+    low-RAM worker) on a daemon thread until the video has a result, then writes the
+    ready segments into the pending mpv session (``refresh_playback_session``); the skip
+    script re-reads it and shows the button from then on. A deferred step (heavy work
+    busy, energy saving) is retried every ``retry_seconds`` until ``max_seconds``. When
+    it ends without segments the session stops being pending. Never raises: playback
+    does not depend on it.
+    """
+
+    RETRY_SECONDS = 20.0
+    MAX_SECONDS = 30 * 60.0
+    FINAL_STATUSES = frozenset({"disabled", "tool_missing", "idle", "error"})
+
+    def __init__(
+        self,
+        *,
+        cache_dir: Path,
+        video: Path,
+        session: Path,
+        run_pass: Callable[[], Any],
+        logger: logging.Logger | None = None,
+        retry_seconds: float | None = None,
+        max_seconds: float | None = None,
+    ) -> None:
+        import threading
+
+        self.cache_dir = Path(cache_dir)
+        self.video = Path(video)
+        self.session = Path(session)
+        self.run_pass = run_pass
+        self.logger = logger or logging.getLogger(__name__)
+        self.retry_seconds = self.RETRY_SECONDS if retry_seconds is None else float(retry_seconds)
+        self.max_seconds = self.MAX_SECONDS if max_seconds is None else float(max_seconds)
+        self._stop = threading.Event()
+        self._thread: Any = None
+        self.outcome = ""
+
+    def start(self) -> "PlaybackDetection":
+        import threading
+
+        self._thread = threading.Thread(target=self.run, name="pudge-intro-playback", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def run(self) -> str:
+        started = time.monotonic()
+        attempts = 0
+        outcome = "timeout"
+        self.logger.info("START step=intro_skipper.playback video=%s", self.video.name)
+        try:
+            while not self._stop.is_set():
+                if refresh_playback_session(self.cache_dir, self.session):
+                    outcome = "segments"
+                    break
+                if analysed(self.cache_dir, self.video):
+                    outcome = "no_segments"
+                    break
+                attempts += 1
+                try:
+                    result = self.run_pass()
+                except Exception as exc:  # noqa: BLE001 - playback never depends on detection
+                    self.logger.warning("FAIL step=intro_skipper.playback error=%r", str(exc)[:200])
+                    result = {"status": "error"}
+                status = str((result or {}).get("status") or "error") if isinstance(result, dict) else "error"
+                if refresh_playback_session(self.cache_dir, self.session):
+                    outcome = "segments"
+                    break
+                if analysed(self.cache_dir, self.video):
+                    outcome = "no_segments"
+                    break
+                if status in self.FINAL_STATUSES:
+                    outcome = status
+                    break
+                if time.monotonic() - started >= self.max_seconds:
+                    break
+                # "ran" on other files of the title (fingerprint budget): go on at once.
+                if self._stop.wait(min(1.0, self.retry_seconds) if status == "ran" else self.retry_seconds):
+                    break
+            else:
+                outcome = "stopped"
+            if self._stop.is_set() and outcome == "timeout":
+                outcome = "stopped"
+        finally:
+            count = None
+            try:
+                count = refresh_playback_session(self.cache_dir, self.session, final=True)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("FAIL step=intro_skipper.playback_session error=%r", str(exc)[:200])
+            self.outcome = outcome
+            self.logger.info(
+                "DONE step=intro_skipper.playback video=%s outcome=%s attempts=%s segments=%s",
+                self.video.name,
+                outcome,
+                attempts,
+                count if count is not None else "-",
+            )
+        return outcome

@@ -2,7 +2,11 @@
 (() => {
   const g = globalThis;
   const api = () => g.pywebview?.api || g.window?.pywebview?.api;
-  const ru = () => String(g.ui?.lang || document.documentElement.lang || 'en').startsWith('ru');
+  // index.html declares `const ui`: a global binding, not a property of window, so g.ui is
+  // undefined in the main window (it exists only in the floating player, which assigns it).
+  // eslint-disable-next-line no-undef
+  const uiRef = () => (typeof ui !== 'undefined' ? ui : g.ui);
+  const ru = () => String(uiRef()?.lang || document.documentElement.lang || 'en').startsWith('ru');
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const AUDIO_KEY = 'pudge.sidebarAudio.last.v1';
   const REVIEW_AT = 'pudge.sidebarReview.lastAt.v1';
@@ -13,12 +17,17 @@
   const UNDO_WINDOW_MS = 10_000;
   const floating = Boolean(g.PudgeAudioFloat);
   const energySaving = () => document.documentElement.classList.contains('energy-saving');
-  const liveTextAllowed = () => !energySaving() && !document.hidden && (floating || !audioState?.float_open);
+  // Someone looks at the window: shown and focused (polls slow down otherwise).
+  const attentive = () => !document.hidden && document.hasFocus?.() !== false;
+  // The read-along panel (audiobook_transcript.js) replaces the live text while it is shown.
+  const transcriptShown = () => Boolean(root?.querySelector?.('.sidebar-audio.transcript-open'));
+  const liveTextAllowed = () => !energySaving() && !document.hidden && (floating || !audioState?.float_open) && !transcriptShown();
   const chapterIndexes = new WeakMap();
 
   let root = null;
   let audioState = null;
   let audioTimer = null;
+  let audioIdleWait = false;
   let liveTimer = null;
   let liveShellKey = '';
   let liveTextSignature = '';
@@ -40,6 +49,11 @@
   let dueStatus = 'loading';
   let dueError = '';
   let retryAt = 0;
+  // Refills in a row that brought no new card: the next background look waits 2, 4, 8,
+  // then 15 minutes (cards become due slowly; each look costs Jiten requests).
+  let emptyChecks = 0;
+  let nextPollAt = 0;
+  const emptyBackoffMs = () => emptyChecks ? Math.min(15 * 60_000, 2 * 60_000 * 2 ** (emptyChecks - 1)) : 0;
   let dueCard = null;
   let dueRevealed = false;
   let dueQueue = [];
@@ -129,8 +143,9 @@
           <button type="button" data-sc-audio="bookmark" aria-label="${PudgeI18n.t('media.bookmark')}" title="${PudgeI18n.t('media.bookmark')}"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
         </div>
         <div class="sidebar-audio-scrubber"><input class="sidebar-audio-timeline" data-sc-audio-timeline type="range" min="0" step="0.1" value="0" aria-label="${PudgeI18n.t('media.position')}"><span class="audiobook-chapter-hover" data-sc-chapter-hover aria-hidden="true"></span></div>
-        <div class="sidebar-audio-time"><span data-sc-position></span><span data-sc-duration></span></div>
+        <div class="sidebar-audio-time"><span data-sc-position></span>${g.PudgeAudiobookTranscript?.toggleMarkup?.() || ''}<span data-sc-duration></span></div>
         ${linked ? '<div data-sc-live-text class="sidebar-ln-live" data-pudge-translate-root data-pudge-study-hover></div>' : ''}
+        ${g.PudgeAudiobookTranscript?.panelMarkup?.() || ''}
       </article>`;
       article = host.querySelector('.sidebar-audio');
       liveShellKey = '';
@@ -174,6 +189,7 @@
     if (duration) duration.textContent = clock(book.duration);
     if (chapterHover && Number(chapterHover.audiobookId) !== Number(book.id)) chapterHover = null; // Book switched.
     paintChapterHover(article, book);
+    g.PudgeAudiobookTranscript?.update?.(article, book, {hiddenText:!floating && Boolean(audioState?.float_open)});
     if (book.linked_light_novel && liveTextAllowed()) scheduleLiveText(book, book.playing ? 30 : 900);
   }
 
@@ -269,9 +285,11 @@
     } finally {
       audioBusy = false;
       clearTimeout(audioTimer);
-      // Nothing playing and Python reports new players itself: only a slow fallback check.
+      // Nothing playing and Python reports new players itself: only a slow fallback check,
+      // slower still while nobody looks at the window (focus checks at once).
       const idle = !anyPlayer() && Boolean(g.PudgePushLive?.());
-      audioTimer = setTimeout(pollAudio, generation !== audioGeneration ? 40 : idle ? 60000 : energySaving() || document.hidden ? 5000 : activeBook()?.playing ? 1000 : 2000);
+      audioIdleWait = idle;
+      audioTimer = setTimeout(pollAudio, generation !== audioGeneration ? 40 : idle ? (attentive() ? 60000 : 300000) : energySaving() || document.hidden ? 5000 : activeBook()?.playing ? 1000 : 2000);
     }
   }
 
@@ -321,10 +339,6 @@
     return /^\[\[PUDGE_LN_IMAGE_URL:.+?\]\]$/u.test(String(value || '').trim());
   }
 
-  function paragraphAudioLength(value) {
-    return isImageParagraph(value) ? 0 : audioTextLength(value);
-  }
-
   function chapterIndex(payload) {
     if (chapterIndexes.has(payload)) return chapterIndexes.get(payload);
     let total = 0;
@@ -352,18 +366,6 @@
       return row;
     });
     const result = {rows, total}; chapterIndexes.set(payload, result); return result;
-  }
-
-  function rawIndexAtAudioOffset(text, audioOffset) {
-    const target = Math.max(0, Number(audioOffset || 0));
-    let normalized = 0, raw = 0;
-    for (const character of String(text || '')) {
-      const width = audioTextLength(character);
-      if (width > 0 && normalized + width > target) return raw;
-      normalized += width;
-      raw += character.length;
-    }
-    return String(text || '').length;
   }
 
   function paragraphPosition(payload, state) {
@@ -470,7 +472,7 @@
       const renderer = g.PudgeReadingTools?.study?.renderParsedText;
       host.dataset.pudgeMediaId = String(book.linked_light_novel?.anilist_id || '');
       host.innerHTML = renderer ? renderer(windowed.payload, {
-        backend:String(g.ui?.lnState?.settings?.study_backend || 'jiten'), highlightOptimalWords:false,
+        backend:String(uiRef()?.lnState?.settings?.study_backend || 'jiten'), highlightOptimalWords:false,
         mediaContext:{kind:'light_novel', book_id:Number(book.linked_light_novel.id)},
       }) : `<p class="current">${esc(windowed.payload.paragraphs[0] || '')}</p>`;
       host.querySelector('p')?.classList.add('current');
@@ -548,6 +550,12 @@
       const result = await api()?.audiobook_float_open?.(Number(book.id));
       if (result?.ok === false) throw new Error(result.error || PudgeI18n.t('sidebar.couldNotOpenFloat'));
       void pollAudio();
+      return;
+    }
+    if (action === 'text') {
+      g.PudgeAudiobookTranscript?.toggle?.();
+      liveTextSignature = '';
+      renderAudio();
       return;
     }
     if (floating && (action === 'open' || action === 'read')) {
@@ -644,7 +652,7 @@
       const close = text.indexOf(']', i + 1);
       if (close < 0) { pending += text.slice(i); break; }
       const reading = text.slice(i + 1, close);
-      const match = pending.match(/([0-9０-９]+|[\u3400-\u9fff々]+)$/u);
+      const match = pending.match(/([0-9０-９]+[\u3400-\u9fff々]+|[0-9０-９]+|[\u3400-\u9fff々]+)$/u);
       if (!match || !reading) { pending += text.slice(i, close + 1); i = close; continue; }
       const base = match[0];
       out += esc(pending.slice(0, pending.length - base.length)) + `<ruby>${esc(base)}<rt>${esc(reading)}</rt></ruby>`;
@@ -663,7 +671,7 @@
       const close = text.indexOf(']', i + 1);
       if (close < 0) { pending += text.slice(i); break; }
       const reading = text.slice(i + 1, close);
-      const match = pending.match(/([0-9０-９]+|[\u3400-\u9fff々]+)$/u);
+      const match = pending.match(/([0-9０-９]+[\u3400-\u9fff々]+|[0-9０-９]+|[\u3400-\u9fff々]+)$/u);
       if (!match || !reading) { pending += text.slice(i, close + 1); i = close; continue; }
       out += pending.slice(0, pending.length - match[0].length) + reading;
       pending = '';
@@ -686,12 +694,6 @@
     }
     candidates.push(String(card?.reading || '').trim());
     return candidates.find(value => value && /^[ぁ-ゟ゠-ヿー・]+$/u.test(value.replace(/\s+/g, ''))) || '';
-  }
-
-  function frontRubySource(card) {
-    const primary = selectedReading(card);
-    const ruby = String(primary?.rubyText || '').trim();
-    return ruby && ruby.includes('[') ? ruby : '';
   }
 
   function secondsText(raw) {
@@ -839,9 +841,12 @@
   function scheduleDue(delay = null) {
     clearTimeout(dueTimer);
     if (floating) return;
-    const wait = delay == null
+    let wait = delay == null
       ? Math.max(1000, intervalMs() - (Date.now() - lastReviewAt()))
       : delay;
+    // With nothing queued a check asks Jiten: while nothing changes it waits for the
+    // back-off (power or visibility changes reschedule here and must not skip it).
+    if (!dueQueue.length && nextPollAt > Date.now()) wait = Math.max(wait, nextPollAt - Date.now());
     dueTimer = setTimeout(() => void checkDue(), wait);
   }
 
@@ -859,7 +864,7 @@
 
   function prefetchDueQueue(force = false) {
     if (floating || document.hidden || (!force && energySaving())) return Promise.resolve();
-    if (!force && Date.now() < retryAt) return Promise.resolve();
+    if (!force && Date.now() < Math.max(retryAt, nextPollAt)) return Promise.resolve();
     if (!force && dueQueue.length >= PREFETCH_LOW_WATER) return Promise.resolve();
     if (prefetchPromise) {
       return prefetchGeneration === queueGeneration ? prefetchPromise
@@ -886,13 +891,16 @@
         dueError = ''; retryAt = 0;
         const incoming = (result?.cards || []).filter(card => card && typeof card === 'object');
         const existing = excludedReviewKeys();
+        let added = 0;
         for (const card of incoming) {
           const key = cardKey(card);
           if (Number(card.wordId) > 0 && Number(card.readingIndex) >= 0 && !existing.has(key)) {
-            existing.add(key); dueQueue.push(card);
+            existing.add(key); dueQueue.push(card); added += 1;
           }
           if (dueQueue.length >= PREFETCH_TARGET) break;
         }
+        emptyChecks = added ? 0 : emptyChecks + 1;
+        nextPollAt = Date.now() + emptyBackoffMs();
       } catch (error) {
         if (generation !== queueGeneration) return;
         dueStatus = 'error'; dueError = String(error?.message || error); retryAt = Date.now() + 60_000; renderDue();
@@ -901,7 +909,8 @@
         prefetchBusy = false;
         prefetchPromise = null;
         clearTimeout(duePrefetchTimer);
-        if (!energySaving()) duePrefetchTimer = setTimeout(() => void prefetchDueQueue(false), dueStatus === 'error' || !dueQueue.length ? 60_000 : 45_000);
+        // Unfocused: every 5 minutes at most (a focus asks again at once).
+        if (!energySaving()) duePrefetchTimer = setTimeout(() => void prefetchDueQueue(false), Math.max(attentive() ? 0 : 300_000, dueStatus === 'error' ? 60_000 : Math.max(45_000, emptyBackoffMs())));
       }
     })();
     return prefetchPromise;
@@ -919,6 +928,8 @@
   async function checkDue() {
     if (floating || document.hidden) return;
     if (dueCard || dueBusy || checkingDue) { scheduleDue(); return; }
+    // Nobody looks at the window: ask Jiten again in 5 minutes (a focus asks at once).
+    if (!attentive()) { scheduleDue(300_000); return; }
     if (intervalMs() > 0 && Date.now() - lastReviewAt() < intervalMs()) { dueStatus='interval'; renderDue(); scheduleDue(); return; }
     checkingDue = true;
     try {
@@ -931,7 +942,7 @@
       dueCard = next;
       dueRevealed = false;
       renderDue();
-      if (!dueCard) scheduleDue(intervalMs() === 0 ? 5_000 : 60_000);
+      if (!dueCard) scheduleDue(Math.max(intervalMs() === 0 ? 5_000 : 60_000, emptyBackoffMs()));
       else if (dueQueue.length < PREFETCH_LOW_WATER) void prefetchDueQueue(false);
     } finally {
       checkingDue = false;
@@ -976,7 +987,7 @@
       renderDue();
       schedulePreviousExpiry();
       if (continuous) {
-        if (!dueCard) scheduleDue(5_000);
+        if (!dueCard) scheduleDue(Math.max(5_000, emptyBackoffMs()));
       } else {
         scheduleDue();
       }
@@ -1031,15 +1042,30 @@
   }
 
   function noteExternalReview(event) {
-    queueGeneration += 1;
     const detail = event?.detail;
-    if (detail?.backend === 'jiten' && Number(detail.wordId) > 0) {
-      recentReviews.set(cardKey(detail), Date.now());
+    const known = detail?.backend === 'jiten' && Number(detail.wordId) > 0;
+    if (known) {
+      const key = cardKey(detail);
+      recentReviews.set(key, Date.now());
+      // Another card was graded (the review gate before an episode): the card on show
+      // stays as it is and only the graded one leaves the queue. Starting over refetched
+      // and swapped the card after every gate grade and spent Jiten's budget the gate needs.
+      if (!dueCard || cardKey(dueCard) !== key) {
+        dueQueue = dueQueue.filter(card => cardKey(card) !== key);
+        localStorage.setItem(REVIEW_AT, String(Date.now()));  // the next card waits the interval again
+        if (!dueCard) {
+          renderDue();
+          scheduleDue();
+        }
+        return;
+      }
     }
+    queueGeneration += 1;
     localStorage.setItem(REVIEW_AT, String(Date.now()));
     dueCard = null;
     dueRevealed = false;
     dueQueue = [];
+    emptyChecks = 0; nextPollAt = 0;
     dueStatus = 'loading';
     renderDue();
     scheduleDue();
@@ -1146,7 +1172,7 @@
         .catch(error => g.toast?.(error?.message || String(error)));
       return;
     }
-    if (event.target.closest?.('[data-sc-retry]')) { retryAt=0; dueStatus='loading'; renderDue(); void checkDue(); return; }
+    if (event.target.closest?.('[data-sc-retry]')) { retryAt=0; emptyChecks=0; nextPollAt=0; dueStatus='loading'; renderDue(); void checkDue(); return; }
     // Audiobook cover: click opens the audiobook; zoom like every other cover
     // (trackpad pinch / drag, handled by CoverPreview). Jiten card image: click zooms.
     const image = event.target.closest?.('.sidebar-due-image img');
@@ -1274,7 +1300,14 @@
   }
   document.addEventListener('visibilitychange', () => {
     powerChanged();
-    if (!document.hidden) { void pollAudio(); if (g.ui?.lnPairedState?.playing) g.startLnPairedInterpolation?.(g.ui.lnPairedState); }
+    if (!document.hidden) { void pollAudio(); const paired = uiRef()?.lnPairedState; if (paired?.playing) g.startLnPairedInterpolation?.(paired); }
+  });
+  // Back in focus: the slow unfocused checks run now instead of up to 5 minutes later.
+  window.addEventListener('focus', () => {
+    if (floating || document.hidden) return;
+    if (audioIdleWait && !audioBusy) { clearTimeout(audioTimer); void pollAudio(); }
+    if (!energySaving()) void prefetchDueQueue(false);
+    if (!dueCard) scheduleDue(1000);
   });
 
   const boot = async () => {

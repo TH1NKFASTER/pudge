@@ -3,7 +3,8 @@
   const inflight = new Map(), hydration = new WeakMap(), warmed = new Map();
   const kana = value => String(value || '').normalize('NFKC')
     .replace(/([^\[\]]+)\[([^\]]+)\]/g, (_, base, reading) => {
-      const prefix = base.match(/^[^\u3400-\u9fff々〆ヵヶ]*/u)?.[0] || '';
+      // Only kana before the annotated part stay (お茶[ちゃ] → おちゃ); digits are read by it (10万[じゅうまん]).
+      const prefix = base.match(/^[\u3040-\u30ffー]*/u)?.[0] || '';
       return prefix + reading;
     }).replace(/\s+/g, '').replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
   function normalize(card = {}) {
@@ -16,7 +17,8 @@
     const reading = row => typeof row === 'string' ? row : row?.reading || row?.rubyText || row?.text || '';
     const primary = kana(card.primary_reading || card.reading || reading(selected) || reading(rows[0]));
     const all = [...new Set([primary, ...(Array.isArray(card.all_readings) ? card.all_readings : []), ...rows.map(reading)]
-      .map(kana).filter(value => value && !/[\u3400-\u9fff々〆ヵヶ]/u.test(value)))];
+      // A reading has kana: another written form (100000 for 十万) is not one.
+      .map(kana).filter(value => value && !/[\u3400-\u9fff々〆ヵヶ]/u.test(value) && /[\u3040-\u30ff]/u.test(value)))];
     return {...card, readings:rows, primary_reading:primary || all[0] || '', all_readings:all};
   }
   function url(card = {}) {
@@ -33,6 +35,9 @@
   function readingsLine(card = {}) {
     const model = normalize(card);
     const surface = String(card.wordTextPlain || card.spelling || card.wordText || '').replace(/\[[^\]]+\]/g, '').replace(/\s+/g, '');
+    // A word written without kanji is its own reading: no second line of kana under it
+    // (other kana there are spelling variants, もらたす under もたらす).
+    if (surface && !/[\u3400-\u9fff々〆ヵヶ]/u.test(surface)) return '';
     return model.all_readings.filter(value => value !== model.primary_reading && value !== kana(surface)).join(' ・ ');
   }
   async function enrich(card) {

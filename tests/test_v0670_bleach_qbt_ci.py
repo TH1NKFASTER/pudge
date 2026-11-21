@@ -10,6 +10,7 @@ from pudge.pipeline_cache import (
 from pudge.subtitle_formats import clean_srt_for_playback
 from pudge.web_app import WebAppApi
 from tests.i18n_support import has_text
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def _srt(text: str = "日本語") -> str:
@@ -85,9 +86,8 @@ def test_alignment_generation_requeues_only_playback_copies_from_alignment_cache
     bleach = manager.db.episode_by_path(video.resolve())
     unaffected = manager.db.episode_by_path(unaffected_video.resolve())
     assert bleach is not None
-    assert bleach.subtitle_path is None
-    assert bleach.state == "waiting_subtitles"
-    assert unaffected is not None
+    assert_rebuilding_with_subtitles_kept(manager, video.resolve())  # kept while it is prepared again
+    assert_not_prepared_again(manager, unaffected_video.resolve())
     assert unaffected.subtitle_path == unaffected_playback.resolve()
     assert final_pipeline_cache_available(video, cfg) is False
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
@@ -123,8 +123,8 @@ def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(tmp_path: Path, mo
 
 
 def test_random_score_wheel_explanation_is_removed(page) -> None:
-    # The rating wheel no longer explains its sector sizes; only the final-episode prompt
-    # keeps its one line of text.
+    # The rating wheel no longer explains its sector sizes; FINALE2: the final-episode prompt
+    # has no explanation line either ("The wheel will choose a score…" removed).
     assert not has_text("The wheel chooses one score")
     assert not has_text("Колесо выбирает одну оценку", "ru")
     for lang in ("en", "ru"):
@@ -135,11 +135,11 @@ def test_random_score_wheel_explanation_is_removed(page) -> None:
             const plain = {copy: copy(), wheel: Boolean($('scoreWheel'))};
             closeModal();
             showScoreModal({media_id: 7, title: 'Show'}, true, 12);
-            return {plain, final: copy(), rateText: t('modal.rateText')};
+            return {plain, final: copy(), wheel: Boolean($('scoreWheel'))};
             """,
             lang=lang,
             api={"final_sequel_option": {"sequel": None}},
         )
         out = result.value
         assert out["plain"] == {"copy": [], "wheel": True}
-        assert out["final"] == [out["rateText"]]
+        assert out["final"] == [] and out["wheel"] is True

@@ -12,6 +12,7 @@ from pudge.subtitle_formats import (
     write_srt,
 )
 from pudge.subtitles.timeline_alignment import _suppress_weak_post_opening_tail_transition
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def _raw_srt(path: Path, cues: list[tuple[float, float, str]]) -> Path:
@@ -110,8 +111,9 @@ def test_generation_17_requeues_only_overlap_sources_and_forces_resync(tmp_path:
     assert manager._requeue_legacy_generated_subtitles() == 1
     first = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 01.mkv")
     second = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 02.mkv")
-    assert first is not None and first.subtitle_path is None
-    assert second is not None and second.subtitle_path is not None
+    assert first is not None and second is not None
+    assert_rebuilding_with_subtitles_kept(manager, first.video_path)  # kept while it is prepared again
+    assert_not_prepared_again(manager, second.video_path)
     assert manager.db.get_state(manager._debug_force_subtitle_state_key(first.video_path), "") == "1"
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 

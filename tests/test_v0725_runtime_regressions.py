@@ -222,7 +222,6 @@ def _match(center: float, offset: float, score: float) -> _WindowMatch:
         onset_f1=0.8,
         activity_f1=0.8,
         mean_error=0.4,
-        rank_delta=0.1,
         gap_fingerprint=0.7,
         edge_hint_distance=None,
     )

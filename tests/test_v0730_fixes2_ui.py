@@ -13,6 +13,7 @@ from pudge.web_app import WebAppApi
 from study_page_support import LN_BOOK
 from test_web_app import make_api
 from tests.test_v072_audio_status_credentials_playback import LN, READER
+from repository_files import in_repository
 
 ROOT = Path(__file__).resolve().parents[1]
 STUDY = {"before": LN_BOOK, "state": {"settings": {"review_gate_ln_enabled": False}}}
@@ -467,4 +468,4 @@ def test_mangaocr_install_log_button_is_fully_removed(page) -> None:
 
 
 def test_repository_root_has_no_leftover_tool_files() -> None:
-    assert not (ROOT / "....").exists()
+    assert not in_repository("....")

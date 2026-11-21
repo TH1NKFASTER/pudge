@@ -16,8 +16,8 @@ WRONG_TITLE = (
 def release(title: str, info_hash: str = "hash") -> NyaaRelease:
     return NyaaRelease(
         title=title,
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text="1.2 GiB",
         size_bytes=int(1.2 * 1024**3),

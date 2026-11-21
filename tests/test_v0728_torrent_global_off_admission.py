@@ -171,13 +171,12 @@ def test_old_off_does_not_stop_newer_on(tmp_path, monkeypatch):
         off_thread.start()
         assert started_off.wait(timeout=5)
         # Wait for Off's published intent without releasing the start guard.
-        for _ in range(100):
-            if not api._torrent_enabled_state():
-                break
+        deadline = time.monotonic() + 30  # 100 x 1 ms was too short for a busy Mac
+        while api._torrent_enabled_state() and time.monotonic() < deadline:
             threading.Event().wait(0.001)
         assert api._torrent_enabled_state() is False
         assert api.set_torrents_enabled(True)["enabled"] is True
-    off_thread.join(timeout=5)
+    off_thread.join(timeout=30)
     assert not off_thread.is_alive()
     assert api._wait_torrent_off_quiet(5)
     assert "quiesce" not in events

@@ -13,6 +13,7 @@ from .build_identity import build_identity
 from .database import Database
 from .energy_diagnostics import summarize_energy_log
 from .runtime import mac_app_instances
+from .url_credentials import redact_url_credentials
 
 
 class DiagnosticRecorder:
@@ -113,7 +114,7 @@ class DebugBundleBuilder:
         # Authorization headers contain a scheme and a credential; scrub the
         # entire value before generic key=value handling can leave the token.
         scrubbed = re.sub(
-            r"(?im)\b(authorization|cookie)\s*:\s*[^\r\n]+",
+            r"(?im)\b(authorization|cookie|x-api-key)\s*:\s*[^\r\n]+",
             r"\1: [REDACTED]",
             text,
         )
@@ -129,10 +130,33 @@ class DebugBundleBuilder:
             r"\1=[REDACTED]",
             scrubbed,
         )
-        scrubbed = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9_./+~=-]+", r"\1 [REDACTED]", scrubbed)
-        scrubbed = re.sub(r"(?i)(https?://)[^\s/:@]+:[^\s/@]+@", r"\1[REDACTED]@", scrubbed)
+        # Any key that ends in "token": X-Pudge-Token: headers, PUDGE_ASSISTANT_TOKEN=,
+        # "token": in JSON and aria2's "token:<secret>" RPC parameter.
         scrubbed = re.sub(
-            r"(?i)([?&](?:pair|token|access_token|api_key)=)[^\s&#\"']+", r"\1[REDACTED]", scrubbed
+            r"(?i)(?<![\w-])([\"']?)([\w-]*token)([\"']?)(\s*[=:]\s*)"
+            r"(?!\[REDACTED\])(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'\]\}]+)",
+            r"\1\2\3\4[REDACTED]",
+            scrubbed,
+        )
+        # The same for a key that ends in a credential word with a prefix: the environment
+        # names Pudge reads (JIMAKU_API_KEY=, PUDGE_QBITTORRENT_PASSWORD=, PUDGE_LLM_API_KEY=),
+        # config-style names (jimaku_api_key =, client_secret:) and tracker passkeys. The
+        # rule above only knew the bare words, so these values reached debug bundles.
+        scrubbed = re.sub(
+            r"(?i)(?<![\w-])([\"']?)([\w-]*(?:api[-_]?key|password|passwd|secret|passkey))([\"']?)(\s*[=:]\s*)"
+            r"(?!\[REDACTED\])(?:\"[^\"]*\"|'[^']*'|[^\s,;\"'\]\}]+)",
+            r"\1\2\3\4[REDACTED]",
+            scrubbed,
+        )
+        scrubbed = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9_./+~=-]+", r"\1 [REDACTED]", scrubbed)
+        # Credentials in any scheme://user:pass@ URL (socks5://, not only http(s)://).
+        scrubbed = redact_url_credentials(scrubbed)
+        # The window's per-launch page key (http://127.0.0.1:<port>/k/<key>/...).
+        scrubbed = re.sub(r"(127\.0\.0\.1:\d+/k/)[A-Za-z0-9_-]+", r"\1[REDACTED]", scrubbed)
+        scrubbed = re.sub(
+            r"(?i)([?&](?:pair|token|access_token|api_key|apikey|key|passkey|password|auth)=)[^\s&#\"']+",
+            r"\1[REDACTED]",
+            scrubbed,
         )
         scrubbed = re.sub(r"(?i)(/api/v1/media/)[^/\s?\"']+", r"\1[REDACTED]", scrubbed)
         return scrubbed
@@ -156,6 +180,7 @@ class DebugBundleBuilder:
         if any(part in normalized for part in sensitive) or normalized in {
             "command",
             "argv",
+            "args",
             "environment",
             "env",
         }:

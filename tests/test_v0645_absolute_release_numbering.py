@@ -184,7 +184,7 @@ def test_jojo_stage_accepts_s06e02_as_absolute_episode_two() -> None:
             "AAC2.0 H.264 (JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - "
             "3rd STAGE, Multi-Audio, Multi-Subs)"
         ),
-        link="https://nyaa.si/view/2165948",
+        link="https://releases.invalid/view/2165948",
         torrent_url="https://example.test/2165948.torrent",
         info_hash="2165948",
         size_text="1.0 GiB",
@@ -345,7 +345,7 @@ def test_jojo_automatic_search_uses_title_only_probe_before_scene_number_guess()
             "AAC2.0 H.264 (JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - "
             "3rd STAGE, Multi-Audio, Multi-Subs)"
         ),
-        link="https://nyaa.si/view/2165948",
+        link="https://releases.invalid/view/2165948",
         torrent_url="https://example.test/2165948.torrent",
         info_hash="2165948",
         size_text="1.0 GiB",
@@ -412,8 +412,8 @@ def test_jojo_real_anilist_stage_title_searches_bare_series_alias_before_number_
             "[Erai-raws] JoJo no Kimyou na Bouken: Steel Ball Run - 02 "
             "[1080p NF WEB-DL AVC AAC][MultiSub][78128421]"
         ),
-        link="https://cn.nyaa.net/view/2165960",
-        torrent_url="https://nyaa.net/download/2165960.torrent",
+        link="https://mirror-b.invalid/view/2165960",
+        torrent_url="https://mirror-a.invalid/download/2165960.torrent",
         info_hash="ac59c36fbf9b6ff9dafd3dfeccd4ff937f0785d4",
         size_text="893.4 MiB",
         size_bytes=int(893.4 * 1024**2),

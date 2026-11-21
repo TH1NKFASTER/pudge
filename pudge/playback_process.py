@@ -9,33 +9,6 @@ import time
 from .process_cleanup import OwnedProcessTree
 
 
-def _close_requested(ipc_socket):
-    """Read an explicit close intent; idle/paused playback alone never counts."""
-    if not ipc_socket:
-        return False
-    try:
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(0.15)
-            client.connect(str(ipc_socket))
-            client.sendall(b'{"command":["get_property","user-data/pudge/closing"],"request_id":73}\n')
-            data = b""
-            received = 0
-            while received < 16384:
-                chunk = client.recv(4096)
-                if not chunk:
-                    break
-                received += len(chunk)
-                data += chunk
-                while b"\n" in data:
-                    line, data = data.split(b"\n", 1)
-                    row = json.loads(line)
-                    if isinstance(row, dict) and row.get("request_id") == 73:
-                        return row.get("error") == "success" and row.get("data") is True
-    except (OSError, ValueError):
-        pass
-    return False
-
-
 def stop_playback_process(process, *, tree=None, ipc_socket=None):
     if ipc_socket and process.poll() is None:
         try:

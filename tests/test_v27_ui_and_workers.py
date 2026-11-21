@@ -83,16 +83,16 @@ LEGACY_ERRORS = (
     ("Ошибка Jimaku API: {0}", "Jimaku API error: {0}"),
     ("Ошибка Jimaku API: неизвестная сетевая ошибка", "Jimaku API error: unknown network error"),
     ("Не удалось скачать {0}: {1}", "Could not download {0}: {1}"),
-    ("Nyaa вернул некорректный RSS: {0}", "Nyaa returned invalid RSS: {0}"),
+    ("Поиск релизов вернул некорректный RSS: {0}", "The release search returned invalid RSS: {0}"),
     (
-        "Команда перед поиском Nyaa завершилась с ошибкой: {0}",
-        "The command before the Nyaa search failed: {0}",
+        "Команда перед поиском релизов завершилась с ошибкой: {0}",
+        "The command before the release search failed: {0}",
     ),
     (
         "Для SOCKS-прокси не установлена зависимость socksio. Повторно запустите ./install.sh.",
         "The SOCKS proxy dependency socksio is not installed. Run ./install.sh again.",
     ),
-    ("Nyaa недоступен{0}: {1}", "Nyaa unavailable{0}: {1}"),
+    ("Поиск релизов недоступен{0}: {1}", "Release search unavailable{0}: {1}"),
     (
         "Команда VPN перед скачиванием завершилась с ошибкой: {0}",
         "The VPN command before downloading failed: {0}",
@@ -157,14 +157,10 @@ LEGACY_ERRORS = (
         "AniList saved the change, but did not return the updated list; using local data",
     ),
     (
-        "Jimaku: найден архив .7z/.rar, но 7-Zip не установлен",
-        "Jimaku: found a .7z/.rar archive, but 7-Zip is not installed",
+        "Jimaku: найден архив .7z/.rar, но нет ни bsdtar, ни 7-Zip",
+        "Jimaku: found a .7z/.rar archive, but neither bsdtar nor 7-Zip was found",
     ),
     ("Jimaku: не удалось распаковать {0}", "Jimaku: could not extract {0}"),
-    (
-        "AniList вернул HTTP 500 на расширенный запрос; использован упрощённый запрос, данные графа оставлены из кэша",
-        "AniList returned HTTP 500 for the extended query; used a simplified query and kept cached graph data",
-    ),
     # Subtitle quality-gate reasons (shown in Diagnostics/debug views).
     ("синхронизация не удалась", "synchronization failed"),
     ("тайминг разрушен при выравнивании: {0}", "timing was broken by alignment: {0}"),
@@ -224,10 +220,10 @@ const drag=name=>({type:'dragenter',dataTransfer:{types:['Files'],files:[{name}]
 const bad=()=>({...drag('a.pdf'),preventDefault(){},stopImmediatePropagation(){},stopPropagation(){}});
 """
     checks = r"""
-listeners.dragenter(drag('a.epub'));assert.equal(box.dataset.dropLabel,'Drop EPUB/TXT here');
-listeners.drop(bad());assert.equal(notices.pop(),'EPUB and TXT files are supported');
-ui.lang='ru';listeners.dragenter(drag('a.txt'));assert.equal(box.dataset.dropLabel,'Бросьте файл сюда · EPUB/TXT');
-listeners.drop(bad());assert.equal(notices.pop(),'Поддерживаются EPUB и TXT');
+listeners.dragenter(drag('a.epub'));assert.equal(box.dataset.dropLabel,'Drop EPUB/TXT or an audiobook here');
+listeners.drop(bad());assert.equal(notices.pop(),'EPUB, TXT and audiobook files are supported');
+ui.lang='ru';listeners.dragenter(drag('a.txt'));assert.equal(box.dataset.dropLabel,'Бросьте файл сюда · EPUB/TXT или аудиокнигу');
+listeners.drop(bad());assert.equal(notices.pop(),'Поддерживаются EPUB, TXT и аудиокниги');
 assert(!classes.has('ln-file-drag'));
 """
     node(setup + i18n_source() + web_module("ln_drop.js") + checks)
@@ -308,7 +304,7 @@ def test_actual_word_dto_populates_both_readings_in_background_and_persistent_ca
     def fetch(route):
         calls.append(route)
         entered.set()
-        assert release.wait(2)
+        assert release.wait(30)
         return powder_dto()
 
     service._jiten_get = fetch
@@ -317,7 +313,7 @@ def test_actual_word_dto_populates_both_readings_in_background_and_persistent_ca
     initial = service.jiten_word(card)
     assert initial["all_readings"] == ["こな"]
     assert time.monotonic() - begin < 0.3
-    assert entered.wait(1)
+    assert entered.wait(30)
     release.set()
     repository.pool.shutdown()
     complete = service.jiten_word(card)
@@ -433,7 +429,9 @@ def test_successful_anilist_update_has_short_osd(language, expected, tmp_path, m
             close=lambda: None,
         ),
     )
-    monkeypatch.setattr(cli, "Database", lambda path: SimpleNamespace(schedule_cleanup=lambda *a, **kw: True))
+    monkeypatch.setattr(
+        cli, "Database", lambda path, **_kw: SimpleNamespace(schedule_cleanup=lambda *a, **kw: True)
+    )
     args = SimpleNamespace(tracking_file=tmp_path / "tracking.json", anilist_action="count", manual=True)
     assert cli._run_anilist_action(args, cfg) == 0
     osd = [line for line in capsys.readouterr().out.splitlines() if line.startswith("OSD:")]

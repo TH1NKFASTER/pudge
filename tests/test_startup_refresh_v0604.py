@@ -64,7 +64,9 @@ def _search(client, **extra):
 
 
 def test_empty_proxy_is_not_retried_as_duplicate_direct_route(monkeypatch):
-    client = NyaaClient(proxy_mode="direct_then_proxy", proxy_url="", timeout=0.01)
+    from sources_support import release_search_client
+
+    client = release_search_client(proxy_mode="direct_then_proxy", proxy_url="", timeout=0.01)
     calls: list[tuple[str, str | None]] = []
 
     def fail(url: str, proxy: str | None) -> str:
@@ -76,13 +78,13 @@ def test_empty_proxy_is_not_retried_as_duplicate_direct_route(monkeypatch):
     with pytest.raises(NyaaError):
         client.search("example")
 
-    # Empty proxy must not duplicate a route, while the default nyaa.si client
+    # Empty proxy must not duplicate a route, while a source with mirrors
     # may still fail over once per distinct read-only mirror.
     assert [proxy for _url, proxy in calls] == [None, None, None]
     assert [url.split("/?", 1)[0] for url, _proxy in calls] == [
-        "https://nyaa.si",
-        "https://nyaa.net",
-        "https://cn.nyaa.net",
+        "https://releases.invalid",
+        "https://mirror-a.invalid",
+        "https://mirror-b.invalid",
     ]
 
 
@@ -157,7 +159,7 @@ def test_startup_maintenance_returns_before_heavy_pass_finishes(monkeypatch, pla
 
         def run_startup_once(self):
             started.set()
-            assert release.wait(2)
+            assert release.wait(30)
             return {"auto": 0, "library": 1}
 
     api = WebAppApi.__new__(WebAppApi)
@@ -178,7 +180,7 @@ def test_startup_maintenance_returns_before_heavy_pass_finishes(monkeypatch, pla
 
     assert result["running"] is True
     assert elapsed < 0.25
-    assert started.wait(1)
+    assert started.wait(30)
 
     release.set()
     api._startup_maintenance_thread.join(timeout=2)

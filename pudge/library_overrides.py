@@ -15,6 +15,18 @@ from .i18n import err
 
 KINDS = frozenset({"ln", "manga", "audiobook"})
 
+# Audiobooks made from anime episodes stand on a shelf of their own: their series is the
+# anime's title, which an audiobook series (the light novel) may carry too, and episode
+# numbers would mix with volume numbers there.
+ANIME_SHELF_PREFIX = "anime-audio:"
+
+
+def anime_shelf_title(title: str) -> str:
+    """The shelf name of anime audiobooks when another shelf already has the plain name."""
+    title = str(title or "").strip()
+    return title if title.casefold().endswith("(anime)") else f"{title} (anime)"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_overrides (
     kind TEXT NOT NULL,

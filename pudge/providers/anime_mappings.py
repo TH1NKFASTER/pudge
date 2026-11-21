@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from ..fsutil import atomic_write_json
+
 FRIBB_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
 ANIME_LISTS_URL = "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-master.xml"
 INDEX_SCHEMA = 1
@@ -234,10 +236,7 @@ class AnimeMappings:
 
     def _save_state(self, state: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".state.", dir=str(self.root))
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
-        os.replace(tmp, self._state_path())
+        atomic_write_json(self._state_path(), state, indent=2, sort_keys=True)
 
     @contextlib.contextmanager
     def _process_lock(self) -> Iterator[bool]:
@@ -422,7 +421,8 @@ class AnimeMappings:
         if not self.available:
             return None
         try:
-            conn = sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True)
+            # Escaped URI: a "?" or "#" in the cache path opened another (empty) file.
+            conn = sqlite3.connect(Path(self.index_path).resolve().as_uri() + "?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             return conn
         except sqlite3.Error:
@@ -482,28 +482,6 @@ class AnimeMappings:
                 "SELECT * FROM fribb WHERE anilist_id=? ORDER BY anidb_id", (int(media_id),)
             ).fetchall()
             return [self._mapping(conn, row) for row in rows]
-        except sqlite3.Error:
-            return []
-        finally:
-            conn.close()
-
-    def anilist_ids_for_tvdb(self, tvdb_id: int) -> list[int]:
-        """All AniList ids on one TVDB series (1:N: seasons, OVAs, movies)."""
-        return self._reverse("tvdb_id", tvdb_id)
-
-    def anilist_ids_for_anidb(self, anidb_id: int) -> list[int]:
-        return self._reverse("anidb_id", anidb_id)
-
-    def _reverse(self, column: str, value: int) -> list[int]:
-        conn = self._connect()
-        if conn is None:
-            return []
-        try:
-            rows = conn.execute(
-                f"SELECT DISTINCT anilist_id FROM fribb WHERE {column}=? AND anilist_id IS NOT NULL ORDER BY anilist_id",
-                (int(value),),
-            ).fetchall()
-            return [int(row[0]) for row in rows]
         except sqlite3.Error:
             return []
         finally:

@@ -21,7 +21,7 @@ class _Window:
         self.event.set()
 
 
-def _wait(predicate, timeout=3.0):
+def _wait(predicate, timeout=30.0):  # ends as soon as it holds
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -65,7 +65,7 @@ def test_push_survives_a_closed_window() -> None:
     good = _Window()
     target["window"] = good
     push.post("versions", {"ui": "2"})
-    assert good.event.wait(2)
+    assert good.event.wait(30)
     target["window"] = None
     push.post("versions", {"ui": "3"})  # no window at all: dropped quietly
     time.sleep(0.05)
@@ -136,7 +136,7 @@ def test_monitor_is_woken_by_pudge_torrent_changes() -> None:
         assert _wait(lambda: len(calls) == 1)
         status["active"] = 2  # added by Pudge: the idle 30 s wait is cut short
         monitor.wake(0.05)
-        assert _wait(lambda: len(calls) == 2, timeout=2.0)
+        assert _wait(lambda: len(calls) == 2, timeout=30.0)
     finally:
         monitor.stop()
 

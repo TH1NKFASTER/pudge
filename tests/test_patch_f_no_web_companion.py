@@ -12,6 +12,7 @@ from pathlib import Path
 from pudge import config as config_module
 from pudge.config import AppConfig, load_config, write_config
 from pudge.web_app import WebAppApi
+from repository_files import in_repository
 
 ROOT = Path(__file__).parents[1]
 
@@ -30,7 +31,7 @@ def make_api(tmp_path: Path) -> WebAppApi:
 def test_companion_code_and_assets_are_gone(tmp_path: Path, page) -> None:
     for module in ("pudge.mobile_sync", "pudge.mobile_sync_http", "pudge.companion_streaming"):
         assert importlib.util.find_spec(module) is None
-    assert not (ROOT / "pudge" / "web" / "companion").exists()
+    assert not in_repository("pudge/web/companion")
     assert not [name for name in dir(WebAppApi) if name.startswith("companion_")]
     # Settings has no companion block (any category) and never asks the backend about one.
     for lang in ("en", "ru"):
@@ -141,6 +142,6 @@ def test_iphone_pairing_still_finds_the_lan_address(tmp_path: Path, monkeypatch)
                 iphone_network, "interface_addresses", lambda: [("lo0", "127.0.0.1"), ("en0", "10.0.0.5")]
             )
             patched.setattr(iphone_network, "default_route_address", lambda: "")
-            assert api._lan_host() == "10.0.0.5"
+            assert api._lan_hosts()[0] == "10.0.0.5"
     finally:
         api.close()

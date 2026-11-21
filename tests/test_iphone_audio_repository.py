@@ -192,10 +192,12 @@ def test_progress_duplicate_replay_before_edition_validation(service):
     # Final receipt, so the phone's outbox moves on instead of a 409 loop.
     assert rejected["status"] == "rejected" and rejected["reason"] == "edition_changed"
     assert service.record_checkpoint(device, stale) == rejected
-    with pytest.raises(ValueError):
-        service.record_checkpoint(
-            device, dict(stale, deviceId=str(uuid.uuid4()), checkpointId=str(uuid.uuid4()))
-        )
+    # A checkpoint saved under another device ID (this phone before it was set up again) is
+    # refused with a final receipt too: a 409 stopped the phone's whole sync for good.
+    other = service.record_checkpoint(
+        device, dict(stale, deviceId=str(uuid.uuid4()), checkpointId=str(uuid.uuid4()))
+    )
+    assert other["status"] == "rejected" and other["reason"] == "device_changed"
 
 
 def test_checkpoint_id_cannot_be_reused_with_changed_body(service):

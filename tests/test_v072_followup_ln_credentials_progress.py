@@ -5,7 +5,6 @@ word card, credential guides, audiobook analysis progress and its STT worker
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import types
 from pathlib import Path
@@ -280,33 +279,23 @@ def test_audiobook_state_resumes_an_interrupted_queued_job(
 
 
 def test_stt_worker_writes_machine_readable_progress(tmp_path: Path, monkeypatch) -> None:
-    # The worker reports mlx-whisper's progress bar as JSON for the parent process.
-    class Bar:
-        def __init__(self, total=None, **_kwargs):
-            self.total, self.n = total, 0
-
-        def update(self, n=1):
-            self.n += n
-
-    fake = types.ModuleType("tqdm")
-    fake.tqdm = Bar
-    monkeypatch.setitem(sys.modules, "tqdm", fake)
-    monkeypatch.setattr(stt_worker, "_PROGRESS_TARGET", [None])
+    # The worker reports Whisper's progress (its callback: frames done, total) as JSON for the parent.
     output = tmp_path / "chunk.progress.json"
-    stt_worker._install_progress_reporter(output)
+    report = stt_worker._progress_reporter(output)
+    assert stt_worker._progress_reporter(None) is None
 
     def reported() -> dict:
         return json.loads(output.read_text(encoding="utf-8"))  # the worker's report file
 
-    bar = fake.tqdm(total=200)
+    report(0, 200)
     assert reported()["percent"] == 0
-    bar.update(50)
+    report(50, 200)
     assert {key: reported()[key] for key in ("percent", "current", "total")} == {
         "percent": 25,
         "current": 50,
         "total": 200,
     }
-    bar.update(150)
+    report(200, 200)
     assert reported()["percent"] == 100
 
 
@@ -380,9 +369,10 @@ def test_audiobook_stt_finds_the_configured_ffmpeg(tmp_path: Path, monkeypatch) 
         Path(command[5]).write_text(
             json.dumps({"segments": [{"start": 1.0, "end": 2.0, "text": "こんにちは"}]}), encoding="utf-8"
         )
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0)
 
-    monkeypatch.setattr("pudge.audiobooks.subprocess.run", run)
+    # The chapter-start worker runs as a registered (cancellable) child process.
+    monkeypatch.setattr("pudge.audiobooks.subprocess.Popen", run)
     segments, info = service._precision_chapter_start_segments(
         5, tmp_path / "alignment.json", chapter_index=1, reference_time=60.0, total_duration=600.0
     )

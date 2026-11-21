@@ -7,7 +7,6 @@ from css_support import css_rules
 
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
-from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
 
 
@@ -57,83 +56,6 @@ def test_planning_relations_round_trip_and_cap_at_two(tmp_path: Path) -> None:
     assert planned["format"] == "MOVIE"
     assert [item["media_id"] for item in planned["relations"]["prequel_levels"][-1]] == [1, 2]
     assert [item["media_id"] for item in planned["relations"]["sequel_levels"][0]] == [4, 5]
-
-
-def test_anilist_library_keeps_direct_anime_prequel_and_sequel_relations(monkeypatch) -> None:
-    client = AniListClient("https://example.invalid", access_token="x")
-    monkeypatch.setattr(client, "viewer", lambda: {"id": 7, "name": "tester"})
-
-    def fake_post(query, variables=None):
-        return {
-            "MediaListCollection": {
-                "lists": [
-                    {
-                        "status": "PLANNING",
-                        "entries": [
-                            {
-                                "progress": 0,
-                                "status": "PLANNING",
-                                "media": {
-                                    "id": 100,
-                                    "title": {"romaji": "Current"},
-                                    "synonyms": [],
-                                    "episodes": 12,
-                                    "format": "TV",
-                                    "status": "NOT_YET_RELEASED",
-                                    "siteUrl": "https://anilist.co/anime/100",
-                                    "coverImage": {},
-                                    "relations": {
-                                        "edges": [
-                                            {
-                                                "relationType": "PREQUEL",
-                                                "node": {
-                                                    "id": 90,
-                                                    "type": "ANIME",
-                                                    "title": {"romaji": "Previous season"},
-                                                    "format": "TV",
-                                                    "seasonYear": 2025,
-                                                    "siteUrl": "https://anilist.co/anime/90",
-                                                },
-                                            },
-                                            {
-                                                "relationType": "SEQUEL",
-                                                "node": {
-                                                    "id": 110,
-                                                    "type": "ANIME",
-                                                    "title": {"romaji": "Next season"},
-                                                    "format": "TV",
-                                                    "seasonYear": 2027,
-                                                    "siteUrl": "https://anilist.co/anime/110",
-                                                },
-                                            },
-                                            {
-                                                "relationType": "ADAPTATION",
-                                                "node": {
-                                                    "id": 999,
-                                                    "type": "MANGA",
-                                                    "title": {"romaji": "Manga"},
-                                                },
-                                            },
-                                        ]
-                                    },
-                                },
-                            }
-                        ],
-                    }
-                ]
-            }
-        }
-
-    monkeypatch.setattr(client, "_post", fake_post)
-    try:
-        items = client.library()
-    finally:
-        client.close()
-
-    assert [(item["relation_type"], item["media_id"]) for item in items[0].relations] == [
-        ("PREQUEL", 90),
-        ("SEQUEL", 110),
-    ]
 
 
 def _node(relation_type: str, media_id: int, title: str, year: int, **extra) -> dict:

@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     request_path, result_path = Path(args[0]), Path(args[1])
     request = json.loads(request_path.read_text(encoding="utf-8"))
     from . import reading_audio_alignment as alignment_module
+    from .fsutil import atomic_write_json
 
     anchor_cache = Path(str(request.get("anchor_cache") or "")) if request.get("anchor_cache") else None
     if anchor_cache is not None and anchor_cache.is_file():
@@ -50,21 +51,17 @@ def main(argv: list[str] | None = None) -> int:
             speech_regions=request.get("speech_regions"),
             chapter_start_segments=_int_keys(request.get("chapter_start_segments")),
             chapter_start_reading_hints=_int_keys(request.get("chapter_start_reading_hints")),
+            minimum_anchor_density=float(request.get("minimum_anchor_density") or 0.0),
         )
         payload: dict[str, Any] = {"ok": True, "alignment": result}
     except Exception as exc:  # noqa: BLE001 - reported to the parent, which shows it on the job
         payload = {"ok": False, "error": str(exc), "type": type(exc).__name__}
     if anchor_cache is not None:
         try:
-            temporary = anchor_cache.with_suffix(anchor_cache.suffix + ".tmp")
-            temporary.write_text(json.dumps(alignment_module.anchor_cache_rows()), encoding="utf-8")
-            temporary.replace(anchor_cache)
+            atomic_write_json(anchor_cache, alignment_module.anchor_cache_rows())
         except OSError:
             pass
-    temporary = result_path.with_suffix(result_path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-    temporary.replace(result_path)
+    atomic_write_json(result_path, payload, ensure_ascii=False, separators=(",", ":"))
     return 0
 
 

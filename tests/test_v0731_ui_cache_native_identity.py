@@ -89,7 +89,11 @@ def test_segment_audio_is_lossless_flac_and_a_forced_resync_reuses_the_cache(
     [command] = commands
     # Mono 16 kHz, FLAC at the fastest level: lossless for ffsubsync, small for mostly silent windows.
     assert command[command.index("-ac") + 1 : command.index("-ac") + 4] == ["1", "-ar", "16000"]
-    assert command[-7:] == ["-c:a", "flac", "-compression_level", "0", "-f", "flac", f"{output}.tmp"]
+    assert command[-7:-1] == ["-c:a", "flac", "-compression_level", "0", "-f", "flac"]
+    # ffmpeg writes a temporary file of its own beside the cache entry, renamed when complete.
+    temporary = Path(command[-1])
+    assert temporary.parent == output.parent and temporary.name.startswith(f".{output.name}.")
+    assert temporary.name.endswith(".flac.tmp") and not temporary.exists()
     # A forced resync of the same window does not decode the episode again; it marks the file as used.
     old = time.time() - 3600
     os.utime(output, (old, old))

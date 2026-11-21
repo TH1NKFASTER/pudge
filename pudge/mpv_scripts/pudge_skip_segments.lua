@@ -1,7 +1,10 @@
 -- Pudge: "Skip opening/ending" button for segments detected by Pudge.
 --
 -- Pudge writes a session JSON (PUDGE_SEGMENTS_FILE) with already detected
--- segments before starting mpv; this script never analyses anything.
+-- segments before starting mpv; this script never analyses anything.  A file
+-- without segments yet gets a session with "pending": true: Pudge detects them
+-- in the background while mpv plays and rewrites the session; this script
+-- re-reads it every POLL_SECONDS until it has segments or is no longer pending.
 -- The button is shown only during the first BUTTON_SECONDS of [start, end)
 -- (also after seeking back into them) and seeks to `end` (absolute+exact),
 -- so a scene after the ending credits stays.  Clicks are
@@ -56,6 +59,8 @@ end
 
 local session = nil
 local segments = {}
+local POLL_SECONDS = 5
+local poll_timer = nil
 local current = nil
 local shown = false -- the button (and its key) is on screen
 local BUTTON_SECONDS = 5
@@ -69,18 +74,18 @@ local function finite(value)
     return type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge
 end
 
-local function read_session()
+local function read_session(quiet)
     if segments_file == '' then return nil end
     local handle = io.open(segments_file, 'r')
     if not handle then
-        mp.msg.warn('pudge skip: session file is missing')
+        if not quiet then mp.msg.warn('pudge skip: session file is missing') end
         return nil
     end
     local content = handle:read('*a')
     handle:close()
     local data = utils.parse_json(content or '')
     if type(data) ~= 'table' or data.version ~= 1 or type(data.segments) ~= 'table' then
-        mp.msg.warn('pudge skip: invalid session file')
+        if not quiet then mp.msg.warn('pudge skip: invalid session file') end
         return nil
     end
     return data
@@ -282,8 +287,44 @@ local function reset()
     clear_button()
 end
 
+local function stop_polling()
+    if poll_timer then
+        poll_timer:kill()
+        poll_timer = nil
+    end
+end
+
+-- A pending session: segments detected during playback appear here. Only a
+-- rewritten session of the same file is taken; a missing or unreadable file
+-- (being replaced) is tried again on the next tick, a gone one ends polling.
+local misses = 0
+local function poll_session()
+    local data = read_session(true)
+    if not data then
+        misses = misses + 1
+        if misses >= 3 then stop_polling() end
+        return
+    end
+    misses = 0
+    if not same_file(data) then
+        stop_polling()
+        return
+    end
+    if #data.segments > 0 then
+        stop_polling()
+        session = data
+        segments = valid_segments(session, mp.get_property_number('duration'))
+        mp.msg.info(string.format('pudge skip: %d segment(s) loaded during playback', #segments))
+        evaluate(nil, mp.get_property_number('time-pos'))
+    elseif data.pending ~= true then
+        stop_polling()
+        mp.msg.info('pudge skip: no segments for this file')
+    end
+end
+
 mp.register_event('file-loaded', function()
     reset()
+    stop_polling()
     segments = {}
     session = read_session()
     if not session then return end
@@ -293,11 +334,17 @@ mp.register_event('file-loaded', function()
     end
     segments = valid_segments(session, mp.get_property_number('duration'))
     mp.msg.info(string.format('pudge skip: %d segment(s) loaded', #segments))
+    if #segments == 0 and session.pending == true then
+        misses = 0
+        poll_timer = mp.add_periodic_timer(POLL_SECONDS, poll_session)
+        mp.msg.info('pudge skip: segments pending; re-reading the session')
+    end
     evaluate(nil, mp.get_property_number('time-pos'))
 end)
 
 mp.register_event('end-file', function()
     reset()
+    stop_polling()
     segments = {}
 end)
 

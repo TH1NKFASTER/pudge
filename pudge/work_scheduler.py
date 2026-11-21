@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - Pudge ships on macOS.
     fcntl = None  # type: ignore[assignment]
 
-from .foreground import foreground_active
+from .foreground import PAUSE_SETTLE_SECONDS, foreground_active, foreground_playback, foreground_video
 from .power_policy import PowerPolicy
 
 
@@ -165,29 +165,54 @@ class WorkScheduler:
     def power_snapshot(self, *, refresh: bool = False) -> dict[str, Any]:
         return self.power_policy.snapshot(refresh=refresh).as_dict()
 
-    def resource_status(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Compatibility view plus the richer PowerPolicy fields."""
-        snapshot = self.power_policy.snapshot(refresh=refresh)
-        payload = snapshot.as_dict()
-        # Historical callers treated an unknown power source as False. Keep that
-        # narrow compatibility while power_snapshot() preserves None/unknown.
-        payload["on_battery"] = bool(snapshot.on_battery)
-        return payload
+    def _paused_foreground_block_reason(self, resource: str = "cpu") -> str | None:
+        """None when the foreground video mpv has been paused (or idle) for a while on AC.
+
+        Power reasons come before the pause's age: on battery the agent exits at once instead
+        of coming back for a pause it may not use anyway."""
+        state, paused_for = foreground_playback(self.cache_dir)
+        if state == "none":
+            return None
+        if state != "paused":
+            return "playing"
+        if self.power_policy.snapshot().on_battery is not False:
+            return "battery"  # also an unknown power source
+        power = self.power_policy.background_block_reason(resource=resource)
+        if power is not None:
+            return power
+        if paused_for < PAUSE_SETTLE_SECONDS:
+            return "paused_recently"
+        return None
+
+    def foreground_video(self) -> Path | None:
+        """The video of the current foreground (the one open in mpv), if any."""
+        return foreground_video(self.cache_dir)
 
     def background_block_reason(
         self,
         *,
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
+        foreground_paused_ok: bool = False,
     ) -> str | None:
+        """Why background work must wait now, or None.
+
+        ``foreground_paused_ok`` is an explicit opt-in (only the intro-skipper pass): a video
+        mpv paused or idle for ``PAUSE_SETTLE_SECONDS`` on AC power does not block it; the
+        power rules (energy saving, thermal) still do. Everything else keeps waiting for the
+        whole foreground session.
+        """
+        requested = WorkPriority(int(priority))
         if foreground_active(self.cache_dir):
-            reason: str | None = "foreground"
-        else:
-            requested = WorkPriority(int(priority))
-            if requested != WorkPriority.BACKGROUND:
-                reason = None
-            else:
+            reason: str | None = (
+                self._paused_foreground_block_reason(resource) if foreground_paused_ok else "foreground"
+            )
+            if reason is None and requested == WorkPriority.BACKGROUND:
                 reason = self.power_policy.background_block_reason(resource=resource)
+        elif requested != WorkPriority.BACKGROUND:
+            reason = None
+        else:
+            reason = self.power_policy.background_block_reason(resource=resource)
         self._background_decision_local.reason = reason
         return reason
 
@@ -196,8 +221,14 @@ class WorkScheduler:
         *,
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
+        foreground_paused_ok: bool = False,
     ) -> bool:
-        return self.background_block_reason(priority=priority, resource=resource) is None
+        return (
+            self.background_block_reason(
+                priority=priority, resource=resource, foreground_paused_ok=foreground_paused_ok
+            )
+            is None
+        )
 
     def background_wait_reason(
         self,
@@ -205,6 +236,7 @@ class WorkScheduler:
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
         fallback: str = "foreground",
+        foreground_paused_ok: bool = False,
     ) -> str | None:
         """Return the admission reason without bypassing background_allowed().
 
@@ -215,7 +247,11 @@ class WorkScheduler:
         probing battery state a second time.
         """
         requested = WorkPriority(int(priority))
-        if requested == WorkPriority.BACKGROUND and resource == "cpu":
+        if foreground_paused_ok:
+            allowed = self.background_allowed(
+                priority=requested, resource=resource, foreground_paused_ok=True
+            )
+        elif requested == WorkPriority.BACKGROUND and resource == "cpu":
             allowed = self.background_allowed()
         else:
             allowed = self.background_allowed(priority=requested, resource=resource)
@@ -233,9 +269,11 @@ class WorkScheduler:
         poll_seconds: float = 0.5,
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
+        foreground_paused_ok: bool = False,
     ) -> bool:
         started = time.monotonic()
-        while not self.background_allowed(priority=priority, resource=resource):
+        paused_ok = {"foreground_paused_ok": True} if foreground_paused_ok else {}
+        while not self.background_allowed(priority=priority, resource=resource, **paused_ok):
             if (cancel_event is not None and cancel_event.is_set()) or (
                 callable(cancel_check) and cancel_check()
             ):
@@ -260,8 +298,11 @@ class WorkScheduler:
         poll_seconds: float = 0.5,
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
+        foreground_paused_ok: bool = False,
     ) -> HeavyWorkLease | None:
         requested_priority = WorkPriority(int(priority))
+        # Only the explicit opt-in passes the flag on (callers may override the checks).
+        paused_ok = {"foreground_paused_ok": True} if foreground_paused_ok else {}
         if foreground_sensitive:
             if wait_for_foreground:
                 if not self.wait_until_background(
@@ -270,10 +311,13 @@ class WorkScheduler:
                     poll_seconds=poll_seconds,
                     priority=requested_priority,
                     resource=resource,
+                    **paused_ok,
                 ):
                     return None
             else:
-                block_reason = self.background_wait_reason(priority=requested_priority, resource=resource)
+                block_reason = self.background_wait_reason(
+                    priority=requested_priority, resource=resource, **paused_ok
+                )
                 if block_reason is not None:
                     self._log(
                         "SKIP step=work_scheduler.heavy name=%s reason=%s",
@@ -361,7 +405,9 @@ class WorkScheduler:
             if locked:
                 try:
                     block_reason = (
-                        self.background_wait_reason(priority=requested_priority, resource=resource)
+                        self.background_wait_reason(
+                            priority=requested_priority, resource=resource, **paused_ok
+                        )
                         if foreground_sensitive
                         else None
                     )

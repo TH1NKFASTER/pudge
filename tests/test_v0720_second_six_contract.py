@@ -29,8 +29,8 @@ def _manager(tmp_path: Path) -> AnimeManager:
 def _release() -> NyaaRelease:
     return NyaaRelease(
         title="[SubsPlease] Sayonara Lara - 07 (1080p)",
-        link="https://nyaa.si/view/7",
-        torrent_url="https://nyaa.si/download/7.torrent",
+        link="https://releases.invalid/view/7",
+        torrent_url="https://releases.invalid/download/7.torrent",
         info_hash="7" * 40,
         size_text="1.2 GiB",
         size_bytes=1200 * 1024 * 1024,

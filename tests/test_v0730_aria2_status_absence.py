@@ -127,7 +127,8 @@ def test_manager_confirms_real_aria2_removal_after_metadata_is_deleted(tmp_path,
         return {"result": "OK"}
 
     client = rpc_client(respond)
-    client._save_metadata({GID: {"info_hash": INFO_HASH}})
+    # add_release records the download folder; files are deleted only inside it.
+    client._save_metadata({GID: {"info_hash": INFO_HASH, "save_path": str(tmp_path)}})
     AnimeManager._delete_confirmed_torrent(client, INFO_HASH, delete_files=True)
 
     assert client.torrent_status(INFO_HASH) is None

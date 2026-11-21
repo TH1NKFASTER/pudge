@@ -69,6 +69,10 @@ class _FakeTorrent:
         self.after_files = after_files
         self.closed = False
 
+    def has_torrent(self, _info_hash):
+        # Both real clients answer it; only a torrent checked as new is deleted on failure.
+        return False
+
     def add_release(self, *_args, **_kwargs):
         self.added += 1
         return "managed-audiobook"

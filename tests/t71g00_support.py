@@ -57,13 +57,12 @@ SEP = "\x1f"
 LSREGISTER = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 )
-FORMULAS = ("mpv", "ffmpeg", "alass", "sevenzip", "aria2", "python@3.12", "python-tk@3.12")
+FORMULAS = ("mpv", "ffmpeg", "alass", "aria2", "python@3.12")
 TOOLS = (
     "mpv/bin/mpv",
     "ffmpeg/bin/ffmpeg",
     "ffmpeg/bin/ffprobe",
     "alass/bin/alass-cli",
-    "sevenzip/bin/7zz",
     "aria2/bin/aria2c",
 )
 PY_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -220,6 +219,8 @@ if args[0] == "wheel":
         wheel.writestr(f"pudge-{version}.dist-info/METADATA", f"Metadata-Version: 2.1\nName: pudge\nVersion: {version}\n")
 elif args[0] == "install":
     target = args[-1]
+    if "--root" in args:  # pip --root ROOT: the same paths under ROOT (the installer's staging)
+        site = Path(args[args.index("--root") + 1] + str(site))
     if target.endswith(".whl") and "--no-deps" in args:
         zipfile.ZipFile(target).extractall(site)
     elif target.startswith("manga-ocr") and os.environ.get("MANGA_OCR_INSTALLS", "1") == "1":
@@ -333,7 +334,8 @@ class Install:
 
     @property
     def agent_plist(self) -> Path:
-        return self.home / "Library" / "LaunchAgents" / "com.pudge.agent.plist"
+        # Outside ~/Library/LaunchAgents: the window bootstraps it by path (only while open).
+        return self.data_dir / "launchd" / "com.pudge.agent.plist"
 
     @property
     def launcher_source(self) -> Path:

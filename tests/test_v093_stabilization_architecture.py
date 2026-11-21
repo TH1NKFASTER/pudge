@@ -156,9 +156,9 @@ def test_work_scheduler_resource_probe_failure_is_nonfatal(tmp_path: Path, monke
         raise TypeError("simulated broken process layer")
 
     monkeypatch.setattr("pudge.work_scheduler.subprocess.run", fail_run)
-    status = scheduler.resource_status(refresh=True)
+    status = scheduler.power_policy.snapshot(refresh=True).as_dict()
 
     assert status["thermal_limited"] is False
-    assert status["on_battery"] is False
+    assert not status["on_battery"]
     assert status["battery_percent"] is None
     assert scheduler.background_allowed() is True

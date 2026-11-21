@@ -10,7 +10,17 @@ import time
 from pathlib import Path
 
 from .i18n import err
+from .fsutil import atomic_write_json
 from .runtime import worker_environment
+
+
+# mpv is optional (install.sh no longer installs it). The fast-play launcher exits with
+# this code when mpv is missing, so the window offers the setup guide, not a raw error.
+MPV_MISSING_EXIT_CODE = 127
+
+
+class MpvNotFoundError(RuntimeError):
+    """The mpv binary is not installed (or its configured path is gone)."""
 
 
 _MPV_OPTION_CACHE: dict[tuple[str, int, int], frozenset[str]] = {}
@@ -146,12 +156,7 @@ def _write_mpv_start_ack(pid: int) -> Path | None:
     path = Path(raw).expanduser()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps({"pid": int(pid), "started_at": time.time()}),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        atomic_write_json(path, {"pid": int(pid), "started_at": time.time()})
         return path
     except OSError:
         return None
@@ -242,7 +247,7 @@ def run_mpv(
     try:
         process = subprocess.Popen(command, env=env)
     except FileNotFoundError as exc:
-        raise RuntimeError(err("media.mpvNotFound", path=command[0])) from exc
+        raise MpvNotFoundError(err("media.mpvNotFound", path=command[0])) from exc
     ack_path = _write_mpv_start_ack(process.pid)
     try:
         from .logging_utils import configure_logging

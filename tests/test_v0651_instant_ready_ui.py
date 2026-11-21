@@ -40,7 +40,6 @@ def test_web_api_exposes_cheap_ready_marker_and_state_payload(tmp_path: Path) ->
     api = _make_api(tmp_path)
     api.manager.db.set_state("ready_state_version", "123456")
 
-    assert api.ready_state_version() == "123456"
     assert api.ui_state_versions()["ready"] == "123456"
     assert "ui" in api.ui_state_versions()
     assert api.get_state_fast()["ready_state_version"] == "123456"

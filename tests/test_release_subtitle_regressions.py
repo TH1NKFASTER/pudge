@@ -292,7 +292,7 @@ def test_requeue_preserves_ready_subtitles_when_speech_worker_is_unavailable(
     manager.config = SimpleNamespace(sync=SyncConfig())
     monkeypatch.setattr(
         "pudge.subtitles.stt.subprocess.run",
-        lambda *a, **k: subprocess.CompletedProcess(a[0], 0 if worker_ready else 3, "", "mlx-whisper absent"),
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0 if worker_ready else 3, "", "mlx absent"),
     )
     monkeypatch.setattr("pudge.manager.invalidate_final_pipeline_result", lambda *_a: None)
     assert manager._requeue_unverified_timeline_edits() == int(worker_ready)

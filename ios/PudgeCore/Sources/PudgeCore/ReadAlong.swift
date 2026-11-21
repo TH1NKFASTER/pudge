@@ -9,6 +9,9 @@ public struct ReadAlongSentence: Codable, Hashable {
     public let end: Int
     /// Words: [utf16 start, utf16 end (in `text`), normalized offset, wordId, readingIndex].
     public let w: [[Int]]?
+    /// The line's own [startMs, endMs] on the book clock (subtitle lines of an audiobook made
+    /// from anime). Two lines shown at once start together, which the anchors cannot say.
+    public let t: [Int64]?
 
     public var words: [ReadAlongWord] {
         (w ?? []).compactMap { row in
@@ -71,6 +74,14 @@ public struct ReadAlongChapter: Codable, Hashable, Identifiable {
         let left = anchors[low], right = anchors[high]
         let span = Double(max(1, right[1] - left[1]))
         return left[0] + Int64(Double(Int64(offset) - left[1]) / span * Double(right[0] - left[0]))
+    }
+
+    /// Audio time where a sentence starts: its own time when it has one, else by the anchors.
+    public func startMs(ofSentence index: Int) -> Int64 {
+        guard sentences.indices.contains(index) else { return startMs }
+        let sentence = sentences[index]
+        if let own = sentence.t, own.count == 2 { return own[0] }
+        return timeMs(atOffset: sentence.start)
     }
 
     /// Sentence being read at a normalized offset.

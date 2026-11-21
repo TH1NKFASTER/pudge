@@ -60,6 +60,8 @@ pudge/assets/jimaku-trial-key
 # iPhone project: local signing and Xcode/SwiftPM state
 ios/Config/Signing.local.xcconfig
 ios/**/xcuserdata/
+# Xcode writes this workspace file when it opens the project (make release needs a clean tree).
+ios/Pudge.xcodeproj/project.xcworkspace/contents.xcworkspacedata
 ios/PudgeCore/.build/
 
 # Test caches

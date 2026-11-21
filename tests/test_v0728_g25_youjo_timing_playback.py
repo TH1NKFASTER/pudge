@@ -6,12 +6,12 @@ from pudge.subtitles.timeline_alignment import _stabilize_decreasing_boundaries
 
 def test_youjo_style_decreasing_clock_reanchors_to_real_source_gap() -> None:
     cues = [
-        (71.772, 74.274, "目撃者は最小限に抑え"),
-        (74.274, 77.678, "不幸な事故のタイミングを狙わねば"),
+        (71.772, 74.274, "荷物は朝のうちに運び"),
+        (74.274, 77.678, "昼の便に間に合わせなければ"),
         (94.561, 101.401, "（悲鳴）"),
-        (101.401, 104.571, "西から東"),
-        (104.571, 106.740, "そして また西へ"),
-        (106.740, 110.577, "命令とはいえ"),
+        (101.401, 104.571, "北から南"),
+        (104.571, 106.740, "そして また北へ"),
+        (106.740, 110.577, "仕事とはいえ"),
     ]
     segments = [
         {
@@ -70,9 +70,9 @@ def test_playback_cleaner_keeps_japanese_han_only_lines(tmp_path: Path) -> None:
     )
     source.write_text(
         normal + "11\n00:02:04,405 --> 00:02:08,409\n"
-        "出発前\nルーデルドルフ閣下が　こちらを。\n\n"
+        "出発前\n大佐殿が　お待ちです。\n\n"
         "12\n00:03:29,590 --> 00:03:32,660\n"
-        "敵爆撃機より\n魔導反応感知！\n\n",
+        "東門付近より\n煙発生確認！\n\n",
         encoding="utf-8",
     )
 
@@ -80,9 +80,9 @@ def test_playback_cleaner_keeps_japanese_han_only_lines(tmp_path: Path) -> None:
     payload = cleaned_output.read_text(encoding="utf-8")
 
     assert "出発前" in payload
-    assert "ルーデルドルフ閣下が" in payload
-    assert "敵爆撃機より" in payload
-    assert "魔導反応感知！" in payload
+    assert "大佐殿が" in payload
+    assert "東門付近より" in payload
+    assert "煙発生確認！" in payload
     assert result["bilingual_profile"]["removed_inline_chinese_lines"] == 0
     assert result["bilingual_cjk"] is False
 

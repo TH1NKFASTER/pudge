@@ -142,7 +142,7 @@ def test_uninstall_api_starts_the_detached_cleanup_then_closes_the_window(
         def start(self):
             pass
 
-    monkeypatch.setattr(web_app, "launch_uninstaller", launched.append)
+    monkeypatch.setattr(web_app, "launch_uninstaller", lambda plan, **_options: launched.append(plan))
     monkeypatch.setattr(web_app.threading, "Timer", Timer)
     monkeypatch.setattr(web_app.sys, "platform", "linux")
     with pytest.raises(RuntimeError, match=re.escape(en("error.web.uninstallMacOnly"))):

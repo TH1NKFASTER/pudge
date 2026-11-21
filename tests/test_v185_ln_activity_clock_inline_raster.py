@@ -17,7 +17,7 @@ from t71g19_support import LN_PAIRED, OPEN
 
 
 def _trace_shape_alignment() -> dict[str, object]:
-    """Real 第三幕 shape around 通行証をもらって from the v184 trace."""
+    """Real 第三幕 shape (offsets and times only) from the v184 trace."""
     return {
         "chapters": [
             {
@@ -72,7 +72,7 @@ def test_live_clock_holds_offset_during_internal_vad_pauses() -> None:
 
 def test_seek_inverse_uses_same_activity_clock() -> None:
     alignment = _trace_shape_alignment()
-    # Offset 147 is around 通行証. Seeking must land in active speech, never in
+    # Offset 147 is inside a spoken word. Seeking must land in active speech, never in
     # the long quiet interval before the next activity region.
     position = audio_position_for_light_novel_offset(alignment, 2, 147)
     assert position is not None

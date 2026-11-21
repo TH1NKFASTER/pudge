@@ -100,7 +100,7 @@ def test_narrow_torrent_writer_preserves_unrelated_config_without_keychain(
 ) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[nyaa]\nbase_url = "https://nyaa.si"\ntorrents_enabled = false\n\n'
+        '[nyaa]\nbase_url = "https://releases.invalid"\ntorrents_enabled = false\n\n'
         '[qbittorrent]\npassword = "do-not-touch"\n',
         encoding="utf-8",
     )
@@ -119,7 +119,7 @@ def test_narrow_torrent_writer_preserves_unrelated_config_without_keychain(
 
     # The file the writer produced: only the flag changed, the other sections are untouched.
     written = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert written["nyaa"] == {"base_url": "https://nyaa.si", "torrents_enabled": True}
+    assert written["nyaa"] == {"base_url": "https://releases.invalid", "torrents_enabled": True}
     assert written["qbittorrent"] == {"password": "do-not-touch"}
     assert load_config(config_path).nyaa.torrents_enabled is True
 

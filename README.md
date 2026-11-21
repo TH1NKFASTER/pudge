@@ -8,11 +8,12 @@ new episodes, prepare subtitles, play video through mpv, track progress, and
 pair audiobooks with Light Novels without turning the setup into a collection
 of separate scripts.
 
-Current version: **0.8.0**.
+Current version: **0.8.1**.
 
 ## What Pudge can do
 
-- find anime releases through Nyaa and download them with Pudge or qBittorrent;
+- search the release sources you add in Settings → Sources (Pudge ships with
+  none) and download the releases with Pudge's torrent client or qBittorrent;
 - find Japanese subtitles, check their timing, and repair missing or stale prepared subtitles;
 - keep watched progress in sync with AniList;
 - read EPUB/TXT Light Novels and CBZ/ZIP manga;
@@ -34,9 +35,11 @@ Use Settings to configure study providers, playback and optional reading reviews
 - accounts or tokens only for integrations you choose, such as Jimaku, AniList,
   or Jiten. The official jpdb-mpv-plugin handles its own authorization.
 
-The installer adds the media and download tools Pudge needs through Homebrew.
-During initial setup, Pudge checks the required tools and can repair a missing
-Homebrew installation. It can also install the separate
+The installer adds ffmpeg and the download tools Pudge needs through Homebrew.
+mpv is optional: it is needed to watch anime and listen to audiobooks, and
+Homebrew downloads about 1 GB with its dependencies, so the first-run guide
+offers to install it (manga and light novels work without it). During initial
+setup, Pudge checks the tools it uses. It can also install the separate
 [JitenMPV](https://github.com/Sirush/JitenMPV) plugin when you explicitly select
 it.
 
@@ -50,7 +53,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.8.0.zip
+unzip pudge-macos-v0.8.1.zip
 cd pudge
 ./install.sh
 ```

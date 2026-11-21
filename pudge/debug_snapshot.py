@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .build_identity import build_identity
+from .fsutil import atomic_write_json
 from .logging_utils import DEFAULT_LOG_PATH, tail_log
 from .i18n import err
 
@@ -95,9 +96,7 @@ def write_prepare_debug_result(
         "stdout": _redact(str(stdout or "")[-120000:]),
         "stderr": _redact(str(stderr or "")[-40000:]),
     }
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload, ensure_ascii=False, indent=2)
 
 
 def prune_subtitle_debug(cache_dir: Path, *, keep_videos: int = SUBTITLE_DEBUG_KEEP_VIDEOS) -> int:
@@ -162,10 +161,7 @@ def record_video_selection_debug(
         "selected": _jsonable(selected),
         "candidates": [_jsonable(item) for item in releases[:50]],
     }
-    target = root / key
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(target)
+    atomic_write_json(root / key, payload, ensure_ascii=False, indent=2)
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -115,6 +115,13 @@ class CacheRegistry:
         now = time.time()
         removed = 0
         removed_bytes = 0
+        victims: list[tuple[dict[str, Any], Path, int]] = []
+        # Read and decide first; the rows go in one short transaction and the files after
+        # it (DB-10): a write opened at the first DELETE used to hold the library write
+        # lock while later entries were rmtree'd, so mpv saves and workers waited. A row
+        # is deleted only while it is unpinned and untouched since the decision, and only
+        # the files of the rows actually deleted go: an entry another process re-pinned
+        # or used meanwhile keeps its file and row.
         with self.database.connect() as conn:
             for category, policy in policies.items():
                 rows = conn.execute(
@@ -135,17 +142,47 @@ class CacheRegistry:
                     if bool(row["pinned"]) or path in protected or not evictable:
                         retained += size
                         continue
-                    if path != self.cache_root and self.cache_root in path.parents:
-                        try:
-                            if path.is_dir():
-                                shutil.rmtree(path)
-                            else:
-                                path.unlink(missing_ok=True)
-                        except OSError:
-                            continue
-                    conn.execute("DELETE FROM cache_registry WHERE cache_key=?", (row["cache_key"],))
-                    removed += 1
-                    removed_bytes += size
+                    victims.append((dict(row), path, size))
+        if not victims:
+            return {"removed": 0, "removed_bytes": 0}
+        claimed: list[tuple[dict[str, Any], Path, int]] = []
+        with self.database.connect() as conn:
+            for row, path, size in victims:
+                cursor = conn.execute(
+                    "DELETE FROM cache_registry WHERE cache_key=? AND path=? AND pinned=0 AND accessed_at IS ?",
+                    (row["cache_key"], row["path"], row["accessed_at"]),
+                )
+                if int(cursor.rowcount or 0):
+                    claimed.append((row, path, size))
+        failed: list[dict[str, Any]] = []
+        for row, path, size in claimed:
+            with self.database.connect() as conn:
+                again = conn.execute(
+                    "SELECT 1 FROM cache_registry WHERE path=? LIMIT 1", (row["path"],)
+                ).fetchone()
+            if again is not None:
+                continue  # registered again after the delete: someone uses the file now
+            if path != self.cache_root and self.cache_root in path.parents:
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    failed.append(row)
+                    continue
+            removed += 1
+            removed_bytes += size
+        if failed:
+            # A file that could not go keeps its row (it is still on disk and counted).
+            with self.database.connect() as conn:
+                for row in failed:
+                    columns = list(row)
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO cache_registry({','.join(columns)}) "
+                        f"VALUES({','.join('?' * len(columns))})",
+                        tuple(row[column] for column in columns),
+                    )
         return {"removed": removed, "removed_bytes": removed_bytes}
 
     def enforce_folders(

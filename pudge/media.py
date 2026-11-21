@@ -150,21 +150,3 @@ def find_embedded_japanese_subtitles(
         key=lambda item: (item.score, item.codec in TEXT_CODECS),
         reverse=True,
     )
-
-
-def find_embedded_japanese_subtitle(
-    video: Path,
-    ffprobe: str,
-    ffmpeg: str,
-    verbose: bool = False,
-    text_only: bool = False,
-) -> EmbeddedSubtitle | None:
-    candidates = find_embedded_japanese_subtitles(
-        video,
-        ffprobe,
-        ffmpeg,
-        verbose=verbose,
-    )
-    if text_only:
-        candidates = [candidate for candidate in candidates if candidate.codec in TEXT_CODECS]
-    return candidates[0] if candidates else None

@@ -29,6 +29,14 @@
 .manga-v2-page-frame{position:relative;margin:0;display:grid;place-items:center;min-width:0;flex:0 0 auto}
 .manga-v2-page-frame img{display:block;object-fit:contain;max-width:none;max-height:none;box-shadow:0 10px 42px rgba(0,0,0,.45)}
 .manga-v2-text-layer{position:absolute;inset:0;z-index:2;pointer-events:none}
+/* Two pages: a scanned page straightened and aligned with its facing page (pudge/manga_align.py).
+   Its picture and its text layers turn and move together around the page's centre; the frame
+   keeps the page's place, cuts it off at the gutter and paints its backing behind it. */
+.manga-v2-page-frame.aligned>*{transform:var(--manga-align);transform-origin:50% 50%}
+.manga-v2-page-frame.aligned[data-align-gutter="right"]{clip-path:inset(-50% 0 -50% -50%)}
+.manga-v2-page-frame.aligned[data-align-gutter="left"]{clip-path:inset(-50% -50% -50% 0)}
+.manga-v2-page-frame.aligned[data-align-gutter] img{box-shadow:none}
+.manga-v2-page-frame.aligned[data-align-backing="1"]::before{content:"";position:absolute;z-index:-1;left:var(--manga-align-left);top:var(--manga-align-top);width:var(--manga-align-width);height:var(--manga-align-height);background:var(--manga-align-fill)}
 .manga-v2-text-region{position:absolute;display:block;min-width:18px;min-height:18px;padding:0;border:0;background:transparent;pointer-events:none;cursor:default;overflow:visible;outline:none;user-select:none;-webkit-user-select:none}
 .manga-v2-region-content{position:absolute;z-index:2;inset:0;overflow:visible;padding:0;border:0;background:transparent;box-shadow:none;font-size:clamp(10px,1.25vw,18px);line-height:1.12;text-align:left;white-space:pre-wrap;pointer-events:none;user-select:none;-webkit-user-select:none;cursor:default}
 .manga-v2-region-content,.manga-v2-region-content *{color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}
@@ -199,3 +207,7 @@
 .manga-volume-words{max-height:52vh;overflow:auto;margin:8px 0}
 .manga-volume-word{cursor:pointer}
 .manga-volume-word input{margin:0 8px 0 0}
+
+/* A volume whose archive or image folder moved or was deleted (opening it offers Find…). */
+.ln-entry.manga-missing .ln-card-cover{opacity:.45;filter:grayscale(1)}
+.ln-card-meta>.manga-missing-badge{color:var(--danger);border-color:rgba(255,107,125,.5)}

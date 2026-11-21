@@ -134,7 +134,11 @@
       navigator.clipboard.writeText(invitation.invitation).then(() => say(PudgeI18n.t('pairing.copied'))).catch(showError);
     };
     if (timer) clearInterval(timer);
-    timer = setInterval(() => { refresh().catch(showError); }, 2000);
+    // Every 2 s while someone can see the section. With the window in the background only a
+    // pairing code that is still valid keeps the check going (its approval and its end);
+    // otherwise the status was asked for every 2 s for as long as Settings stayed open behind.
+    // (Back in front, the next tick is at most 2 s away.)
+    timer = setInterval(() => { if (!document.hidden || live()) refresh().catch(showError); }, 2000);
     refresh().catch(showError);
   };
   window.PudgeIPhoneSettings = {enhance};

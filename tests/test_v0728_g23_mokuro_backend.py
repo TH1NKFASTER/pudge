@@ -207,6 +207,7 @@ def test_installing_mokuro_creates_its_own_environment_with_the_pinned_version(
         "-m",
         "pip",
         "install",
+        "--no-cache-dir",
         "--upgrade",
         "pip",
         "mokuro==0.2.5",

@@ -7,24 +7,77 @@ import re
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import iphone_network
+from .iphone_grammar import BODY_LIMIT as _GRAMMAR_BODY_LIMIT
 from .iphone_service import IPhoneService, PairingRefused, encoded
 from .i18n import err
+from .memory_diagnostics import memory_step
 
 # A connection waiting for a request (or the TLS handshake) is closed after this.
 _IDLE_TIMEOUT = 5.0
 # While a file goes to the phone: Wi-Fi stalls and a busy phone pause reading for longer
 # than the idle timeout without the transfer being dead (the phone itself waits 120 s).
 _TRANSFER_TIMEOUT = 120.0
+# A pairing request is four short fields (well under 2 KB); it is read before any
+# authentication, so a stranger on the Wi-Fi must not make the Mac buffer megabytes.
+_PAIR_BODY_LIMIT = 16 * 1024
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"Invalid number {name}")
+
+
+def request_json(data: bytes) -> Any:
+    """A request body as JSON. NaN and Infinity (Python's extension of JSON, never sent by the
+    phone's encoder) are refused: an infinite "activeSeconds" counted a watch, an infinite place
+    was stored and every later answer carrying it was no JSON a browser or phone could read."""
+    return json.loads(data, parse_constant=_no_constant)
+
+
+def media_refusal(exc: BaseException) -> bool:
+    """A media request refused for good (HTTP 422: the phone shows the reason and does not send
+    it again): the item is gone or the request is invalid (MediaError, ValueError, KeyError), or
+    something is not set up on the Mac (errors marked ``setup_required``, e.g. "Jiten API token
+    is not configured"). Everything else is temporary (HTTP 503, sent again later):
+    MediaTemporaryError ("the Mac app is still starting"), a Jiten rate limit or outage, the
+    release search, a locked database, a full disk, a RuntimeError while Pudge shuts down."""
+    from .iphone_media import MediaError, MediaTemporaryError
+
+    if isinstance(exc, MediaTemporaryError):
+        return False
+    if getattr(exc, "setup_required", False) is True:
+        return True
+    return isinstance(exc, (MediaError, ValueError, KeyError))
+
+
+def access_refused(exc: BaseException) -> bool:
+    """A PermissionError about the device's access (HTTP 401): raised by the phone API itself,
+    without an errno (a bad or revoked token, an archive of another device). One with an errno
+    is the file system refusing a file (EACCES/EPERM: no read permission, a volume macOS does
+    not let Pudge read). Answered 401 too, the phone said "Access was revoked on the Mac.
+    Connect the Mac again." and stopped a streamed episode for good, while pairing was fine."""
+    return isinstance(exc, PermissionError) and exc.errno is None
 
 
 def _logger(service: Any) -> Any:
     return getattr(getattr(service, "api", None), "logger", None)
+
+
+def _no_delay(sock: Any) -> None:
+    """Every write goes out at once (TCP_NODELAY). An answer is written in parts (headers,
+    then the body), and Nagle held each later part until the phone acknowledged the first,
+    which the phone delays (delayed ACK): 40-200 ms added to every answer, so AVPlayer's
+    stream of byte ranges stalled on a fast Wi-Fi."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
 
 
 def parse_range(value: str | None, size: int) -> tuple[int, int]:
@@ -38,6 +91,9 @@ def parse_range(value: str | None, size: int) -> tuple[int, int]:
         count = int(right)
         if count <= 0:
             raise ValueError("Invalid Range")
+        if size <= 0:
+            # An empty file has no last bytes: "bytes 0--1/0" is not a valid answer (RFC 9110).
+            raise ValueError("Range not satisfiable")
         return max(0, size - count), size - 1
     start = int(left)
     end = min(size - 1, int(right)) if right else size - 1
@@ -54,28 +110,53 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
         # Request paths, bearer credentials and pairing payloads are never logged.
         pass
 
-    def json(self, code: int, value: dict) -> None:
+    def json(self, code: int, value: dict, etag: str | None = None, *, body: bytes | None = None) -> None:
+        """``body``: ``value`` already encoded (the caller hashed it for its ETag)."""
         if code >= 400:
             # Unread request bodies must never be parsed as the next request.
             self.close_connection = True
-        body = encoded(value).encode()
+        if body is None:
+            body = encoded(value).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if etag is not None:
+            self.send_header("ETag", etag)
         if code >= 400:
             self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
-    def body(self, limit: int = 2 * 1024 * 1024) -> bytes:
+    def handle_one_request(self) -> None:
+        # The idle timeout is per read: a client sending one byte every few seconds held the
+        # connection (and its thread) without end. TLS handshake, request line and headers
+        # now share one deadline; parse_request cancels it, so answers (streams) are not cut.
+        self.server.set_deadline(self.request, self.server.header_deadline)
+        super().handle_one_request()
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            self.server.set_deadline(self.request, None)
+        return parsed
+
+    def read_body(self, size: int, deadline: float | None = None) -> bytes:
+        # A total deadline for the body too, for the same reason as for the headers.
+        self.server.set_deadline(self.request, deadline or self.server.body_deadline)
+        try:
+            return self.rfile.read(size)
+        finally:
+            self.server.set_deadline(self.request, None)
+
+    def body(self, limit: int = 2 * 1024 * 1024, deadline: float | None = None) -> bytes:
         raw = self.headers.get("Content-Length", "")
         if not raw.isdigit() or not 0 < int(raw) <= limit:
             raise ValueError("Invalid request size")
         size = int(raw)
         self._body_read = True
-        data = self.rfile.read(size)
+        data = self.read_body(size, deadline)
         if len(data) != size:
             raise ValueError("Incomplete request")
         return data
@@ -96,10 +177,11 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         size = int(raw)
-        if size > 4 * 1024 * 1024:
+        # Before authentication (capabilities) only a small body is read, as for pairing.
+        if size > (4 * 1024 * 1024 if self._authenticated else _PAIR_BODY_LIMIT):
             self.close_connection = True
             return
-        if size and len(self.rfile.read(size)) != size:
+        if size and len(self.read_body(size)) != size:
             self.close_connection = True
 
     def run_request(self) -> None:
@@ -127,12 +209,33 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                         "activity",
                         # Checkpoint reason "unfinish" (Mark unfinished); "reset" keeps Finished.
                         "progress-unfinish",
+                        # POST /api/v2/sync/state: progress and bookmarks of many books at once.
+                        "state-batch",
+                        # Merged periodic checkpoints ("continuousSince") count as listening.
+                        "checkpoint-runs",
+                        # GET /api/v2/catalog?lazy=1 + POST /api/v2/assets/prepare.
+                        "lazy-catalog",
+                        # POST /api/v2/inventory: what the device has downloaded (Mac library icons).
+                        "inventory",
+                        # Watch an episode from the Mac: POST media/episodes/<id>/stream holds the
+                        # copy (media/streams/<id>/keepalive|close), byte ranges with ?stream=<id>.
+                        "video-stream",
+                        # Episode copies in smaller sizes: "quality" (original | smaller | saver) on
+                        # media/episodes/<id> (?quality=), .../prepare and .../stream (body);
+                        # "qualities" with each one's size on episodes and the episode list.
+                        "video-quality",
+                        # GET /api/v2/catalog answers with an ETag and 304 to If-None-Match.
+                        "catalog-etag",
+                        # POST media/ln/<id>/position {finished: true, finishOnly: true}: the
+                        # volume is marked read without touching its place or read marker.
+                        "ln-finish",
                     ],
                 },
             )
             return
         if self.command == "POST" and route == "/api/v2/pair":
-            payload = json.loads(self.body())
+            # Unauthenticated: a small body within the header deadline.
+            payload = request_json(self.body(_PAIR_BODY_LIMIT, self.server.header_deadline))
             if not isinstance(payload, dict):
                 raise ValueError("Invalid body")
             try:
@@ -147,42 +250,64 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
         if not auth.startswith("Bearer "):
             raise PermissionError("Authentication required")
         device = service.authenticate(auth[7:])
+        self._authenticated = True
         self.server.attach_device(self.request, device)
+        if (
+            self.headers.get("X-Pudge-Discovery") == "any-name"
+            or route == "/api/v2/sync/state"
+            or (route == "/api/v2/catalog" and "lazy=1" in request.query)
+        ) and callable(getattr(service, "note_new_discovery", None)):
+            # Only newer phone builds send these: the legacy Bonjour name can go once all do.
+            service.note_new_discovery(device)
         if route.startswith("/api/v2/media/"):
-            self.media_request(service, route, parse_qs(request.query))
+            self.media_request(service, route, parse_qs(request.query), device)
             return
         if self.command == "GET" and route == "/api/v2/commands":
             self.json(200, service.commands(device))
             return
         if self.command == "GET" and route == "/api/v2/catalog":
-            scan = service.refresh_catalog()
-            self.json(200, {**service.catalog(), **scan})
+            lazy = parse_qs(request.query).get("lazy", [""])[0] == "1"
+            scan = service.refresh_catalog(lazy=lazy)
+            # ETag + If-None-Match → 304: a foreground or network-change refresh of an unchanged
+            # library no longer sends (and the phone no longer saves) every manifest again.
+            self.json_if_changed({**service.catalog(lazy=lazy), **scan})
             return
         resource_match = re.fullmatch("/api/v2/resources/([^/]+)/content", route)
         if self.command == "GET" and resource_match:
-            sha = parse_qs(request.query).get("sha256", [""])[0]
+            query = parse_qs(request.query)
+            sha = query.get("sha256", [""])[0]
+            # Played from the Mac (AVPlayer's byte ranges), not downloaded: names the stream.
+            stream = query.get("stream", [""])[0][:64]
             path = service.resource(resource_match[1], sha)
             size = path.stat().st_size
+            etag = '"' + sha + '"'
+            requested = self.headers.get("Range")
+            if_range = self.headers.get("If-Range")
+            if requested and if_range is not None and if_range.strip() != etag:
+                # A resumed download whose bytes are another edition (RFC 9110 If-Range; there is
+                # no Last-Modified, so a date never matches): the whole file, not the rest.
+                requested = None
             try:
-                start, end = parse_range(self.headers.get("Range"), size)
+                start, end = parse_range(requested, size)
             except ValueError:
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            self.send_response(206 if self.headers.get("Range") else 200)
+            self.send_response(206 if requested else 200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(end - start + 1))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("ETag", '"' + sha + '"')
+            # The content's SHA-256: the same after a Mac restart, so a cut download resumes.
+            self.send_header("ETag", etag)
             self.send_header("Cache-Control", "private, no-store")
-            if self.headers.get("Range"):
+            if requested:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
             # From here on a failure must not append JSON to a half-sent body.
             self._streaming = True
-            self.stream_resource(service, device, resource_match[1], path, start, end, size)
+            self.stream_resource(service, device, resource_match[1], path, start, end, size, stream=stream)
             return
         asset_match = re.fullmatch("/api/v2/assets/([^/]+)/(manifest|progress|bookmarks)", route)
         if self.command == "GET" and asset_match:
@@ -206,8 +331,16 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                 ),
             )
             return
+        if self.command == "POST" and route == "/api/v2/inventory":
+            from .iphone_inventory import BODY_LIMIT
+
+            payload = request_json(self.body(BODY_LIMIT))
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid body")
+            self.json(200, service.record_inventory(device, payload))
+            return
         if self.command == "POST":
-            payload = json.loads(self.body())
+            payload = request_json(self.body())
             if not isinstance(payload, dict):
                 raise ValueError("Invalid body")
             if route == "/api/v2/archives":
@@ -228,6 +361,10 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                 result = service.handoff(device, payload)
             elif route == "/api/v2/handoff/ack":
                 result = service.acknowledge_handoff(device, payload)
+            elif route == "/api/v2/sync/state":
+                result = service.sync_state(payload.get("assets"), payload.get("since"))
+            elif route == "/api/v2/assets/prepare":
+                result = service.prepare_asset(payload.get("assetId"))
             elif route == "/api/v2/activity":
                 result = service.media.record_activity(
                     device, service.device_name(device), payload.get("items"), sent_at=payload.get("sentAt")
@@ -240,15 +377,27 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
         self.json(404, {"error": "Unknown operation"})
 
     def stream_resource(
-        self, service: IPhoneService, device: str, resource: str, path: Any, start: int, end: int, size: int
+        self,
+        service: IPhoneService,
+        device: str,
+        resource: str,
+        path: Any,
+        start: int,
+        end: int,
+        size: int,
+        stream: str = "",
     ) -> None:
-        """Send bytes start..end of a resource; every transfer and cut is logged (EVENT iphone.transfer)."""
+        """Send bytes start..end of a resource; every transfer and cut is logged (EVENT iphone.transfer).
+
+        ``stream``: a byte range of an episode played from the Mac (many short ranges, cancelled
+        by every seek): it renews the stream, only real failures are logged, and reaching the
+        last byte is no download."""
         logger = _logger(service)
         media = getattr(service, "media", None)
         pin = getattr(media, "video_streaming", None)
         length, sent, began = end - start + 1, 0, time.monotonic()
         reason = "done"
-        if logger is not None:
+        if logger is not None and not stream:
             logger.info(
                 "EVENT iphone.transfer start resource=%s bytes=%s offset=%s size=%s",
                 resource[:8],
@@ -274,6 +423,12 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                         raise OSError("Resource truncated")
                     self.wfile.write(chunk)
                     sent += len(chunk)
+            if not stream and end == size - 1 and callable(getattr(service, "record_download", None)):
+                # The phone has the file up to its last byte (a resumed download sends the rest).
+                try:
+                    service.record_download(device, resource)
+                except Exception:  # noqa: BLE001 - bookkeeping never breaks a finished transfer
+                    pass
         except (TimeoutError, socket.timeout):
             reason = "phone_stopped_reading"
             raise
@@ -290,7 +445,12 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                 self.connection.settimeout(_IDLE_TIMEOUT)
             except OSError:
                 pass
-            if logger is not None:
+            used = getattr(media, "stream_used", None)
+            if stream and callable(used):
+                used(stream, device, sent, cut=reason != "done")
+            # A stream's range cut by the phone (a seek, the player closed) is no failure.
+            quiet = bool(stream) and reason in {"done", "phone_closed"}
+            if logger is not None and not quiet:
                 logger.info(
                     "EVENT iphone.transfer %s resource=%s bytes=%s/%s seconds=%.1f%s",
                     "done" if reason == "done" else "cut",
@@ -298,20 +458,21 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                     sent,
                     length,
                     time.monotonic() - began,
-                    "" if reason == "done" else f" reason={reason}",
+                    ("" if reason == "done" else f" reason={reason}") + (" stream=1" if stream else ""),
                 )
 
-    def media_request(self, service: IPhoneService, route: str, query: dict) -> None:
+    def media_request(self, service: IPhoneService, route: str, query: dict, device: str = "") -> None:
+        # A grammar question carries its chat: well under the general 2 MB.
+        limit = _GRAMMAR_BODY_LIMIT if route.startswith("/api/v2/media/grammar/") else 2 * 1024 * 1024
+
         def body() -> dict:
-            payload = json.loads(self.body())
+            payload = request_json(self.body(limit))
             if not isinstance(payload, dict):
                 raise ValueError("Invalid body")
             return payload
 
         try:
-            result = service.media.handle(self.command, route, query, body)
-        except PermissionError:
-            raise
+            result = service.media.handle(self.command, route, query, body, device=device)
         except KeyError as exc:
             if "Unknown media operation" in str(exc):
                 self.json(404, {"error": "Unknown operation"})
@@ -319,6 +480,8 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                 self.json(422, {"error": "This item is no longer on the Mac"})
             return
         except Exception as exc:  # noqa: BLE001 - readable reason for the phone
+            if access_refused(exc):
+                raise  # 401; a file the Mac may not read is a failure like any other (503)
             message = str(exc).strip() or type(exc).__name__
             logger = getattr(getattr(service, "api", None), "logger", None)
             if logger is not None:
@@ -329,7 +492,11 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
                     type(exc).__name__,
                     message[:400],
                 )
-            self.json(422, {"error": message[:400]})
+            # 422 is final for the phone (a watched mark is not sent again): only a refusal
+            # about the item itself. Anything else (a locked database, a full disk, a service
+            # down) is 503 and the phone sends it again later; a watched mark answered 422 for
+            # "database is locked" never reached AniList.
+            self.json(422 if media_refusal(exc) else 503, {"error": message[:400]})
             return
         if isinstance(result, tuple):
             data, kind = result
@@ -340,18 +507,51 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if self.command == "GET" and isinstance(result, dict):
+            # A list the phone asks for again and again (the anime list while the app is in
+            # front): unchanged since its last answer, only "304" goes back.
+            self.json_if_changed(result)
+            return
         self.json(200, result)
+
+    def json_if_changed(self, value: dict) -> None:
+        """A GET answer with an ETag: unchanged since the phone's last one (If-None-Match),
+        only "304" goes back, without a body the phone would decode and apply again. Older
+        phones never send If-None-Match. Encoded once: hashed for the ETag and sent as it is
+        (subtitle tracks and catalogs are MBs; hashing is cheap next to building them)."""
+        body = encoded(value).encode()
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        if (self.headers.get("If-None-Match") or "").strip() == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.json(200, value, etag=etag, body=body)
 
     def handle_request(self) -> None:
         self._streaming = False
         self._body_read = False
+        self._authenticated = False
         try:
             try:
-                self.run_request()
+                with memory_step(
+                    _logger(self.server.service),
+                    "iphone.request",
+                    route=f"{self.command}:{urlparse(self.path).path}"[:120],
+                ):
+                    self.run_request()
                 self.drain_unread_body()
-            except PermissionError:
+            except PermissionError as exc:
                 self.close_connection = True
-                self.json(401, {"error": "Device access revoked or invalid"})
+                if access_refused(exc):
+                    self.json(401, {"error": "Device access revoked or invalid"})
+                elif not self._streaming:
+                    # The file system refused a file (access_refused): sent again later. Once a
+                    # file's bytes are on their way nothing is added (an "HTTP/1.1 401" answer
+                    # written into the body of a 200 broke the phone's copy).
+                    self.json(503, {"error": "Storage or network unavailable"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError):
                 self.close_connection = True
                 self.json(409, {"error": "Invalid request or resource revision; refresh and retry"})
@@ -377,12 +577,36 @@ class IPhoneHandler(http.server.BaseHTTPRequestHandler):
 class IPhoneHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Every connection is a thread, and the TLS handshake and headers come before any
+    # authentication: an unpaired device on the Wi-Fi opened hundreds of dripping
+    # connections and threads. Connections over these caps are closed at once (a phone
+    # uses a few URL sessions of 2-4 connections each, plus the video player).
+    max_connections = 128
+    max_client_connections = 32
+    # Connections from addresses that have not authenticated lately share this part of
+    # max_connections: devices on the Wi-Fi that never paired (4 hosts x 32 sockets) filled
+    # every place and kept the paired phones out. A phone's address counts as known for
+    # KNOWN_CLIENT_SECONDS after its last authenticated request.
+    max_unknown_connections = 64
+    known_client_seconds = 3600.0
+    # Total time for TLS handshake + request line + headers, and for reading a body.
+    header_deadline = 15.0
+    body_deadline = _TRANSFER_TIMEOUT
 
     def __init__(self, address, service):
         self.service = service
         self._request_condition = threading.Condition()
         self._active_requests: set[Any] = set()
         self._request_devices: dict[Any, str] = {}
+        self._request_clients: dict[Any, str] = {}
+        self._client_connections: dict[str, int] = {}
+        # Addresses that authenticated (address -> monotonic time) and the admitted
+        # connections that count as unknown.
+        self._known_clients: dict[str, float] = {}
+        self._unknown_requests: set[Any] = set()
+        self._deadlines: dict[Any, float] = {}
+        self._deadline_thread: threading.Thread | None = None
+        self._deadlines_stopped = False
         self.closing = False
         # Which connections are served (iphone_network.accepts): private LAN addresses only.
         self.accepts = iphone_network.accepts
@@ -400,6 +624,19 @@ class IPhoneHTTPServer(http.server.ThreadingHTTPServer):
         with self._request_condition:
             if request in self._active_requests:
                 self._request_devices[request] = device
+                client = self._request_clients.get(request, "")
+                if client:
+                    self._known_clients[client] = time.monotonic()
+                self._unknown_requests.discard(request)
+
+    def _known(self, client: str) -> bool:
+        seen = self._known_clients.get(client)
+        if seen is None:
+            return False
+        if time.monotonic() - seen > self.known_client_seconds:
+            self._known_clients.pop(client, None)
+            return False
+        return True
 
     def close_requests(self, device: str | None = None) -> int:
         """Cut the connections of one device (revoked), or all of them (access turned off)."""
@@ -420,10 +657,29 @@ class IPhoneHTTPServer(http.server.ThreadingHTTPServer):
     def process_request(self, request: Any, client_address: Any) -> None:
         # Register before starting the daemon thread: shutdown must also see
         # accepted requests whose handler has not begun running yet.
-        request.settimeout(_IDLE_TIMEOUT)
+        client = str(client_address[0]) if client_address else ""
         with self._request_condition:
-            self._active_requests.add(request)
+            known = self._known(client)
+            admitted = (
+                len(self._active_requests) < self.max_connections
+                and self._client_connections.get(client, 0) < self.max_client_connections
+                and (
+                    known
+                    or len(self._unknown_requests) < min(self.max_unknown_connections, self.max_connections)
+                )
+            )
+            if admitted:
+                self._active_requests.add(request)
+                self._request_clients[request] = client
+                self._client_connections[client] = self._client_connections.get(client, 0) + 1
+                if not known:
+                    self._unknown_requests.add(request)
+        if not admitted:
+            self.shutdown_request(request)
+            return
         try:
+            request.settimeout(_IDLE_TIMEOUT)
+            _no_delay(request)
             super().process_request(request, client_address)
         except BaseException:
             self._request_finished(request)
@@ -437,9 +693,62 @@ class IPhoneHTTPServer(http.server.ThreadingHTTPServer):
 
     def _request_finished(self, request: Any) -> None:
         with self._request_condition:
+            if request in self._active_requests:
+                client = self._request_clients.pop(request, "")
+                count = self._client_connections.get(client, 0) - 1
+                if count > 0:
+                    self._client_connections[client] = count
+                else:
+                    self._client_connections.pop(client, None)
             self._active_requests.discard(request)
+            self._unknown_requests.discard(request)
             self._request_devices.pop(request, None)
+            self._deadlines.pop(request, None)
             self._request_condition.notify_all()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A connection cut by a deadline, a revocation or the phone itself is expected.
+        if isinstance(sys.exc_info()[1], OSError):
+            return
+        super().handle_error(request, client_address)
+
+    def set_deadline(self, request: Any, seconds: float | None) -> None:
+        """Shut the connection down unless the deadline is cancelled (None) within `seconds`."""
+        with self._request_condition:
+            if seconds is None:
+                self._deadlines.pop(request, None)
+                return
+            if request not in self._active_requests:
+                return
+            self._deadlines[request] = time.monotonic() + seconds
+            if self._deadline_thread is None:
+                # One timer thread for all connections, not one per request.
+                self._deadline_thread = threading.Thread(
+                    target=self._enforce_deadlines, name="pudge-iphone-deadlines", daemon=True
+                )
+                self._deadline_thread.start()
+            self._request_condition.notify_all()
+
+    def _enforce_deadlines(self) -> None:
+        with self._request_condition:
+            while not self._deadlines_stopped:
+                now = time.monotonic()
+                for request, deadline in list(self._deadlines.items()):
+                    if deadline <= now:
+                        del self._deadlines[request]
+                        try:
+                            # The plain socket, as in close_requests: the blocked read fails at once.
+                            socket.socket.shutdown(request, socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                upcoming = min(self._deadlines.values(), default=None)
+                self._request_condition.wait(None if upcoming is None else max(0.01, upcoming - now))
+
+    def server_close(self) -> None:
+        with self._request_condition:
+            self._deadlines_stopped = True
+            self._request_condition.notify_all()
+        super().server_close()
 
     def wait_for_requests(self, *, timeout: float = 5.0) -> bool:
         """Drain admitted requests after shutdown has stopped new admission."""

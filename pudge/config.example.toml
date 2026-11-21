@@ -24,8 +24,9 @@ disk_limit_gb = 500.0
 disk_free_reserve_gb = 0.0
 
 [nyaa]
+# Pudge ships with no release sources: add them in Settings → Sources
+# (stored in sources.json next to this file).
 enabled = true
-base_url = "https://nyaa.si"
 category = "1_2"
 proxy_mode = "direct_then_proxy"
 proxy_url = ""
@@ -42,6 +43,7 @@ preferred_video_codecs = ["HEVC", "AV1", "AVC"]
 preferred_sources = ["BluRay", "WEB-DL", "WEBRip"]
 require_japanese_audio = true
 avoid_upscaled = true
+allow_camrips = false
 trusted_groups = ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
 preferred_groups = ["EMBER", "Judas", "Anime Time"]
 blocked_groups = []
@@ -100,6 +102,14 @@ stereo_downmix = false
 mpv_mark_watched = "Ctrl+a"
 # Skip the opening/ending; bound only while the skip button is visible.
 mpv_skip_segment = "Tab"
+# Line keys in mpv; "" leaves a key unbound (mpv itself has previous/next line on Ctrl+Left/Right).
+mpv_replay_line = "Ctrl+r"
+mpv_previous_line = ""
+mpv_next_line = ""
+# Pause at the end of every subtitle line (toggled in mpv, off at each start).
+mpv_auto_pause = ""
+# Sets a subtitle delay carried from other episodes of the same release back to zero.
+mpv_reset_carried_delay = "Ctrl+z"
 # System-wide shortcut for the Screen text panel (OCR of the game window); "" turns it off.
 screen_text_toggle = "Meta+Alt+Shift+v"
 
@@ -110,6 +120,8 @@ energy_sample_seconds = 30.0
 [power]
 manual_energy_saving = false
 auto_battery_energy_saving = true
+# Experimental: lets the hidden window drop its page, runs heavy one-off work in worker processes.
+low_ram_mode = false
 
 [tools]
 mpv = "mpv"

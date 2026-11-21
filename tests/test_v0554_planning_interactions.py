@@ -2,41 +2,7 @@ from pathlib import Path
 
 from css_support import css_rules
 
-from pudge.providers.anilist import _overlay_relation_list_entries
 from test_v0552_planning_relations import DIAGRAM, planning_relations_state
-
-
-def test_completed_collection_entry_marks_nested_relation_watched() -> None:
-    relations = [
-        {
-            "media_id": 20,
-            "episodes": 12,
-            "list_status": "",
-            "progress": 0,
-            "watched": False,
-            "relations": [
-                {
-                    "media_id": 10,
-                    "episodes": 24,
-                    "list_status": "",
-                    "progress": 0,
-                    "watched": False,
-                }
-            ],
-        }
-    ]
-
-    _overlay_relation_list_entries(
-        relations,
-        {
-            20: {"status": "COMPLETED", "progress": 12, "episodes": 12},
-            10: {"status": "COMPLETED", "progress": 24, "episodes": 24},
-        },
-    )
-
-    assert relations[0]["watched"] is True
-    assert relations[0]["list_status"] == "COMPLETED"
-    assert relations[0]["relations"][0]["watched"] is True
 
 
 PREVIEW = """

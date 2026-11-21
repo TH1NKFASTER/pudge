@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import io
 import json
+import os
 import posixpath
 import re
 import shutil
@@ -19,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable, Iterable
 from urllib.parse import unquote
 
 _LN_DATABASE_GATE_INIT = threading.Lock()
@@ -27,18 +29,37 @@ _LN_DATABASE_GATE_INIT = threading.Lock()
 import httpx
 from rapidfuzz import fuzz
 
+from .archive_limits import (
+    BOOK_ARCHIVE_LIMIT,
+    IMAGE_MEMBER_LIMIT,
+    TEXT_MEMBER_LIMIT,
+    ArchiveBudget,
+    ArchiveTooLargeError,
+    extract_member,
+    read_member,
+)
 from .branding import APP_SLUG
-from .i18n import err
+from .database_storage import pack_json, unpack_json
+from .fsutil import atomic_write_bytes, temporary_sibling
+from .i18n import err, t
+from .junk_files import junk_path, software_path
 from .cover_assets import CoverRef
-from .llm import OllamaClient, build_chat_payload
+from .extra_files import title_folder_name
+from .llm import LLM_TRANSPORT_REASONS, OllamaClient, build_chat_payload
 from .library_groups import literature_franchise_metadata
 from . import library_overrides
+from . import ln_read_marker
 from . import study_secrets
+from .secrets_store import keep_masked_secret, masked_secret
+from .url_credentials import mask_url_password, restore_url_password
 from .library_overrides import kanji_volume_digits as _kanji_volume_digits
 from .metadata_cache import MetadataCache
-from .providers.nyaa import NyaaClient, NyaaRelease
-from .providers.qbittorrent import QBittorrentClient
+from .providers.nyaa import NoReleaseSourceError, NyaaClient, NyaaRelease
+from .sources import load_sources
+from .providers.qbittorrent import QBittorrentClient, QBittorrentError
 from . import grammar_analysis
+from . import jiten_client
+from . import word_lexicon
 from .jpdb_parse import (
     JPDB_PARSER_SCHEMA,
     JPDB_POSITION_ENCODING,
@@ -68,6 +89,7 @@ from .review_providers import (
     JPDB_API_BASE,
     JitenReviewProvider,
     JpdbReviewProvider,
+    ReviewNotSent,
     ReviewOutcomeUnknown,
     ReviewProviderError,
     credential_account_key,
@@ -79,8 +101,66 @@ class LightNovelError(RuntimeError):
     pass
 
 
+class LightNovelImportConflict(LightNovelError):
+    """The library has another book under this title (and volume): the user chooses
+    Keep both or Replace (``import_file(on_conflict=...)``)."""
+
+    def __init__(self, source: Path, existing: dict[str, Any]) -> None:
+        super().__init__(err("ln.importConflict", title=str(existing.get("title") or "")))
+        self.source = source
+        self.existing = existing
+
+
+LN_IMPORT_CONFLICT_CHOICES = frozenset({"ask", "replace", "keep_both"})
+
+
+class LightNovelSetupRequired(LightNovelError):
+    """Readable and lasting until the user sets something up (a missing API token): the iPhone
+    shows it and does not send the request again (HTTP 422); other failures are temporary."""
+
+    setup_required = True
+
+
 class JitenMutationUnknown(LightNovelError):
     """A Jiten mutation may have been applied (timeout, network error, HTTP 408/5xx)."""
+
+
+class LightNovelUnavailable(LightNovelError):
+    """The service is closing (a restore, quitting): nothing is wrong with the book."""
+
+
+def permanent_import_failure(exc: BaseException) -> bool:
+    """An automatic import that fails the same way until the file changes: its contents
+    cannot be read as a book, or the book was removed. Never a setup the user can still
+    do, a conflict the user decides, a closed service, a disk or database error."""
+    if isinstance(
+        exc,
+        (
+            LightNovelSetupRequired,
+            LightNovelImportConflict,
+            LightNovelUnavailable,
+            JitenMutationUnknown,
+            JitenUnavailableError,
+            OSError,
+            sqlite3.Error,
+        ),
+    ):
+        return False
+    # ValueError covers UnicodeError and ArchiveTooLargeError; SyntaxError the XML ParseError.
+    return isinstance(exc, (LightNovelError, zipfile.BadZipFile, ValueError, KeyError, SyntaxError))
+
+
+class JitenUnavailableError(LightNovelError):
+    """Nothing was sent: Jiten's rate limit (or Retry-After) or an outage holds requests back."""
+
+    def __init__(self, message: str, *, reason: str = "", retry_after: float = 0.0) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retry_after = float(retry_after)
+
+    @classmethod
+    def of(cls, exc: "jiten_client.JitenRefused") -> "JitenUnavailableError":
+        return cls(str(exc), reason=exc.reason, retry_after=exc.retry_after)
 
 
 def _japanese_text_profile(chapters: list[tuple[str, str]]) -> dict[str, Any]:
@@ -132,6 +212,7 @@ class _TextExtractor(HTMLParser):
         self._body_depth = 0
         self._ruby_depth = 0
         self._ruby_parts: list[str] = []
+        self._markers: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.casefold()
@@ -163,7 +244,10 @@ class _TextExtractor(HTMLParser):
                 )
             marker = self._image_resolver(src) if src else ""
             if marker:
-                self.parts.extend(["\n", marker, "\n"])
+                # A slot, filled in text(): book text is cleaned of marker-like
+                # strings first, and only real illustrations become markers.
+                self._markers.append(marker)
+                self.parts.extend(["\n", _MARKER_SLOT, "\n"])
             return
         if tag == "ruby":
             if self._ruby_depth == 0:
@@ -201,6 +285,7 @@ class _TextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
             return
+        data = data.replace(_MARKER_SLOT, "")
         # XHTML metadata/CSS before <body> must never become a "chapter".
         if self._seen_body and self._body_depth <= 0:
             return
@@ -210,19 +295,112 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
     def text(self) -> str:
-        value = html.unescape("".join(self.parts)).replace("\u3000", " ")
+        value = _clean_book_text(html.unescape("".join(self.parts)).replace("\u3000", " "))
         lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
-        return "\n".join(line for line in lines if line)
+        value = "\n".join(line for line in lines if line)
+        markers = iter(self._markers)
+        return re.sub(_MARKER_SLOT, lambda _match: next(markers, ""), value)
+
+
+# Stands in for an illustration marker while a document is being extracted.
+_MARKER_SLOT = "\x00"
+
+
+def _clean_book_text(value: str) -> str:
+    """Text from a book file, before any offsets into it are computed."""
+    # U+FEFF (a byte-order mark, or a zero-width no-break space) is invisible and
+    # the reader's audio offsets skip it, so a kept one shifted the highlighting.
+    value = value.replace("\ufeff", "")
+    # Book text spelling Pudge's own [[PUDGE_...]] markers stays text: a paragraph
+    # "[[PUDGE_LN_IMAGE_URL:https://...]]" was shown as an image from that URL.
+    return re.sub(r"\[+(?=\[PUDGE_)", "", value)
 
 
 def _safe_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|]", " ", value).strip()
-    value = re.sub(r"\s+", " ", value)
-    return value[:160] or "Light Novel"
+    value = re.sub(r"\s+", " ", value)[:160].strip()
+    # A file name holds 255 bytes: 160 Japanese characters are 480, and a book with a
+    # title over 85 characters could not be imported ("File name too long"). Names
+    # that fit stay as they were (a book imported again finds its folder).
+    while len(value.encode("utf-8")) > 255:
+        value = value[:-1].strip()
+    # "." and ".." are not folder names: a book titled ".." was copied next to,
+    # not into, the Light Novels folder.
+    if value in {"", ".", ".."}:
+        return "Light Novel"
+    return value
 
 
-def _plain_html(raw: bytes, *, image_resolver: Any | None = None) -> str:
+_XML_DECLARED_ENCODING = re.compile(rb"""^\s*<\?xml[^>]*?\bencoding\s*=\s*['"]([A-Za-z0-9._-]+)['"]""")
+_HTML_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*['"]?([A-Za-z0-9._-]+)""", re.IGNORECASE)
+
+
+# Japanese encodings older books use, strictest first. "shift_jis" is JIS X 0208 only:
+# a Windows file with ①, Ⅱ, ㈱ or 髙 (NEC/IBM characters, cp932) is not valid in it, and
+# one such character used to turn the whole book into U+FFFD.
+_JAPANESE_LEGACY_ENCODINGS = ("shift_jis", "cp932", "euc_jp", "euc_jis_2004")
+_ASCII_BYTES = bytes(range(128))
+
+
+def _decode_japanese_legacy(raw: bytes) -> str | None:
+    """``raw`` read as Shift_JIS, Windows-31J or EUC-JP; None when it is none of them."""
+    for encoding in _JAPANESE_LEGACY_ENCODINGS:
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _decode_markup(raw: bytes) -> str:
+    """Text of one EPUB (X)HTML/XML document.
+
+    EPUB allows UTF-16, and older Japanese EPUBs declare Shift_JIS/EUC-JP: read as
+    UTF-8 their text became U+FFFD (and the XML parser refused multi-byte encodings,
+    which failed the whole import). A BOM wins, then the XML declaration, then a
+    ``<meta charset>``; a declared encoding the bytes do not decode with is ignored.
+    Bytes that are not UTF-8 at all (no declaration, a name Python does not know such
+    as x-sjis, or "Shift_JIS" with Windows-only characters) are read as a legacy
+    Japanese encoding; a UTF-8 document with a few damaged bytes stays UTF-8.
+    """
+    raw = bytes(raw or b"")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    head = raw[:1024]
+    match = _XML_DECLARED_ENCODING.match(head) or _HTML_META_CHARSET.search(head)
+    if match:
+        declared = match.group(1).decode("ascii", errors="ignore").strip().casefold()
+        if declared and declared.replace("_", "-") not in {"utf-8", "utf8", "us-ascii", "ascii"}:
+            try:
+                return raw.decode(declared)
+            except (LookupError, UnicodeError):
+                pass
     text = raw.decode("utf-8", errors="replace")
+    damaged = text.count("�")
+    # Legacy text read as UTF-8 loses about every second non-ASCII byte.
+    if damaged and damaged * 4 >= len(raw.translate(None, _ASCII_BYTES)):
+        legacy = _decode_japanese_legacy(raw)
+        if legacy is not None:
+            return legacy
+    return text
+
+
+def _xml_root(raw: bytes) -> ET.Element:
+    """``ET.fromstring`` that also reads documents in a multi-byte legacy encoding."""
+    try:
+        return ET.fromstring(raw)
+    except ValueError as exc:
+        if isinstance(exc, ET.ParseError):
+            raise
+        # expat: "multi-byte encodings are not supported" (Shift_JIS, EUC-JP, GBK...).
+        text = re.sub(r"^\s*<\?xml[^>]*\?>", "", _decode_markup(raw), count=1)
+        return ET.fromstring(text)
+
+
+def _plain_html(raw: bytes | str, *, image_resolver: Any | None = None) -> str:
+    text = raw if isinstance(raw, str) else _decode_markup(raw)
     parser = _TextExtractor(image_resolver=image_resolver)
     parser.feed(text)
     return parser.text()
@@ -266,6 +444,7 @@ def _split_html_nav_sections(
     targets: list[tuple[str, str]],
     *,
     image_resolver: Any | None = None,
+    lead_label: str = "",
 ) -> list[tuple[str, str]]:
     """Split one XHTML spine document at TOC fragment anchors.
 
@@ -273,10 +452,14 @@ def _split_html_nav_sections(
     logical chapters only as ``file.xhtml#chapter-id`` entries in the TOC.
     Pudge used to collapse those hrefs to the file path and therefore imported
     the whole book as one chapter.
+
+    Text before the first anchor (a prologue, illustrations) is a leading
+    section, titled ``lead_label`` (the TOC entry for the file itself), else its
+    first heading, else "" (the caller decides). It used to be dropped.
     """
     if len(targets) < 2:
         return []
-    source = raw.decode("utf-8", errors="replace")
+    source = _decode_markup(raw)
     located: list[tuple[int, str, str]] = []
     seen_offsets: set[int] = set()
     for fragment, label in targets:
@@ -301,12 +484,60 @@ def _split_html_nav_sections(
         return []
     located.sort(key=lambda row: row[0])
     sections: list[tuple[str, str]] = []
+    lead_source = source[: located[0][0]]
+    # Already decoded: re-encoded slices kept their "encoding=Shift_JIS" declaration.
+    lead_text = _plain_html(lead_source, image_resolver=image_resolver)
+    if lead_text.strip():
+        # Only headings name the lead: its <head><title> is usually the book title.
+        lead_heading = _html_chapter_title(re.sub(r"(?is)<head\b.*?</head\s*>", "", lead_source))
+        label = re.sub(r"\s+", " ", str(lead_label or "")).strip()
+        # An empty title tells the caller the text has no name of its own.
+        sections.append((label or lead_heading, lead_text))
     for index, (offset, label, _fragment) in enumerate(located):
         end = located[index + 1][0] if index + 1 < len(located) else len(source)
-        text = _plain_html(source[offset:end].encode("utf-8"), image_resolver=image_resolver)
+        text = _plain_html(source[offset:end], image_resolver=image_resolver)
         if text.strip():
             sections.append((label, text))
     return sections if len(sections) >= 2 else []
+
+
+def _remap_reading_position(
+    old: list[tuple[str, int]],
+    new: list[tuple[str, int]],
+    chapter: int,
+    offset: float,
+) -> tuple[int, float]:
+    """Move a (chapter, offset) position from old chapters to re-extracted ones.
+
+    ``old``/``new`` are (text hash, length) per chapter. A re-index used to keep
+    the raw chapter index, so a book split differently jumped to another place
+    (6 chapters at 4/0.5 re-indexed into 3 showed 100%).
+    """
+    if not new:
+        return 0, 0.0
+    chapter = max(0, int(chapter))
+    offset = max(0.0, min(1.0, float(offset)))
+    if old == new:
+        return min(chapter, len(new) - 1), offset
+    if chapter < len(old):
+        # The same chapter text survived (say a prologue was added before it).
+        same = [index for index, (digest, _length) in enumerate(new) if digest == old[chapter][0]]
+        if same:
+            return min(same, key=lambda index: abs(index - chapter)), offset
+    old_total = sum(length for _digest, length in old)
+    if chapter >= len(old):
+        position = float(old_total)
+    else:
+        position = sum(length for _digest, length in old[:chapter]) + offset * old[chapter][1]
+    # The same share of the book: the text is the same, only cut differently.
+    new_total = sum(length for _digest, length in new)
+    target = position / old_total * new_total if old_total > 0 else 0.0
+    start = 0
+    for index, (_digest, length) in enumerate(new):
+        if target < start + length or index == len(new) - 1:
+            return index, max(0.0, min(1.0, (target - start) / length)) if length > 0 else 0.0
+        start += length
+    return len(new) - 1, 1.0
 
 
 def _romaji_to_hiragana(value: str) -> str:
@@ -581,7 +812,9 @@ def _series_title(value: str) -> str:
 
 def _series_key(value: str) -> str:
     text = _series_title(value)
-    text = re.sub(r"[\s\[\](){}._・･:：!！?？'\"“”‘’—–-]+", "", text)
+    # Tildes and wave dashes are one mark in titles: 無職転生 〜異世界行ったら本気だす〜 (U+301C)
+    # and ～…～ (U+FF5E, ~ after NFKC) are one series (volume 1 stood apart from 2 and 3).
+    text = re.sub(r"[\s\[\](){}._・･:：!！?？'\"“”‘’—–\-~〜∼〰]+", "", text)
     return text.casefold()
 
 
@@ -637,9 +870,9 @@ def _epub_visible_contents_labels(value: str) -> list[str]:
     return labels
 
 
-def _html_chapter_title(raw: bytes) -> str:
+def _html_chapter_title(raw: bytes | str) -> str:
     """Best-effort semantic title when EPUB navigation omits a spine label."""
-    source = raw.decode("utf-8", errors="replace")
+    source = raw if isinstance(raw, str) else _decode_markup(raw)
     candidates: list[str] = []
     for pattern in (r"<h[1-4][^>]*>(.*?)</h[1-4]>", r"<title[^>]*>(.*?)</title>"):
         for match in re.finditer(pattern, source, flags=re.I | re.S):
@@ -659,11 +892,29 @@ def _html_chapter_title(raw: bytes) -> str:
     return ""
 
 
+def _epub_join(parent: PurePosixPath, href_path: str) -> str:
+    """The archive member an EPUB href names, or "" when it leaves the archive.
+
+    Sigil-style books link ``Text/nav.xhtml`` -> ``../Text/c0.xhtml``; without
+    normalizing, those links matched no member (titles fell back to "Chapter N"
+    and covers went missing).
+    """
+    joined = posixpath.normpath(str((parent / PurePosixPath(href_path)).as_posix()))
+    if joined == ".." or joined.startswith(("../", "/")):
+        return ""
+    return joined
+
+
 def _epub_cover_blob(path: Path) -> tuple[bytes, str] | None:
     """Read only an EPUB cover without parsing chapter bodies."""
     with zipfile.ZipFile(path) as zf:
+        budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
+
+        def read(name: str, limit: int = TEXT_MEMBER_LIMIT) -> bytes:
+            return read_member(zf, name, limit=limit, budget=budget)
+
         try:
-            container = ET.fromstring(zf.read("META-INF/container.xml"))
+            container = _xml_root(read("META-INF/container.xml"))
         except (KeyError, ET.ParseError) as exc:
             raise LightNovelError(err("ln.epubInvalidContainer", error=exc)) from exc
         rootfile = next((node for node in container.iter() if node.tag.endswith("rootfile")), None)
@@ -673,7 +924,7 @@ def _epub_cover_blob(path: Path) -> tuple[bytes, str] | None:
         if not opf_path:
             raise LightNovelError(err("ln.epubEmptyRootfile"))
         try:
-            opf = ET.fromstring(zf.read(opf_path))
+            opf = _xml_root(read(opf_path))
         except (KeyError, ET.ParseError) as exc:
             raise LightNovelError(err("ln.epubInvalidPackage", error=exc)) from exc
 
@@ -710,10 +961,9 @@ def _epub_cover_blob(path: Path) -> tuple[bytes, str] | None:
         if cover_entry is None:
             return None
         href, media_type, _props = cover_entry
-        href_path = PurePosixPath(unquote(str(href).split("#", 1)[0]))
-        archive_path = str((PurePosixPath(opf_path).parent / href_path).as_posix())
+        archive_path = _epub_join(PurePosixPath(opf_path).parent, unquote(str(href).split("#", 1)[0]))
         try:
-            raw = zf.read(archive_path)
+            raw = read(archive_path, IMAGE_MEMBER_LIMIT)
         except KeyError:
             return None
         if not raw:
@@ -729,10 +979,45 @@ def _epub_cover_blob(path: Path) -> tuple[bytes, str] | None:
         return raw, suffix
 
 
+# One EPUB illustration: a full-page scan is a few MB and at most a few dozen megapixels.
+# Larger is a broken or hostile file (a tiny PNG can declare 50000 x 50000 pixels): it is
+# left out at import instead of being stored and decoded by the reader and the phone.
+LN_ILLUSTRATION_LIMIT = 32 * 1024 * 1024
+LN_ILLUSTRATION_MAX_PIXELS = 80_000_000
+
+
+def _illustration_acceptable(raw: bytes) -> bool:
+    """An illustration's bytes are within the limits (only its header is read)."""
+    if len(raw) > LN_ILLUSTRATION_LIMIT:
+        return False
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+    except Exception as exc:  # noqa: BLE001 - Pillow's own bomb refusal, or a format it does not read
+        return "DecompressionBomb" not in type(exc).__name__
+    return int(width) * int(height) <= LN_ILLUSTRATION_MAX_PIXELS
+
+
+# Text one book may hold. A long real volume has well under a million characters;
+# a crafted EPUB (one document repeated in the spine, or many tiny compressed
+# documents) produced 178 M characters and 635 MB of memory.
+EPUB_TEXT_LIMIT = 20_000_000
+# Spine documents kept between the contents scan and the chapter pass (each is read once).
+_EPUB_RAW_REUSE_LIMIT = 64 * 1024 * 1024
+
+
 def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes, str] | None]:
     with zipfile.ZipFile(path) as zf:
+        # Members are read with size caps: a tiny EPUB could unpack to gigabytes.
+        budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
+
+        def read(name: str, limit: int = TEXT_MEMBER_LIMIT) -> bytes:
+            return read_member(zf, name, limit=limit, budget=budget)
+
         try:
-            container = ET.fromstring(zf.read("META-INF/container.xml"))
+            container = _xml_root(read("META-INF/container.xml"))
         except (KeyError, ET.ParseError) as exc:
             raise LightNovelError(err("ln.epubInvalidContainer", error=exc)) from exc
         rootfile = next((node for node in container.iter() if node.tag.endswith("rootfile")), None)
@@ -742,7 +1027,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
         if not opf_path:
             raise LightNovelError(err("ln.epubEmptyRootfile"))
         try:
-            opf = ET.fromstring(zf.read(opf_path))
+            opf = _xml_root(read(opf_path))
         except (KeyError, ET.ParseError) as exc:
             raise LightNovelError(err("ln.epubInvalidPackage", error=exc)) from exc
 
@@ -782,15 +1067,47 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
 
         def archive_path_for(href: str, *, relative_to: PurePosixPath | None = None) -> str:
             path_part, _fragment = href_parts(href)
-            href_path = PurePosixPath(path_part)
             parent = relative_to if relative_to is not None else base
-            return str((parent / href_path).as_posix())
+            return _epub_join(parent, path_part)
+
+        # A document listed several times in the spine is read once: each listing
+        # used to be parsed and stored again (a 20 KB EPUB grew the library by 67 MB).
+        unique_spine: list[tuple[str, bool]] = []
+        spine_documents: set[str] = set()
+        for spine_idref, spine_linear in spine:
+            spine_entry = manifest.get(spine_idref)
+            if not spine_entry:
+                continue
+            spine_document = archive_path_for(spine_entry[0])
+            if spine_document in spine_documents:
+                continue
+            spine_documents.add(spine_document)
+            unique_spine.append((spine_idref, spine_linear))
+        spine = unique_spine
+
+        def text_budget() -> Any:
+            used = 0
+
+            def charge(count: int) -> None:
+                nonlocal used
+                used += max(0, int(count))
+                if used > EPUB_TEXT_LIMIT:
+                    raise LightNovelError(err("ln.bookTooLong", limit=EPUB_TEXT_LIMIT // 1_000_000))
+
+            return charge
+
+        raw_documents: dict[str, bytes] = {}
+        raw_kept = 0
 
         # EPUB3 nav / EPUB2 NCX titles and fragment targets. Some books keep
         # multiple TOC chapters in a single spine XHTML document, so fragments
         # are structural metadata rather than something we can discard.
         nav_titles: dict[str, str] = {}
         nav_targets: dict[str, list[tuple[str, str]]] = {}
+        # TOC labels of whole files (no fragment): they name the text before a
+        # file's first fragment anchor.
+        nav_file_titles: dict[str, str] = {}
+        content_file_titles: dict[str, str] = {}
 
         def add_nav_target(href: str, label: str, *, relative_to: PurePosixPath) -> None:
             label = re.sub(r"\s+", " ", str(label or "")).strip()
@@ -799,6 +1116,8 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             archive_path = archive_path_for(href, relative_to=relative_to)
             _path_part, fragment = href_parts(href)
             nav_titles.setdefault(archive_path, label)
+            if not fragment:
+                nav_file_titles.setdefault(archive_path, label)
             if fragment:
                 row = (fragment, label)
                 rows = nav_targets.setdefault(archive_path, [])
@@ -810,7 +1129,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             nav_href = nav_item[0]
             nav_path = archive_path_for(nav_href)
             try:
-                nav_root = ET.fromstring(zf.read(nav_path))
+                nav_root = _xml_root(read(nav_path))
                 nav_parent = PurePosixPath(nav_path).parent
                 nav_nodes = [node for node in nav_root.iter() if node.tag.rsplit("}", 1)[-1] == "nav"]
                 toc_nodes = [
@@ -839,7 +1158,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
         if ncx_entry is not None:
             ncx_path = archive_path_for(ncx_entry[0])
             try:
-                ncx_root = ET.fromstring(zf.read(ncx_path))
+                ncx_root = _xml_root(read(ncx_path))
                 ncx_parent = PurePosixPath(ncx_path).parent
                 for point in (node for node in ncx_root.iter() if node.tag.rsplit("}", 1)[-1] == "navPoint"):
                     content = next((n for n in point.iter() if n.tag.rsplit("}", 1)[-1] == "content"), None)
@@ -871,6 +1190,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
         content_nav_titles: dict[str, str] = {}
         content_nav_targets: dict[str, list[tuple[str, str]]] = {}
         visible_contents_labels: list[str] = []
+        charge_scan = text_budget()
         for spine_idref, spine_linear in spine:
             if not spine_linear:
                 continue
@@ -879,11 +1199,19 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
                 continue
             source_archive = archive_path_for(spine_entry[0])
             try:
-                source_root = ET.fromstring(zf.read(source_archive))
-            except (KeyError, ET.ParseError):
+                source_raw = read(source_archive)
+            except KeyError:
+                continue
+            if raw_kept + len(source_raw) <= _EPUB_RAW_REUSE_LIMIT:
+                raw_documents[source_archive] = source_raw
+                raw_kept += len(source_raw)
+            try:
+                source_root = _xml_root(source_raw)
+            except ET.ParseError:
                 continue
             source_parent = PurePosixPath(source_archive).parent
-            source_plain = _plain_html(zf.read(source_archive))
+            source_plain = _plain_html(source_raw)
+            charge_scan(len(source_plain))
             page_labels = _epub_visible_contents_labels(source_plain)
             if page_labels and not visible_contents_labels:
                 visible_contents_labels = page_labels
@@ -900,9 +1228,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
                 if not path_part:
                     target_archive = source_archive
                 else:
-                    target_archive = posixpath.normpath(
-                        str((source_parent / PurePosixPath(unquote(path_part))).as_posix())
-                    )
+                    target_archive = _epub_join(source_parent, unquote(path_part))
                 fragment = unquote(fragment) if separator else ""
                 if target_archive not in spine_archive_paths:
                     continue
@@ -925,6 +1251,8 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
                 continue
             for target_archive, fragment, label in rows:
                 content_nav_titles.setdefault(target_archive, label)
+                if not fragment:
+                    content_file_titles.setdefault(target_archive, label)
                 if fragment:
                     target_rows = content_nav_targets.setdefault(target_archive, [])
                     row = (fragment, label)
@@ -969,6 +1297,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
                 pending_images = []
             chapters.append((chapter_title, chapter_text))
 
+        charge_text = text_budget()
         for idref, linear in spine:
             entry = manifest.get(idref)
             if not entry:
@@ -977,10 +1306,12 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             if media_type and "html" not in media_type and "xml" not in media_type:
                 continue
             archive_path = archive_path_for(href)
-            try:
-                raw_chapter = zf.read(archive_path)
-            except KeyError:
-                continue
+            raw_chapter = raw_documents.pop(archive_path, None)
+            if raw_chapter is None:
+                try:
+                    raw_chapter = read(archive_path)
+                except KeyError:
+                    continue
             lower_hint = f"{idref} {href} {props}".casefold()
             chapter_parent = PurePosixPath(archive_path).parent
 
@@ -988,23 +1319,36 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
                 raw_src = str(src or "").split("#", 1)[0].strip()
                 if not raw_src or raw_src.startswith(("data:", "http:", "https:")):
                     return ""
-                resolved = posixpath.normpath(
-                    str((chapter_parent / PurePosixPath(unquote(raw_src))).as_posix())
-                )
-                return _ln_epub_image_marker(resolved)
+                resolved = _epub_join(chapter_parent, unquote(raw_src))
+                return _ln_epub_image_marker(resolved) if resolved else ""
 
+            lead_label = nav_file_titles.get(archive_path, "")
+            if not lead_label or _series_key(lead_label) == _series_key(title):
+                lead_label = content_file_titles.get(archive_path) or lead_label
             split_sections = _split_html_nav_sections(
-                raw_chapter, best_fragment_targets(archive_path), image_resolver=image_resolver
+                raw_chapter,
+                best_fragment_targets(archive_path),
+                image_resolver=image_resolver,
+                lead_label=lead_label,
             )
             if split_sections:
+                charge_text(sum(len(section_text) for _section_title, section_text in split_sections))
                 for chapter_title, chapter_text in split_sections:
-                    if not _is_epub_image_only_text(chapter_text) and _is_technical_epub_section(
-                        chapter_title, chapter_text, lower_hint
-                    ):
+                    image_only = _is_epub_image_only_text(chapter_text)
+                    if not image_only and _is_technical_epub_section(chapter_title, chapter_text, lower_hint):
                         continue
+                    if not chapter_title:
+                        # Untitled text before the file's first TOC anchor
+                        # continues the previous file's chapter, or opens the book.
+                        if chapters and not image_only:
+                            old_title, old_text = chapters[-1]
+                            chapters[-1] = (old_title, f"{old_text.rstrip()}\n{chapter_text.strip()}".strip())
+                            continue
+                        chapter_title = t("ln.chapterBeginning")
                     append_content_chapter(chapter_title, chapter_text, lower_hint)
                 continue
             chapter_text = _plain_html(raw_chapter, image_resolver=image_resolver)
+            charge_text(len(chapter_text))
             if not chapter_text.strip():
                 continue
             if not linear and not _is_epub_image_only_text(chapter_text):
@@ -1122,7 +1466,7 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             href, media_type, _props = cover_entry
             archive_path = archive_path_for(href)
             try:
-                raw = zf.read(archive_path)
+                raw = read(archive_path, IMAGE_MEMBER_LIMIT)
                 suffix = PurePosixPath(href).suffix.casefold()
                 if not suffix:
                     suffix = {
@@ -1184,9 +1528,18 @@ def _is_technical_epub_section(title: str, text: str, hint: str = "") -> bool:
 
 
 def _txt_metadata(path: Path) -> tuple[str, list[tuple[str, str]]]:
+    too_long = LightNovelError(err("ln.bookTooLong", limit=EPUB_TEXT_LIMIT // 1_000_000))
+    # Shift_JIS/EUC-JP take 2 bytes a character, UTF-8 Japanese 3.
+    if path.stat().st_size > EPUB_TEXT_LIMIT * 4:
+        raise too_long
     raw = path.read_bytes()
     text = ""
-    for encoding in ("utf-8", "shift_jis", "euc_jp"):
+    # utf-8-sig: a byte-order mark is not text (it shifted the audio highlighting).
+    # A UTF-16 file (Windows Notepad's "Unicode") has a BOM; without this check it
+    # fell through to U+FFFD garbage.
+    encodings = ("utf-16",) if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else ()
+    # cp932 after shift_jis: a Windows text with ①, Ⅱ or 髙 was refused as "not a book".
+    for encoding in (*encodings, "utf-8-sig", *_JAPANESE_LEGACY_ENCODINGS):
         try:
             text = raw.decode(encoding)
             break
@@ -1194,7 +1547,9 @@ def _txt_metadata(path: Path) -> tuple[str, list[tuple[str, str]]]:
             continue
     if not text:
         text = raw.decode("utf-8", errors="replace")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > EPUB_TEXT_LIMIT:
+        raise too_long
+    text = _clean_book_text(text.replace("\r\n", "\n").replace("\r", "\n"))
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -1269,6 +1624,9 @@ class LightNovelSettings:
     # When the local LLM fails, translate the selection with Google instead
     # (the selected text leaves the Mac; the result is labelled "Google").
     translation_google_fallback: bool = True
+    # Google Translate (an unofficial web endpoint) at all: off for new installs.
+    # Off means no text is ever sent to Google, neither first nor as a fallback.
+    google_translate: bool = False
     # Subtitle translations are prepared ahead during playback with a local LLM;
     # with a remote/paid one (API calls) only when this is on.
     translation_prewarm_remote: bool = False
@@ -1304,13 +1662,135 @@ def jiten_marked_sentence(sentence: str, surface: str) -> str:
     return f"{before}**{word}**{after}"
 
 
+def _same_file_content(first: Path, second: Path) -> bool:
+    """Both files hold the same bytes (size first, then a streamed SHA-256)."""
+    try:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        digests = []
+        for path in (first, second):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digests.append(digest.digest())
+        return digests[0] == digests[1]
+    except OSError:
+        return False
+
+
+def _utf16_offsets(text: str) -> list[int] | None:
+    """Python index of every UTF-16 offset in ``text``; None when both count the same.
+
+    Token ``start``/``end`` from Jiten and jpdb are UTF-16 offsets (what the reader's
+    JavaScript indexes by). A character outside the BMP (𠮟, 𩸽, an emoji) is two of
+    them and one Python character: every later offset is one too high for each.
+    """
+    if len(text.encode("utf-16-le", "surrogatepass")) == 2 * len(text):
+        return None
+    mapping: list[int] = []
+    for index, character in enumerate(text):
+        mapping.append(index)
+        if ord(character) > 0xFFFF:
+            mapping.append(index)
+    mapping.append(len(text))
+    return mapping
+
+
+def chapter_word_positions_from(text: str, parsed: dict[str, Any]) -> list[tuple[int, int, int]]:
+    """(character offset in ``text``, wordId, readingIndex) of a chapter's cached Jiten parse."""
+    paragraphs = parsed.get("paragraphs") or []
+    groups = parsed.get("tokens") or []
+    result: list[tuple[int, int, int]] = []
+    cursor = 0
+    for index, paragraph in enumerate(paragraphs):
+        paragraph = str(paragraph or "")
+        at = text.find(paragraph, cursor) if paragraph else -1
+        if at < 0:
+            continue
+        cursor = at + len(paragraph)
+        group = groups[index] if index < len(groups) and isinstance(groups[index], list) else []
+        offsets = _utf16_offsets(paragraph) if group else None
+        for token in group:
+            if not isinstance(token, dict):
+                continue
+            try:
+                start = int(token.get("start") or 0)
+                word_id = int(token.get("wordId"))
+                reading = int(token.get("readingIndex"))
+            except (TypeError, ValueError):
+                continue
+            if offsets is not None and 0 <= start < len(offsets):
+                start = offsets[start]
+            if word_id > 0 and reading >= 0 and 0 <= start < len(paragraph):
+                result.append((at + start, word_id, reading))
+    result.sort()
+    return result
+
+
 class LightNovelService:
-    CONTENT_SCHEMA = 10
+    # 11: text before a file's first TOC anchor kept, "../" TOC links, no BOM,
+    # no marker-like book text.
+    CONTENT_SCHEMA = 11
     JITEN_BASE = JITEN_API_BASE
     JPDB_BASE = JPDB_API_BASE
     # jpdb documents `text_too_long` without a numeric limit; keep batches small.
     JPDB_PARSE_BATCH_CHARS = 4000
     WORD_COLOR_THEMES = {"balanced", "jiten", "jpdb", "focus", "underline", "none", "custom"}
+    # Every key save_settings stores. A row of any of them means LN settings were
+    # stored before (an existing install; see google_translate in settings()).
+    SETTINGS_KEYS = frozenset(
+        {
+            "jiten_api_key",
+            "jpdb_api_token",
+            "study_backend",
+            "show_furigana",
+            "furigana_on_hover",
+            "furigana_on_reading",
+            "show_pitch_accent",
+            "furigana_unknown_only",
+            "word_mark_style",
+            "furigana_states",
+            "underline_states",
+            "study_card_mode",
+            "study_card_triggers",
+            "review_mode",
+            "review_shortcuts",
+            "custom_css",
+            "parse_ahead",
+            "auto_download_nyaa",
+            "nyaa_category",
+            "reader_font",
+            "reader_theme",
+            "reader_font_size",
+            "reader_text_color",
+            "reader_background_color",
+            "reader_width",
+            "reader_line_height",
+            "reader_indent",
+            "reader_vertical",
+            "reader_mode",
+            "blur_images",
+            "auto_bookmarks",
+            "highlight_optimal_words",
+            "word_color_theme",
+            *(f"word_color_{state}" for state in WORD_STATES),
+            "pitch_accent_color",
+            "audiobook_generation_provider",
+            "audiobook_tts_model",
+            "audiobook_character_voices",
+            "irodori_tts_enabled",
+            "irodori_tts_auto_generate",
+            "irodori_tts_url",
+            "irodori_tts_api_key",
+            "irodori_tts_voice",
+            "irodori_tts_caption",
+            "irodori_tts_speed",
+            "translation_google_fallback",
+            "google_translate",
+            "translation_prewarm_remote",
+        }
+    )
 
     JITEN_STUDY_STATES = (
         "new",
@@ -1326,13 +1806,21 @@ class LightNovelService:
     )
     DEFAULT_FURIGANA_STATES = "new,learning,young,mature,due,failed"
     DEFAULT_UNDERLINE_STATES = "new,learning,young,mature,due,failed,known,mastered,never-forget,blacklisted"
-    JITEN_LIVE_STATE_TTL_SECONDS = 45.0
+    # Word states are fresh for 15 minutes (kept in SQLite across launches); while a
+    # reader asks for states, Jiten's overview-version is checked at most once a minute
+    # and a change (a review, an added word, on any device) makes all of them stale.
+    JITEN_LIVE_STATE_TTL_SECONDS = 900.0
+    JITEN_OVERVIEW_CHECK_SECONDS = 60.0
+    JITEN_LIVE_STATE_MEMORY_ENTRIES = 20_000
+    JITEN_LIVE_STATE_KEEP_SECONDS = 7 * 86400
+    JITEN_LIVE_STATE_KEEP_ROWS = 100_000
     # A re-grade within this window after an unknown review outcome resends the same
     # attempt id, so Jiten's ClientRequestId dedupe counts the review once.
     STUDY_UNKNOWN_REVIEW_WINDOW_SECONDS = 600.0
-    JITEN_STATE_PREFETCH_BATCH_SIZE = 200
-    JITEN_STATE_PREFETCH_PAUSE_SECONDS = 0.20
-    JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS = 60.0
+    # known-ids/amount loads all of the user's cards on Jiten: kept 6 hours (or until the
+    # overview-version changes); a failure is not asked again for 10 minutes.
+    JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS = 6 * 3600.0
+    JITEN_OPTIMAL_WORD_STATS_FAILURE_SECONDS = 600.0
     JITEN_KNOWN_STATE_BY_VALUE = {
         0: "new",
         1: "young",
@@ -1489,6 +1977,10 @@ class LightNovelService:
         self._parse_flights: dict[str, threading.Event] = {}
         self._parse_inflight: set[str] = set()
         self._parse_inflight_lock = threading.Lock()
+        self._suspect_probe_lock = threading.Lock()
+        self._suspect_probe_running = False
+        self._suspect_probe_not_before = 0.0
+        self._suspect_scanned: set[str] = set()
         self._anilist_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._state_refresh_lock = threading.Lock()
         self._state_refreshing = False
@@ -1520,12 +2012,15 @@ class LightNovelService:
         # Volume repair runs once per process and again after an import, not on
         # every library read.
         self._volume_repair_due = True
+        # One monitor per (torrent hash, volume) waiting for a volume download.
+        self._volume_downloads_lock = threading.RLock()
+        self._volume_monitors: dict[tuple[str, int], threading.Thread] = {}
         self._ensure_schema()
         self._load_literature_snapshot()
         self._reconcile_local_series_links()
 
     def _log(self, message: str, *args: Any) -> None:
-        if self.logger:
+        if getattr(self, "logger", None):
             try:
                 self.logger.info(message, *args)
             except Exception:
@@ -1543,7 +2038,7 @@ class LightNovelService:
         condition = self._database_gate()
         with condition:
             if self._closed:
-                raise LightNovelError("Light novel service is closed")
+                raise LightNovelUnavailable("Light novel service is closed")
             self._active_database_connections += 1
         conn = None
         try:
@@ -1610,6 +2105,7 @@ class LightNovelService:
                     current_chapter INTEGER NOT NULL DEFAULT 0,
                     current_offset REAL NOT NULL DEFAULT 0,
                     finished INTEGER NOT NULL DEFAULT 0,
+                    position_updated_at REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -1666,12 +2162,55 @@ class LightNovelService:
                     result_json TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                -- Chapter paragraphs Jiten left mostly unparsed: asked again now and then;
+                -- a chapter whose paragraph now parses is parsed again when it is opened.
+                CREATE TABLE IF NOT EXISTS ln_parse_suspects (
+                    text_hash TEXT NOT NULL,
+                    paragraph_hash TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    coverage REAL NOT NULL,
+                    first_seen REAL NOT NULL,
+                    last_checked REAL NOT NULL,
+                    PRIMARY KEY(text_hash,paragraph_hash)
+                );
+                CREATE TABLE IF NOT EXISTS ln_parse_stale (
+                    text_hash TEXT PRIMARY KEY,
+                    marked_at REAL NOT NULL
+                );
+                -- Jiten word states per account (live lookups); fresh for 15 minutes and
+                -- after that only a fallback colour while Jiten does not answer.
+                CREATE TABLE IF NOT EXISTS jiten_state_cache (
+                    account_key TEXT NOT NULL,
+                    word_id INTEGER NOT NULL,
+                    reading_index INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    fetched_at REAL NOT NULL,
+                    PRIMARY KEY(account_key,word_id,reading_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_jiten_state_cache_fetched ON jiten_state_cache(fetched_at);
+                CREATE TABLE IF NOT EXISTS jiten_state_meta (
+                    account_key TEXT PRIMARY KEY,
+                    overview_version TEXT NOT NULL DEFAULT '',
+                    stale_before REAL NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS character_name_overrides (
                     media_id INTEGER NOT NULL,
                     source TEXT NOT NULL,
                     preferred TEXT NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(media_id,source)
+                );
+                -- Finished volumes AniList has not taken yet (finish_volume): sent again on refresh.
+                CREATE TABLE IF NOT EXISTS ln_anilist_pending (
+                    account TEXT NOT NULL,
+                    media_id INTEGER NOT NULL,
+                    book_id INTEGER,
+                    progress_volumes INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT '',
+                    queued_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(account,media_id)
                 );
                 CREATE TABLE IF NOT EXISTS media_identities (
                     kind TEXT NOT NULL,
@@ -1686,6 +2225,13 @@ class LightNovelService:
                 );
                 """
             )
+            parse_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_parse_cache)")}
+            if "parse_version" not in parse_columns:
+                # Jiten's parseVersion of the answer ('' for parses stored before it was kept).
+                conn.execute("ALTER TABLE ln_parse_cache ADD COLUMN parse_version TEXT NOT NULL DEFAULT ''")
+            if "used_at" not in parse_columns:
+                # Last use (day precision) of a parse, for pruning one-off study texts.
+                conn.execute("ALTER TABLE ln_parse_cache ADD COLUMN used_at REAL")
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_books)")}
             if "jiten_deck_id" not in columns:
                 conn.execute("ALTER TABLE ln_books ADD COLUMN jiten_deck_id INTEGER")
@@ -1693,6 +2239,30 @@ class LightNovelService:
                 conn.execute("ALTER TABLE ln_books ADD COLUMN content_schema INTEGER NOT NULL DEFAULT 1")
             if "anilist_user_score" not in columns:
                 conn.execute("ALTER TABLE ln_books ADD COLUMN anilist_user_score REAL")
+            # When the reading place last moved (Mac clock). updated_at also changes on AniList
+            # refreshes, scores and covers, so a newer place from the phone was dropped as
+            # older. Existing books: the last saved bookmark, or 0 (the phone's place counts).
+            if "position_updated_at" not in columns:
+                conn.execute("ALTER TABLE ln_books ADD COLUMN position_updated_at REAL NOT NULL DEFAULT 0")
+                conn.execute(
+                    "UPDATE ln_books SET position_updated_at=COALESCE("
+                    "(SELECT updated_at FROM ln_bookmarks WHERE book_id=ln_books.id),0)"
+                )
+            # The "read up to here" marker (ln_read_marker): which device set it.
+            marker_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_bookmarks)")}
+            if "device_id" not in marker_columns:
+                conn.execute("ALTER TABLE ln_bookmarks ADD COLUMN device_id TEXT NOT NULL DEFAULT 'mac'")
+            if "device_name" not in marker_columns:
+                conn.execute("ALTER TABLE ln_bookmarks ADD COLUMN device_name TEXT NOT NULL DEFAULT ''")
+            # Markers a phone sent (its marker id): a resend of one is answered as the first time.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS ln_marker_events("
+                "event_id TEXT PRIMARY KEY,book_id INTEGER NOT NULL,moved INTEGER NOT NULL DEFAULT 0,"
+                "created_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ln_marker_events_created ON ln_marker_events(created_at)"
+            )
             # Chapter lengths are stored once so the library list does not
             # measure every chapter's text on each read.
             chapter_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_chapters)")}
@@ -1803,17 +2373,25 @@ class LightNovelService:
                 values.get("irodori_tts_url", "http://127.0.0.1:8088").strip().rstrip("/")
                 or "http://127.0.0.1:8088"
             ),
-            irodori_tts_api_key=values.get("irodori_tts_api_key", ""),
+            irodori_tts_api_key=study_secrets.resolve(
+                "irodori_tts_api_key", values.get("irodori_tts_api_key", "")
+            ),
             irodori_tts_voice=values.get("irodori_tts_voice", "none").strip() or "none",
             irodori_tts_caption=values.get("irodori_tts_caption", "").strip(),
             irodori_tts_speed=max(0.25, min(4.0, float(values.get("irodori_tts_speed", "1") or 1))),
             translation_google_fallback=values.get("translation_google_fallback", "1") != "0",
+            google_translate=(
+                values["google_translate"] == "1"
+                if "google_translate" in values
+                # Settings stored before this switch existed: keep Google as it was.
+                else any(key in self.SETTINGS_KEYS for key in values)
+            ),
             translation_prewarm_remote=values.get("translation_prewarm_remote", "0") == "1",
         )
 
     def _move_study_tokens_to_keychain(self, values: dict[str, str]) -> None:
-        """Jiten/jpdb tokens still in SQLite move to the Keychain (once)."""
-        for name in ("jiten_api_key", "jpdb_api_token"):
+        """Jiten/jpdb tokens and the TTS server key still in SQLite move to the Keychain (once)."""
+        for name in study_secrets.KEYCHAIN_ACCOUNTS:
             token = str(values.get(name) or "").strip()
             if not token or not study_secrets.store(name, token):
                 continue
@@ -1825,64 +2403,21 @@ class LightNovelService:
             self._log("LN study token moved to the Keychain name=%s", name)
 
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
-        allowed = {
-            "jiten_api_key",
-            "jpdb_api_token",
-            "study_backend",
-            "show_furigana",
-            "furigana_on_hover",
-            "furigana_on_reading",
-            "show_pitch_accent",
-            "furigana_unknown_only",
-            "word_mark_style",
-            "furigana_states",
-            "underline_states",
-            "study_card_mode",
-            "study_card_triggers",
-            "review_mode",
-            "review_shortcuts",
-            "custom_css",
-            "parse_ahead",
-            "auto_download_nyaa",
-            "nyaa_category",
-            "reader_font",
-            "reader_theme",
-            "reader_font_size",
-            "reader_text_color",
-            "reader_background_color",
-            "reader_width",
-            "reader_line_height",
-            "reader_indent",
-            "reader_vertical",
-            "reader_mode",
-            "blur_images",
-            "auto_bookmarks",
-            "highlight_optimal_words",
-            "word_color_theme",
-            *(f"word_color_{state}" for state in WORD_STATES),
-            "pitch_accent_color",
-            "audiobook_generation_provider",
-            "audiobook_tts_model",
-            "audiobook_character_voices",
-            "irodori_tts_enabled",
-            "irodori_tts_auto_generate",
-            "irodori_tts_url",
-            "irodori_tts_api_key",
-            "irodori_tts_voice",
-            "irodori_tts_caption",
-            "irodori_tts_speed",
-            "translation_google_fallback",
-            "translation_prewarm_remote",
-        }
+        allowed = self.SETTINGS_KEYS
         current = self.settings()
         requested_provider = values.get("audiobook_generation_provider")
         if requested_provider is None and "irodori_tts_enabled" in values:
             requested_provider = "irodori" if bool(values.get("irodori_tts_enabled")) else "off"
         if requested_provider is None:
             requested_provider = current.audiobook_generation_provider
+        # The window holds the mask for a saved token ("keep it"); an empty field clears it.
         payload = {
-            "jiten_api_key": str(values.get("jiten_api_key", current.jiten_api_key)).strip(),
-            "jpdb_api_token": str(values.get("jpdb_api_token", current.jpdb_api_token)).strip(),
+            "jiten_api_key": keep_masked_secret(
+                values.get("jiten_api_key", current.jiten_api_key), current.jiten_api_key
+            ).strip(),
+            "jpdb_api_token": keep_masked_secret(
+                values.get("jpdb_api_token", current.jpdb_api_token), current.jpdb_api_token
+            ).strip(),
             "study_backend": str(values.get("study_backend", current.study_backend)).strip().lower(),
             "review_mode": normalize_mode(str(values.get("review_mode", current.review_mode))),
             "review_shortcuts": json.dumps(
@@ -1973,10 +2508,12 @@ class LightNovelService:
             "irodori_tts_auto_generate": "1"
             if bool(values.get("irodori_tts_auto_generate", current.irodori_tts_auto_generate))
             else "0",
-            "irodori_tts_url": str(values.get("irodori_tts_url", current.irodori_tts_url)).strip().rstrip("/")
+            "irodori_tts_url": restore_url_password(
+                str(values.get("irodori_tts_url", current.irodori_tts_url)), current.irodori_tts_url
+            ).rstrip("/")
             or "http://127.0.0.1:8088",
-            "irodori_tts_api_key": str(
-                values.get("irodori_tts_api_key", current.irodori_tts_api_key)
+            "irodori_tts_api_key": keep_masked_secret(
+                values.get("irodori_tts_api_key", current.irodori_tts_api_key), current.irodori_tts_api_key
             ).strip(),
             "irodori_tts_voice": str(values.get("irodori_tts_voice", current.irodori_tts_voice)).strip()
             or "none",
@@ -1990,6 +2527,9 @@ class LightNovelService:
                 "1"
                 if bool(values.get("translation_google_fallback", current.translation_google_fallback))
                 else "0"
+            ),
+            "google_translate": (
+                "1" if bool(values.get("google_translate", current.google_translate)) else "0"
             ),
             "translation_prewarm_remote": (
                 "1"
@@ -2027,7 +2567,7 @@ class LightNovelService:
             payload["study_card_mode"] = "button"
         if payload["word_color_theme"] not in self.WORD_COLOR_THEMES:
             payload["word_color_theme"] = "jiten"
-        for name in ("jiten_api_key", "jpdb_api_token"):
+        for name in study_secrets.KEYCHAIN_ACCOUNTS:
             # Tokens go to the Keychain; SQLite keeps "" (kept there only without a Keychain).
             if study_secrets.store(name, payload[name]):
                 payload[name] = ""
@@ -2040,11 +2580,25 @@ class LightNovelService:
                     )
         return self.settings_payload()
 
+    def reader_settings_payload(self) -> dict[str, Any]:
+        """Settings for chapters, study texts and the reader state: without the API keys
+        (the reader only needs to know whether one is configured)."""
+        payload = dict(self.settings_payload())
+        for key, flag in (("jiten_api_key", "jiten_configured"), ("jpdb_api_token", "jpdb_configured")):
+            payload.setdefault(flag, bool(str(payload.get(key) or "").strip()))
+            if key in payload:
+                payload[key] = ""
+        return payload
+
     def settings_payload(self) -> dict[str, Any]:
         s = self.settings()
+        # Tokens never reach the window (every state build, chapter and study text
+        # carries these settings): a set token is shown as the mask.
         return {
-            "jiten_api_key": s.jiten_api_key,
-            "jpdb_api_token": s.jpdb_api_token,
+            "jiten_api_key": masked_secret(s.jiten_api_key),
+            "jpdb_api_token": masked_secret(s.jpdb_api_token),
+            "jiten_configured": bool(str(s.jiten_api_key or "").strip()),
+            "jpdb_configured": bool(str(s.jpdb_api_token or "").strip()),
             "study_backend": s.study_backend,
             "review_mode": s.review_mode,
             "review_shortcuts": json.loads(s.review_shortcuts),
@@ -2081,13 +2635,14 @@ class LightNovelService:
             "pitch_accent_color": s.pitch_accent_color,
             "translation_language": s.translation_language,
             "translation_google_fallback": s.translation_google_fallback,
+            "google_translate": s.google_translate,
             "translation_prewarm_remote": s.translation_prewarm_remote,
             "audiobook_generation_provider": s.audiobook_generation_provider,
             "audiobook_tts_model": s.audiobook_tts_model,
             "irodori_tts_enabled": s.irodori_tts_enabled,
             "irodori_tts_auto_generate": s.irodori_tts_auto_generate,
-            "irodori_tts_url": s.irodori_tts_url,
-            "irodori_tts_api_key": s.irodori_tts_api_key,
+            "irodori_tts_url": mask_url_password(s.irodori_tts_url),
+            "irodori_tts_api_key": masked_secret(s.irodori_tts_api_key),
             "irodori_tts_voice": s.irodori_tts_voice,
             "irodori_tts_caption": s.irodori_tts_caption,
             "irodori_tts_speed": s.irodori_tts_speed,
@@ -2157,10 +2712,6 @@ class LightNovelService:
                 )
                 changed += 1
         return changed
-
-    def _deleted_source_paths(self) -> set[str]:
-        with self._connection() as conn:
-            return {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_deleted_sources")}
 
     def is_deleted_source(self, source: Path) -> bool:
         try:
@@ -2233,12 +2784,17 @@ class LightNovelService:
         try:
             from PIL import Image
 
-            with Image.open(source) as image:
-                image = image.convert("RGB")
-                image.thumbnail(self.COVER_LIST_SIZE, Image.LANCZOS)
-                temporary = thumb.with_name(thumb.name + ".tmp")
-                image.save(temporary, "JPEG", quality=85, optimize=True)
-            temporary.replace(thumb)
+            temporary = temporary_sibling(thumb)
+            try:
+                with Image.open(source) as opened:
+                    # A JPEG cover decodes at a reduced scale (draft) before resizing.
+                    opened.draft("RGB", tuple(self.COVER_LIST_SIZE))
+                    image = opened.convert("RGB")
+                    image.thumbnail(self.COVER_LIST_SIZE, Image.LANCZOS)
+                    image.save(temporary, "JPEG", quality=85, optimize=True)
+                temporary.replace(thumb)
+            finally:
+                temporary.unlink(missing_ok=True)
             return True
         except Exception as exc:  # noqa: BLE001 - the full cover keeps working
             self._log("LN cover thumbnail skipped cover=%s error=%s", source.name, exc)
@@ -2257,7 +2813,7 @@ class LightNovelService:
         if made:
             self._log("LN cover thumbnails made=%s", made)
 
-    def _store_cover_bytes(self, raw: bytes, suffix: str) -> str:
+    def _store_cover_bytes(self, raw: bytes, suffix: str, *, thumbnail: bool = True) -> str:
         suffix = suffix.casefold() if str(suffix).startswith(".") else f".{suffix.casefold()}"
         if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
             suffix = ".jpg"
@@ -2266,13 +2822,84 @@ class LightNovelService:
         digest = hashlib.sha256(raw).hexdigest()[:24]
         target = self.cover_cache_dir / f"ln-{digest}{suffix}"
         if not target.is_file() or target.stat().st_size != len(raw):
-            temp = target.with_suffix(target.suffix + ".tmp")
-            temp.write_bytes(raw)
-            temp.replace(target)
+            atomic_write_bytes(target, raw)
+        # Only a book cover is shown in the library list: an illustration needs no list copy.
         thumb = target.with_name(target.name + ".list.jpg")
-        if not thumb.is_file():
+        if thumbnail and not thumb.is_file():
             self._make_cover_thumbnail(target, thumb)
         return f"covers/{target.name}"
+
+    # Members of an EPUB that are never illustrations (the rest may be, whatever their name).
+    _EPUB_TEXT_SUFFIXES = frozenset(
+        {
+            ".xhtml",
+            ".html",
+            ".htm",
+            ".xml",
+            ".opf",
+            ".ncx",
+            ".css",
+            ".js",
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
+            ".smil",
+        }
+    )
+
+    def _restore_missing_inline_images(self, book_id: int, text: str) -> int:
+        """Put back a chapter's illustrations that are gone from the cover cache.
+
+        They live only in the cache (``~/Library/Caches``), which macOS or a cleanup
+        tool may empty; only the book cover used to be repaired, so illustrations
+        stayed broken until the next reindex. They are read again from the EPUB
+        (once per book and missing set per launch).
+        """
+        names = {
+            Path(url).name
+            for url in re.findall(
+                r"\[\[PUDGE_LN_IMAGE_URL:(covers/ln-[0-9a-f]{24}\.[a-z]+)\]\]", str(text or "")
+            )
+        }
+        missing = {name for name in names if not (self.cover_cache_dir / name).is_file()}
+        if not missing:
+            return 0
+        tried = self.__dict__.setdefault("_inline_restore_tried", set())
+        key = (int(book_id), frozenset(missing))
+        if key in tried:
+            return 0
+        tried.add(key)
+        with self._connection() as conn:
+            row = conn.execute("SELECT file_path FROM ln_books WHERE id=?", (int(book_id),)).fetchone()
+        source = Path(str(row["file_path"] or "")) if row is not None else Path()
+        if source.suffix.casefold() != ".epub" or not source.is_file():
+            return 0
+        wanted = {name[3:27]: name for name in missing}
+        restored = 0
+        try:
+            self.cover_cache_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(source) as zf:
+                budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
+                for info in zf.infolist():
+                    if (
+                        info.is_dir()
+                        or PurePosixPath(info.filename).suffix.casefold() in self._EPUB_TEXT_SUFFIXES
+                        or info.file_size > LN_ILLUSTRATION_LIMIT  # never imported as an illustration
+                    ):
+                        continue
+                    raw = read_member(zf, info, limit=LN_ILLUSTRATION_LIMIT, budget=budget)
+                    name = wanted.pop(hashlib.sha256(raw).hexdigest()[:24], None)
+                    if name is not None:
+                        self._store_cover_bytes(raw, Path(name).suffix, thumbnail=False)
+                        restored += 1
+                    if not wanted:
+                        break
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, ArchiveTooLargeError) as exc:
+            self._log("LN illustration repair skipped book=%s error=%s", book_id, exc)
+        if restored:
+            self._log("LN restored missing EPUB illustrations book=%s count=%s", book_id, restored)
+        return restored
 
     def cover_ref(self, book_id: int, *, asset_base: str) -> CoverRef:
         book = self.book(int(book_id))
@@ -2358,36 +2985,126 @@ class LightNovelService:
                 parts.append(f"b.{quoted}")
         return ",".join(parts)
 
+    @staticmethod
+    def _source_key(source: Path) -> tuple[str, int, int] | None:
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
+        return (str(source), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _parse_source(self, source: Path) -> tuple[str, str, list[tuple[str, str]], tuple[bytes, str] | None]:
+        """(file type, title, chapters, cover) of an EPUB/TXT, parsed once per check and import.
+
+        The library and watched-folder scans check a new book's language and then
+        import it: both parsed the whole book. An accepted check keeps its result
+        for the import that follows (only the last book is kept).
+        """
+        key = self._source_key(source)
+        held = self.__dict__.get("_parsed_source")
+        if held is not None and key is not None and held[0] == key:
+            self._parsed_source = None
+            return held[1]
+        if source.suffix.casefold() == ".epub":
+            title, chapters, cover = _epub_metadata(source)
+            parsed = ("epub", title, chapters, cover)
+        elif source.suffix.casefold() == ".txt":
+            title, chapters = _txt_metadata(source)
+            parsed = ("txt", title, chapters, None)
+        else:
+            raise LightNovelError(err("ln.onlyEpubTxt"))
+        return parsed
+
     def source_language_profile(self, source: Path) -> dict[str, Any]:
         source = Path(source).expanduser().resolve()
-        if source.suffix.casefold() == ".epub":
-            _title, chapters, _cover = _epub_metadata(source)
-        elif source.suffix.casefold() == ".txt":
-            _title, chapters = _txt_metadata(source)
-        else:
+        if source.suffix.casefold() not in {".epub", ".txt"}:
             return {"accepted": False, "reason": "unsupported"}
-        profile = _japanese_text_profile(chapters)
+        parsed = self._parse_source(source)
+        profile = _japanese_text_profile(parsed[2])
         profile["path"] = str(source)
+        if profile.get("accepted"):
+            self._parsed_source = (self._source_key(source), parsed)
         return profile
 
     def is_probably_japanese_source(self, source: Path) -> bool:
         try:
             return bool(self.source_language_profile(source).get("accepted"))
-        except (OSError, LightNovelError, UnicodeError, zipfile.BadZipFile):
+        except (OSError, LightNovelError, UnicodeError, zipfile.BadZipFile, ArchiveTooLargeError):
             return False
 
-    def import_file(self, source: Path, *, explicit: bool = True) -> dict[str, Any]:
+    def _import_target(
+        self,
+        target: Path,
+        source: Path,
+        title: str,
+        volume: int | None,
+        on_conflict: str = "replace",
+    ) -> tuple[Path, int]:
+        """Where a copied book goes, and the number of the same-titled book it is kept
+        beside (``keep_both``; 0 otherwise): its own name, unless another book already has it.
+
+        Two volumes are often both "book.epub" (``Vol1/book.epub``, ``Vol2/book.epub``)
+        and land in the same series folder: the second copy overwrote the first and
+        took over its row and reading place. A file with the same content keeps the
+        name. The same title (and volume) with other contents is an updated copy or
+        another book: ``replace`` takes the name, ``keep_both`` the next free one, and
+        ``ask`` raises LightNovelImportConflict for the user to choose.
+        """
+        stem, suffix = target.stem, target.suffix
+        kept_beside = 0
+        for number in range(1, 1000):
+            candidate = target if number == 1 else target.with_name(f"{stem} ({number}){suffix}")
+            if not candidate.exists() or _same_file_content(candidate, source):
+                return candidate, (number if kept_beside else 0)
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT id,title,volume FROM ln_books WHERE file_path=?", (str(candidate.resolve()),)
+                ).fetchone()
+                manual = library_overrides.load(conn, "ln").get(int(row["id"])) if row is not None else None
+            if row is None or str(row["title"] or "") != title:
+                continue
+            if volume is not None and not (manual or {}).get("volume") and int(row["volume"] or 0) != volume:
+                continue
+            if on_conflict == "keep_both":
+                kept_beside = number
+                continue
+            if on_conflict == "ask":
+                raise LightNovelImportConflict(
+                    source,
+                    {
+                        "id": int(row["id"]),
+                        "title": str(row["title"] or ""),
+                        "path": str(candidate.resolve()),
+                    },
+                )
+            return candidate, 0
+        raise LightNovelError(err("ln.importOutsideFolder"))
+
+    # A text file chosen by hand (drop, Import) with no Japanese at all is no book; the
+    # automatic imports (watched folders) need the full language check.
+    MIN_EXPLICIT_TXT_JAPANESE_CHARS = 1
+
+    def import_file(
+        self, source: Path, *, explicit: bool = True, on_conflict: str = "replace"
+    ) -> dict[str, Any]:
+        """Import one EPUB/TXT. ``on_conflict``: what a book with the same title (and volume)
+        but other contents does: ``replace`` it, ``keep_both`` (this one gets a numbered name
+        and title) or ``ask`` (LightNovelImportConflict; nothing is imported)."""
+        if on_conflict not in LN_IMPORT_CONFLICT_CHOICES:
+            raise LightNovelError(err("ln.importConflictChoice"))
         source = Path(source).expanduser().resolve()
+        if software_path(source):
+            raise LightNovelError(err("ln.notABook", name=source.name))
         cover_blob: tuple[bytes, str] | None = None
         if source.suffix.casefold() == ".epub":
-            title, chapters, cover_blob = _epub_metadata(source)
-            file_type = "epub"
+            file_type, title, chapters, cover_blob = self._parse_source(source)
             # Inline illustrations are stored in the existing cover cache and
             # represented by tiny marker paragraphs, preserving their reading
             # order without sending binary/image markup to Jiten.
             image_urls: dict[str, str] = {}
             try:
                 with zipfile.ZipFile(source) as zf:
+                    budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
                     for _chapter_title, chapter_text in chapters:
                         for marker in re.findall(r"\[\[PUDGE_EPUB_IMAGE:[A-Za-z0-9_-]+\]\]", chapter_text):
                             if marker in image_urls:
@@ -2396,29 +3113,47 @@ class LightNovelService:
                             if not archive_path:
                                 continue
                             try:
-                                raw_image = zf.read(archive_path)
-                            except KeyError:
+                                raw_image = read_member(
+                                    zf, archive_path, limit=LN_ILLUSTRATION_LIMIT, budget=budget
+                                )
+                            except (
+                                KeyError,
+                                RuntimeError,
+                                NotImplementedError,
+                                zipfile.BadZipFile,
+                                ArchiveTooLargeError,
+                            ):
+                                # Missing, encrypted, oversized or damaged illustration: only
+                                # that image is lost (it used to fail the whole import).
+                                continue
+                            if not _illustration_acceptable(raw_image):
+                                self._log("LN illustration left out (too large) name=%s", archive_path)
                                 continue
                             suffix = PurePosixPath(archive_path).suffix.casefold() or ".jpg"
-                            image_urls[marker] = self._store_cover_bytes(raw_image, suffix)
-            except (OSError, zipfile.BadZipFile):
-                image_urls = {}
-            if image_urls:
-                chapters = [
-                    (
-                        chapter_title,
-                        "\n".join(
-                            f"[[PUDGE_LN_IMAGE_URL:{image_urls.get(line, '')}]]"
-                            if line in image_urls
-                            else line
-                            for line in chapter_text.splitlines()
-                        ),
-                    )
-                    for chapter_title, chapter_text in chapters
-                ]
+                            image_urls[marker] = self._store_cover_bytes(raw_image, suffix, thumbnail=False)
+            except (OSError, zipfile.BadZipFile) as exc:
+                # The illustrations stored so far stay (each file is written whole).
+                self._log("LN illustrations incomplete path=%s error=%s", source, exc)
+            marker_line = re.compile(r"\[\[PUDGE_EPUB_IMAGE:[A-Za-z0-9_-]+\]\]")
+
+            def with_illustrations(chapter_text: str) -> str:
+                if "[[PUDGE_EPUB_IMAGE:" not in chapter_text:
+                    return chapter_text
+                lines: list[str] = []
+                for line in chapter_text.splitlines():
+                    if line in image_urls:
+                        lines.append(f"[[PUDGE_LN_IMAGE_URL:{image_urls[line]}]]")
+                    elif not marker_line.fullmatch(line):
+                        lines.append(line)
+                    # else: an illustration that could not be read. Its internal marker used
+                    # to stay in the chapter: shown as text and sent to the word parser.
+                return "\n".join(lines)
+
+            chapters = [
+                (chapter_title, with_illustrations(chapter_text)) for chapter_title, chapter_text in chapters
+            ]
         elif source.suffix.casefold() == ".txt":
-            title, chapters = _txt_metadata(source)
-            file_type = "txt"
+            file_type, title, chapters, _cover = self._parse_source(source)
         else:
             raise LightNovelError(err("ln.onlyEpubTxt"))
         title = html.unescape(str(title or "")).strip() or source.stem
@@ -2434,6 +3169,24 @@ class LightNovelService:
             managed_source = source.is_relative_to(self.root.resolve())
         except (AttributeError, ValueError):
             managed_source = str(source).startswith(str(self.root.resolve()) + str(Path("/")))
+        if not managed_source:
+            # Checked before anything is copied into the library: a package's LICENSE or
+            # SOURCES.txt used to be copied (each into a folder of its own) and only then
+            # rejected by the library scan. Books already in the library keep importing.
+            profile = _japanese_text_profile(chapters)
+            if (not explicit and not profile.get("accepted")) or (
+                explicit
+                and file_type == "txt"
+                and int(profile.get("japanese_chars") or 0) < self.MIN_EXPLICIT_TXT_JAPANESE_CHARS
+            ):
+                self._log(
+                    "LN import refused non-book source path=%s explicit=%s japanese_chars=%s letters=%s",
+                    source,
+                    explicit,
+                    profile.get("japanese_chars"),
+                    profile.get("letters"),
+                )
+                raise LightNovelError(err("ln.notABook", name=source.name))
         if managed_source:
             target = source
         else:
@@ -2441,12 +3194,37 @@ class LightNovelService:
                 re.sub(r"(?i)\b(?:vol(?:ume)?|v)\s*[._ -]*\d{1,3}\b", "", title).strip() or title
             )
             target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / source.name
+            target, copy_number = self._import_target(
+                target_dir / source.name, source, title, explicit_volume, on_conflict
+            )
+            if copy_number:
+                # Kept beside a book of the same title: the number tells them apart.
+                title = f"{title} ({copy_number})"
         target = target.expanduser().resolve()
+        if managed_source:
+            # A re-read of a book kept beside another keeps its numbered title.
+            with self._connection() as conn:
+                row = conn.execute("SELECT title FROM ln_books WHERE file_path=?", (str(target),)).fetchone()
+            if row is not None and re.fullmatch(re.escape(title) + r" \(\d+\)", str(row["title"] or "")):
+                title = str(row["title"])
+        if not managed_source and not target.is_relative_to(self.root.resolve()):
+            raise LightNovelError(err("ln.importOutsideFolder"))
         if not explicit and self.is_deleted_source(target):
             raise LightNovelError(err("ln.sourceRemoved"))
         if source != target:
-            shutil.copy2(source, target)
+            # Copied beside the target first: a copy cut off half-way (a full disk, a
+            # drive that went away) used to leave half a book over the library's copy,
+            # which Replace overwrites.
+            handle, partial_name = tempfile.mkstemp(
+                dir=target.parent, prefix=f".{APP_SLUG}-import-", suffix=".tmp"
+            )
+            partial = Path(partial_name)
+            try:
+                os.close(handle)
+                shutil.copy2(source, partial)
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
         if explicit:
             self._clear_deleted_source(target)
             with self._connection() as conn:
@@ -2480,13 +3258,52 @@ class LightNovelService:
             manual = library_overrides.load(conn, "ln").get(book_id) or {}
             if manual.get("volume") is not None:
                 conn.execute("UPDATE ln_books SET volume=? WHERE id=?", (int(manual["volume"]), book_id))
+            old_chapters = [
+                (str(item["text_hash"]), int(item["length"] or 0))
+                for item in conn.execute(
+                    "SELECT text_hash,COALESCE(char_count,LENGTH(text)) AS length FROM ln_chapters "
+                    "WHERE book_id=? ORDER BY chapter_index",
+                    (book_id,),
+                )
+            ]
             conn.execute("DELETE FROM ln_chapters WHERE book_id=?", (book_id,))
+            new_chapters: list[tuple[str, int]] = []
             for index, (chapter_title, text) in enumerate(chapters):
                 text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                new_chapters.append((text_hash, len(text)))
                 conn.execute(
                     "INSERT INTO ln_chapters(book_id,chapter_index,title,text,text_hash,char_count) VALUES(?,?,?,?,?,?)",
                     (book_id, index, chapter_title, text, text_hash, len(text)),
                 )
+            if old_chapters and old_chapters != new_chapters:
+                # Keep the reading place and the bookmark on the same text.
+                position = conn.execute(
+                    "SELECT current_chapter,current_offset FROM ln_books WHERE id=?", (book_id,)
+                ).fetchone()
+                chapter, offset = _remap_reading_position(
+                    old_chapters,
+                    new_chapters,
+                    int(position["current_chapter"] or 0),
+                    float(position["current_offset"] or 0.0),
+                )
+                conn.execute(
+                    "UPDATE ln_books SET current_chapter=?,current_offset=? WHERE id=?",
+                    (chapter, offset, book_id),
+                )
+                bookmark = conn.execute(
+                    "SELECT chapter_index,offset FROM ln_bookmarks WHERE book_id=?", (book_id,)
+                ).fetchone()
+                if bookmark is not None:
+                    chapter, offset = _remap_reading_position(
+                        old_chapters,
+                        new_chapters,
+                        int(bookmark["chapter_index"] or 0),
+                        float(bookmark["offset"] or 0.0),
+                    )
+                    conn.execute(
+                        "UPDATE ln_bookmarks SET chapter_index=?,offset=? WHERE book_id=?",
+                        (chapter, offset, book_id),
+                    )
         self._volume_repair_due = True
         self._inherit_series_anilist(book_id)
         book = self.book(book_id)
@@ -2530,7 +3347,13 @@ class LightNovelService:
             }
         added = 0
         for path in self.root.rglob("*"):
-            if not path.is_file() or path.suffix.casefold() not in {".epub", ".txt"}:
+            if (
+                path.suffix.casefold() not in {".epub", ".txt"}
+                or junk_path(path, self.root)
+                or software_path(path.relative_to(self.root))
+            ):
+                continue
+            if not path.is_file():
                 continue
             resolved = str(path.resolve())
             if resolved in known or resolved in deleted:
@@ -2560,6 +3383,18 @@ class LightNovelService:
                 added += 1
             except Exception as exc:
                 self._log("LN import skipped path=%s error=%s", path, exc)
+                if permanent_import_failure(exc):
+                    # Not parsed again on every Refresh while the file stays as it is.
+                    try:
+                        with self._connection() as conn:
+                            conn.execute(
+                                "INSERT INTO ln_scan_rejections(file_path,mtime_ns,size,checked_at) VALUES(?,?,?,?) "
+                                "ON CONFLICT(file_path) DO UPDATE SET mtime_ns=excluded.mtime_ns,size=excluded.size,checked_at=excluded.checked_at",
+                                (resolved, signature[0], signature[1], time.time()),
+                            )
+                        rejected[resolved] = signature
+                    except (LightNovelError, sqlite3.Error):
+                        pass
         return added
 
     def _repair_missing_volumes(self) -> int:
@@ -2652,7 +3487,14 @@ class LightNovelService:
                 return item
             raw, suffix = cover
             restored_url = self._store_cover_bytes(raw, suffix)
-        except (OSError, LightNovelError, zipfile.BadZipFile, UnicodeError, ET.ParseError) as exc:
+        except (
+            OSError,
+            LightNovelError,
+            zipfile.BadZipFile,
+            UnicodeError,
+            ET.ParseError,
+            ArchiveTooLargeError,
+        ) as exc:
             self._log("LN cover repair skipped book=%s error=%s", item.get("id"), exc)
             return item
         if restored_url != cover_url:
@@ -2771,6 +3613,37 @@ class LightNovelService:
         if str(item.get("cover_url") or "").startswith("data:"):
             item["cover_url"] = ""
         return self._apply_override(item)
+
+    def shelf_keys(self) -> dict[int, str]:
+        """Series key of every book as the library groups it (titles only, no chapter scan).
+
+        A Finder drop compares its volumes with these to say "added to the series".
+        """
+        with self._connection() as conn:
+            overrides = library_overrides.load(conn, "ln")
+            rows = conn.execute("SELECT id,title,anilist_id FROM ln_books").fetchall()
+        items = []
+        for row in rows:
+            title = str(row["title"] or "")
+            items.append(
+                {
+                    "id": int(row["id"]),
+                    "series_key": f"anilist:{int(row['anilist_id'])}"
+                    if row["anilist_id"]
+                    else (_series_key(title) or f"book:{int(row['id'])}"),
+                    "series_title": _series_title(title) or title,
+                }
+            )
+        return {
+            int(item["id"]): str(item["series_key"])
+            for item in library_overrides.apply_all(items, overrides, _series_key)
+        }
+
+    def mark_changed(self) -> int:
+        """Books were added outside a refresh (a Finder drop): later snapshots carry a newer version."""
+        with self._state_refresh_lock:
+            self._state_version += 1
+            return int(self._state_version)
 
     def book(self, book_id: int) -> dict[str, Any]:
         with self._connection() as conn:
@@ -2916,64 +3789,68 @@ class LightNovelService:
     def _jiten_request(self, action: str, payload: dict[str, Any] | None = None) -> Any:
         token = self.settings().jiten_api_key
         if not token:
-            raise LightNovelError(err("ln.jitenTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jitenTokenMissing"))
         url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
-        last: Exception | None = None
-        for attempt in range(3):
-            if action == "reader/parse":
-                self._reserve_parse_request_start()
+        if action == "reader/parse":
+            self._reserve_parse_request_start()
+        try:
+            # The shared client keeps to the request and parse budgets, waits out a
+            # 429's Retry-After (background work) and retries 5xx/timeouts.
+            response = jiten_client.request(
+                "POST", url, headers=self._jiten_headers(token), json=payload, timeout=30, attempts=3
+            )
+        except jiten_client.JitenRefused as exc:
+            raise JitenUnavailableError.of(exc) from exc
+        except httpx.HTTPError as exc:
+            raise LightNovelError(err("ln.jitenRequestFailed", error=exc)) from exc
+        if response.status_code == 429:
+            seconds = jiten_client.retry_after_seconds(response.headers.get("Retry-After"))
+            raise JitenUnavailableError(
+                err("ln.jitenRateLimited", seconds=int(seconds + 0.999)),
+                reason="rate_limited",
+                retry_after=seconds,
+            )
+        # Authentication/path/client errors are deterministic: do not turn one
+        # bad request into three slow requests per chapter batch.
+        if 400 <= response.status_code < 500:
+            detail = ""
             try:
-                response = httpx.post(url, headers=self._jiten_headers(token), json=payload, timeout=30)
-                if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < 2:
-                        time.sleep(0.6 * (2**attempt))
-                        continue
-                # Authentication/path/client errors are deterministic: do not turn one
-                # bad request into three slow requests per chapter batch.
-                if 400 <= response.status_code < 500 and response.status_code != 429:
-                    detail = ""
-                    try:
-                        body = response.json()
-                        detail = (
-                            str(body.get("error_message") or body.get("detail") or "")
-                            if isinstance(body, dict)
-                            else ""
-                        )
-                    except Exception:
-                        detail = ""
-                    raise LightNovelError(
-                        err(
-                            "ln.jitenHttp",
-                            status=response.status_code,
-                            detail=": " + detail if detail else "",
-                        )
-                    )
-                response.raise_for_status()
-                data = response.json() if response.content else {}
-                if isinstance(data, dict) and data.get("error_message"):
-                    raise LightNovelError(str(data["error_message"]))
-                return data
-            except LightNovelError:
-                raise
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                last = exc
-                if attempt < 2:
-                    time.sleep(0.6 * (2**attempt))
-                    continue
-                break
-            except (httpx.HTTPError, ValueError) as exc:
-                last = exc
-                break
-        raise LightNovelError(err("ln.jitenRequestFailed", error=last))
+                body = response.json()
+                detail = (
+                    str(body.get("error_message") or body.get("detail") or "")
+                    if isinstance(body, dict)
+                    else ""
+                )
+            except Exception:
+                detail = ""
+            raise LightNovelError(
+                err(
+                    "ln.jitenHttp",
+                    status=response.status_code,
+                    detail=": " + detail if detail else "",
+                )
+            )
+        try:
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LightNovelError(err("ln.jitenRequestFailed", error=exc)) from exc
+        if isinstance(data, dict) and data.get("error_message"):
+            raise LightNovelError(str(data["error_message"]))
+        return data
 
     def _jiten_mutation(self, action: str, payload: dict[str, Any] | None = None) -> Any:
         """Single-send Jiten mutation. Ambiguous failures are never retried here."""
         token = self.settings().jiten_api_key
         if not token:
-            raise LightNovelError(err("ln.jitenTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jitenTokenMissing"))
         url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
         try:
-            response = httpx.post(url, headers=self._jiten_headers(token), json=payload, timeout=30)
+            response = jiten_client.request(
+                "POST", url, headers=self._jiten_headers(token), json=payload, timeout=30, attempts=1
+            )
+        except jiten_client.JitenRefused as exc:
+            raise JitenUnavailableError.of(exc) from exc  # not sent: safe to try again
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise JitenMutationUnknown(err("ln.jitenMutationUnknown", error=exc)) from exc
         if response.status_code == 408 or response.status_code >= 500:
@@ -3010,29 +3887,30 @@ class LightNovelService:
         if token:
             headers["Authorization"] = f"ApiKey {token}"
         url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
-        last: Exception | None = None
-        for attempt in range(3):
-            try:
-                response = httpx.get(
-                    url,
-                    headers=headers,
-                    params=params or {},
-                    timeout=20,
-                    follow_redirects=True,
+        try:
+            response = jiten_client.request(
+                "GET",
+                url,
+                headers=headers,
+                params=params or {},
+                timeout=20,
+                follow_redirects=True,
+                attempts=3,
+                backoff=0.5,
+            )
+            if response.status_code == 429:
+                seconds = jiten_client.retry_after_seconds(response.headers.get("Retry-After"))
+                raise JitenUnavailableError(
+                    err("ln.jitenRateLimited", seconds=int(seconds + 0.999)),
+                    reason="rate_limited",
+                    retry_after=seconds,
                 )
-                if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < 2:
-                        time.sleep(0.5 * (2**attempt))
-                        continue
-                response.raise_for_status()
-                return response.json() if response.content else {}
-            except (httpx.HTTPError, ValueError) as exc:
-                last = exc
-                if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)) and attempt < 2:
-                    time.sleep(0.5 * (2**attempt))
-                    continue
-                break
-        raise LightNovelError(err("ln.jitenRequestFailed", error=last))
+            response.raise_for_status()
+            return response.json() if response.content else {}
+        except jiten_client.JitenRefused as exc:
+            raise JitenUnavailableError.of(exc) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LightNovelError(err("ln.jitenRequestFailed", error=exc)) from exc
 
     def jiten_profile_word_colors(self) -> dict[str, Any]:
         """Word colours of the user's first Jiten display profile (Jiten without its
@@ -3043,8 +3921,10 @@ class LightNovelService:
             return {"ok": False, "reason": "no_key"}
         url = f"{self.JITEN_BASE}/user/settings/display-profiles"
         try:
-            response = httpx.get(url, headers=self._jiten_headers(token), timeout=20, follow_redirects=True)
-        except httpx.HTTPError as exc:
+            response = jiten_client.request(
+                "GET", url, headers=self._jiten_headers(token), timeout=20, follow_redirects=True
+            )
+        except (httpx.HTTPError, jiten_client.JitenRefused) as exc:
             self._log("FAIL jiten.profile_colors reason=offline error=%r", str(exc)[:200])
             return {"ok": False, "reason": "offline"}
         if response.status_code >= 400:
@@ -3117,6 +3997,61 @@ class LightNovelService:
         account_key = credential_account_key("jiten", self.settings().jiten_api_key)
         return (account_key, int(word_id), int(reading_index))
 
+    def _live_state_extras(self) -> dict[str, Any]:
+        """In-flight lookups and overview-version bookkeeping (created on first use)."""
+        extras = self.__dict__.get("_jiten_live_extras")
+        if extras is None:
+            extras = self.__dict__.setdefault(
+                "_jiten_live_extras",
+                {
+                    "lock": threading.Lock(),
+                    "inflight": {},  # (account, word, reading) -> Event of the request asking Jiten
+                    "stale_before": {},  # account -> monotonic time: older entries are stale
+                    "overview_checked": {},  # account -> monotonic time of the last check
+                    "overview_running": set(),
+                    "pruned_at": 0.0,
+                },
+            )
+        return extras
+
+    # After JITEN_LIVE_STATE_TTL_SECONDS without a new state every kept one is stale (only a
+    # fallback): an idle reader keeps this many of the newest in memory (SQLite has the batch).
+    JITEN_LIVE_STATE_IDLE_ENTRIES = 2_000
+
+    def release_idle(self, force: bool = False) -> int:
+        """Trim the Jiten live-state memory once reading stopped (``force``: now)."""
+        dropped = 0
+        lock = self.__dict__.get("_jiten_live_state_lock")
+        if lock is None or not lock.acquire(blocking=False):
+            return 0
+        try:
+            cache = self._jiten_live_state_cache
+            now = time.monotonic()
+            newest = max((entry[0] for entry in cache.values()), default=float("-inf"))
+            if (force or now - newest >= self.JITEN_LIVE_STATE_TTL_SECONDS) and (
+                len(cache) > self.JITEN_LIVE_STATE_IDLE_ENTRIES
+            ):
+                oldest = sorted(cache, key=lambda item: cache[item][0])[: -self.JITEN_LIVE_STATE_IDLE_ENTRIES]
+                for key in oldest:
+                    cache.pop(key, None)
+                dropped = len(oldest)
+            idle = force or now - newest >= self.JITEN_LIVE_STATE_TTL_SECONDS
+        finally:
+            lock.release()
+        extras = self.__dict__.get("_jiten_live_extras")
+        if idle and extras is not None:
+            with extras["lock"]:
+                absent = extras.get("absent")
+                if absent:
+                    # Only "not in SQLite" answers: asking SQLite again is all it costs.
+                    dropped += len(absent)
+                    absent.clear()
+        return dropped
+
+    def _live_state_fresh(self, account_key: str, fetched_at: float, now: float) -> bool:
+        stale_before = self._live_state_extras()["stale_before"].get(account_key, float("-inf"))
+        return now - fetched_at <= self.JITEN_LIVE_STATE_TTL_SECONDS and fetched_at >= stale_before
+
     def _cached_jiten_live_state(
         self,
         word_id: int,
@@ -3124,6 +4059,7 @@ class LightNovelService:
         *,
         allow_stale: bool = False,
         account_key: str | None = None,
+        stored: bool = True,
     ) -> dict[str, Any] | None:
         key = (
             (account_key, int(word_id), int(reading_index))
@@ -3134,19 +4070,265 @@ class LightNovelService:
             return None
         with self._jiten_live_state_lock:
             cached = self._jiten_live_state_cache.get(key)
+        if cached is None and stored:
+            cached = self._stored_live_states(key[0], [(key[1], key[2])]).get((key[1], key[2]))
         if cached is None:
             return None
         fetched_at, payload = cached
-        if not allow_stale and time.monotonic() - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS:
+        fresh = self._live_state_fresh(key[0], fetched_at, time.monotonic())
+        if not allow_stale and not fresh:
             return None
         result = dict(payload)
-        result["stale"] = bool(time.monotonic() - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS)
+        result["stale"] = not fresh
         return result
 
     def invalidate_jiten_live_state(self, word_id: int, reading_index: int) -> None:
         key = self._jiten_live_state_key(word_id, reading_index)
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            invalidated = extras.setdefault("invalidated", {})
+            if len(invalidated) > 10_000:
+                invalidated.clear()
+            invalidated[key] = time.monotonic()
         with self._jiten_live_state_lock:
             self._jiten_live_state_cache.pop(key, None)
+        try:
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE jiten_state_cache SET fetched_at=0 WHERE account_key=? AND word_id=? AND reading_index=?",
+                    key,
+                )
+        except Exception:  # noqa: BLE001 - no database (test double): memory is enough
+            pass
+
+    def _invalidated_since(self, key: tuple[str, int, int], started: float) -> bool:
+        """The word changed (graded, added) after a request for its state was sent: that answer
+        may be the state from before and must not be cached as fresh."""
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            return extras.get("invalidated", {}).get(key, float("-inf")) >= started
+
+    def _stored_live_states(
+        self, account_key: str, pairs: list[tuple[int, int]]
+    ) -> dict[tuple[int, int], tuple[float, dict[str, Any]]]:
+        """States kept in SQLite, with their age as a monotonic time (like the memory cache)."""
+        if not pairs or "db_path" not in self.__dict__:
+            return {}
+        found: dict[tuple[int, int], tuple[float, dict[str, Any]]] = {}
+        now_wall, now = time.time(), time.monotonic()
+        try:
+            with self._connection() as conn:
+                stale_row = conn.execute(
+                    "SELECT stale_before FROM jiten_state_meta WHERE account_key=?", (account_key,)
+                ).fetchone()
+                for offset in range(0, len(pairs), 400):
+                    chunk = pairs[offset : offset + 400]
+                    marks = ",".join("(?,?)" for _ in chunk)
+                    rows = conn.execute(
+                        "SELECT word_id,reading_index,payload,fetched_at FROM jiten_state_cache "
+                        f"WHERE account_key=? AND (word_id,reading_index) IN (VALUES {marks})",
+                        (account_key, *[value for pair in chunk for value in pair]),
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            payload = json.loads(row["payload"])
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(payload, dict):
+                            fetched = now - (now_wall - float(row["fetched_at"] or 0.0))
+                            found[(int(row["word_id"]), int(row["reading_index"]))] = (fetched, payload)
+        except Exception:  # noqa: BLE001 - an unreadable cache is only a miss
+            return {}
+        if stale_row is not None and float(stale_row["stale_before"] or 0.0) > 0:
+            mono = now - (now_wall - float(stale_row["stale_before"]))
+            extras = self._live_state_extras()
+            with extras["lock"]:
+                if mono > extras["stale_before"].get(account_key, float("-inf")):
+                    extras["stale_before"][account_key] = mono
+        if found:
+            with self._jiten_live_state_lock:
+                for pair, entry in found.items():
+                    key = (account_key, pair[0], pair[1])
+                    current = self._jiten_live_state_cache.get(key)
+                    if current is None or current[0] < entry[0]:
+                        self._jiten_live_state_cache[key] = entry
+        return found
+
+    def _prime_live_states(self, account_key: str, pairs: list[tuple[int, int]]) -> None:
+        """Load the states of many words kept in SQLite into memory with one connection.
+
+        Words SQLite does not have are remembered for this run, so building the next
+        payload asks SQLite only for words it has not looked for yet (a live lookup, which
+        goes to Jiten anyway, still reads SQLite first)."""
+        if not account_key or not pairs:
+            return
+        extras = self._live_state_extras()
+        with self._jiten_live_state_lock:
+            cache = self._jiten_live_state_cache
+            with extras["lock"]:
+                absent = extras.setdefault("absent", set())
+                wanted = list(
+                    dict.fromkeys(
+                        pair
+                        for pair in pairs
+                        if (account_key, *pair) not in cache and (account_key, *pair) not in absent
+                    )
+                )
+        if not wanted:
+            return
+        found = self._stored_live_states(account_key, wanted)
+        with extras["lock"]:
+            absent = extras.setdefault("absent", set())
+            absent.update((account_key, *pair) for pair in wanted if pair not in found)
+            if len(absent) > 200_000:
+                absent.clear()
+
+    def _store_live_states(self, account_key: str, payloads: dict[tuple[int, int], dict[str, Any]]) -> None:
+        if not payloads or "db_path" not in self.__dict__:
+            return
+        now = time.time()
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            absent = extras.get("absent")
+            if absent:
+                absent.difference_update((account_key, *pair) for pair in payloads)
+        try:
+            with self._connection() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO jiten_state_cache(account_key,word_id,reading_index,payload,fetched_at) "
+                    "VALUES(?,?,?,?,?)",
+                    [
+                        (account_key, pair[0], pair[1], json.dumps(payload, ensure_ascii=False), now)
+                        for pair, payload in payloads.items()
+                    ],
+                )
+                if now - float(extras["pruned_at"]) > 3600:
+                    extras["pruned_at"] = now
+                    conn.execute(
+                        "DELETE FROM jiten_state_cache WHERE fetched_at<?",
+                        (now - self.JITEN_LIVE_STATE_KEEP_SECONDS,),
+                    )
+                    conn.execute(
+                        "DELETE FROM jiten_state_cache WHERE rowid IN (SELECT rowid FROM jiten_state_cache "
+                        "ORDER BY fetched_at DESC LIMIT -1 OFFSET ?)",
+                        (self.JITEN_LIVE_STATE_KEEP_ROWS,),
+                    )
+        except Exception as exc:  # noqa: BLE001 - the memory cache still holds them
+            self._log("Jiten state cache write skipped: %s", exc)
+        with self._jiten_live_state_lock:
+            cache = self._jiten_live_state_cache
+            if len(cache) > self.JITEN_LIVE_STATE_MEMORY_ENTRIES:
+                for key in sorted(cache, key=lambda item: cache[item][0])[: len(cache) // 4]:
+                    cache.pop(key, None)
+
+    def _mark_live_states_stale(self, account_key: str) -> None:
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            extras["stale_before"][account_key] = time.monotonic()
+        with self._jiten_optimal_stats_lock:
+            self._jiten_optimal_stats_cache.pop(account_key, None)
+        try:
+            with self._connection() as conn:
+                conn.execute(
+                    "INSERT INTO jiten_state_meta(account_key,stale_before) VALUES(?,?) "
+                    "ON CONFLICT(account_key) DO UPDATE SET stale_before=excluded.stale_before",
+                    (account_key, time.time()),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def check_jiten_overview_version(self, token: str, account_key: str) -> bool | None:
+        """Ask Jiten's overview-version once; True when it changed (all states are then stale)."""
+        try:
+            response = jiten_client.request(
+                "GET",
+                f"{self.JITEN_BASE}/srs/overview-version",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"ApiKey {token}",
+                    "User-Agent": APP_SLUG,
+                },
+                timeout=10,
+                interactive=False,
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+        except Exception:  # noqa: BLE001 - states keep their 15 minutes
+            return None
+        raw_version = data.get("version") if isinstance(data, dict) else data
+        # No version in the answer is no version (not the text "None", which never changed).
+        version = "" if raw_version is None else str(raw_version).strip()
+        if not version:
+            return None
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            seen_here = extras.setdefault("versions", {}).get(account_key, "")
+            extras["versions"][account_key] = version
+        saved, shared_stale_before = "", 0.0
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT overview_version,stale_before FROM jiten_state_meta WHERE account_key=?",
+                    (account_key,),
+                ).fetchone()
+                if row is not None:
+                    saved = str(row["overview_version"] or "")
+                    shared_stale_before = float(row["stale_before"] or 0.0)
+                conn.execute(
+                    "INSERT INTO jiten_state_meta(account_key,overview_version) VALUES(?,?) "
+                    "ON CONFLICT(account_key) DO UPDATE SET overview_version=excluded.overview_version",
+                    (account_key, version),
+                )
+        except Exception:  # noqa: BLE001 - no database: compare within this run only
+            pass
+        # The version this process saw last decides (another Pudge process, the agent or
+        # the mpv study helper, may have saved the new one already); on the first check of
+        # a run, the version the last run saved.
+        previous = seen_here or saved
+        changed = bool(previous) and previous != version
+        if changed:
+            self._mark_live_states_stale(account_key)
+            self._log("EVENT jiten.overview_version changed=1 version=%s", version)
+        elif shared_stale_before > 0 and self._apply_shared_stale_before(account_key, shared_stale_before):
+            # Another process noticed the change first: its "stale before" holds here too.
+            changed = True
+        return changed
+
+    def _apply_shared_stale_before(self, account_key: str, stale_before_wall: float) -> bool:
+        """Adopt a "stale before" another process saved; True when it is newer than this one's."""
+        mono = time.monotonic() - (time.time() - float(stale_before_wall))
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            # A second of slack: this process's own mark comes back through the database.
+            if mono <= extras["stale_before"].get(account_key, float("-inf")) + 1.0:
+                return False
+            extras["stale_before"][account_key] = mono
+        with self._jiten_optimal_stats_lock:
+            self._jiten_optimal_stats_cache.pop(account_key, None)
+        return True
+
+    def _schedule_overview_check(self, token: str, account_key: str) -> None:
+        """At most once a minute while states are asked for: check overview-version in the background."""
+        extras = self._live_state_extras()
+        now = time.monotonic()
+        with extras["lock"]:
+            last = extras["overview_checked"].get(account_key)
+            if (last is not None and now - last < self.JITEN_OVERVIEW_CHECK_SECONDS) or account_key in extras[
+                "overview_running"
+            ]:
+                return
+            extras["overview_checked"][account_key] = now
+            extras["overview_running"].add(account_key)
+
+        def worker() -> None:
+            try:
+                self.check_jiten_overview_version(token, account_key)
+            finally:
+                with extras["lock"]:
+                    extras["overview_running"].discard(account_key)
+
+        threading.Thread(target=worker, name="ln-jiten-overview", daemon=True).start()
 
     def _jiten_live_state_payload(
         self,
@@ -3188,7 +4370,7 @@ class LightNovelService:
         settings = self.settings()
         token = str(settings.jiten_api_key or "").strip()
         if not token:
-            raise LightNovelError(err("ln.jitenTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jitenTokenMissing"))
         account_key = credential_account_key("jiten", token)
         if not account_key:
             raise LightNovelError(err("ln.jitenAccountUnavailable"))
@@ -3206,71 +4388,182 @@ class LightNovelService:
             ordered.append(pair)
         if not ordered:
             return []
+        if not force:
+            self._schedule_overview_check(token, account_key)
 
-        now = time.monotonic()
         ready: dict[tuple[int, int], dict[str, Any]] = {}
-        pending: list[tuple[int, int]] = []
         stale: dict[tuple[int, int], dict[str, Any]] = {}
-        with self._jiten_live_state_lock:
-            for pair in ordered:
-                cached = self._jiten_live_state_cache.get((account_key, pair[0], pair[1]))
-                if cached is None:
-                    pending.append(pair)
+
+        def from_cache(candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            """Fill `ready` with fresh entries; return the pairs Jiten has to be asked for."""
+            now = time.monotonic()
+            missing: list[tuple[int, int]] = []
+            with self._jiten_live_state_lock:
+                entries = {
+                    pair: self._jiten_live_state_cache.get((account_key, *pair)) for pair in candidates
+                }
+            unknown = [pair for pair, entry in entries.items() if entry is None]
+            if unknown:
+                entries.update(self._stored_live_states(account_key, unknown))
+            for pair in candidates:
+                entry = entries.get(pair)
+                if entry is None:
+                    missing.append(pair)
                     continue
-                fetched_at, payload = cached
+                fetched_at, payload = entry
                 snapshot = dict(payload)
-                expired = now - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS
-                snapshot["stale"] = bool(expired)
+                fresh = self._live_state_fresh(account_key, fetched_at, now)
+                snapshot["stale"] = not fresh
                 stale[pair] = snapshot
-                if not force and not expired:
+                if fresh and not force:
                     snapshot["knowledgeStatus"] = "live_state_cache"
                     ready[pair] = snapshot
                 else:
-                    pending.append(pair)
+                    missing.append(pair)
+            return missing
 
-        if pending:
-            try:
-                response = self._jiten_request(
-                    "reader/lookup-vocabulary",
-                    {"words": [[word_id, reading_index] for word_id, reading_index in pending]},
-                )
-                rows = response.get("result") if isinstance(response, dict) else None
-                deck_rows = response.get("decks") if isinstance(response, dict) else None
-                if not isinstance(rows, list) or len(rows) != len(pending):
-                    raise LightNovelError(err("ln.jitenStateCountMismatch"))
-                if not isinstance(deck_rows, list) or len(deck_rows) != len(pending):
-                    # Deck membership unknown: never call a word "not in deck".
-                    deck_rows = [None for _ in pending]
-                fetched_at = time.monotonic()
-                with self._jiten_live_state_lock:
-                    for pair, raw_states, deck_ids in zip(pending, rows, deck_rows):
-                        payload = self._jiten_live_state_payload(
-                            pair[0],
-                            pair[1],
-                            raw_states,
-                            knowledge_status="live_provider_batch",
-                            study_deck_ids=deck_ids,
-                        )
-                        self._jiten_live_state_cache[(account_key, pair[0], pair[1])] = (
-                            fetched_at,
-                            dict(payload),
-                        )
-                        ready[pair] = payload
-            except Exception:
-                missing = []
+        pending = from_cache(ordered)
+        extras = self._live_state_extras()
+        waits: list[tuple[tuple[int, int], threading.Event]] = []
+        failure: Exception | None = None
+        for round_number in range(2):
+            if not pending:
+                break
+            # One request per pair at a time: a pair another caller is asking Jiten
+            # for is waited for, not asked again (JITEN-13).
+            own: list[tuple[int, int]] = []
+            flight = threading.Event()
+            with extras["lock"]:
                 for pair in pending:
-                    snapshot = stale.get(pair)
-                    if snapshot is None:
-                        missing.append(pair)
-                        continue
-                    snapshot = dict(snapshot)
-                    snapshot["knowledgeStatus"] = "stale_live_state_cache"
-                    snapshot["stale"] = True
-                    ready[pair] = snapshot
-                if missing:
-                    raise
+                    other = extras["inflight"].get((account_key, *pair))
+                    if other is not None and round_number == 0:
+                        waits.append((pair, other))
+                    else:
+                        extras["inflight"][(account_key, *pair)] = flight
+                        own.append(pair)
+            try:
+                if own:
+                    ready.update(self._fetch_live_states(account_key, own))
+            except Exception as exc:
+                failure = exc
+            finally:
+                with extras["lock"]:
+                    for pair in own:
+                        if extras["inflight"].get((account_key, *pair)) is flight:
+                            extras["inflight"].pop((account_key, *pair), None)
+                flight.set()
+            if not waits:
+                break
+            for _pair, event in waits:
+                event.wait(35.0)
+            waited = [pair for pair, _event in waits]
+            waits = []
+            # A pair the other request did not bring is asked once more here.
+            with self._jiten_live_state_lock:
+                now = time.monotonic()
+                pending = []
+                for pair in waited:
+                    entry = self._jiten_live_state_cache.get((account_key, *pair))
+                    if (
+                        entry is not None
+                        and (now - entry[0] <= 60.0 or not force)
+                        and self._live_state_fresh(account_key, entry[0], now)
+                    ):
+                        snapshot = dict(entry[1])
+                        snapshot["stale"] = False
+                        ready[pair] = snapshot
+                    else:
+                        pending.append(pair)
+
+        if failure is not None:
+            missing = []
+            for pair in ordered:
+                if pair in ready:
+                    continue
+                snapshot = stale.get(pair)
+                if snapshot is None:
+                    missing.append(pair)
+                    continue
+                snapshot = dict(snapshot)
+                snapshot["knowledgeStatus"] = "stale_live_state_cache"
+                snapshot["stale"] = True
+                ready[pair] = snapshot
+            if missing:
+                raise failure
 
         return [ready[pair] for pair in ordered if pair in ready]
+
+    def jiten_cached_states(self, pairs: list[tuple[int, int]]) -> dict[tuple[int, int], str]:
+        """normalizedState of the words whose Jiten state is already on this Mac (memory or
+        SQLite, fresh or stale). Never asks Jiten: words not kept are left out."""
+        token = str(self.settings().jiten_api_key or "").strip()
+        account_key = credential_account_key("jiten", token) if token else ""
+        if not account_key:
+            return {}
+        wanted: list[tuple[int, int]] = []
+        for word_id, reading_index in dict.fromkeys(pairs or []):
+            try:
+                wanted.append((int(word_id), int(reading_index)))
+            except (TypeError, ValueError):
+                continue
+        with self._jiten_live_state_lock:
+            entries = {pair: self._jiten_live_state_cache.get((account_key, *pair)) for pair in wanted}
+        unknown = [pair for pair, entry in entries.items() if entry is None]
+        if unknown:
+            entries.update(self._stored_live_states(account_key, unknown))
+        result: dict[tuple[int, int], str] = {}
+        now = time.monotonic()
+        for pair, entry in entries.items():
+            # A word changed here (added, graded) is kept with no time: its state is not known.
+            if entry is None or now - float(entry[0]) > 3e8:
+                continue
+            state = str(entry[1].get("normalizedState") or "")
+            if state:
+                result[pair] = state
+        return result
+
+    def _fetch_live_states(
+        self, account_key: str, pending: list[tuple[int, int]]
+    ) -> dict[tuple[int, int], dict[str, Any]]:
+        started = time.monotonic()
+        response = self._jiten_request(
+            "reader/lookup-vocabulary",
+            {"words": [[word_id, reading_index] for word_id, reading_index in pending]},
+        )
+        rows = response.get("result") if isinstance(response, dict) else None
+        deck_rows = response.get("decks") if isinstance(response, dict) else None
+        if not isinstance(rows, list) or len(rows) != len(pending):
+            raise LightNovelError(err("ln.jitenStateCountMismatch"))
+        if not isinstance(deck_rows, list) or len(deck_rows) != len(pending):
+            # Deck membership unknown: never call a word "not in deck".
+            deck_rows = [None for _ in pending]
+        fetched_at = time.monotonic()
+        result: dict[tuple[int, int], dict[str, Any]] = {}
+        with self._jiten_live_state_lock:
+            for pair, raw_states, deck_ids in zip(pending, rows, deck_rows):
+                payload = self._jiten_live_state_payload(
+                    pair[0],
+                    pair[1],
+                    raw_states,
+                    knowledge_status="live_provider_batch",
+                    study_deck_ids=deck_ids,
+                )
+                result[pair] = payload
+                if self._invalidated_since((account_key, pair[0], pair[1]), started):
+                    # Graded while Jiten answered: maybe the state from before the grade; not
+                    # kept (the next request asks Jiten again).
+                    payload["stale"] = True
+                    continue
+                self._jiten_live_state_cache[(account_key, pair[0], pair[1])] = (fetched_at, dict(payload))
+        stored = {}
+        for pair, payload in result.items():
+            if payload.get("stale"):
+                continue
+            kept = dict(payload)
+            kept.pop("stale", None)
+            stored[pair] = kept
+        self._store_live_states(account_key, stored)
+        return result
 
     def jiten_card_media(self, pairs: list[tuple[int, int]]) -> dict[tuple[int, int], dict[str, Any]]:
         """Best-effort fetch of the user's Jiten per-card media for review UI."""
@@ -3316,20 +4609,40 @@ class LightNovelService:
         """Return the account Mature count and N+1 frequency ceiling.
 
         Jiten exposes the authoritative Mature count separately from the local
-        parsed corpus. Keep it briefly cached per account: the threshold only
-        changes after reviews and does not need to accompany every reader batch.
+        parsed corpus. It is kept 6 hours per account (dropped when the overview-version
+        changes); a failed request answers the last value (or the default) for 10 minutes.
         """
         token = str(self.settings().jiten_api_key or "").strip()
+        default = {"matureWords": 0, "optimalWordLimit": 1000}
         if not token:
-            return {"matureWords": 0, "optimalWordLimit": 1000}
+            return dict(default)
         account_key = credential_account_key("jiten", token)
         now = time.monotonic()
-        if account_key and not force:
+        cached = None
+        if account_key:
             with self._jiten_optimal_stats_lock:
                 cached = self._jiten_optimal_stats_cache.get(account_key)
-            if cached is not None and now - cached[0] <= self.JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS:
-                return dict(cached[1])
-        data = self._jiten_get("user/vocabulary/known-ids/amount")
+            if cached is not None and not force:
+                ttl = (
+                    self.JITEN_OPTIMAL_WORD_STATS_FAILURE_SECONDS
+                    if cached[1].get("_failed")
+                    else self.JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS
+                )
+                if now - cached[0] <= ttl:
+                    return {key: value for key, value in cached[1].items() if not key.startswith("_")}
+        try:
+            data = self._jiten_get("user/vocabulary/known-ids/amount")
+        except Exception:
+            if not account_key:
+                raise
+            kept = {
+                key: value
+                for key, value in (cached[1] if cached else default).items()
+                if not key.startswith("_")
+            }
+            with self._jiten_optimal_stats_lock:
+                self._jiten_optimal_stats_cache[account_key] = (now, {**kept, "_failed": 1})
+            return kept
         mature = 0
         if isinstance(data, dict):
             try:
@@ -3343,6 +4656,45 @@ class LightNovelService:
             with self._jiten_optimal_stats_lock:
                 self._jiten_optimal_stats_cache[account_key] = (now, dict(payload))
         return payload
+
+    def jiten_optimal_word_stats_cached(self) -> dict[str, int]:
+        """The N+1 ceiling without waiting for Jiten: the cached value now, a refresh in the background."""
+        token = str(self.settings().jiten_api_key or "").strip()
+        account_key = credential_account_key("jiten", token) if token else ""
+        if not account_key:
+            return {"matureWords": 0, "optimalWordLimit": 1000}
+        with self._jiten_optimal_stats_lock:
+            cached = self._jiten_optimal_stats_cache.get(account_key)
+        now = time.monotonic()
+        if cached is not None:
+            ttl = (
+                self.JITEN_OPTIMAL_WORD_STATS_FAILURE_SECONDS
+                if cached[1].get("_failed")
+                else self.JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS
+            )
+            if now - cached[0] <= ttl:
+                return {key: value for key, value in cached[1].items() if not key.startswith("_")}
+        extras = self._live_state_extras()
+        with extras["lock"]:
+            running = extras.setdefault("amount_running", set())
+            start = account_key not in running
+            running.add(account_key)
+        if start:
+
+            def worker() -> None:
+                try:
+                    with jiten_client.background_requests():
+                        self.jiten_optimal_word_stats()
+                except Exception as exc:  # noqa: BLE001 - the default ceiling stays
+                    self._log("Jiten known-ids amount skipped: %s", exc)
+                finally:
+                    with extras["lock"]:
+                        running.discard(account_key)
+
+            threading.Thread(target=worker, name="ln-jiten-amount", daemon=True).start()
+        if cached is not None:
+            return {key: value for key, value in cached[1].items() if not key.startswith("_")}
+        return {"matureWords": 0, "optimalWordLimit": 1000}
 
     def chapter_word_positions(self, text_hash: str) -> list[tuple[int, int, int]] | None:
         """Words of a chapter as (character offset in the chapter text, wordId, readingIndex).
@@ -3361,140 +4713,8 @@ class LightNovelService:
         parsed = self._cached_parse(key, provider="jiten")
         if parsed is None:
             return None
-        text = str(row["text"] or "")
-        paragraphs = parsed.get("paragraphs") or []
-        groups = parsed.get("tokens") or []
-        result: list[tuple[int, int, int]] = []
-        cursor = 0
-        for index, paragraph in enumerate(paragraphs):
-            paragraph = str(paragraph or "")
-            at = text.find(paragraph, cursor) if paragraph else -1
-            if at < 0:
-                continue
-            cursor = at + len(paragraph)
-            group = groups[index] if index < len(groups) and isinstance(groups[index], list) else []
-            for token in group:
-                if not isinstance(token, dict):
-                    continue
-                try:
-                    start = int(token.get("start") or 0)
-                    word_id = int(token.get("wordId"))
-                    reading = int(token.get("readingIndex"))
-                except (TypeError, ValueError):
-                    continue
-                if word_id > 0 and reading >= 0 and 0 <= start < len(paragraph):
-                    result.append((at + start, word_id, reading))
-        result.sort()
-        return result
-
-    def jiten_corpus_pairs(self) -> list[tuple[int, int]]:
-        """Return parsed local vocabulary ordered by Jiten frequency, then local occurrence count."""
-        stats: dict[tuple[int, int], list[int | None]] = {}
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "SELECT parsed_json FROM ln_parse_cache WHERE parser_schema LIKE 'jiten%' ORDER BY created_at"
-            )
-            for row in cursor:
-                try:
-                    parsed = json.loads(str(row["parsed_json"] or "{}"))
-                except (TypeError, json.JSONDecodeError):
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                for item in parsed.get("vocabulary") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        pair = (int(item.get("wordId")), int(item.get("readingIndex")))
-                    except (TypeError, ValueError):
-                        continue
-                    if pair[0] <= 0 or pair[1] < 0:
-                        continue
-                    entry = stats.setdefault(pair, [None, 0])
-                    try:
-                        rank = int(item.get("frequencyRank"))
-                    except (TypeError, ValueError):
-                        rank = 0
-                    if rank > 0 and (entry[0] is None or rank < int(entry[0])):
-                        entry[0] = rank
-                for group in parsed.get("tokens") or []:
-                    if not isinstance(group, list):
-                        continue
-                    for token_row in group:
-                        if not isinstance(token_row, dict):
-                            continue
-                        try:
-                            pair = (
-                                int(token_row.get("wordId")),
-                                int(token_row.get("readingIndex")),
-                            )
-                        except (TypeError, ValueError):
-                            continue
-                        if pair[0] <= 0 or pair[1] < 0:
-                            continue
-                        entry = stats.setdefault(pair, [None, 0])
-                        entry[1] = int(entry[1] or 0) + 1
-
-        unknown_rank = 1 << 60
-        return sorted(
-            stats,
-            key=lambda pair: (
-                int(stats[pair][0]) if stats[pair][0] is not None else unknown_rank,
-                -int(stats[pair][1] or 0),
-                pair[0],
-                pair[1],
-            ),
-        )
-
-    def jiten_prefetch_corpus_states(
-        self,
-        *,
-        cancel_event: threading.Event | None = None,
-        batch_size: int | None = None,
-    ) -> dict[str, Any]:
-        """Warm the R15 live-state cache from the already parsed local LN/manga corpus."""
-        if not str(self.settings().jiten_api_key or "").strip():
-            return {"ok": False, "reason": "no_api_key", "total": 0, "warmed": 0}
-        pairs = self.jiten_corpus_pairs()
-        size = max(1, min(500, int(batch_size or self.JITEN_STATE_PREFETCH_BATCH_SIZE)))
-        warmed = 0
-        batches = 0
-        for offset in range(0, len(pairs), size):
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            batch = pairs[offset : offset + size]
-            try:
-                warmed += len(self.jiten_live_states(batch))
-                batches += 1
-            except Exception as exc:
-                self._log(
-                    "Jiten state corpus prefetch stopped offset=%s total=%s error=%s",
-                    offset,
-                    len(pairs),
-                    exc,
-                )
-                return {
-                    "ok": False,
-                    "reason": "provider_error",
-                    "total": len(pairs),
-                    "warmed": warmed,
-                    "batches": batches,
-                    "error": str(exc),
-                }
-            if offset + size < len(pairs) and self.JITEN_STATE_PREFETCH_PAUSE_SECONDS > 0:
-                if cancel_event is not None:
-                    if cancel_event.wait(self.JITEN_STATE_PREFETCH_PAUSE_SECONDS):
-                        break
-                else:
-                    time.sleep(self.JITEN_STATE_PREFETCH_PAUSE_SECONDS)
-        cancelled = bool(cancel_event is not None and cancel_event.is_set())
-        return {
-            "ok": not cancelled,
-            "reason": "cancelled" if cancelled else "complete",
-            "total": len(pairs),
-            "warmed": warmed,
-            "batches": batches,
-        }
+        self.remember_vocabulary(parsed.get("vocabulary"), digest=key)
+        return chapter_word_positions_from(str(row["text"] or ""), parsed)
 
     def jiten_live_state(
         self,
@@ -3510,7 +4730,7 @@ class LightNovelService:
             raise LightNovelError(err("ln.jitenInvalidCard"))
         token = str(self.settings().jiten_api_key or "").strip()
         if not token:
-            raise LightNovelError(err("ln.jitenTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jitenTokenMissing"))
 
         if not force:
             cached = self._cached_jiten_live_state(word_id, reading_index)
@@ -3520,6 +4740,7 @@ class LightNovelService:
 
         stale = self._cached_jiten_live_state(word_id, reading_index, allow_stale=True)
         try:
+            started = time.monotonic()
             raw = self._jiten_get(f"vocabulary/{word_id}/{reading_index}/known-state")
             payload = self._jiten_live_state_payload(
                 word_id,
@@ -3529,6 +4750,10 @@ class LightNovelService:
                 study_deck_ids=(stale or {}).get("studyDeckIds"),
             )
             key = self._jiten_live_state_key(word_id, reading_index)
+            if self._invalidated_since(key, started):
+                # Graded while Jiten answered: maybe the state from before the grade.
+                payload["stale"] = True
+                return payload
             with self._jiten_live_state_lock:
                 self._jiten_live_state_cache[key] = (time.monotonic(), dict(payload))
             return payload
@@ -3702,6 +4927,12 @@ class LightNovelService:
                 "NOVEL",
                 [str(book.get("series_title") or ""), str(book.get("title") or "")],
             )
+        # A bound deck's stats are kept 7 days like the other Jiten media stats ("Refresh
+        # Jiten data" drops them): the library no longer asks Jiten on every render.
+        cache_key = {"jiten_deck_id": int(deck_id), "authenticated": bool(self.settings().jiten_api_key)}
+        cached = self._jiten_media_cache.get(cache_key, ttl_seconds=7 * 24 * 3600)
+        if isinstance(cached, dict):
+            return dict(cached)
         main, children = self._jiten_detail_with_subdecks(int(deck_id))
         if not main:
             return {"available": False}
@@ -3709,6 +4940,7 @@ class LightNovelService:
         result["coverage_available"] = bool(
             self.settings().jiten_api_key and main.get("coverage") is not None
         )
+        self._jiten_media_cache.put(cache_key, result)
         return result
 
     def jiten_media_stats(
@@ -3834,7 +5066,9 @@ class LightNovelService:
             if volumes:
                 result["volumes"] = volumes
         self._jiten_media_cache.put(cache_key, result)
-        self._jiten_media_cache.prune(older_than_seconds=60 * 24 * 3600, max_entries=1000)
+        self._jiten_media_cache.prune(
+            older_than_seconds=60 * 24 * 3600, max_entries=1000, min_interval_seconds=600
+        )
         return result
 
     def invalidate_jiten_media_stats(self) -> int:
@@ -3847,13 +5081,32 @@ class LightNovelService:
             rows = conn.execute(
                 "SELECT text,text_hash FROM ln_chapters ORDER BY book_id,chapter_index"
             ).fetchall()
+        # Only whether a parse is stored: "Refresh Jiten data" unpacked every chapter's
+        # parse (megabytes of JSON each) to see that, with the button waiting meanwhile.
+        stored = self.stored_jiten_parses(str(row["text_hash"] or "") for row in rows)
         pending: list[tuple[str, str]] = []
         for row in rows:
             digest = str(row["text_hash"] or "")
             text = str(row["text"] or "")
-            if text.strip() and digest and self._cached_parse(digest, provider="jiten") is None:
+            if text.strip() and digest and digest not in stored:
                 pending.append((text, digest))
         return pending
+
+    def stored_jiten_parses(self, text_hashes: Iterable[str]) -> set[str]:
+        """The keys among ``text_hashes`` that have a Jiten parse stored (nothing is unpacked)."""
+        wanted = list(dict.fromkeys(str(value) for value in text_hashes if value))
+        found: set[str] = set()
+        with self._connection() as conn:
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                found.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        f"SELECT text_hash FROM ln_parse_cache WHERE text_hash IN ({','.join('?' * len(chunk))})",
+                        chunk,
+                    )
+                )
+        return found
 
     def jiten_preparse(
         self, text: str, digest: str | None = None, *, interactive: bool = True
@@ -3864,7 +5117,46 @@ class LightNovelService:
         if digest is None:
             digest = hashlib.sha256(("study-v1\0" + selected[:20000]).encode("utf-8")).hexdigest()
             selected = selected[:20000]
-        return self._parse_text(selected, str(digest), provider="jiten", interactive=interactive)
+        parsed = self._parse_text(selected, str(digest), provider="jiten", interactive=interactive)
+        self.remember_vocabulary(parsed.get("vocabulary"), digest=str(digest))
+        return parsed
+
+    def remember_vocabulary(self, vocabulary: Any, *, digest: str = "") -> None:
+        """Keep what the words of a Jiten parse are called (pudge/word_lexicon.py), once per parse."""
+        if not vocabulary or "db_path" not in self.__dict__:
+            return
+        try:
+            with self._connection() as conn:
+                word_lexicon.remember(conn, vocabulary, digest=str(digest or ""))
+        except Exception:  # noqa: BLE001 - names of words are a convenience of the word lists
+            pass
+
+    def word_names(self, pairs: list[tuple[int, int]], *, fetch: int = 0) -> dict[tuple[int, int], dict]:
+        """Spelling, reading, meaning and parts of speech of many words, without waiting for
+        Jiten: from the kept vocabulary of parsed texts, then from the word cache. Up to
+        ``fetch`` of the words still unnamed get their dictionary entry fetched on the
+        paced background queue (they are named on a later call)."""
+        wanted = list(dict.fromkeys((int(word), int(reading)) for word, reading in pairs or []))
+        if not wanted:
+            return {}
+        try:
+            with self._connection() as conn:
+                found = word_lexicon.lookup(conn, wanted)
+        except Exception:  # noqa: BLE001 - an unreadable table is only a miss
+            found = {}
+        missing = [pair for pair in wanted if pair not in found]
+        if not missing:
+            return found
+        account = self.study_provider_capabilities("jiten").get("account_key") or "unconfigured"
+        cards = self._word_repository().get_many(account, missing)
+        for pair in missing:
+            info = word_lexicon.word_info(cards.get(pair))
+            if info["spelling"]:
+                found[pair] = info
+            elif fetch > 0:
+                fetch -= 1
+                self.jiten_word({"wordId": pair[0], "readingIndex": pair[1]}, background=True)
+        return found
 
     def parse_chapter_for_statistics(self, text_hash: str) -> bool:
         """Parse a chapter read (e.g. on the iPhone) but never opened here, for word stats.
@@ -3877,7 +5169,8 @@ class LightNovelService:
             ).fetchone()
         if row is None:
             return False
-        self._parse_text(str(row["text"] or ""), str(text_hash), provider="jiten", interactive=False)
+        parsed = self._parse_text(str(row["text"] or ""), str(text_hash), provider="jiten", interactive=False)
+        self.remember_vocabulary(parsed.get("vocabulary"), digest=str(text_hash))
         return True
 
     def tts_source(self, book_id: int) -> dict[str, Any]:
@@ -3913,7 +5206,7 @@ class LightNovelService:
         # talks to the same account even if settings change meanwhile.
         token = token if token is not None else self.settings().jpdb_api_token
         if not token:
-            raise LightNovelError(err("ln.jpdbTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jpdbTokenMissing"))
         try:
             response = httpx.post(
                 f"{self.JPDB_BASE}/{action.lstrip('/')}",
@@ -3964,19 +5257,143 @@ class LightNovelService:
         *,
         provider: str | None = None,
         scope: tuple[str, str] | None = None,
+        versions: list[str] | None = None,
     ) -> dict[str, Any] | None:
         text_hash = self._parse_cache_key(text_hash, scope or self._parse_scope(provider))
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT parsed_json FROM ln_parse_cache WHERE text_hash=?", (text_hash,)
+                "SELECT parsed_json,parse_version,used_at FROM ln_parse_cache WHERE text_hash=?", (text_hash,)
             ).fetchone()
+            if row is not None and float(row["used_at"] or 0.0) < time.time() - 86400:
+                # Last use, kept to the day: one-off study texts unused for long are pruned.
+                conn.execute(
+                    "UPDATE ln_parse_cache SET used_at=? WHERE text_hash=?", (time.time(), text_hash)
+                )
         if row is None:
             return None
+        if versions is not None:
+            versions.append(str(row["parse_version"] or ""))
         try:
-            data = json.loads(str(row["parsed_json"]))
-        except json.JSONDecodeError:
+            data = unpack_json(row["parsed_json"])
+        except ValueError:
             return None
         return data if isinstance(data, dict) else None
+
+    # One-off study texts (subtitle and VN lines, manga bubbles, selections) kept at most.
+    STUDY_PARSE_KEEP_ROWS = 50_000
+    STUDY_PARSE_KEEP_SECONDS = 90 * 86400
+
+    def _current_jiten_parse(self, text_hash: str) -> dict[str, Any] | None:
+        """The cached Jiten parse, unless it is a study text parsed by an older Jiten parser.
+
+        A book chapter of an older parser stays (it is marked stale and parsed again in
+        the background when it is opened); a short study text is simply parsed again."""
+        versions: list[str] = []
+        cached = self._cached_parse(text_hash, provider="jiten", versions=versions)
+        current = str(getattr(self, "_jiten_reader_version", "") or "")
+        if cached is None or not current or not versions or versions[0] in ("", current):
+            return cached
+        with self._connection() as conn:
+            chapter = conn.execute(
+                "SELECT 1 FROM ln_chapters WHERE text_hash=? LIMIT 1", (text_hash,)
+            ).fetchone()
+        return cached if chapter else None
+
+    def _ensure_jiten_reader_version(self) -> None:
+        """Once per launch: Jiten's parser version (stale parses) and pruning of old study texts."""
+        lock = self.__dict__.setdefault("_jiten_version_lock", threading.Lock())
+        with lock:
+            if self.__dict__.get("_jiten_version_started"):
+                return
+            self._jiten_version_started = True
+        threading.Thread(
+            target=self._check_jiten_reader_version, name="ln-jiten-version", daemon=True
+        ).start()
+
+    def _check_jiten_reader_version(self) -> str:
+        try:
+            self.prune_study_parses()
+        except Exception as exc:  # noqa: BLE001 - tried again on the next launch
+            self._log("LN study parse prune skipped: %s", exc)
+        try:
+            # Anonymous and cached by Jiten for a minute; one try, the next launch asks again.
+            response = jiten_client.request(
+                "GET",
+                f"{self.JITEN_BASE}/reader/version",
+                headers={"Accept": "application/json", "User-Agent": APP_SLUG},
+                timeout=20,
+                interactive=False,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001 - parses stay as they are until the next launch
+            self._log("LN Jiten parser version check skipped: %s", exc)
+            return ""
+        version = str(
+            (data.get("parseVersion") or data.get("ParseVersion") or "") if isinstance(data, dict) else ""
+        )
+        if not version:
+            return ""
+        self._jiten_reader_version = version
+        with self._connection() as conn:
+            marked = conn.execute(
+                "INSERT OR IGNORE INTO ln_parse_stale(text_hash,marked_at) SELECT text_hash,? FROM ln_parse_cache "
+                "WHERE parser_schema='jiten-v1' AND parse_version<>'' AND parse_version<>? "
+                "AND text_hash IN (SELECT text_hash FROM ln_chapters)",
+                (time.time(), version),
+            ).rowcount
+        self._log("RESULT step=ln.jiten_parse_version version=%s stale_chapters=%s", version, marked)
+        return version
+
+    def prune_study_parses(self, *, now: float | None = None) -> int:
+        """Drop Jiten parses of one-off study texts unused for 90 days, and the oldest beyond 50k.
+
+        Only Jiten study texts (``jiten-v1`` rows that are no book chapter) are pruned: jpdb
+        parses (their keys are account-scoped, not chapter hashes), book chapters and the
+        bubbles of manga volumes still in the library (their OCR text) are kept. Batches
+        left by a chapter that never finished parsing go after 90 days."""
+        moment = time.time() if now is None else float(now)
+        cutoff = moment - self.STUDY_PARSE_KEEP_SECONDS
+        with self._connection() as conn:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS pudge_parse_keep(text_hash TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM temp.pudge_parse_keep")
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manga_ocr_cache'"
+            ).fetchone():
+                texts = [
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT text FROM manga_ocr_cache WHERE TRIM(COALESCE(text,''))<>''"
+                    ).fetchall()
+                ]
+                keys = {self._study_text_key(text)[1] for text in texts}
+                keys.update(
+                    hashlib.sha256(("study-v1\0" + text.strip()[:20000]).encode("utf-8")).hexdigest()
+                    for text in texts
+                )  # the key "Refresh Jiten data" used for bubbles
+                conn.executemany(
+                    "INSERT OR IGNORE INTO temp.pudge_parse_keep VALUES(?)", ((key,) for key in keys)
+                )
+            one_off = (
+                "parser_schema='jiten-v1' AND text_hash NOT IN (SELECT text_hash FROM ln_chapters) "
+                "AND text_hash NOT IN (SELECT text_hash FROM temp.pudge_parse_keep)"
+            )
+            removed = conn.execute(
+                "DELETE FROM ln_parse_cache WHERE parser_schema='jiten-batch-v1' AND COALESCE(used_at,created_at)<?",
+                (cutoff,),
+            ).rowcount
+            removed += conn.execute(
+                f"DELETE FROM ln_parse_cache WHERE {one_off} AND COALESCE(used_at,created_at)<?", (cutoff,)
+            ).rowcount
+            removed += conn.execute(
+                f"DELETE FROM ln_parse_cache WHERE text_hash IN (SELECT text_hash FROM ln_parse_cache "
+                f"WHERE {one_off} ORDER BY COALESCE(used_at,created_at) DESC LIMIT -1 OFFSET ?)",
+                (int(self.STUDY_PARSE_KEEP_ROWS),),
+            ).rowcount
+            conn.execute("DELETE FROM temp.pudge_parse_keep")
+        if removed:
+            self._log("RESULT step=ln.study_parse_prune removed=%s", removed)
+        return int(removed)
 
     def _parse_text(
         self,
@@ -4073,7 +5490,7 @@ class LightNovelService:
                 conn.execute(
                     "INSERT OR REPLACE INTO ln_parse_cache("
                     "text_hash,parsed_json,parser_schema,created_at) VALUES(?,?,?,?)",
-                    (cache_key, json.dumps(parsed, ensure_ascii=False), JPDB_PARSER_SCHEMA, time.time()),
+                    (cache_key, pack_json(parsed), JPDB_PARSER_SCHEMA, time.time()),
                 )
             # The result belongs to the account it was fetched with (cached
             # above under that account). If the user switched accounts while
@@ -4094,9 +5511,10 @@ class LightNovelService:
         text_hash: str,
         *,
         interactive: bool = True,
+        force: bool = False,
     ) -> dict[str, Any]:
         while True:
-            cached = self._cached_parse(text_hash, provider="jiten")
+            cached = None if force else self._current_jiten_parse(text_hash)
             if cached is not None:
                 return cached
             with self._parse_flights_lock:
@@ -4113,7 +5531,7 @@ class LightNovelService:
 
         try:
             # A cache writer may have completed between the first lookup and flight ownership.
-            cached = self._cached_parse(text_hash, provider="jiten")
+            cached = None if force else self._current_jiten_parse(text_hash)
             if cached is not None:
                 return cached
             paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
@@ -4132,12 +5550,34 @@ class LightNovelService:
                 batches.append(current)
             all_tokens: list[Any] = []
             vocabulary: dict[tuple[int, int], Any] = {}
-            for batch in batches:
-                with self._parse_request_slot(interactive=interactive):
-                    result = self._jiten_request("reader/parse", {"text": batch})
-                batch_tokens = result.get("tokens") or []
+            parse_version = ""
+            # A chapter of several batches keeps each answered batch (until the whole
+            # chapter is stored), so a throttled or failed chapter resumes, not restarts.
+            batch_keys = (
+                [self._parse_batch_key(batch) for batch in batches]
+                if len(batches) > 1
+                else [""] * len(batches)
+            )
+            # Work started in the background (iPhone package, statistics) stays background.
+            interactive = bool(interactive) and not jiten_client.in_background()
+            for batch, batch_key in zip(batches, batch_keys):
+                result = self._cached_parse_batch(batch_key) if batch_key else None
+                if result is not None and not _batch_answer_fits(result, batch):
+                    # Stored before answers were checked: forgotten, asked once more.
+                    self._forget_parse_batch(batch_key)
+                    result = None
+                if result is None:
+                    with self._parse_request_slot(interactive=interactive):
+                        with jiten_client.background_requests(not interactive):
+                            result = self._jiten_request("reader/parse", {"text": batch})
+                    # Only an answer with one token list per paragraph is kept: a short one
+                    # stored here failed the check below on every later attempt for 90 days.
+                    if batch_key and _batch_answer_fits(result, batch):
+                        self._store_parse_batch(batch_key, result)
+                batch_tokens = (result.get("tokens") if isinstance(result, dict) else None) or []
                 if len(batch_tokens) != len(batch):
                     raise LightNovelError(err("ln.jitenParseCountMismatch"))
+                parse_version = parse_version or str(result.get("parseVersion") or "")
                 all_tokens.extend(batch_tokens)
                 for item in result.get("vocabulary") or []:
                     if isinstance(item, dict):
@@ -4157,14 +5597,20 @@ class LightNovelService:
             with self._connection() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO ln_parse_cache("
-                    "text_hash,parsed_json,parser_schema,created_at) VALUES(?,?,?,?)",
+                    "text_hash,parsed_json,parser_schema,created_at,parse_version,used_at) VALUES(?,?,?,?,?,?)",
                     (
                         text_hash,
-                        json.dumps(parsed, ensure_ascii=False),
+                        pack_json(parsed),
                         "jiten-v1",
+                        time.time(),
+                        parse_version,
                         time.time(),
                     ),
                 )
+                if any(batch_keys):
+                    marks = ",".join("?" * len(batch_keys))
+                    conn.execute(f"DELETE FROM ln_parse_cache WHERE text_hash IN ({marks})", batch_keys)
+                self._record_parse_suspects(conn, text_hash, paragraphs, display_tokens)
             return parsed
         finally:
             with self._parse_flights_lock:
@@ -4174,28 +5620,249 @@ class LightNovelService:
                     flight.set()
 
     @staticmethod
+    def _parse_batch_key(batch: list[str]) -> str:
+        return hashlib.sha256(("jiten-batch-v1\0" + "\n".join(batch)).encode("utf-8")).hexdigest()
+
+    def _cached_parse_batch(self, key: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT parsed_json FROM ln_parse_cache WHERE text_hash=? AND parser_schema='jiten-batch-v1'",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = unpack_json(row["parsed_json"])
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _forget_parse_batch(self, key: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM ln_parse_cache WHERE text_hash=? AND parser_schema='jiten-batch-v1'", (key,)
+            )
+
+    def _store_parse_batch(self, key: str, result: dict[str, Any]) -> None:
+        kept = {name: result.get(name) for name in ("tokens", "vocabulary", "parseVersion") if name in result}
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ln_parse_cache(text_hash,parsed_json,parser_schema,created_at,used_at) "
+                "VALUES(?,?,?,?,?)",
+                (key, pack_json(kept), "jiten-batch-v1", time.time(), time.time()),
+            )
+
+    # A paragraph with this many Japanese letters of which Jiten covered less than this
+    # share is a suspect (interjections such as 「──っ！」 are too short to count).
+    SUSPECT_MIN_LETTERS = 16
+    SUSPECT_MAX_COVERAGE = 0.7
+    SUSPECT_RECHECK_SECONDS = 7 * 86400
+    SUSPECT_PROBE_GAP_SECONDS = 86400
+    SUSPECT_PROBE_LIMIT = 20
+    SUSPECT_KEEP = 400
+    _SUSPECT_LETTER = re.compile(r"[\u3040-\u30ff\u3400-\u9fff々〆ヵヶー]")
+
+    @classmethod
+    def _parse_coverage(cls, text: str, tokens: Any) -> tuple[int, float]:
+        """(Japanese letters, share of them inside a token) of one parsed paragraph."""
+        covered = [False] * len(text)
+        offsets = _utf16_offsets(text)
+        for token in tokens if isinstance(tokens, list) else []:
+            try:
+                start, end = int(token.get("start")), int(token.get("end"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if offsets is not None:
+                start = offsets[max(0, min(start, len(offsets) - 1))]
+                end = offsets[max(0, min(end, len(offsets) - 1))]
+            for index in range(max(0, start), min(len(text), end)):
+                covered[index] = True
+        letters = [index for index, character in enumerate(text) if cls._SUSPECT_LETTER.match(character)]
+        if not letters:
+            return 0, 1.0
+        return len(letters), sum(covered[index] for index in letters) / len(letters)
+
+    def _record_parse_suspects(
+        self,
+        conn: sqlite3.Connection,
+        text_hash: str,
+        paragraphs: list[str],
+        tokens: list[Any],
+        *,
+        fresh: bool = True,
+    ) -> None:
+        """Remember chapter paragraphs Jiten left mostly unparsed; a fresh parse replaces them
+        (and is no longer stale). A cached parse is looked at once per run (older caches)."""
+        try:
+            suspects = []
+            for paragraph, paragraph_tokens in zip(paragraphs, tokens):
+                if _is_ln_image_paragraph(paragraph):
+                    continue
+                letters, coverage = self._parse_coverage(paragraph, paragraph_tokens)
+                if letters >= self.SUSPECT_MIN_LETTERS and coverage < self.SUSPECT_MAX_COVERAGE:
+                    digest = hashlib.sha256(paragraph.encode("utf-8")).hexdigest()
+                    suspects.append((digest, paragraph, coverage))
+            if fresh:
+                conn.execute("DELETE FROM ln_parse_stale WHERE text_hash=?", (text_hash,))
+            keep = [digest for digest, _paragraph, _coverage in suspects]
+            conn.execute(
+                "DELETE FROM ln_parse_suspects WHERE text_hash=?"
+                + (f" AND paragraph_hash NOT IN ({','.join('?' * len(keep))})" if keep else ""),
+                (text_hash, *keep),
+            )
+            # Only book chapters: a study text (a subtitle line) has no chapter to re-parse.
+            if (
+                not suspects
+                or not conn.execute(
+                    "SELECT 1 FROM ln_chapters WHERE text_hash=? LIMIT 1", (text_hash,)
+                ).fetchone()
+            ):
+                return
+            now = time.time()
+            for digest, paragraph, coverage in suspects:
+                conn.execute(
+                    "INSERT INTO ln_parse_suspects(text_hash,paragraph_hash,text,coverage,first_seen,last_checked) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(text_hash,paragraph_hash) DO UPDATE SET coverage=excluded.coverage",
+                    (text_hash, digest, paragraph, round(coverage, 3), now, now),
+                )
+            conn.execute(
+                "DELETE FROM ln_parse_suspects WHERE rowid IN (SELECT rowid FROM ln_parse_suspects "
+                "ORDER BY first_seen DESC LIMIT -1 OFFSET ?)",
+                (self.SUSPECT_KEEP,),
+            )
+        except sqlite3.Error as exc:
+            self._log("LN parse suspects not recorded: %s", exc)
+
+    def _after_chapter_open(self, row: sqlite3.Row, parsed: dict[str, Any] | None = None) -> None:
+        """Re-parse a stale chapter in the background and now and then ask Jiten about
+        the paragraphs it could not parse. Never in the way of opening the chapter."""
+        try:
+            if self._parse_scope()[0] != "jiten":
+                return
+            self._ensure_jiten_reader_version()
+            digest = str(row["text_hash"])
+            if isinstance(parsed, dict) and digest not in self._suspect_scanned:
+                # Parsed before suspects were kept: looked at once when it is opened.
+                self._suspect_scanned.add(digest)
+                with self._connection() as conn:
+                    self._record_parse_suspects(
+                        conn,
+                        digest,
+                        list(parsed.get("paragraphs") or []),
+                        list(parsed.get("tokens") or []),
+                        fresh=False,
+                    )
+            with self._connection() as conn:
+                stale = conn.execute("SELECT 1 FROM ln_parse_stale WHERE text_hash=?", (digest,)).fetchone()
+            if stale:
+                self._reparse_stale_chapter(str(row["text"]), digest)
+            self._maybe_probe_parse_suspects()
+        except Exception as exc:  # noqa: BLE001 - the chapter is already served
+            try:
+                self._log("LN parse recheck skipped: %s", exc)
+            except Exception:  # noqa: BLE001 - a partial test double
+                pass
+
+    def _reparse_stale_chapter(self, text: str, digest: str) -> None:
+        with self._parse_inflight_lock:
+            if digest in self._parse_inflight:
+                return
+            self._parse_inflight.add(digest)
+
+        def worker() -> None:
+            try:
+                # The old parse stays on screen; the next opening shows the new one.
+                self._parse_text_jiten(text, digest, interactive=False, force=True)
+                self._log("RESULT step=ln.parse_stale_refresh text_hash=%s", digest[:12])
+            except Exception as exc:  # noqa: BLE001 - stays stale, tried again on the next opening
+                self._log("LN stale chapter re-parse failed: %s", exc)
+            finally:
+                with self._parse_inflight_lock:
+                    self._parse_inflight.discard(digest)
+
+        threading.Thread(target=worker, name="ln-jiten-stale", daemon=True).start()
+
+    def _maybe_probe_parse_suspects(self) -> bool:
+        """At most once a day, and each paragraph at most once a week: one Jiten request
+        with the suspects due. Started when a chapter is opened, so only while reading."""
+        now = time.time()
+        with self._suspect_probe_lock:
+            if self._suspect_probe_running or now < self._suspect_probe_not_before:
+                return False
+            with self._connection() as conn:
+                last = conn.execute("SELECT MAX(last_checked) AS value FROM ln_parse_suspects").fetchone()
+                due = conn.execute(
+                    "SELECT 1 FROM ln_parse_suspects WHERE last_checked<=? LIMIT 1",
+                    (now - self.SUSPECT_RECHECK_SECONDS,),
+                ).fetchone()
+            if not due or (last and float(last["value"] or 0) > now - self.SUSPECT_PROBE_GAP_SECONDS):
+                self._suspect_probe_not_before = now + 3600
+                return False
+            self._suspect_probe_running = True
+            self._suspect_probe_not_before = now + self.SUSPECT_PROBE_GAP_SECONDS
+
+        def worker() -> None:
+            try:
+                self._probe_parse_suspects()
+            except Exception as exc:  # noqa: BLE001 - tried again tomorrow
+                self._log("LN parse suspects check failed: %s", exc)
+            finally:
+                with self._suspect_probe_lock:
+                    self._suspect_probe_running = False
+
+        threading.Thread(target=worker, name="ln-jiten-suspects", daemon=True).start()
+        return True
+
+    def _probe_parse_suspects(self) -> dict[str, int]:
+        now = time.time()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT paragraph_hash,text,MIN(coverage) AS coverage FROM ln_parse_suspects "
+                "WHERE last_checked<=? GROUP BY paragraph_hash ORDER BY MIN(last_checked) LIMIT ?",
+                (now - self.SUSPECT_RECHECK_SECONDS, self.SUSPECT_PROBE_LIMIT),
+            ).fetchall()
+        if not rows:
+            return {"checked": 0, "improved": 0}
+        texts = [str(row["text"]) for row in rows]
+        with self._parse_request_slot(interactive=False):
+            result = self._jiten_request("reader/parse", {"text": texts})
+        tokens = result.get("tokens") if isinstance(result, dict) else None
+        if not isinstance(tokens, list) or len(tokens) != len(texts):
+            raise LightNovelError(err("ln.jitenParseCountMismatch"))
+        improved: list[str] = []
+        for row, text, paragraph_tokens in zip(rows, texts, tokens):
+            _letters, coverage = self._parse_coverage(text, paragraph_tokens)
+            old = float(row["coverage"] or 0.0)
+            if coverage >= old + 0.15 or (coverage >= 0.9 and coverage > old + 0.05):
+                improved.append(str(row["paragraph_hash"]))
+        checked = [str(row["paragraph_hash"]) for row in rows]
+        with self._connection() as conn:
+            marks = ",".join("?" * len(checked))
+            conn.execute(
+                f"UPDATE ln_parse_suspects SET last_checked=? WHERE paragraph_hash IN ({marks})",
+                (now, *checked),
+            )
+            if improved:
+                marks = ",".join("?" * len(improved))
+                conn.execute(
+                    "INSERT OR IGNORE INTO ln_parse_stale(text_hash,marked_at) "
+                    f"SELECT DISTINCT text_hash,? FROM ln_parse_suspects WHERE paragraph_hash IN ({marks})",
+                    (now, *improved),
+                )
+        self._log(
+            "RESULT step=ln.parse_suspects checked=%s improved=%s parse_version=%s",
+            len(checked),
+            len(improved),
+            str(result.get("parseVersion") or "") if isinstance(result, dict) else "",
+        )
+        return {"checked": len(checked), "improved": len(improved)}
+
+    @staticmethod
     def _normalized_state(states: list[str], study_deck_ids: Any = None) -> str:
         """One of the nine word states (Jiten's priority); a New word in none of the
         user's study decks is "not_in_deck" when deck membership is known."""
         in_deck = bool(study_deck_ids) if isinstance(study_deck_ids, list) else None
         return normalized_word_state(states, in_deck=in_deck)
-
-    def _jpdb_states(self, pairs: list[tuple[int, int]]) -> dict[tuple[int, int], list[str]]:
-        if not pairs or not self.settings().jpdb_api_token:
-            return {}
-        result = self._jpdb_request(
-            "lookup-vocabulary", {"list": [[a, b] for a, b in pairs], "fields": ["card_state"]}
-        )
-        rows = result.get("vocabulary_info") or []
-        out: dict[tuple[int, int], list[str]] = {}
-        for pair, row in zip(pairs, rows):
-            states: list[str] = []
-            if isinstance(row, list) and row:
-                candidate = row[0]
-                if isinstance(candidate, list):
-                    states = [str(x) for x in candidate]
-            out[pair] = states
-        return out
 
     def jpdb_live_states(self, pairs: list[tuple[int, int]]) -> list[dict[str, Any]]:
         """Live jpdb card state for native (vid, sid) pairs via ``lookup-vocabulary``.
@@ -4207,7 +5874,7 @@ class LightNovelService:
         """
         token = str(self.settings().jpdb_api_token or "").strip()
         if not token:
-            raise LightNovelError(err("ln.jpdbTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jpdbTokenMissing"))
         ordered: list[tuple[int, int]] = []
         seen: set[tuple[int, int]] = set()
         for raw_vid, raw_sid in pairs:
@@ -4267,9 +5934,10 @@ class LightNovelService:
             if row is None:
                 raise LightNovelError(err("ln.chapterNotFound"))
             if touch:
+                now = time.time()
                 conn.execute(
-                    "UPDATE ln_books SET current_chapter=?,updated_at=? WHERE id=?",
-                    (int(chapter_index), time.time(), int(book_id)),
+                    "UPDATE ln_books SET current_chapter=?,position_updated_at=?,updated_at=? WHERE id=?",
+                    (int(chapter_index), now, now, int(book_id)),
                 )
         return row
 
@@ -4339,6 +6007,24 @@ class LightNovelService:
             credential_account_key("jiten", self.settings().jiten_api_key) if backend == "jiten" else ""
         )
         vocabulary = parsed.get("vocabulary") or []
+        if account_key:
+            # One SQLite read for all of the text's words; the lookups below use memory only.
+            wanted: list[tuple[int, int]] = []
+            for row in [
+                *vocabulary,
+                *(
+                    token
+                    for group in parsed.get("tokens") or []
+                    if isinstance(group, list)
+                    for token in group
+                ),
+            ]:
+                if isinstance(row, dict):
+                    try:
+                        wanted.append((int(row.get("wordId")), int(row.get("readingIndex"))))
+                    except (TypeError, ValueError):
+                        continue
+            self._prime_live_states(account_key, wanted)
         vocab_map: dict[tuple[int, int], dict[str, Any]] = {}
         result_vocab: list[dict[str, Any]] = []
         for item in vocabulary:
@@ -4364,7 +6050,7 @@ class LightNovelService:
                 clone["reviewable"] = False
             else:
                 live = self._cached_jiten_live_state(
-                    pair[0], pair[1], allow_stale=True, account_key=account_key
+                    pair[0], pair[1], allow_stale=True, account_key=account_key, stored=False
                 )
                 states = (
                     list(live.get("states") or [])
@@ -4424,7 +6110,7 @@ class LightNovelService:
                     else:
                         live = (
                             self._cached_jiten_live_state(
-                                pair[0], pair[1], allow_stale=True, account_key=account_key
+                                pair[0], pair[1], allow_stale=True, account_key=account_key, stored=False
                             )
                             if pair is not None
                             else None
@@ -4478,15 +6164,137 @@ class LightNovelService:
             "paragraphs": parsed.get("paragraphs") or [],
             "tokens": tokens,
             "vocabulary": vocabulary,
-            "settings": self.settings_payload(),
+            "settings": self.reader_settings_payload(),
             "parsing": False,
         }
+
+    @staticmethod
+    def _study_text_key(text: str) -> tuple[str, str]:
+        """(the study text as parsed, its study-v1 cache key)."""
+        selected = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()[:20000]
+        return selected, hashlib.sha256(("study-v1\0" + selected).encode("utf-8")).hexdigest()
+
+    def alias_study_parse(
+        self, text: str, source_text: str, convert: Callable[[dict[str, Any]], dict[str, Any] | None]
+    ) -> bool:
+        """Give `text` the cached Jiten parse of `source_text`, converted (no request).
+
+        A manga text box is served with its dot runs as ellipses ("あ．．．い" -> "あ…い"), while
+        its words were parsed (after OCR, or when it was looked up) as it was recognized: the
+        reader then finds a parse for the text it shows. Nothing changes when `text` has a
+        parse of its own, `source_text` has none or `convert` gives none."""
+        if self._parse_scope()[0] != "jiten":
+            return False
+        selected, digest = self._study_text_key(text)
+        source, source_digest = self._study_text_key(source_text)
+        if not selected or not source or digest == source_digest:
+            return False
+        if self._current_jiten_parse(digest) is not None:
+            return False
+        versions: list[str] = []
+        cached = self._cached_parse(source_digest, provider="jiten", versions=versions)
+        if cached is None:
+            return False
+        converted = convert(cached)
+        if not isinstance(converted, dict):
+            return False
+        now = time.time()
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ln_parse_cache("
+                "text_hash,parsed_json,parser_schema,created_at,parse_version,used_at) VALUES(?,?,?,?,?,?)",
+                (digest, pack_json(converted), "jiten-v1", now, versions[0] if versions else "", now),
+            )
+        return True
+
+    def parse_study_texts(self, texts: list[str]) -> int:
+        """Parse many short study texts (manga bubbles after OCR) in a few Jiten requests.
+
+        Each text is stored under its own study-v1 key, exactly as ``parse_study_text``
+        would store it, so the reader still finds every bubble in the cache. Background
+        priority. Returns how many texts were parsed now (cached ones are skipped)."""
+        if self._parse_scope()[0] != "jiten":
+            count = 0
+            for text in texts:
+                if self._study_text_key(text)[0]:
+                    self.parse_study_text(text)
+                    count += 1
+            return count
+        items: list[tuple[str, list[str]]] = []
+        seen: set[str] = set()
+        for text in texts:
+            selected, digest = self._study_text_key(text)
+            if not selected or digest in seen or self._current_jiten_parse(digest) is not None:
+                continue
+            seen.add(digest)
+            items.append((digest, [part.strip() for part in selected.split("\n") if part.strip()]))
+        batches: list[list[tuple[str, list[str]]]] = []
+        size = 0
+        for item in items:
+            length = sum(len(part) for part in item[1] if not _is_ln_image_paragraph(part))
+            if batches and batches[-1] and size + length <= 14000:
+                batches[-1].append(item)
+                size += length
+            else:
+                batches.append([item])
+                size = length
+        parsed_now = 0
+        for batch in batches:
+            flat = [part for _digest, parts in batch for part in parts if not _is_ln_image_paragraph(part)]
+            result: dict[str, Any] = {"tokens": [], "vocabulary": []}
+            if flat:
+                with self._parse_request_slot(interactive=False):
+                    with jiten_client.background_requests():
+                        result = self._jiten_request("reader/parse", {"text": flat})
+                if len(result.get("tokens") or []) != len(flat):
+                    raise LightNovelError(err("ln.jitenParseCountMismatch"))
+            vocabulary: dict[tuple[int, int], Any] = {}
+            for item in result.get("vocabulary") or []:
+                try:
+                    vocabulary[(int(item.get("wordId")), int(item.get("readingIndex")))] = item
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            rows = iter(result.get("tokens") or [])
+            now = time.time()
+            with self._connection() as conn:
+                for digest, parts in batch:
+                    display = [[] if _is_ln_image_paragraph(part) else next(rows) for part in parts]
+                    pairs: list[tuple[int, int]] = []
+                    for group in display:
+                        for token in group if isinstance(group, list) else []:
+                            try:
+                                pair = (int(token.get("wordId")), int(token.get("readingIndex")))
+                            except (AttributeError, TypeError, ValueError):
+                                continue
+                            if pair in vocabulary and pair not in pairs:
+                                pairs.append(pair)
+                    parsed = {
+                        "tokens": display,
+                        "vocabulary": [vocabulary[pair] for pair in pairs],
+                        "paragraphs": parts,
+                    }
+                    conn.execute(
+                        "INSERT OR REPLACE INTO ln_parse_cache("
+                        "text_hash,parsed_json,parser_schema,created_at,parse_version,used_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            digest,
+                            pack_json(parsed),
+                            "jiten-v1",
+                            now,
+                            str(result.get("parseVersion") or ""),
+                            now,
+                        ),
+                    )
+                    parsed_now += 1
+        return parsed_now
 
     def parse_study_text(self, text: str) -> dict[str, Any]:
         selected = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()[:20000]
         if not selected:
             raise LightNovelError(err("ln.noJapaneseText"))
         digest = hashlib.sha256(("study-v1\0" + selected).encode("utf-8")).hexdigest()
+        if self._parse_scope()[0] == "jiten":
+            self._ensure_jiten_reader_version()  # once per launch (also prunes old study texts)
         parsed = self._parse_text(selected, digest)
         settings = self.settings()
         tokens, vocabulary = self._provider_scoped_study_payload(parsed, settings.study_backend)
@@ -4495,15 +6303,17 @@ class LightNovelService:
             "paragraphs": parsed.get("paragraphs") or [],
             "tokens": tokens,
             "vocabulary": vocabulary,
-            "settings": self.settings_payload(),
+            "settings": self.reader_settings_payload(),
         }
 
     def chapter(self, book_id: int, chapter_index: int) -> dict[str, Any]:
         row = self._chapter_row(book_id, chapter_index)
         text_value = str(row["text"])
+        self._restore_missing_inline_images(int(book_id), text_value)
         parsed = self._parse_text(text_value, str(row["text_hash"]))
         payload = self._chapter_payload(row, parsed)
         self._schedule_parse_ahead(int(book_id), int(chapter_index))
+        self._after_chapter_open(row, parsed)
         return payload
 
     def chapter_fast(self, book_id: int, chapter_index: int) -> dict[str, Any]:
@@ -4512,11 +6322,13 @@ class LightNovelService:
             reader_generation = self._reader_generation
             self._prefetch_generation += 1  # cancel prefetch from the previous chapter
         row = self._chapter_row(book_id, chapter_index)
+        self._restore_missing_inline_images(int(book_id), str(row["text"]))
         digest = str(row["text_hash"])
         cached = self._cached_parse(digest)
         if cached is not None:
             payload = self._chapter_payload(row, cached)
             self._schedule_parse_ahead(int(book_id), int(chapter_index), reader_generation=reader_generation)
+            self._after_chapter_open(row, cached)
             return payload
         paragraphs = [p.strip() for p in str(row["text"]).split("\n") if p.strip()]
         with self._parse_inflight_lock:
@@ -4527,7 +6339,7 @@ class LightNovelService:
 
             def worker() -> None:
                 try:
-                    self._parse_text(str(row["text"]), digest)
+                    self._parse_open_chapter(str(row["text"]), digest, reader_generation)
                     with self._prefetch_lock:
                         still_current = reader_generation == self._reader_generation
                     if still_current:
@@ -4551,9 +6363,30 @@ class LightNovelService:
             "paragraphs": paragraphs,
             "tokens": [],
             "vocabulary": [],
-            "settings": self.settings_payload(),
+            "settings": self.reader_settings_payload(),
             "parsing": True,
         }
+
+    # The open chapter is parsed on its own thread (never a UI or request thread): it may
+    # wait this long for Jiten's budget or a Retry-After, and tries again while the reader
+    # still shows it (the batches already answered are kept), so the reader keeps polling
+    # and gets its words instead of an error.
+    CHAPTER_PARSE_MAX_WAIT_SECONDS = 90.0
+    CHAPTER_PARSE_ATTEMPTS = 3
+
+    def _parse_open_chapter(self, text: str, digest: str, reader_generation: int) -> None:
+        for attempt in range(self.CHAPTER_PARSE_ATTEMPTS):
+            try:
+                with jiten_client.wait_limit(self.CHAPTER_PARSE_MAX_WAIT_SECONDS):
+                    self._parse_text(text, digest)
+                return
+            except JitenUnavailableError as exc:
+                with self._prefetch_lock:
+                    still_current = reader_generation == self._reader_generation
+                if attempt + 1 >= self.CHAPTER_PARSE_ATTEMPTS or not still_current:
+                    raise
+                self._log("WAIT step=ln.chapter_parse reason=%s retry_s=%.0f", exc.reason, exc.retry_after)
+                time.sleep(max(1.0, min(float(exc.retry_after or 0.0), self.CHAPTER_PARSE_MAX_WAIT_SECONDS)))
 
     def chapter_parse_status(self, book_id: int, chapter_index: int) -> dict[str, Any]:
         row = self._chapter_row(book_id, chapter_index, touch=False)
@@ -4576,27 +6409,34 @@ class LightNovelService:
             generation = self._prefetch_generation
         if mode == "current":
             return
+        scope = self._parse_scope()
         with self._connection() as conn:
             if mode == "book":
                 rows = conn.execute(
-                    "SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index>? ORDER BY chapter_index",
+                    "SELECT chapter_index,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index>? ORDER BY chapter_index",
                     (book_id, chapter_index),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index=?",
+                    "SELECT chapter_index,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index=?",
                     (book_id, chapter_index + 1),
                 ).fetchall()
-        pending = [
-            (str(r["text"]), str(r["text_hash"]))
-            for r in rows
-            if self._cached_parse(str(r["text_hash"])) is None
-        ]
+            # Only whether a parse is stored: every opened chapter used to read the text of
+            # all later chapters and unpack each stored parse (megabytes of JSON) to see that.
+            pending = [
+                (int(r["chapter_index"]), str(r["text_hash"]))
+                for r in rows
+                if conn.execute(
+                    "SELECT 1 FROM ln_parse_cache WHERE text_hash=?",
+                    (self._parse_cache_key(str(r["text_hash"]), scope),),
+                ).fetchone()
+                is None
+            ]
         if not pending:
             return
 
         def worker() -> None:
-            for text, digest in pending:
+            for index, digest in pending:
                 with self._prefetch_lock:
                     if generation != self._prefetch_generation:
                         return
@@ -4605,7 +6445,14 @@ class LightNovelService:
                         continue
                     self._parse_inflight.add(digest)
                 try:
-                    self._parse_text(text, digest, interactive=False)
+                    with self._connection() as conn:
+                        row = conn.execute(
+                            "SELECT text FROM ln_chapters WHERE book_id=? AND chapter_index=? AND text_hash=?",
+                            (book_id, index, digest),
+                        ).fetchone()
+                    if row is None:
+                        continue  # the book was removed or read again meanwhile
+                    self._parse_text(str(row["text"]), digest, interactive=False)
                 except Exception as exc:
                     self._log("LN parse-ahead failed: %s", exc)
                     return
@@ -4921,6 +6768,7 @@ class LightNovelService:
         self._character_cache.prune(
             older_than_seconds=180 * 24 * 3600,
             max_entries=500,
+            min_interval_seconds=600,
         )
         return self._merge_character_glossary(int(media_id), rows)
 
@@ -4958,8 +6806,9 @@ class LightNovelService:
     ) -> dict[str, Any]:
         """Translate a selection: with the LLM when it is on (with or without context).
 
-        Google is used only when the LLM is off, or when it fails and the Google
-        fallback setting is on (``google_fallback=False`` never sends to Google).
+        Google is used only with the Google Translate setting on: when the LLM is
+        off, or when it fails and the Google fallback setting is on
+        (``google_fallback=False`` never sends to Google).
         """
         selected = re.sub(r"\s+", " ", str(text or "")).strip()[:450]
         preceding = "\n".join(
@@ -4988,7 +6837,14 @@ class LightNovelService:
                 "provider": str(row["provider"] or ""),
                 "cached": True,
             }
-        provider = "local_llm" if self.config.llm.enabled else "google"
+        settings = self.settings()
+        if self.config.llm.enabled:
+            provider = "local_llm"
+        elif settings.google_translate:
+            provider = "google"
+        else:
+            # Nothing may translate: no request leaves the Mac.
+            raise LightNovelError(err("ln.translationUnavailable"))
         try:
             if provider == "local_llm":
                 translated = self._translate_local_llm(selected, preceding, target, glossary)
@@ -4999,7 +6855,7 @@ class LightNovelService:
                 )
         except Exception as primary_exc:
             if provider == "local_llm" and not (
-                google_fallback and self.settings().translation_google_fallback
+                google_fallback and settings.translation_google_fallback and settings.google_translate
             ):
                 # The user keeps book text on the Mac: no Google fallback.
                 raise LightNovelError(err("ln.localTranslationFailed", error=primary_exc)) from primary_exc
@@ -5086,6 +6942,11 @@ class LightNovelService:
         def chat(system: str, user: str) -> dict[str, Any] | None:
             value = client.json_chat(system, user)
             raw_seen.append(value)
+            # A rejected key, a rate limit or a down service is not fixed by asking
+            # again with the schema reminder: stop and report that cause.
+            failure = str(getattr(client, "last_error_reason", "") or "")
+            if value is None and failure in LLM_TRANSPORT_REASONS:
+                raise grammar_analysis.GrammarAnalysisError(failure)
             return value
 
         try:
@@ -5199,7 +7060,9 @@ class LightNovelService:
             client.close()
         if reply is None:
             self._log("FAIL step=assistant.chat detail=%r", (client.last_error or "")[:300])
-            return {"ok": False, "reason": "llm_error", "detail": (client.last_error or "")[:300]}
+            failure = str(getattr(client, "last_error_reason", "") or "")
+            reason = failure if failure in LLM_TRANSPORT_REASONS else "llm_error"
+            return {"ok": False, "reason": reason, "detail": (client.last_error or "")[:300]}
         return {"ok": True, "reply": reply.strip()[:12000]}
 
     def cancel_reader_background(self) -> None:
@@ -5216,39 +7079,208 @@ class LightNovelService:
         offset: float,
         *,
         source: str = "manual",
+        char_offset: int | None = None,
+        known_at: float | None = None,
     ) -> dict[str, Any]:
+        """The Mac reader's place and its "read up to here" marker (by the marker's rules,
+        ln_read_marker): at ``char_offset`` when the reader sent one, else at the place.
+
+        ``known_at``: the ``position_updated_at`` of the place the reader last loaded or saved.
+        An automatic save sent with it is kept out (``kept``: "newer") when the place moved
+        elsewhere since (the phone read on) and is further ahead: a Mac reader left open used
+        to put the place back with its next dwell save. "Read up to here" always counts."""
         chapter = max(0, int(chapter_index))
         position = max(0.0, min(1.0, float(offset)))
-        kind = "auto" if str(source).casefold() == "auto" else "manual"
-        now = time.time()
-        with self._connection() as conn:
-            exists = conn.execute("SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)).fetchone()
-            if exists is None:
-                raise LightNovelError(err("ln.notFound"))
-            conn.execute(
-                "UPDATE ln_books SET current_chapter=?,current_offset=?,updated_at=? WHERE id=?",
-                (chapter, position, now, int(book_id)),
-            )
-            conn.execute(
-                """INSERT INTO ln_bookmarks(book_id,chapter_index,offset,source,updated_at)
-                   VALUES(?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
-                   chapter_index=excluded.chapter_index,offset=excluded.offset,
-                   source=excluded.source,updated_at=excluded.updated_at""",
-                (int(book_id), chapter, position, kind, now),
-            )
+        automatic = ln_read_marker.kind_of(source) == "auto"
+        saved = self.set_position(int(book_id), chapter, position, known_at=known_at if automatic else None)
+        moved = self.move_read_marker(
+            int(book_id),
+            chapter,
+            source=source,
+            char_offset=char_offset,
+            offset=position if char_offset is None else None,
+        )
+        marker = moved["marker"] or {}
         return {
             "book_id": int(book_id),
             "chapter_index": chapter,
             "offset": position,
-            "source": kind,
-            "updated_at": now,
+            "source": marker.get("source") or ln_read_marker.kind_of(source),
+            "updated_at": marker.get("updated_at") or time.time(),
+            "moved": moved["moved"],
+            "read_marker": moved["marker"],
+            **({} if saved else {"kept": "newer"}),
         }
+
+    def set_position(
+        self, book_id: int, chapter_index: int, offset: float, *, known_at: float | None = None
+    ) -> bool:
+        """The reading place alone (where the volume opens, progress); the marker keeps its rules.
+
+        With ``known_at`` (see save_bookmark) a place behind one stored after that time is
+        not saved: False."""
+        now = time.time()
+        chapter = max(0, int(chapter_index))
+        position = max(0.0, min(1.0, float(offset)))
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT current_chapter,current_offset,position_updated_at FROM ln_books WHERE id=?",
+                (int(book_id),),
+            ).fetchone()
+            if row is None:
+                raise LightNovelError(err("ln.notFound"))
+            if (
+                known_at is not None
+                and float(row["position_updated_at"] or 0.0) > float(known_at)
+                and (chapter, position)
+                < (int(row["current_chapter"] or 0), float(row["current_offset"] or 0.0))
+            ):
+                self._log(
+                    "SKIP step=ln.position reason=newer_place_elsewhere book=%s chapter=%s",
+                    book_id,
+                    chapter,
+                )
+                return False
+            conn.execute(
+                "UPDATE ln_books SET current_chapter=?,current_offset=?,position_updated_at=?,updated_at=? WHERE id=?",
+                (chapter, position, now, now, int(book_id)),
+            )
+        return True
+
+    @staticmethod
+    def _chapter_lengths(conn: sqlite3.Connection, book_id: int) -> dict[int, int]:
+        return {
+            int(row[0]): int(row[1] or 0)
+            for row in conn.execute(
+                "SELECT chapter_index,COALESCE(char_count,LENGTH(text)) FROM ln_chapters WHERE book_id=?",
+                (int(book_id),),
+            )
+        }
+
+    @staticmethod
+    def _marker_row(row: Any, lengths: dict[int, int], book_id: int) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        chapter = int(row["chapter_index"] or 0)
+        offset = max(0.0, min(1.0, float(row["offset"] or 0.0)))
+        size = lengths.get(chapter, 0)
+        return {
+            "book_id": int(book_id),
+            "chapter_index": chapter,
+            "offset": offset,
+            "char_offset": int(round(offset * size)),
+            "source": ln_read_marker.kind_of(row["source"]),
+            "updated_at": float(row["updated_at"] or 0.0),
+            "device_id": str(row["device_id"] or "mac"),
+            "device_name": str(row["device_name"] or ""),
+            "auto_min_chars": ln_read_marker.AUTO_MIN_CHARS,
+        }
+
+    def read_marker(self, book_id: int) -> dict[str, Any] | None:
+        """The volume's "read up to here" marker (ln_read_marker), or None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT chapter_index,offset,source,updated_at,device_id,device_name FROM ln_bookmarks WHERE book_id=?",
+                (int(book_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._marker_row(row, self._chapter_lengths(conn, int(book_id)), int(book_id))
+
+    def move_read_marker(
+        self,
+        book_id: int,
+        chapter_index: int,
+        *,
+        source: str = "manual",
+        char_offset: int | None = None,
+        offset: float | None = None,
+        device_id: str = "mac",
+        device_name: str = "",
+        at: float | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Moves the marker when its rules allow (ln_read_marker.accepts): ``{"moved", "marker"}``.
+
+        The place is ``char_offset`` (characters from the chapter start) or ``offset`` (0-1 of
+        the chapter); an automatic one starts at its sentence. ``at``: when it was set there
+        (seconds, Mac clock; never later than now). ``event_id``: a phone's marker id; the same
+        id again (a resend after a lost answer) changes nothing and gets the first answer, with
+        ``duplicate`` (kept 30 days, as long as the phone keeps unsent markers)."""
+        kind = ln_read_marker.kind_of(source)
+        if kind == "auto" and not self.settings().auto_bookmarks:
+            # "Auto-bookmark after 20 s" is off: only "Read up to here" moves the marker.
+            return {"moved": False, "marker": self.read_marker(int(book_id))}
+        now = time.time()
+        when = now if at is None else max(0.0, min(float(at), now))
+        chapter = max(0, int(chapter_index))
+        with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)).fetchone() is None:
+                raise LightNovelError(err("ln.notFound"))
+            lengths = self._chapter_lengths(conn, int(book_id))
+            if lengths and chapter not in lengths:
+                earlier = [index for index in lengths if index <= chapter]
+                chapter = max(earlier) if earlier else min(lengths)
+            size = lengths.get(chapter, 0)
+            if char_offset is not None:
+                char = max(0, min(size, int(char_offset)))
+            else:
+                char = int(round(max(0.0, min(1.0, float(offset or 0.0))) * size))
+            if kind == "auto" and size:
+                row = conn.execute(
+                    "SELECT text FROM ln_chapters WHERE book_id=? AND chapter_index=?",
+                    (int(book_id), chapter),
+                ).fetchone()
+                if row is not None:
+                    char = ln_read_marker.sentence_start(str(row["text"] or ""), char)
+            select = "SELECT chapter_index,offset,source,updated_at,device_id,device_name FROM ln_bookmarks WHERE book_id=?"
+            if event_id:
+                # Written first: a second request with this id waits for this one, then is a duplicate.
+                conn.execute("DELETE FROM ln_marker_events WHERE created_at<?", (now - 30 * 86400,))
+                first = conn.execute(
+                    "INSERT OR IGNORE INTO ln_marker_events(event_id,book_id,moved,created_at) VALUES(?,?,0,?)",
+                    (str(event_id), int(book_id), now),
+                ).rowcount
+                if not first:
+                    seen = conn.execute(
+                        "SELECT moved FROM ln_marker_events WHERE event_id=?", (str(event_id),)
+                    ).fetchone()
+                    current = self._marker_row(
+                        conn.execute(select, (int(book_id),)).fetchone(), lengths, int(book_id)
+                    )
+                    return {"moved": bool(seen and seen["moved"]), "marker": current, "duplicate": True}
+            current = self._marker_row(
+                conn.execute(select, (int(book_id),)).fetchone(), lengths, int(book_id)
+            )
+            moved = ln_read_marker.accepts(current, kind, chapter, char, when, lengths)
+            if moved:
+                conn.execute(
+                    """INSERT INTO ln_bookmarks(book_id,chapter_index,offset,source,updated_at,device_id,device_name)
+                       VALUES(?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
+                       chapter_index=excluded.chapter_index,offset=excluded.offset,source=excluded.source,
+                       updated_at=excluded.updated_at,device_id=excluded.device_id,device_name=excluded.device_name""",
+                    (
+                        int(book_id),
+                        chapter,
+                        (char / size) if size else 0.0,
+                        kind,
+                        when,
+                        str(device_id or "mac"),
+                        str(device_name or ""),
+                    ),
+                )
+                current = self._marker_row(
+                    conn.execute(select, (int(book_id),)).fetchone(), lengths, int(book_id)
+                )
+                if event_id:
+                    conn.execute("UPDATE ln_marker_events SET moved=1 WHERE event_id=?", (str(event_id),))
+        return {"moved": moved, "marker": current}
 
     def progress_summary(self, book_id: int) -> dict[str, Any]:
         """Return exact character-weighted local reading progress for one book."""
         with self._connection() as conn:
             row = conn.execute(
-                """SELECT b.current_chapter,b.current_offset,b.finished,
+                """SELECT b.current_chapter,b.current_offset,b.finished,b.position_updated_at,
                           COALESCE(SUM(COALESCE(c.char_count,LENGTH(c.text))),0) AS character_count,
                           COALESCE(SUM(
                               CASE
@@ -5282,6 +7314,8 @@ class LightNovelService:
             "reading_progress": max(0.0, min(1.0, progress)),
             "reading_progress_percent": round(max(0.0, min(1.0, progress)) * 100.0, 2),
             "finished": bool(row["finished"]),
+            # The place's version: the reader sends it back with its next save (known_at).
+            "position_updated_at": float(row["position_updated_at"] or 0.0),
         }
 
     def reset_position(self, book_id: int) -> dict[str, Any]:
@@ -5290,15 +7324,17 @@ class LightNovelService:
             if exists is None:
                 raise LightNovelError(err("ln.notFound"))
             conn.execute("DELETE FROM ln_bookmarks WHERE book_id=?", (int(book_id),))
+            now = time.time()
             conn.execute(
-                "UPDATE ln_books SET current_chapter=0,current_offset=0,updated_at=? WHERE id=?",
-                (time.time(), int(book_id)),
+                "UPDATE ln_books SET current_chapter=0,current_offset=0,position_updated_at=?,updated_at=? WHERE id=?",
+                (now, now, int(book_id)),
             )
         return self.book(int(book_id))
 
     def update_position(self, book_id: int, chapter_index: int, offset: float) -> None:
         # Compatibility with older WebViews. New readers call save_bookmark and
-        # distinguish deliberate/manual bookmarks from dwell-based ones.
+        # distinguish deliberate/manual bookmarks from dwell-based ones; an automatic
+        # place moves the read marker only by its rules.
         self.save_bookmark(int(book_id), int(chapter_index), float(offset), source="auto")
 
     def study_provider_capabilities(self, backend: str) -> dict[str, Any]:
@@ -5312,12 +7348,14 @@ class LightNovelService:
 
         with self._prefetch_lock:
             if getattr(self, "_closed", False):
-                raise LightNovelError("Light novel service is closed")
+                raise LightNovelUnavailable("Light novel service is closed")
             if not hasattr(self, "_jiten_word_repository"):
                 self._jiten_word_repository = JitenWordRepository(self.db_path, getattr(self, "logger", None))
             return self._jiten_word_repository
 
-    def jiten_word(self, card):
+    def jiten_word(self, card, background: bool = False):
+        """The word's card now; its dictionary entry is fetched on the word queue when missing
+        or stale (`background`: nobody waits for it — paced, paused on a rate limit)."""
         account = self.study_provider_capabilities("jiten").get("account_key") or "unconfigured"
 
         def fetch():
@@ -5332,7 +7370,10 @@ class LightNovelService:
             try:
                 payload = self._jiten_get(f"vocabulary/{word_id}/{reading_index}/info")
             except LightNovelError as exc:
-                if "404" in str(exc):
+                cause = exc.__cause__
+                # Jiten's own 404 only: a 5xx whose message carries a URL with "404" in a word id
+                # (140401) marked the word "not found" for good.
+                if isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 404:
                     return {**card, "dictionary_complete": True, "not_found": True}
                 raise
             if (self.study_provider_capabilities("jiten").get("account_key") or "unconfigured") != account:
@@ -5351,7 +7392,7 @@ class LightNovelService:
                 raise LightNovelError(err("ln.jitenWordNoReadings"))
             return {**payload, "wordId": word_id, "readingIndex": reading_index, "dictionary_complete": True}
 
-        return self._word_repository().resolve(account, card, fetch)
+        return self._word_repository().resolve(account, card, fetch, background=background)
 
     def jiten_words_cached(self, cards, fetch_limit=40):
         """Dictionary cards of many words from the word cache, without waiting for Jiten.
@@ -5369,18 +7410,21 @@ class LightNovelService:
                 result.append({**card, **cached})
             elif fetch_limit > 0:
                 fetch_limit -= 1
-                result.append(self.jiten_word(card))
+                result.append(self.jiten_word(card, background=True))
             else:
                 result.append({**card, **(cached or {})})
         return result
 
-    def cache_jiten_words(self, cards):
+    def cache_jiten_words(self, cards, resolve: int = 0):
+        """Keep the lexical fields of parsed or due words; `resolve` of them also get their
+        dictionary entry fetched now (review cards). A parsed text fetches nothing: a word's
+        dictionary entry is asked for when its card is opened."""
         account = self.study_provider_capabilities("jiten").get("account_key") or "unconfigured"
         repository = self._word_repository()
         for card, lexical in zip(cards, repository.put_many(account, cards)):
             card.update(lexical)
-        # Resolve the next eight concurrently through the same repository.
-        for card in cards[:8]:
+        # Resolve the next few concurrently through the same repository.
+        for card in cards[: max(0, int(resolve))]:
             self.jiten_word(card)
         return cards
 
@@ -5403,7 +7447,7 @@ class LightNovelService:
                 trusted_previous_keys=set(trusted_previous_keys or set()),
             )
             cards = [card for card in (result.get("cards") or []) if isinstance(card, dict)]
-            self.cache_jiten_words(cards)
+            self.cache_jiten_words(cards, resolve=8)  # gate cards are shown next: fetch their entries
 
             def enrich_media():
                 if cards:
@@ -5475,6 +7519,10 @@ class LightNovelService:
             return result
         except ReviewOutcomeUnknown:
             raise
+        except ReviewNotSent as exc:
+            # Pudge's Jiten budget held the grade back: nothing reached Jiten, the card
+            # stays on offer and the same grade can be sent again after ``retry_after``.
+            raise JitenUnavailableError(str(exc), reason="rate_limited", retry_after=exc.retry_after) from exc
         except ReviewProviderError as exc:
             raise LightNovelError(str(exc)) from exc
 
@@ -5535,7 +7583,7 @@ class LightNovelService:
             return  # card media needs Jiten+; said once this session, not on every add
         token = str(self.settings().jiten_api_key or "").strip()
         if not token:
-            raise LightNovelError(err("ln.jitenTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.jitenTokenMissing"))
         headers = {
             "Accept": "application/json",
             "Authorization": f"ApiKey {token}",
@@ -5543,13 +7591,14 @@ class LightNovelService:
         }
         url = f"{self.JITEN_BASE}/srs/card-media/{int(word_id)}/{int(reading_index)}"
         try:
-            response = httpx.post(
+            response = jiten_client.request(
+                "POST",
                 url,
                 headers=headers,
                 files={"file": (str(filename or "pudge-manga-page.jpg"), image_bytes, "image/jpeg")},
                 timeout=30,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.NetworkError, jiten_client.JitenRefused) as exc:
             raise LightNovelError(err("ln.jitenMediaUploadFailed", error=exc)) from exc
         if response.status_code >= 400:
             detail = ""
@@ -5922,12 +7971,20 @@ class LightNovelService:
         )
 
     def _anilist_post(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        from .providers.anilist import ANILIST_USER_AGENT, AniListError, note_response, raise_if_refusing
+
         if not self.config.anilist.access_token:
-            raise LightNovelError(err("ln.anilistTokenMissing"))
+            raise LightNovelSetupRequired(err("ln.anilistTokenMissing"))
+        try:
+            # The anime client's 403/429 cool-down holds here too: nothing is sent meanwhile.
+            raise_if_refusing()
+        except AniListError as exc:
+            raise LightNovelError(str(exc)) from exc
         headers = {
             "Authorization": f"Bearer {self.config.anilist.access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": ANILIST_USER_AGENT,
         }
         response = httpx.post(
             self.config.anilist.endpoint,
@@ -5935,6 +7992,7 @@ class LightNovelService:
             json={"query": query, "variables": variables},
             timeout=30,
         )
+        note_response(response, access_token=str(self.config.anilist.access_token or ""), query=query)
         response.raise_for_status()
         data = response.json()
         if data.get("errors"):
@@ -6129,10 +8187,6 @@ class LightNovelService:
             for item in self.anilist_literature(force=force)
             if str(item.get("format") or "").upper() == "NOVEL"
         ]
-
-    def anilist_planning_literature(self) -> list[dict[str, Any]]:
-        items = self._anilist_cache[1] if self._anilist_cache is not None else []
-        return [dict(item) for item in items if str(item.get("status") or "").upper() == "PLANNING"]
 
     @staticmethod
     def _anilist_search_text(value: str) -> str:
@@ -6446,6 +8500,7 @@ class LightNovelService:
 
     def open_book(self, book_id: int) -> dict[str, Any]:
         book = self.book(book_id)
+        book["read_marker"] = self.read_marker(int(book_id))  # "read up to here" (ln_read_marker)
         media_id = book.get("anilist_id")
         old_status = str(book.get("anilist_status") or "")
         if (
@@ -6486,6 +8541,12 @@ class LightNovelService:
         return book
 
     def finish_volume(self, book_id: int) -> dict[str, Any]:
+        """Mark a volume finished here at once; AniList is told in the background.
+
+        AniList was asked first and a failure (offline, a 403/429 cool-down, an expired
+        token) left the volume unfinished and the window waiting on the network. Now the
+        update waits in ``ln_anilist_pending`` (one row per account and title, the highest
+        progress) until AniList takes it: sent now, and again on each library refresh."""
         book = self.book(book_id)
         volume = int(book.get("volume") or (int(book.get("anilist_progress_volumes") or 0) + 1))
         # Finishing an earlier volume again must never roll AniList progress back.
@@ -6496,15 +8557,112 @@ class LightNovelService:
             if book.get("anilist_total_volumes") and progress >= int(book["anilist_total_volumes"])
             else "CURRENT"
         )
-        if media_id and self.config.anilist.enabled and self.config.anilist.access_token:
-            entry = self._save_anilist_volume(int(media_id), progress, status)
-            status = str(entry.get("status") or status)
+        account = (
+            self._literature_account()
+            if media_id and self.config.anilist.enabled and self.config.anilist.access_token
+            else ""
+        )
+        now = time.time()
         with self._connection() as conn:
             conn.execute(
                 "UPDATE ln_books SET finished=1,anilist_status=?,anilist_progress_volumes=MAX(anilist_progress_volumes,?),updated_at=? WHERE id=?",
-                (status, volume, time.time(), int(book_id)),
+                (status, volume, now, int(book_id)),
             )
+            if account:
+                conn.execute(
+                    "INSERT INTO ln_anilist_pending(account,media_id,book_id,progress_volumes,status,queued_at) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(account,media_id) DO UPDATE SET "
+                    "book_id=excluded.book_id,"
+                    "progress_volumes=MAX(ln_anilist_pending.progress_volumes,excluded.progress_volumes),"
+                    "status=CASE WHEN ln_anilist_pending.status='COMPLETED' THEN 'COMPLETED' "
+                    "ELSE excluded.status END,queued_at=excluded.queued_at",
+                    (account, int(media_id), int(book_id), int(progress), status, now),
+                )
+        if account:
+            self._start_anilist_volume_sync((account, int(media_id), int(book_id), int(progress), status))
         return self.book(book_id)
+
+    def _start_anilist_volume_sync(self, first: tuple[str, int, int, int, str] | None = None) -> bool:
+        """Send the waiting volume updates on a thread of their own (one at a time)."""
+        lock = self.__dict__.setdefault("_anilist_volume_lock", threading.Lock())
+        with lock:
+            self.__dict__.setdefault("_anilist_volume_queue", []).append(first)
+            if self.__dict__.get("_anilist_volume_running"):
+                return False
+            self._anilist_volume_running = True
+
+        def worker() -> None:
+            while True:
+                with lock:
+                    queue = self._anilist_volume_queue
+                    if not queue:
+                        self._anilist_volume_running = False
+                        return
+                    item = queue.pop(0)
+                try:
+                    if item is not None:
+                        self._send_anilist_volume(*item)
+                    self.flush_anilist_volumes()
+                except Exception as exc:  # noqa: BLE001 - the rows stay for the next refresh
+                    self._log("LN AniList volume sync failed: %s", exc)
+
+        threading.Thread(target=worker, name="ln-anilist-volume", daemon=True).start()
+        return True
+
+    def _send_anilist_volume(
+        self, account: str, media_id: int, book_id: int, progress: int, status: str
+    ) -> bool:
+        """One waiting update to AniList; True when AniList took it (its row is then gone)."""
+        if account != self._literature_account():
+            return False  # signed out or another account: its updates wait for it
+        try:
+            entry = self._save_anilist_volume(int(media_id), int(progress), status)
+        except Exception as exc:  # noqa: BLE001 - offline, refused, expired: tried again later
+            self._log("LN AniList volume update waits media=%s volumes=%s error=%s", media_id, progress, exc)
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE ln_anilist_pending SET attempts=attempts+1,last_error=? WHERE account=? AND media_id=?",
+                    (str(exc)[:300], account, int(media_id)),
+                )
+            return False
+        answered = str((entry or {}).get("status") or status)
+        with self._connection() as conn:
+            # A newer finish queued meanwhile (more volumes, or COMPLETED) stays to be sent.
+            conn.execute(
+                "DELETE FROM ln_anilist_pending WHERE account=? AND media_id=? AND progress_volumes<=? "
+                "AND (status<>'COMPLETED' OR ?='COMPLETED')",
+                (account, int(media_id), int(progress), status),
+            )
+            conn.execute(
+                "UPDATE ln_books SET anilist_status=?,updated_at=? WHERE id=?",
+                (answered, time.time(), int(book_id)),
+            )
+        self._log("RESULT step=ln.anilist_volume media=%s volumes=%s status=%s", media_id, progress, answered)
+        return True
+
+    def flush_anilist_volumes(self) -> int:
+        """Send the volume updates waiting for this AniList account; stops at the first failure."""
+        account = self._literature_account()
+        if not account:
+            return 0
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT media_id,book_id,progress_volumes,status FROM ln_anilist_pending "
+                "WHERE account=? ORDER BY queued_at",
+                (account,),
+            ).fetchall()
+        sent = 0
+        for row in rows:
+            if not self._send_anilist_volume(
+                account,
+                int(row["media_id"]),
+                int(row["book_id"] or 0),
+                int(row["progress_volumes"]),
+                str(row["status"] or ""),
+            ):
+                break
+            sent += 1
+        return sent
 
     def set_finished(self, book_id: int, finished: bool) -> dict[str, Any]:
         """Set the local Finished badge without reducing AniList progress."""
@@ -6568,8 +8726,10 @@ class LightNovelService:
         clean_query = self._nyaa_title(query)
         if not clean_query:
             return []
+        sources = load_sources(self.config)
         client = NyaaClient(
-            self.config.nyaa.base_url,
+            sources.release_search,
+            mirrors=sources.mirrors,
             category=settings.nyaa_category,
             proxy_mode=self.config.nyaa.proxy_mode,
             proxy_url=self.config.nyaa.proxy_url,
@@ -6608,13 +8768,67 @@ class LightNovelService:
                 "volume_end": volume_range[1] if volume_range else None,
                 "volume_range": list(volume_range) if volume_range else None,
                 "contains_target_volume": bool(target and volume_range),
+                "series_title": clean_query,
             }
             for r, volume_range, _exact in eligible[:30]
         ]
 
+    def _anilist_novel_title(self, media_id: int) -> str:
+        """The AniList title of a novel already listed (no network): "" when unknown."""
+        cached = self._anilist_cache
+        for item in cached[1] if cached is not None else []:
+            if int(item.get("media_id") or 0) == int(media_id):
+                return str(item.get("title") or "").strip()
+        return ""
+
+    def download_folder(self, release: dict[str, Any]) -> Path:
+        """The folder a novel release is downloaded into: ``<Light Novels>/<title>``.
+
+        The same per-title folder anime gets (``extra_files.title_folder_name``): the
+        AniList title when the request names the novel (``media_id``, or ``book_id`` of
+        a book bound to AniList), else the series title searched for, else the
+        release's own title without volume numbers.
+        """
+        media_id = 0
+        try:
+            media_id = int(release.get("media_id") or 0)
+        except (TypeError, ValueError):
+            media_id = 0
+        book: dict[str, Any] = {}
+        try:
+            book_id = int(release.get("book_id") or 0)
+        except (TypeError, ValueError):
+            book_id = 0
+        if book_id:
+            try:
+                book = self.book(book_id)
+            except Exception:  # noqa: BLE001 - a deleted book only loses the better name
+                book = {}
+            if not media_id:
+                media_id = int(book.get("anilist_id") or 0)
+        title = (
+            (self._anilist_novel_title(media_id) if media_id else "")
+            or str(release.get("series_title") or "").strip()
+            or str(book.get("series_title") or "").strip()
+            or self._nyaa_title(str(release.get("title") or ""))
+        )
+        if not title:
+            return self.root
+        # A leading dot would make it a hidden folder the library scan skips.
+        name = title_folder_name(title).lstrip(". ")
+        if not name:
+            return self.root
+        folder = (self.root / name).resolve()
+        root = self.root.resolve()
+        if folder == root or not folder.is_relative_to(root) or folder.parent != root:
+            return self.root
+        return folder
+
     def download_nyaa_release(self, release: dict[str, Any]) -> dict[str, Any]:
         if not self.config.qbittorrent.enabled:
             raise LightNovelError(err("ln.downloadsNeedQbt"))
+        folder = self.download_folder(release)
+        folder.mkdir(parents=True, exist_ok=True)
         item = NyaaRelease(
             title=str(release.get("title") or ""),
             link=str(release.get("link") or ""),
@@ -6642,17 +8856,38 @@ class LightNovelService:
             auto_start_app=self.config.qbittorrent.auto_start_app,
         )
         target_volume = max(0, int(release.get("target_volume") or 0))
+        # Set only for a torrent this call really added: the user's own torrent
+        # (or another volume of this pack still downloading) is never narrowed,
+        # relabelled or deleted.
+        added_hash = ""
+        torrent_hash = ""
+        already_added = False
+        existing: dict[str, Any] = {}
+        selected_files: list[str] = []
         try:
-            torrent_hash = qbt.add_release(
+            torrent_hash, added = qbt.add_release_checked(
                 item,
-                save_path=self.root,
+                save_path=folder,
                 category=f"{APP_SLUG}-ln",
                 tags=[APP_SLUG, "light-novel"] + ([f"volume: {target_volume}"] if target_volume else []),
                 paused=bool(target_volume),
                 stop_at_metadata=bool(target_volume),
+                adopt_existing=False,
             )
-            selected_files: list[str] = []
-            if target_volume:
+            if not added:
+                existing = qbt.find_torrent(torrent_hash) or {}
+                if not self._own_ln_torrent_for(existing, target_volume):
+                    self._log(
+                        "SKIP step=ln.nyaa_download reason=torrent_already_in_client hash=%s", torrent_hash
+                    )
+                    raise LightNovelError(err("ln.torrentAlreadyInClient"))
+                # Pudge's own download of this release (or volume) is still there:
+                # nothing to add, and nothing of it is changed.
+                already_added = True
+                self._log("SKIP step=ln.nyaa_download reason=already_added hash=%s", torrent_hash)
+            else:
+                added_hash = str(torrent_hash or "")
+            if target_volume and not already_added:
                 selected_files = self._select_torrent_volume_files(
                     qbt,
                     torrent_hash,
@@ -6664,27 +8899,73 @@ class LightNovelService:
                 )
                 qbt.start(torrent_hash)
         except Exception:
-            if target_volume and "torrent_hash" in locals() and torrent_hash:
+            if target_volume and added_hash:
                 try:
-                    qbt.delete(torrent_hash, delete_files=True)
+                    qbt.delete(added_hash, delete_files=True)
                 except Exception:
                     pass
             raise
         finally:
             qbt.close()
-        if target_volume and torrent_hash:
-            threading.Thread(
-                target=self._finish_volume_torrent,
-                args=(str(torrent_hash), target_volume),
-                name=f"ln-volume-{target_volume}-download",
-                daemon=True,
-            ).start()
+        volume_torrent = bool(target_volume and torrent_hash) and (
+            not already_added or self._torrent_volume_tag(existing) == target_volume
+        )
+        if volume_torrent:
+            waiting = any(
+                row["hash"] == str(torrent_hash).lower()
+                and int(row["volume"]) == target_volume
+                and row.get("state") != "failed"
+                for row in self._volume_downloads()
+            )
+            media_id = int(release.get("media_id") or 0) or None
+            if not waiting:
+                # New, or Pudge's own volume torrent whose monitor an older version lost.
+                # That one stays where qBittorrent has it (the old layout: the root).
+                save_dir = str(existing.get("save_path") or "") if already_added else str(folder)
+                self._register_volume_download(
+                    str(torrent_hash), target_volume, title=item.title, media_id=media_id, folder=save_dir
+                )
+            elif media_id is not None:
+                # Auto-download asked for it: skip it on later passes while it downloads.
+                self._change_volume_download(str(torrent_hash), target_volume, {"media_id": media_id})
+            self._start_volume_monitor(str(torrent_hash), target_volume)
         return {
             "ok": True,
+            "already_added": already_added,
             "torrent_hash": torrent_hash,
             "target_volume": target_volume or None,
             "selected_files": selected_files if target_volume else [],
         }
+
+    @staticmethod
+    def _torrent_tags(torrent: dict[str, Any]) -> set[str]:
+        return {tag.strip().casefold() for tag in str(torrent.get("tags") or "").split(",") if tag.strip()}
+
+    @classmethod
+    def _torrent_volume_tag(cls, torrent: dict[str, Any]) -> int | None:
+        for tag in cls._torrent_tags(torrent):
+            if tag.startswith("volume:"):
+                try:
+                    return int(tag.split(":", 1)[1].strip())
+                except ValueError:
+                    continue
+        return None
+
+    @classmethod
+    def _own_ln_torrent_for(cls, torrent: dict[str, Any], target_volume: int) -> bool:
+        """A torrent in qBittorrent that Pudge's Light novels added for this request.
+
+        Its LN category or tag marks it as Pudge's. A whole release, or the same
+        volume, is "already added". Pudge's torrent of another volume of the pack
+        is still downloading that volume, so the request is refused, as for a
+        torrent the person added themselves.
+        """
+        if str(torrent.get("category") or "") != f"{APP_SLUG}-ln" and "light-novel" not in cls._torrent_tags(
+            torrent
+        ):
+            return False
+        volume = cls._torrent_volume_tag(torrent)
+        return volume is None or volume == int(target_volume or 0)
 
     def _qbt_client(self) -> QBittorrentClient:
         return QBittorrentClient(
@@ -6775,16 +9056,29 @@ class LightNovelService:
         qbt.set_file_priority(torrent_hash, selected_ids, 6)
         return [str(row.get("name") or "") for row in selected]
 
+    def _volume_download_folder(self, entry: dict[str, Any] | None) -> Path:
+        """The save folder a volume download was added with, inside the library; else the root."""
+        value = str((entry or {}).get("folder") or "").strip()
+        if not value:
+            return self.root
+        folder = Path(value).expanduser().resolve()
+        if not folder.is_relative_to(self.root.resolve()):
+            return self.root
+        return folder
+
     def _materialize_selected_volume(
         self,
         selected: list[dict[str, Any]],
         target_volume: int,
+        *,
+        folder: Path | None = None,
     ) -> list[Path]:
         archives: list[Path] = []
         extracted = 0
+        base = folder or self.root
         for row in selected:
             relative = Path(str(row.get("name") or ""))
-            source = (self.root / relative).resolve()
+            source = (base / relative).resolve()
             try:
                 source.relative_to(self.root.resolve())
             except ValueError as exc:
@@ -6803,93 +9097,327 @@ class LightNovelService:
                         if Path(name).suffix.casefold() in {".epub", ".txt"}
                         and self._torrent_file_volume(name) == int(target_volume)
                     ]
+                    budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
                     for member in members:
-                        destination = self._selected_volume_destination(Path(member).name, target_volume)
-                        with archive.open(member) as src, destination.open("wb") as dst:
-                            shutil.copyfileobj(src, dst)
+                        destination = self._selected_volume_destination(
+                            Path(member).name, target_volume, folder=base
+                        )
+                        try:
+                            extract_member(
+                                archive, member, destination, limit=BOOK_ARCHIVE_LIMIT, budget=budget
+                            )
+                        except ArchiveTooLargeError as exc:
+                            raise LightNovelError(str(exc)) from exc
                         extracted += 1
                 continue
-            from .providers.jimaku import find_7zip
+            from .providers.jimaku import (
+                ArchiveToolMissingError,
+                ArchiveUnreadableError,
+                list_archive,
+                unpack_archive,
+            )
 
-            tool = find_7zip()
-            if not tool:
-                raise LightNovelError(err("ln.sevenZipRequired"))
-            with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ln-volume-") as temp_dir:
-                completed = subprocess.run(
-                    [tool, "x", "-y", f"-o{temp_dir}", str(source)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=300,
-                    check=False,
-                )
-                if completed.returncode != 0:
-                    raise LightNovelError(err("ln.extractFailed", name=relative.name))
+            # Only the volume's own files are unpacked, under the book limit, next to
+            # the library (a hidden folder the scans skip): a whole batch used to be
+            # unpacked into the system temp folder with no size limit.
+            with tempfile.TemporaryDirectory(prefix=f".{APP_SLUG}-ln-volume-", dir=self.root) as temp_dir:
+                # macOS's bsdtar first (Homebrew's 7-Zip is no longer installed), 7zz as fallback.
+                try:
+                    wanted = [
+                        name
+                        for name in list_archive(source, timeout=120)
+                        if not name.endswith("/")
+                        and Path(name).suffix.casefold() in {".epub", ".txt"}
+                        and self._torrent_file_volume(name) == int(target_volume)
+                    ]
+                    if wanted:
+                        unpack_archive(
+                            source, Path(temp_dir), limit=BOOK_ARCHIVE_LIMIT, timeout=300, members=wanted
+                        )
+                except ArchiveTooLargeError as exc:
+                    raise LightNovelError(str(exc)) from exc
+                except ArchiveToolMissingError as exc:
+                    raise LightNovelError(err("ln.sevenZipRequired")) from exc
+                except ArchiveUnreadableError as exc:
+                    raise LightNovelError(
+                        err("ln.extractFailedDetail", name=relative.name, error=exc)
+                    ) from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise LightNovelError(err("ln.extractFailed", name=relative.name)) from exc
                 for candidate in Path(temp_dir).rglob("*"):
                     if (
-                        candidate.is_file()
+                        not candidate.is_symlink()
+                        and candidate.is_file()
                         and candidate.suffix.casefold() in {".epub", ".txt"}
                         and self._torrent_file_volume(str(candidate.relative_to(temp_dir)))
                         == int(target_volume)
                     ):
                         shutil.copy2(
                             candidate,
-                            self._selected_volume_destination(candidate.name, target_volume),
+                            self._selected_volume_destination(candidate.name, target_volume, folder=base),
                         )
                         extracted += 1
         if archives and not extracted:
             raise LightNovelError(err("ln.volumeNotInArchive", volume=target_volume))
         return archives
 
-    def _selected_volume_destination(self, name: str, target_volume: int) -> Path:
+    def _selected_volume_destination(
+        self, name: str, target_volume: int, *, folder: Path | None = None
+    ) -> Path:
+        base = folder or self.root
         safe_name = Path(str(name or "")).name or f"volume-{int(target_volume):02d}.epub"
-        destination = self.root / safe_name
+        destination = base / safe_name
         if not destination.exists():
             return destination
-        return self.root / f"{destination.stem}-volume-{int(target_volume):02d}{destination.suffix}"
+        return base / f"{destination.stem}-volume-{int(target_volume):02d}{destination.suffix}"
+
+    # Volume downloads waiting for qBittorrent, kept across restarts so a
+    # finished archive is still extracted; failures stay listed for the window.
+    _VOLUME_DOWNLOADS_KEY = "nyaa_volume_downloads:v1"
+    VOLUME_DOWNLOAD_MAX_SECONDS = 14 * 24 * 3600.0
+    VOLUME_DOWNLOAD_POLL_SECONDS = 20.0
+
+    def _volume_downloads(self) -> list[dict[str, Any]]:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT value FROM ln_settings WHERE key=?", (self._VOLUME_DOWNLOADS_KEY,)
+                ).fetchone()
+            values = json.loads(str(row[0])) if row else []
+        except (sqlite3.Error, ValueError, TypeError):
+            return []
+        if not isinstance(values, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            torrent_hash = str(value.get("hash") or "").strip().lower()
+            try:
+                volume = int(value.get("volume") or 0)
+            except (TypeError, ValueError):
+                continue
+            if torrent_hash and volume > 0:
+                result.append({**value, "hash": torrent_hash, "volume": volume})
+        return result
+
+    def _save_volume_downloads(self, rows: list[dict[str, Any]]) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO ln_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (self._VOLUME_DOWNLOADS_KEY, json.dumps(rows, ensure_ascii=False)),
+            )
+
+    def _change_volume_download(self, torrent_hash: str, volume: int, changes: dict[str, Any] | None) -> None:
+        """Update (``changes``) or forget (None) one volume download."""
+        key = (str(torrent_hash or "").strip().lower(), int(volume))
+        with self._volume_downloads_lock:
+            rows = []
+            for row in self._volume_downloads():
+                if (row["hash"], int(row["volume"])) == key:
+                    if changes is None:
+                        continue
+                    row = {**row, **changes, "updated_at": time.time()}
+                rows.append(row)
+            self._save_volume_downloads(rows)
+        self.mark_changed()
+
+    def _register_volume_download(
+        self,
+        torrent_hash: str,
+        volume: int,
+        *,
+        title: str = "",
+        media_id: int | None = None,
+        folder: str = "",
+    ) -> None:
+        key = (str(torrent_hash or "").strip().lower(), int(volume))
+        now = time.time()
+        with self._volume_downloads_lock:
+            rows = [row for row in self._volume_downloads() if (row["hash"], int(row["volume"])) != key]
+            rows.append(
+                {
+                    "hash": key[0],
+                    "volume": key[1],
+                    "title": str(title or ""),
+                    "media_id": media_id,
+                    # The torrent's save folder; rows of older versions have none (the root).
+                    "folder": str(folder or ""),
+                    "state": "downloading",
+                    "error": "",
+                    "started_at": now,
+                    "updated_at": now,
+                }
+            )
+            self._save_volume_downloads(rows)
+        self.mark_changed()
+
+    def _fail_volume_download(self, torrent_hash: str, volume: int, error: object) -> None:
+        self._log("LN volume download failed volume=%s hash=%s error=%s", volume, torrent_hash, error)
+        try:
+            self._change_volume_download(torrent_hash, volume, {"state": "failed", "error": str(error)})
+        except LightNovelError:
+            pass  # the service was closed (restore): the next instance resumes it
+
+    def volume_downloads(self) -> list[dict[str, Any]]:
+        """Volume downloads still waiting, and failed ones until the person dismisses them."""
+        return [
+            {
+                "hash": row["hash"],
+                "volume": int(row["volume"]),
+                "title": str(row.get("title") or ""),
+                "media_id": row.get("media_id"),
+                "state": "failed" if row.get("state") == "failed" else "downloading",
+                "error": str(row.get("error") or ""),
+            }
+            for row in self._volume_downloads()
+        ]
+
+    def _volume_downloads_payload(self) -> list[dict[str, Any]]:
+        try:
+            return self.volume_downloads()
+        except Exception:  # noqa: BLE001 - the notice list never breaks the Light novels page
+            return []
+
+    def dismiss_volume_download(self, torrent_hash: str, volume: int) -> dict[str, Any]:
+        """Forget a failed volume download (the torrent itself is left as it is)."""
+        key = (str(torrent_hash or "").strip().lower(), int(volume))
+        with self._volume_downloads_lock:
+            rows = self._volume_downloads()
+            kept = [
+                row
+                for row in rows
+                if (row["hash"], int(row["volume"])) != key or row.get("state") != "failed"
+            ]
+            changed = len(kept) != len(rows)
+            if changed:
+                self._save_volume_downloads(kept)
+        if changed:
+            self.mark_changed()
+        return {"ok": True, "volume_downloads": self.volume_downloads()}
+
+    def _start_volume_monitor(self, torrent_hash: str, volume: int) -> bool:
+        key = (str(torrent_hash or "").strip().lower(), int(volume))
+        with self._volume_downloads_lock:
+            running = self._volume_monitors.get(key)
+            if running is not None and running.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self._finish_volume_torrent,
+                args=key,
+                name=f"ln-volume-{key[1]}-download",
+                daemon=True,
+            )
+            self._volume_monitors[key] = thread
+            thread.start()
+        return True
+
+    def resume_volume_downloads(self) -> int:
+        """After a restart: watch the volume downloads that were still waiting."""
+        if not self.config.qbittorrent.enabled:
+            return 0
+        started = 0
+        for row in self._volume_downloads():
+            if row.get("state") != "failed" and self._start_volume_monitor(row["hash"], int(row["volume"])):
+                started += 1
+        if started:
+            self._log("RESUME step=ln.volume_downloads monitors=%s", started)
+        return started
 
     def _finish_volume_torrent(self, torrent_hash: str, target_volume: int) -> None:
+        key = (str(torrent_hash or "").strip().lower(), int(target_volume))
         qbt = self._qbt_client()
+        # Waiting never launches a closed qBittorrent; it asks again later.
+        qbt.start_policy = lambda: False
         try:
-            deadline = time.monotonic() + 14 * 24 * 3600
-            while time.monotonic() < deadline:
-                files = qbt.files(torrent_hash)
+            entry = next(
+                (row for row in self._volume_downloads() if (row["hash"], int(row["volume"])) == key), None
+            )
+            started_at = float((entry or {}).get("started_at") or time.time())
+            deadline = started_at + self.VOLUME_DOWNLOAD_MAX_SECONDS
+            while not self._closed:
+                if time.time() > deadline:
+                    self._fail_volume_download(
+                        torrent_hash, target_volume, err("ln.volumeDownloadTimedOut", volume=target_volume)
+                    )
+                    return
+                try:
+                    files = qbt.files(torrent_hash)
+                except QBittorrentError:
+                    # qBittorrent closed or busy: wait. A torrent removed from it ends the wait.
+                    try:
+                        gone = qbt.find_torrent(torrent_hash) is None
+                    except QBittorrentError:
+                        gone = False
+                    if gone:
+                        self._fail_volume_download(
+                            torrent_hash, target_volume, err("ln.volumeTorrentRemoved", volume=target_volume)
+                        )
+                        return
+                    files = []
                 selected = [row for row in files if int(row.get("priority") or 0) > 0]
                 if selected and all(float(row.get("progress") or 0.0) >= 0.999 for row in selected):
-                    archives = self._materialize_selected_volume(selected, target_volume)
-                    qbt.delete(torrent_hash, delete_files=False)
-                    for archive in archives:
-                        archive.unlink(missing_ok=True)
+                    archives = self._materialize_selected_volume(
+                        selected, target_volume, folder=self._volume_download_folder(entry)
+                    )
+                    self._change_volume_download(torrent_hash, target_volume, None)
+                    try:
+                        qbt.delete(torrent_hash, delete_files=False)
+                    except QBittorrentError as exc:
+                        # Still seeding from the archive: keep it.
+                        self._log("WARN step=ln.volume_torrent_remove volume=%s error=%s", target_volume, exc)
+                    else:
+                        for archive in archives:
+                            archive.unlink(missing_ok=True)
                     self.scan_downloaded()
                     self._log("LN volume download complete volume=%s", target_volume)
                     return
-                time.sleep(20.0)
+                time.sleep(self.VOLUME_DOWNLOAD_POLL_SECONDS)
         except Exception as exc:
-            self._log("LN volume download monitor failed volume=%s error=%s", target_volume, exc)
+            if not self._closed:
+                self._fail_volume_download(torrent_hash, target_volume, exc)
         finally:
             qbt.close()
+            with self._volume_downloads_lock:
+                if self._volume_monitors.get(key) is threading.current_thread():
+                    self._volume_monitors.pop(key, None)
 
     def auto_download_missing(self) -> list[dict[str, Any]]:
         if not self.settings().auto_download_nyaa or not self.config.qbittorrent.enabled:
             return []
         results: list[dict[str, Any]] = []
-        books_by_media = {int(b["anilist_id"]): b for b in self.books() if b.get("anilist_id")}
+        # Every local volume counts (finished or not), not one arbitrary book per title.
+        owned: dict[int, set[int]] = {}
+        for book in self.books():
+            if book.get("anilist_id") and int(book.get("volume") or 0) > 0:
+                owned.setdefault(int(book["anilist_id"]), set()).add(int(book["volume"]))
+        # A volume already waiting in qBittorrent (or failed: shown to the person) is not searched again.
+        pending = {
+            (int(row.get("media_id") or 0), int(row["volume"]))
+            for row in self._volume_downloads()
+            if row.get("media_id")
+        }
         for novel in self.anilist_novels():
             media_id = int(novel.get("media_id") or 0)
             if not media_id or str(novel.get("status") or "").upper() not in {"PLANNING", "CURRENT"}:
                 continue
             progress = int(novel.get("progress_volumes") or 0)
             next_volume = progress + 1
-            local = books_by_media.get(media_id)
-            if local and int(local.get("volume") or 0) >= next_volume and not int(local.get("finished") or 0):
+            if next_volume in owned.get(media_id, set()) or (media_id, next_volume) in pending:
                 continue
             query = self._nyaa_title(str(novel.get("title") or ""))
-            releases = self.search_nyaa(query, target_volume=next_volume)
+            try:
+                releases = self.search_nyaa(query, target_volume=next_volume)
+            except NoReleaseSourceError:
+                # No source in Settings → Sources: one quiet line per pass.
+                self._log("SKIP step=ln.auto_download reason=no_release_source")
+                return results
             if not releases:
                 continue
             best = next((r for r in releases if int(r.get("seeders") or 0) > 0), releases[0])
             try:
-                added = self.download_nyaa_release(best)
+                added = self.download_nyaa_release({**best, "media_id": media_id})
                 results.append({"media_id": media_id, "volume": next_volume, "title": best["title"], **added})
             except Exception as exc:
                 self._log("LN auto Nyaa failed for %s: %s", novel.get("title"), exc)
@@ -6897,6 +9425,9 @@ class LightNovelService:
 
     def _state_payload_fast(self) -> dict[str, Any]:
         self._ensure_literature_account()
+        # Read the version before the books: a snapshot must never claim a version
+        # bumped after its rows were read (a drop finishing meanwhile would be lost).
+        version = int(self._state_version)
         literature = [
             dict(item) for item in (self._anilist_cache[1] if self._anilist_cache is not None else [])
         ]
@@ -6930,9 +9461,10 @@ class LightNovelService:
             "books": books,
             "anilist": novels,
             "planning": planning,
-            "settings": self.settings_payload(),
+            "settings": self.reader_settings_payload(),
             "refreshing": bool(self._state_refreshing),
-            "version": int(self._state_version),
+            "volume_downloads": self._volume_downloads_payload(),
+            "version": version,
         }
 
     def request_state_refresh(self, *, force: bool = False) -> bool:
@@ -6953,6 +9485,8 @@ class LightNovelService:
                 self.reindex_outdated_sources()
                 self._reconcile_local_series_links()
                 if account and account == self._literature_account():
+                    # Volumes finished while AniList did not answer, before its list is read.
+                    self.flush_anilist_volumes()
                     self.anilist_novels(force=force)
                     if account != self._literature_account():
                         return
@@ -6989,3 +9523,9 @@ class LightNovelService:
         payload = self._state_payload_fast()
         payload["refresh_started"] = started
         return payload
+
+
+def _batch_answer_fits(result: Any, batch: list[str]) -> bool:
+    """A Jiten reader/parse answer with one token list per paragraph of ``batch``."""
+    tokens = result.get("tokens") if isinstance(result, dict) else None
+    return isinstance(tokens, list) and len(tokens) == len(batch)

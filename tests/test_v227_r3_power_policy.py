@@ -281,7 +281,9 @@ def test_power_settings_are_saved_and_the_window_follows_the_power_mode(page) ->
         "saving": True,
         "status": f"{texts['active']} · {texts['manual']} · 64%",
     }
-    assert out["front"] == 2 and out["behind"] == 2  # every 30 s in front, every minute behind
+    # Every minute in front; hidden, the planned check runs once, then every 10 minutes
+    # (showing the window asks at once; MEM7 window polls).
+    assert out["front"] == 1 and out["behind"] == 1, out
 
 
 def test_scheduler_background_allowed_override_remains_admission_seam(tmp_path: Path, monkeypatch) -> None:

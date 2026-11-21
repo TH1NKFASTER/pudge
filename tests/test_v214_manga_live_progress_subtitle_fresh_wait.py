@@ -186,7 +186,7 @@ def test_manual_fresh_subtitle_waits_for_playback_and_the_heavy_slot(tmp_path: P
     marker.unlink()
     # Playback ended: the job now queues for the heavy-work slot as user work (background
     # work is asked to yield to it).
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 30  # ends as soon as the job queued
     while (
         not scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND) and time.monotonic() < deadline
     ):

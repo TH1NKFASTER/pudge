@@ -14,6 +14,7 @@ import statistics
 import httpx
 
 from .config import LLMConfig
+from .fsutil import atomic_write_json
 from .models import AniListAnime, SubtitleCandidate, VideoIdentity
 from .logging_utils import configure_logging, timed_step
 from .subtitle_formats import parse_srt
@@ -99,6 +100,32 @@ def build_openai_chat_payload(config: LLMConfig, system: str, user: str) -> dict
     if effort == "none":
         payload["temperature"] = config.temperature
     return payload
+
+
+# Why an LLM call failed, for readable messages (grammar explain, reading assistant):
+# transport/provider failures are not "the model answered something unreadable".
+LLM_AUTH = "llm_auth"  # 401/403: API key invalid, expired or not allowed
+LLM_RATE_LIMITED = "llm_rate_limited"  # 429: rate limit or quota
+LLM_SERVICE_UNAVAILABLE = "llm_service_unavailable"  # 5xx, timeout, connection failure
+LLM_HTTP_ERROR = "llm_error"  # any other HTTP/transport failure
+LLM_NO_JSON = "llm_no_json"  # the call worked but the answer had no JSON object
+LLM_TRANSPORT_REASONS = frozenset({LLM_AUTH, LLM_RATE_LIMITED, LLM_SERVICE_UNAVAILABLE, LLM_HTTP_ERROR})
+
+
+def llm_failure_reason(exc: BaseException) -> str:
+    """Classify an exception raised by an LLM HTTP call."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = int(getattr(exc.response, "status_code", 0) or 0)
+        if status in {401, 403}:
+            return LLM_AUTH
+        if status == 429:
+            return LLM_RATE_LIMITED
+        if status >= 500:
+            return LLM_SERVICE_UNAVAILABLE
+        return LLM_HTTP_ERROR
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return LLM_SERVICE_UNAVAILABLE
+    return LLM_HTTP_ERROR
 
 
 def _response_error_detail(response: Any) -> str:
@@ -345,6 +372,8 @@ class OllamaClient:
         self.base_url = config.base_url.rstrip("/")
         self.model = config.model
         self.last_error = ""
+        # One of the LLM_* reasons above for the last failed call ("" after a success).
+        self.last_error_reason = ""
         self.client = httpx.Client(
             timeout=config.timeout_seconds,
             follow_redirects=True,
@@ -421,11 +450,14 @@ class OllamaClient:
         response.raise_for_status()
         body = response.json()
         if provider == "openai":
-            choice = body["choices"][0]
+            # `{"choices": []}` (or no message/content) used to raise IndexError
+            # past the malformed-reply handling; it is an empty answer instead.
+            choices = body.get("choices") if isinstance(body, dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices else {}
             meta["finish_reason"] = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
-            message = choice["message"]
+            message = choice.get("message") if isinstance(choice, dict) else None
             meta["refusal"] = str(message.get("refusal") or "") if isinstance(message, dict) else ""
-            content = message["content"]
+            content = message.get("content") if isinstance(message, dict) else ""
             usage = body.get("usage") if isinstance(body, dict) else None
             if isinstance(usage, dict):
                 meta["prompt_tokens"] = usage.get("prompt_tokens")
@@ -495,8 +527,10 @@ class OllamaClient:
                 decoded = _decode_json_content(content)
                 meta["parse_ms"] = round((time.perf_counter() - parse_started) * 1000.0, 1)
                 self.last_error = ""
+                self.last_error_reason = ""
                 finish_reason = str(meta.get("finish_reason") or "")
                 if decoded is None:
+                    self.last_error_reason = LLM_NO_JSON
                     if meta.get("refusal"):
                         self.last_error = f"LLM refused: {str(meta['refusal'])[:200]}"
                     elif not content.strip():
@@ -522,6 +556,9 @@ class OllamaClient:
                 self._log_call(call_id, started, meta, ok=decoded is not None, request_chars=len(user))
                 return decoded
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.last_error_reason = (
+                llm_failure_reason(exc) if isinstance(exc, httpx.HTTPError) else LLM_NO_JSON
+            )
             if isinstance(exc, httpx.HTTPStatusError):
                 detail = _response_error_detail(exc.response)
                 status = getattr(exc.response, "status_code", None)
@@ -542,6 +579,7 @@ class OllamaClient:
         try:
             content, meta = self._complete(messages, json_mode=False)
             self.last_error = ""
+            self.last_error_reason = ""
             if not content.strip():
                 self.last_error = (
                     f"LLM returned empty content (finish_reason={meta.get('finish_reason') or 'unknown'})"
@@ -549,6 +587,9 @@ class OllamaClient:
             self._log_call(call_id, started, meta, ok=bool(content.strip()), request_chars=chars)
             return content if content.strip() else None
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.last_error_reason = (
+                llm_failure_reason(exc) if isinstance(exc, httpx.HTTPError) else LLM_NO_JSON
+            )
             if isinstance(exc, httpx.HTTPStatusError):
                 detail = _response_error_detail(exc.response)
                 status = getattr(exc.response, "status_code", None)
@@ -856,16 +897,12 @@ class OllamaClient:
         if cache_path is not None:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps(
-                        {"cached_at": time.time(), "result": final_result},
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
+                atomic_write_json(
+                    cache_path,
+                    {"cached_at": time.time(), "result": final_result},
+                    ensure_ascii=False,
+                    indent=2,
                 )
-                temporary.replace(cache_path)
             except OSError:
                 pass
         self.logger.info(

@@ -101,7 +101,7 @@ def test_planning_card_auto_downloads_released_episodes(page) -> None:
             out.progress = {title: __text('#modalTitle'), body: __text('#modalBody')};
             await __tick(1500);
             out.done = {title: __text('#modalTitle'), body: __text('#modalBody'), reloaded: states() - before};
-            out.texts = {searching: PudgeI18n.t('ui.searchingReleasedEpisodes'), checking: PudgeI18n.t('ui.checkingLocalFilesAndSearching'),
+            out.texts = {searching: PudgeI18n.t('ui.searchingReleasedEpisodes'), checking: PudgeI18n.t('planned.searchStepLocal'),
                          complete: PudgeI18n.t('ui.searchComplete'), added: PudgeI18n.t('ui.added'), local: PudgeI18n.t('ui.alreadyLocal'),
                          missing: PudgeI18n.t('ui.notFound'), summary: PudgeI18n.t('ui.addedAlreadyLocalNotFound', {added: 1, local: 1, missing: 1, error: 0})};
             return out;
@@ -114,7 +114,7 @@ def test_planning_card_auto_downloads_released_episodes(page) -> None:
         assert out["button"] == out["label"]
         assert result.calls_of("start_planning_episode_download") == [[9]]
         assert out["progress"]["title"] == f"{texts['searching']} — Planned"
-        assert out["progress"]["body"].startswith(f"{texts['checking']} 0 / 3")
+        assert out["progress"]["body"].startswith(texts["checking"])
         assert out["done"]["title"] == f"{texts['complete']} — Planned"
         body = out["done"]["body"]
         assert body.startswith(texts["summary"])

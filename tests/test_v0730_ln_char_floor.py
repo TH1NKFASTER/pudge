@@ -8,7 +8,7 @@ def _rows(points):
 
 
 def test_burst_after_slow_bridge_borrows_from_earlier_speech():
-    # おばあちゃん|から: 7 chars over 1.6 s, then ゃ and ん at 40 ms each.
+    # A word ending in ゃん, then から: 7 chars over 1.6 s, then ゃ and ん at 40 ms each.
     anchors = _rows([(3070.88, 13043), (3072.48, 13050), (3072.52, 13051), (3072.56, 13052)])
     fixed, changed = _enforce_min_char_duration(anchors, [{"start": 3070.0, "end": 3074.0}])
     times = [row["time"] for row in fixed]

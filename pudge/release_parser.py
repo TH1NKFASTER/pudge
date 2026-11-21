@@ -9,6 +9,9 @@ codecs, checksum, type) plus *safety* decisions made once for every caller:
   an extra (NCOP/NCED/PV/...) or a special (SP) gives ``episode=None`` — never
   ``12.5 -> 12``, ``01-12 -> 1`` or ``v2 -> 2``.
 * ``episode_range`` keeps an explicit span; ``raw_episodes`` keeps the text.
+* ``season=0`` (``S00E03``, which Anitomy does not read) is the specials
+  season: ``episode`` is then the special's number, never a regular episode
+  of the TV entry (callers check the season).
 * ``double_episode_span`` accepts exactly one kind of span as playable: two
   consecutive regular episodes in one file (``- 01-02``, ``- 05 ~ 06``,
   ``S01E01-E02``), never a pack.
@@ -54,8 +57,31 @@ EXTRA_TYPES = {
     "cd",
 }
 SPECIAL_TYPES = {"sp", "special", "specials", "sps", "omake", "picture drama", "recap"}
+# The pinned anitopy never reports CM, Menu, Trailer, Omake, Recap... as a type
+# ("Show - CM 01" came out as regular episode 1), so the name is checked too.
+_TYPE_WORDS = "|".join(
+    sorted(
+        (re.escape(word).replace(r"\ ", r"\s*") for word in EXTRA_TYPES | SPECIAL_TYPES),
+        key=len,
+        reverse=True,
+    )
+)
+_TYPE_NUMBER = r"(?:\s*[#.]?\s*\d{1,3}(?:[-.]\d{1,3})?(?:v\d+)?)"
+_TITLE_TYPE_RE = re.compile(rf"(?i)\s[-–—]\s*(?P<kind>{_TYPE_WORDS}){_TYPE_NUMBER}?$")
+_DASH_TYPE_RE = re.compile(
+    rf"(?i)(?P<kind>{_TYPE_WORDS}){_TYPE_NUMBER}?(?=$|\s*[\[(]|\s+[-–—]\s|\.[A-Za-z0-9]{{2,4}}$)"
+)
+_BRACKET_TYPE_RE = re.compile(
+    rf"(?i)(?<=.)[\[(]\s*(?P<kind>{_TYPE_WORDS})(?P<number>{_TYPE_NUMBER})?\s*[\])]"
+)
+# A named SP/Special may be an AniList entry of its own; every other bonus clip
+# (CM, Menu, Omake, Recap, Picture Drama...) follows the NCOP/NCED rules.
+_NAMED_SPECIAL_KEYS = {"sp", "sps", "special", "specials"}
+_NAMED_TYPE_KEYS = {word.replace(" ", "") for word in EXTRA_TYPES | SPECIAL_TYPES}
 _RANGE_TAIL_RE = re.compile(r"^\s*[~\-–—]\s*0*(\d{1,4})\b")
 _JP_EPISODE_RE = re.compile(r"第\s*0*(\d{1,4})\s*[話回]")
+# "Show - S00E03", "Show.S0E03": season 0 is the specials season (Anitomy does not read it).
+_SEASON_ZERO_RE = re.compile(r"(?i)(?:^|[\s._\-\[(])S0{1,2}E0*(?P<episode>\d{1,4})(?:v\d+)?(?=$|[\s._\-\])])")
 _LEGACY_RANGE_RE = re.compile(
     r"(?i)(?:^|[\s(\[_])(?:ep?\s*)?0*(\d{1,3})\s*(?:-|~|–|—|to)\s*(?:ep?\s*)?0*(\d{1,3})(?=$|[\s)\]_])"
 )
@@ -106,9 +132,35 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)] if str(value).strip() else []
 
 
+# No episode, season, year or version has more digits. Python's int() refuses a run of
+# more than 4300 digits (ValueError), and a release name with one raised out of every
+# parser built on this one.
+_MAX_NUMBER_DIGITS = 9
+
+
 def _int_or_none(value: Any) -> int | None:
     text = str(value or "").strip()
-    return int(text) if text.isdigit() else None
+    # isdecimal, not isdigit: "①" and "²" are digits to isdigit() but int() refuses them,
+    # and one such file or release name raised out of every parser built on this one.
+    return int(text) if text.isdecimal() and len(text) <= _MAX_NUMBER_DIGITS else None
+
+
+def _type_from_name(text: str, title: str, has_episode: bool) -> str:
+    """The bonus-file kind (CM, Menu, Omake...) the name shows but anitopy did not type."""
+    # "Show - CM 01", "Show - Omake01v2": anitopy keeps the word at the end of the title.
+    match = _TITLE_TYPE_RE.search(title)
+    if match is None:
+        # "Show S2 - Teaser 01": anitopy calls it the episode title. Only right
+        # after the first " - ": in "Show - 07 - Recap" it is episode 7's title.
+        body = re.sub(r"^\s*(?:\[[^\]]*\]\s*)+", "", text)
+        dash = re.search(r"\s[-–—]\s*", body)
+        match = _DASH_TYPE_RE.match(body, dash.end()) if dash else None
+    if match is None:
+        # "[G] Show [Menu 01]"; a bare "(Recap)" next to an episode number is that episode's title.
+        bracket = _BRACKET_TYPE_RE.search(text)
+        if bracket is not None and (bracket.group("number") or not has_episode):
+            match = bracket
+    return re.sub(r"\s+", " ", match.group("kind")).strip() if match else ""
 
 
 def _legacy_only(name: str, warnings: list[str]) -> ParsedRelease:
@@ -119,11 +171,16 @@ def _legacy_only(name: str, warnings: list[str]) -> ParsedRelease:
         if 1 <= start < end <= 500:
             span = (start, end)
     jp = _JP_EPISODE_RE.search(name)
+    zero = _SEASON_ZERO_RE.search(name)
+    episode = int(jp.group(1)) if jp and span is None else None
+    if zero is not None and span is None:
+        episode = int(zero.group("episode"))
     return ParsedRelease(
         raw_name=name,
-        episode=int(jp.group(1)) if jp and span is None else None,
+        season=0 if zero is not None else None,
+        episode=episode,
         episode_range=span,
-        explicit_episode=bool(jp and span is None),
+        explicit_episode=episode is not None,
         parser_source="legacy",
         warnings=tuple(warnings),
     )
@@ -163,7 +220,7 @@ def parse_release_name(name: str) -> ParsedRelease:
             warnings.append("unparsed_episode_list")
     elif raw_episodes:
         value = raw_episodes[0]
-        if value.isdigit():
+        if value.isdecimal() and len(value) <= _MAX_NUMBER_DIGITS:
             episode = int(value)
         elif re.fullmatch(r"\d+\.\d+", value):
             fractional = True
@@ -196,6 +253,14 @@ def parse_release_name(name: str) -> ParsedRelease:
 
     extra = any(part in EXTRA_TYPES for part in re.split(r"[\s/]+", type_key) if part)
     special = any(part in SPECIAL_TYPES for part in re.split(r"[\s/]+", type_key) if part)
+    if not extra and not special:
+        named = _type_from_name(text, str(data.get("anime_title") or ""), bool(raw_episodes))
+        key = re.sub(r"\s+", "", named.casefold())
+        if key in _NAMED_TYPE_KEYS:
+            special = key in _NAMED_SPECIAL_KEYS
+            extra = not special
+            anime_type = f"{anime_type} {named}".strip()
+            warnings.append("type_from_name")
     if type_key in {"ova", "ona", "oad"}:
         warnings.append("ova_numbering_may_differ")
     if span is not None or fractional or extra or special:
@@ -216,6 +281,13 @@ def parse_release_name(name: str) -> ParsedRelease:
     season = seasons[0] if len(seasons) == 1 else None
     if len(seasons) > 1:
         warnings.append("multiple_seasons")
+    zero = _SEASON_ZERO_RE.search(text) if not seasons else None
+    if zero is not None:
+        # S00E03 is special 3 (a special, OVA or extra), never regular episode 3.
+        season = 0
+        warnings.append("season_zero")
+        if span is None and not fractional and not extra and not special:
+            episode, explicit = int(zero.group("episode")), True
 
     return ParsedRelease(
         raw_name=text,

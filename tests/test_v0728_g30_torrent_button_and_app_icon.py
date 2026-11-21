@@ -4,9 +4,11 @@ app icon (behaviour; audit 71Б rewrite)."""
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from tests.css_support import css_rules
@@ -55,6 +57,7 @@ def test_torrent_toggle_keeps_original_two_line_height_in_every_state(page) -> N
             ), name
 
 
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="install.sh is a zsh script")
 def test_runtime_app_icon_has_safe_padding_and_install_uses_same_asset(tmp_path: Path) -> None:
     with Image.open(ICON) as image:
         rgba = image.convert("RGBA")

@@ -14,44 +14,55 @@ from pudge.process_priority import BACKGROUND_PRIORITY_ENV
 
 ROOT = Path(__file__).resolve().parents[1]
 
-_FAKE_MLX = """
+# Stands in for the vendored pudge.whisper_mlx (MLX is not installed on CI).
+_FAKE_WHISPER = """
 import os
+import sys
 from pathlib import Path
 
 LOADS = []
 
-def transcribe(audio, path_or_hf_repo, language, word_timestamps, verbose):
+def transcribe(audio, path_or_hf_repo, language, word_timestamps, verbose, progress_callback):
     LOADS.append(path_or_hf_repo)
     name = Path(audio).name
     if name == "crash.flac":
         os._exit(9)
     if name == "fail.flac":
         raise RuntimeError("bad audio")
-    import tqdm
-    bar = tqdm.tqdm(total=4)
-    bar.update(4)
+    if progress_callback is not None:
+        progress_callback(0, 4)
+        progress_callback(4, 4)
     print("noise on stdout must not break the protocol")
     return {"segments": [{"start": 0.0, "end": 1.0, "text": name, "calls": len(LOADS)}]}
-"""
 
-_FAKE_TQDM = """
-class tqdm:
-    def __init__(self, *args, total=0, **kwargs):
-        self.total = total
-        self.n = 0
-    def update(self, n=1):
-        self.n += n
+sys.modules["pudge.whisper_mlx"] = sys.modules[__name__]
 """
 
 
 def _fake_environment(tmp_path: Path) -> dict[str, str]:
     fake = tmp_path / "fake-modules"
     fake.mkdir(exist_ok=True)
-    (fake / "mlx_whisper.py").write_text(_FAKE_MLX, encoding="utf-8")
-    (fake / "tqdm.py").write_text(_FAKE_TQDM, encoding="utf-8")
+    (fake / "fake_whisper.py").write_text(_FAKE_WHISPER, encoding="utf-8")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(fake), str(ROOT), env.get("PYTHONPATH", "")])
     return env
+
+
+def _fake_python(tmp_path: Path) -> str:
+    """A `python` that loads the stand-in before running `-m MODULE ARGS` (MLX is absent on CI)."""
+    wrapper = tmp_path / "fake-modules" / "python"
+    wrapper.parent.mkdir(exist_ok=True)
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import runpy, sys\n"
+        "import fake_whisper\n"
+        "assert sys.argv[1] == '-m'\n"
+        "sys.argv = sys.argv[2:]\n"
+        "runpy.run_module(sys.argv[0], run_name='__main__', alter_sys=True)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return str(wrapper)
 
 
 def _wait_answer(worker, request_id, timeout=30.0):
@@ -68,7 +79,7 @@ def _wait_answer(worker, request_id, timeout=30.0):
 def test_one_stt_worker_serves_every_chunk_and_reports_crashes(tmp_path):
     from pudge.audiobooks import _SttWorker
 
-    command = [sys.executable, "-m", "pudge.subtitles.stt_worker", "--serve", "tiny-model"]
+    command = [_fake_python(tmp_path), "-m", "pudge.subtitles.stt_worker", "--serve", "tiny-model"]
     worker = _SttWorker(command, env=_fake_environment(tmp_path), stderr_path=tmp_path / "worker.log")
     try:
         for number in (1, 2):
@@ -187,10 +198,12 @@ def test_a_crashed_worker_is_restarted_once_and_finished_chunks_are_kept(tmp_pat
     # Chunks 2 and 3 were cut ahead on the extraction thread while the previous one was recognized.
     assert [name.startswith("audiobook-stt-cut") for name, _start in cuts] == [False, True, True]
 
+    # The finished transcript replaces its chunk checkpoints (they only duplicated it).
+    checkpoint = service._transcription_checkpoint_dir(output)
+    assert not checkpoint.exists()
+
     # Two crashes on the same chunk: an error that keeps the finished checkpoints.
     output.unlink()
-    checkpoint = service._transcription_checkpoint_dir(output)
-    (checkpoint / "chunk-00003.json").unlink()
     workers[:] = [_Worker(crash_on={3}), _Worker(crash_on={3})]
     service._transcription_cancel_events[book_id] = threading.Event()
     done = threading.Event()
@@ -205,7 +218,7 @@ def test_serving_worker_runs_at_low_priority_and_rejects_unknown_arguments(tmp_p
     from pudge.process_priority import BACKGROUND_NICE, mark_background
 
     service = _service(tmp_path)
-    service.python, service.stt_model = sys.executable, "tiny-model"
+    service.python, service.stt_model = _fake_python(tmp_path), "tiny-model"
     worker = service._start_stt_worker(mark_background(_fake_environment(tmp_path)), tmp_path / "worker.log")
     try:
         request = {

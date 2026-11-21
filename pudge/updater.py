@@ -53,11 +53,21 @@ def _safe_json(path: Path) -> dict[str, Any]:
 class AppUpdater:
     """Safe updater for stable release installs and clean development checkouts."""
 
-    def __init__(self, *, logger: Any = None, before_install: Any = None, request_quit: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        logger: Any = None,
+        before_install: Any = None,
+        request_quit: Any = None,
+        install_not_started: Any = None,
+    ) -> None:
         self.logger = logger
         self.installer_pid: int | None = None
         self.before_install = before_install
         self.request_quit = request_quit
+        # Called when before_install succeeded but the installer could not be
+        # started: the app resumes the background work before_install stopped.
+        self.install_not_started = install_not_started
         self.marker_path = DATA_DIR / "install-source.json"
         self.update_root = DATA_DIR / "updates"
         self.log_path = LOG_DIR / f"{APP_SLUG}-update.log"
@@ -166,7 +176,11 @@ class AppUpdater:
 
     def _development_status(self, source: dict[str, Any]) -> dict[str, Any]:
         path = Path(str(source["source_path"]))
-        dirty = bool(self._git(path, "status", "--porcelain", "--untracked-files=normal"))
+        # Xcode rewrites the iPhone project (ios/) whenever it opens it; those local changes are
+        # not part of the Mac app and never block its update (a merge that touches them still fails).
+        dirty = bool(
+            self._git(path, "status", "--porcelain", "--untracked-files=normal", "--", ".", ":(exclude)ios")
+        )
         branch = self._git_optional(path, "symbolic-ref", "--short", "-q", "HEAD")
         head = self._git(path, "rev-parse", "HEAD")
         installed_revision = str(source.get("source_revision") or "")
@@ -372,7 +386,10 @@ class AppUpdater:
                 follow_redirects=True,
             )
             response.raise_for_status()
-            value = response.text.strip().split()[0].casefold()
+            # An empty checksum file raised IndexError ("list index out of range" in the
+            # update status) instead of the message below.
+            fields = response.text.split()
+            value = fields[0].casefold() if fields else ""
             if re.fullmatch(r"[0-9a-f]{64}", value):
                 return value
         raise UpdateError(err("web.updateNoDigest"))
@@ -454,7 +471,11 @@ class AppUpdater:
 
     def _launch_script(self, project: Path, prefix: list[str]) -> None:
         project = project.resolve()
-        script = project.parent / "run-pudge-update.zsh"
+        # In the updater's own folder, never next to a development checkout (a
+        # ~/Downloads/run-pudge-update.zsh stayed there for good); the script
+        # removes itself when it ends.
+        self.update_root.mkdir(parents=True, exist_ok=True)
+        script = self.update_root / f"run-{APP_SLUG}-update.zsh"
         app_path = Path.home() / "Applications" / (APP_NAME + ".app")
         rollback_path = self.update_root / "rollback" / (APP_NAME + ".app.before-update")
         source_pid = os.getpid()
@@ -469,28 +490,47 @@ class AppUpdater:
         ]
         # Only a downloaded release belongs to the updater. A development
         # checkout and rollback data must never be removed by this exit trap.
+        cleanup: list[str] = [f"  /bin/rm -f {shlex.quote(str(script))}"]
         update_root = self.update_root.resolve()
         if project.is_relative_to(update_root):
             relative = project.relative_to(update_root)
             if relative.parts and re.fullmatch(r"v\d+\.\d+\.\d+-.+", relative.parts[0]):
                 downloaded = update_root / relative.parts[0]
-                commands.extend(
-                    [
-                        "cleanup_update_source() {",
-                        "  local result=$?",
-                        f"  /bin/rm -rf {shlex.quote(str(downloaded))}",
-                        "  return $result",
-                        "}",
-                        "trap cleanup_update_source EXIT",
-                    ]
-                )
-        if prefix_line:
-            commands.append(prefix_line)
+                cleanup.append(f"  /bin/rm -rf {shlex.quote(str(downloaded))}")
+        # The app quits as soon as this script starts. A step that failed under
+        # set -e (git merge, the rollback copy) used to end the script there and
+        # the app never came back: now the exit trap logs the step and reopens
+        # the current version once the old process has gone.
         commands.extend(
             [
+                "update_handled=0",
+                "update_step='start'",
+                "finish_update() {",
+                "  local result=$?",
+                "  if (( result != 0 && update_handled == 0 )); then",
+                f"    echo \"Updater error: step '$update_step' failed (exit $result); reopening {APP_NAME}.\" >&2",
+                "    for attempt in {1..300}; do",
+                f"      if ! /bin/kill -0 {source_pid} >/dev/null 2>&1; then break; fi",
+                "      /bin/sleep 0.1",
+                "    done",
+                f"    if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))} --args --pudge-after-update || true; fi",
+                "  fi",
+                *cleanup,
+                "  return $result",
+                "}",
+                "trap finish_update EXIT",
+            ]
+        )
+        if prefix_line:
+            commands.extend([f"update_step={shlex.quote(prefix_line)}", prefix_line])
+        commands.extend(
+            [
+                f"update_step={shlex.quote('cd ' + str(project))}",
                 f"cd {shlex.quote(str(project))}",
+                "update_step='copy of the current app for rollback'",
                 f"rm -rf {shlex.quote(str(rollback_path))}",
                 f"if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/ditto {shlex.quote(str(app_path))} {shlex.quote(str(rollback_path))}; fi",
+                "update_step='waiting for the old app to quit'",
                 f"echo 'Updater: stopping source Pudge PID {source_pid}'",
                 "# Wait for the native quit path to finish cleanup and exit.",
                 "for attempt in {1..300}; do",
@@ -499,30 +539,40 @@ class AppUpdater:
                 "done",
                 f"if /bin/kill -0 {source_pid} >/dev/null 2>&1; then",
                 f"  echo 'Updater error: source Pudge PID {source_pid} has not exited after graceful cleanup; refusing to replace the running app.' >&2",
-                f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))}; fi",
+                "  update_handled=1",
+                f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))} --args --pudge-after-update; fi",
                 "  exit 1",
                 "fi",
+                "update_step='install.sh --update'",
                 "if ! /bin/zsh ./install.sh --update; then",
                 f"  rm -rf {shlex.quote(str(app_path))}",
                 f"  if [[ -d {shlex.quote(str(rollback_path))} ]]; then /bin/mv {shlex.quote(str(rollback_path))} {shlex.quote(str(app_path))}; fi",
-                f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))}; fi",
+                "  update_handled=1",
+                f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))} --args --pudge-after-update; fi",
                 "  exit 1",
                 "fi",
+                "update_step='reopening the updated app'",
                 f"rm -rf {shlex.quote(str(rollback_path))}",
-                f"/usr/bin/open -n {shlex.quote(str(app_path))}",
+                f"/usr/bin/open -n {shlex.quote(str(app_path))} --args --pudge-after-update",
             ]
         )
         script.write_text("\n".join(commands) + "\n", encoding="utf-8")
         os.chmod(script, 0o700)
         if callable(self.before_install):
             self.before_install()
-        installer = subprocess.Popen(
-            ["/bin/zsh", str(script)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        try:
+            installer = subprocess.Popen(
+                ["/bin/zsh", str(script)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except BaseException:
+            script.unlink(missing_ok=True)
+            if callable(self.install_not_started):
+                self.install_not_started()
+            raise
         # The quitting app stops its leftover children; the installer is one of
         # them and must survive that cleanup (it was silently killed before).
         self.installer_pid = int(getattr(installer, "pid", 0) or 0) or None

@@ -175,7 +175,7 @@ def test_asset_server_streams_original_manga_preview_with_revision_cache_headers
     try:
         host, port = server.server_address
         with urllib.request.urlopen(
-            f"http://{host}:{port}/api/covers/manga/9/{revision}", timeout=3
+            f"http://{host}:{port}/k/{api._http_page_key}/api/covers/manga/9/{revision}", timeout=3
         ) as response:
             assert response.read() == raw
             assert response.headers.get_content_type() == "image/jpeg"

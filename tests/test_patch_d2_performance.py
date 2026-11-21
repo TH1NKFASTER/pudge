@@ -331,7 +331,8 @@ def test_asset_server_serves_pages_only_to_its_own_origin(tmp_path):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _asset_handler_for_api(api, web_root))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    service.asset_base = f"http://127.0.0.1:{port}"
+    # The window's asset base carries the per-launch page key.
+    service.asset_base = f"http://127.0.0.1:{port}/k/{api._http_page_key}"
     try:
         path = service.page(book["id"], 0)["url"].split(str(port), 1)[1]
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

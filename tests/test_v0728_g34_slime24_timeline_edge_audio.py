@@ -24,7 +24,6 @@ def _match(center: float, offset: float, *, score: float = 3.0, coverage: float 
         onset_f1=0.9,
         activity_f1=0.9,
         mean_error=0.25,
-        rank_delta=0.01,
         gap_fingerprint=0.8,
         edge_hint_distance=None,
     )

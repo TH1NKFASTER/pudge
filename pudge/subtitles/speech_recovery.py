@@ -12,7 +12,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from ..alignment_guard import _write_exact_srt, validate_alignment_output
+from ..alignment_guard import validate_alignment_output
+from ..subtitle_formats import write_exact_srt
 from ..subtitle_formats import parse_srt
 
 _JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
@@ -22,6 +23,15 @@ def _normalize(text: str) -> str:
     # Multi-language tracks may have a full English translation on another line.
     lines = [line for line in str(text).splitlines() if _JAPANESE.search(line)]
     return "".join(ch for ch in unicodedata.normalize("NFKC", "".join(lines)) if ch.isalnum())
+
+
+def _metric(metrics: dict[str, Any], key: str) -> float:
+    """A segment metric; a missing, non-numeric or non-finite one counts as absent (0)."""
+    try:
+        value = float(metrics.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def recover_constant_speech_clock(
@@ -47,12 +57,12 @@ def recover_constant_speech_clock(
         if not isinstance(segment, dict):
             continue
         metrics = segment.get("metrics") if isinstance(segment.get("metrics"), dict) else segment
-        flags = segment.get("review_flags") or []
+        flags = segment.get("review_flags") if isinstance(segment.get("review_flags"), list) else []
         bad = (
             any(flag in flags for flag in ("possible_repetition", "low_log_probability"))
-            or float(metrics.get("no_speech_prob", 0) or 0) > 0.90
-            or float(metrics.get("avg_logprob", 0) or 0) < -1.0
-            or float(metrics.get("compression_ratio", 0) or 0) > 2.4
+            or _metric(metrics, "no_speech_prob") > 0.90
+            or _metric(metrics, "avg_logprob") < -1.0
+            or _metric(metrics, "compression_ratio") > 2.4
         )
         words = segment.get("words") or []
         if bad or not isinstance(words, list):
@@ -171,7 +181,10 @@ def recover_constant_speech_clock(
     if inlier_fraction < 0.80 or spread > 0.50 or abs(shift) > 30.0:
         meta["reason"] = "speech_clock_not_constant"
         return None, meta
-    if any(start + shift < 0.10 for start, _, _ in cues):
+    # Only lines with Japanese text count: a mark or sign at the very start ("♪", a logo
+    # line at 0-0.1 s) refused the whole recovery for any shift earlier. Such a cue that
+    # would move before 0.1 s starts there instead (as every Pudge writer does).
+    if any(start + shift < 0.10 for start, _, text in cues if _normalize(text)):
         meta["reason"] = "constant_shift_would_clamp_source"
         return None, meta
     key = hashlib.sha256(source.read_bytes() + transcript.read_bytes() + b"speech-constant-v1").hexdigest()[
@@ -179,7 +192,15 @@ def recover_constant_speech_clock(
     ]
     output = cache_dir / "speech-constant" / f"{key}.srt"
     output.parent.mkdir(parents=True, exist_ok=True)
-    _write_exact_srt([(start + shift, end + shift, text) for start, end, text in cues], output)
+    shifted: list[tuple[float, float, str]] = []
+    for start, end, text in cues:
+        moved_start, moved_end = start + shift, end + shift
+        if moved_start < 0.10:
+            if moved_end <= 0.10 + 0.05:
+                continue  # entirely before the video: not shown
+            moved_start = 0.10
+        shifted.append((moved_start, moved_end, text))
+    write_exact_srt(shifted, output)
     guard = validate_alignment_output(source, output)
     meta["alignment_output_guard"] = guard
     if guard.get("status") != "accepted":

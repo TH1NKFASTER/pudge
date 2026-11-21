@@ -22,6 +22,10 @@ def save_playback(
     sequence: int = 0,
     active_total: float = 0,
     ledger: ConsumptionLedger | None = None,
+    sub_delay: float | None = None,
+    subtitle: str | None = None,
+    subtitle_sid: int | None = None,
+    cache_dir: Path | None = None,
 ) -> int:
     import math
 
@@ -31,7 +35,8 @@ def save_playback(
     # Progress, ledger and retry marker commit together across GUI and fallback.
     with db.connection_scope() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        if db.episode_by_path(video) is None:
+        episode = db.episode_by_path(video)
+        if episode is None:
             return 0
         active = active_seconds
         marker = None
@@ -44,13 +49,59 @@ def save_playback(
         (ledger or ConsumptionLedger(db)).record_anime_playback(
             video, position=position, duration=duration, active_seconds=active
         )
+        try:
+            # The part just played, for watched credit summed across devices (iPad + mpv).
+            from .watch_coverage import record_mpv_heartbeat
+
+            record_mpv_heartbeat(db, episode, position=position, duration=duration, active_seconds=active)
+        except Exception as exc:  # noqa: BLE001 - never blocks saving the place
+            print(f"Watch coverage warning: {exc}", file=sys.stderr)
         db.record_playback(video, position, duration, active)
+        if sub_delay is not None:
+            # mpv's z/x delay, kept for the next launch of this same subtitle
+            # (after the sequence check: a late, older save must not undo it).
+            from .subtitle_delay import remember_subtitle_delay
+
+            if not subtitle and subtitle_sid is None:
+                subtitle_sid = getattr(episode, "embedded_subtitle_id", None)
+            remember_subtitle_delay(
+                db,
+                video,
+                sub_delay,
+                subtitle=subtitle or None,
+                embedded_sid=None if subtitle else subtitle_sid,
+                source=_library_subtitle_source(episode, subtitle, subtitle_sid, cache_dir),
+            )
         if marker:
             db.set_state(
                 marker,
                 json.dumps({"sequence": sequence, "total": max(float(previous["total"]), active_total)}),
             )
     return 0
+
+
+def _library_subtitle_source(
+    episode: object, subtitle: str | None, subtitle_sid: int | None, cache_dir: Path | None
+) -> str:
+    """The row's subtitle identity when mpv shows that subtitle (or its cleaned copy), else ""."""
+    from .subtitle_delay import subtitle_identity
+
+    source = getattr(episode, "subtitle_path", None)
+    embedded = getattr(episode, "embedded_subtitle_id", None)
+    if subtitle:
+        if source is None or cache_dir is None:
+            return ""
+        from .subtitle_formats import is_playback_copy_of
+
+        return subtitle_identity(source) if is_playback_copy_of(subtitle, source, cache_dir) else ""
+    if (
+        source is None
+        and embedded is not None
+        and subtitle_sid is not None
+        and int(subtitle_sid) == int(embedded)
+    ):
+        return subtitle_identity(None, embedded)
+    return ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--playback-session", default="")
     p.add_argument("--playback-sequence", type=int, default=0)
     p.add_argument("--playback-active-total", type=float, default=0)
+    p.add_argument("--playback-sub-delay", type=float, default=None)
+    p.add_argument("--playback-subtitle", default="")
+    p.add_argument("--playback-subtitle-sid", type=int, default=None)
     a = p.parse_args(argv)
     try:
         from .restore_guard import database_use
@@ -82,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
                 session=a.playback_session,
                 sequence=a.playback_sequence,
                 active_total=a.playback_active_total,
+                sub_delay=a.playback_sub_delay,
+                subtitle=a.playback_subtitle,
+                subtitle_sid=a.playback_subtitle_sid,
+                cache_dir=cfg.paths.cache_dir,
             )
     except Exception as exc:
         print(f"Playback save warning: {exc}", file=sys.stderr)

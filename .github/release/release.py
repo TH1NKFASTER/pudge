@@ -17,6 +17,8 @@ RELEASE_FILES = (
     "README.md",
     "CHANGELOG.md",
     "uv.lock",
+    # MARKETING_VERSION: the iPhone/iPad app shows Pudge's version (bump_version.py).
+    "ios/Pudge.xcodeproj/project.pbxproj",
 )
 
 
@@ -167,7 +169,7 @@ def validate(python: str) -> None:
 
 
 def commit_if_needed(version: str) -> str:
-    git("add", "--", *RELEASE_FILES)
+    git("add", "--", *[name for name in RELEASE_FILES if (ROOT / name).exists()])
     git("diff", "--cached", "--check")
     ensure_clean_after_stage()
 

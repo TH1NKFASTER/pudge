@@ -9,7 +9,16 @@ public enum FileIntegrity {
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
         var hash = SHA256()
-        while let chunk = try file.read(upToCount: 1024 * 1024), !chunk.isEmpty { hash.update(data: chunk) }
+        // One autorelease pool per chunk: in one long operation the read buffers of a whole
+        // multi-gigabyte episode stayed alive until the end (memory limit, the app was killed).
+        while true {
+            let more: Bool = try autoreleasepool {
+                guard let chunk = try file.read(upToCount: 1024 * 1024), !chunk.isEmpty else { return false }
+                hash.update(data: chunk)
+                return true
+            }
+            if !more { break }
+        }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
         #else
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")

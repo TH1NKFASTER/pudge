@@ -47,8 +47,8 @@ def _manager(tmp_path: Path, monkeypatch, *, total: int = 256 * GB, free: int = 
 def _release(size_bytes: int, info_hash: str = "a" * 40) -> NyaaRelease:
     return NyaaRelease(
         title="[Group] Show - 01 (1080p).mkv",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text="",
         size_bytes=size_bytes,
@@ -221,8 +221,10 @@ def test_manual_download_refuses_to_eat_into_the_reserve(tmp_path, monkeypatch) 
     with pytest.raises(ManagerError) as error:
         manager.add_release(1, _release(5 * GB), episode=1, batch=False, manual=True)
 
-    assert str(error.value) == en("error.manager.notEnoughDiskSpace", free="22.0", reserve="20.0")
-    assert ru("error.manager.notEnoughDiskSpace", free="22.0", reserve="20.0") != str(error.value)
+    # The message also names the download's size and what unfinished downloads take.
+    expected = dict(size="5.0", free="22.0", pending="0.0", reserve="20.0")
+    assert str(error.value) == en("error.manager.notEnoughDiskSpace", **expected)
+    assert ru("error.manager.notEnoughDiskSpace", **expected) != str(error.value)
 
 
 def test_low_free_space_deletes_the_oldest_watched_episodes_under_the_limit(tmp_path, monkeypatch) -> None:
@@ -343,7 +345,7 @@ def test_iphone_staging_and_orphaned_copies_are_cleaned(tmp_path, monkeypatch) -
 
     manager, _, _ = _manager(tmp_path, monkeypatch, free=500 * GB, total=1000 * GB)
     root = manager.config.library.database_path.parent / "iphone"
-    IPhoneService(manager.db, root)
+    service = IPhoneService(manager.db, root)
     stale_transfer = _write(root / "staging" / "old-transfer" / "part", age=4 * DAY).parent
     os.utime(stale_transfer, (time.time() - 4 * DAY,) * 2)
     active_transfer = _write(root / "staging" / "new-transfer" / "part", age=3600).parent
@@ -351,17 +353,28 @@ def test_iphone_staging_and_orphaned_copies_are_cleaned(tmp_path, monkeypatch) -
     live_copy = _write(root / "prepared" / "live-aac-v1.m4a", age=40 * DAY)
     orphan_copy = _write(root / "prepared" / "orphan-aac-v1.m4a", age=40 * DAY)
     old_cover = _write(root / "cover-sources" / "cover", age=100 * DAY)
-    stat = source.stat()
+    # A copy of a current source that nobody downloaded falls under the age/size limits too
+    # (test_fix_iphone_lazy_catalog.py); the one a paired phone downloaded stays.
+    other = _write(tmp_path / "books" / "other.opus", b"other")
+    unused_copy = _write(root / "prepared" / "unused-aac-v1.m4a", age=40 * DAY)
     with manager.db.connect() as conn:
-        conn.execute(
-            "INSERT INTO iphone_prepared(source,size,mtime_ns,result) VALUES(?,?,?,?)",
-            (str(source), stat.st_size, stat.st_mtime_ns, json.dumps({"path": str(live_copy)})),
-        )
+        for book, copy in ((source, live_copy), (other, unused_copy)):
+            stat = book.stat()
+            conn.execute(
+                "INSERT INTO iphone_prepared(source,size,mtime_ns,result) VALUES(?,?,?,?)",
+                (str(book), stat.st_size, stat.st_mtime_ns, json.dumps({"path": str(copy)})),
+            )
+            conn.execute(
+                "INSERT INTO iphone_resources(id,sha,size,path) VALUES(?,?,?,?)",
+                (copy.name, "0" * 64, 1, str(copy)),
+            )
+        conn.execute("INSERT INTO iphone_devices(id,name,token_hash) VALUES('phone','iPhone','x')")
+    service.record_download("phone", live_copy.name)
 
     manager.enforce_derived_caches(force=True)
 
     assert not stale_transfer.exists() and active_transfer.exists()
-    assert live_copy.exists() and not orphan_copy.exists()
+    assert live_copy.exists() and not orphan_copy.exists() and not unused_copy.exists()
     assert not old_cover.exists()
 
 

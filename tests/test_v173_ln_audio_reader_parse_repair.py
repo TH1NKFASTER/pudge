@@ -43,7 +43,7 @@ def test_canonical_reader_parse_retries_degraded_zero_hint_alignment(monkeypatch
     monkeypatch.setattr(
         service,
         "_cached_chapter_start_reading_hints",
-        lambda _book_id: {0: [{"offset_start": 0, "offset_end": 4, "reading": "こだかいおか"}]},
+        lambda _book_id: {0: [{"offset_start": 0, "offset_end": 4, "reading": "しろいすなはま"}]},
     )
     calls = []
     monkeypatch.setattr(

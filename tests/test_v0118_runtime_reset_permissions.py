@@ -256,8 +256,7 @@ def test_import_file_dialogs_open_in_the_home_folder_not_downloads(monkeypatch) 
     dialogs: list[dict] = []
     api.window = SimpleNamespace(create_file_dialog=lambda *_args, **options: dialogs.append(options))
     assert api.choose_light_novel_file() == {"cancelled": True}
-    assert api.choose_manga_file() == {"cancelled": True}
-    assert [options["directory"] for options in dialogs] == [str(Path.home())] * 2
+    assert [options["directory"] for options in dialogs] == [str(Path.home())]
 
 
 # Fast updates keep the native app (and its folder grants): test_install_script.py

@@ -53,17 +53,6 @@ def test_audiobook_state_reads_display_state_and_queues_maintenance_off_call() -
     assert seen.count(False) == 2 and seen.count(True) == 1, "maintenance at most once a minute"
 
 
-def test_visual_novel_windows_are_cached_briefly_and_forced_on_refresh() -> None:
-    api = _api()
-    calls: list[int] = []
-    api.visual_novels = types.SimpleNamespace(windows=lambda: calls.append(1) or [{"id": 7, "label": "VN"}])
-    assert api.visual_novel_windows() == [{"id": 7, "label": "VN"}]
-    api.visual_novel_windows()
-    assert len(calls) == 1
-    api.visual_novel_windows(True)
-    assert len(calls) == 2
-
-
 def test_rapid_tab_switching_starts_one_loader_per_page_and_skips_left_pages(page) -> None:
     # The backend is slow: no Manga/Audiobooks/VN/Statistics state ever arrives.
     result = page.run(
@@ -81,7 +70,7 @@ def test_rapid_tab_switching_starts_one_loader_per_page_and_skips_left_pages(pag
         return {page: ui.page, loads};
         """,
         before="""
-        for (const name of ['manga_state', 'audiobook_state', 'visual_novel_windows', 'visual_novel_state', 'consumption_statistics_query'])
+        for (const name of ['manga_state', 'audiobook_state', 'visual_novel_state', 'consumption_statistics_query'])
           __api[name] = () => new Promise(() => {});
         """,
     )
@@ -94,14 +83,12 @@ def test_rapid_tab_switching_starts_one_loader_per_page_and_skips_left_pages(pag
         for name in (
             "manga_state",
             "audiobook_state",
-            "visual_novel_windows",
             "visual_novel_state",
             "consumption_statistics_query",
         )
     } == {
         "manga_state": 1,
         "audiobook_state": 1,
-        "visual_novel_windows": 0,
         "visual_novel_state": 0,
         "consumption_statistics_query": 1,
     }

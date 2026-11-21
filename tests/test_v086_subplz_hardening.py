@@ -178,8 +178,8 @@ def test_embedded_timing_reference_removes_exact_duplicate_cues(monkeypatch, tmp
             }
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
         Path(command[-1]).write_text(
-            "1\n00:00:00,326 --> 00:00:03,146\nBank of Tatehama\n\n"
-            "2\n00:00:00,326 --> 00:00:03,146\nBank of Tatehama\n\n"
+            "1\n00:00:00,326 --> 00:00:03,146\nBank of Northfield\n\n"
+            "2\n00:00:00,326 --> 00:00:03,146\nBank of Northfield\n\n"
             "3\n00:00:03,146 --> 00:00:04,000\nDialogue\n",
             encoding="utf-8",
         )
@@ -190,7 +190,7 @@ def test_embedded_timing_reference_removes_exact_duplicate_cues(monkeypatch, tmp
 
     assert output is not None
     cues = syncing.parse_srt(output)
-    assert cues == [(0.326, 3.146, "Bank of Tatehama"), (3.146, 4.0, "Dialogue")]
+    assert cues == [(0.326, 3.146, "Bank of Northfield"), (3.146, 4.0, "Dialogue")]
     assert result["duplicate_cues_removed"] == 1
     assert result["cue_count"] == 2
 

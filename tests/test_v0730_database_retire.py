@@ -101,7 +101,7 @@ def test_restore_drains_direct_bridge_writer(tmp_path, monkeypatch):
     restorer = threading.Thread(target=lambda: results.append(api.restore_full_backup()))
     try:
         worker.start()
-        assert entered.wait(2)
+        assert entered.wait(30)
         restorer.start()
         assert not replacing.wait(0.7), "Direct bridge writes bypassed the restore barrier"
         release.set()

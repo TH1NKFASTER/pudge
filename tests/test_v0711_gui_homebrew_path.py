@@ -22,7 +22,7 @@ from t71g00_support import HOMEBREW, SYSTEM_PATH, copy_script, mac_env
 ROOT = Path(__file__).resolve().parents[1]
 LOCATIONS = HOMEBREW
 GUI_PATH = SYSTEM_PATH
-FORMULAS = ("mpv", "ffmpeg", "alass", "sevenzip", "aria2", "python@3.12", "python-tk@3.12")
+FORMULAS = ("mpv", "ffmpeg", "alass", "aria2", "python@3.12")
 ZSH = shutil.which("zsh")
 
 # brew: `list --versions F` succeeds for installed formulas; `install` and `--prefix` work.
@@ -63,7 +63,7 @@ def run_installer(
         pytest.skip("zsh is not installed")
     work = tmp_path / "installer"
     prefix = work / "prefix"
-    tools = ["mpv/bin/mpv", "ffmpeg/bin/ffmpeg", "alass/bin/alass-cli", "sevenzip/bin/7zz"] + (
+    tools = ["mpv/bin/mpv", "ffmpeg/bin/ffmpeg", "alass/bin/alass-cli"] + (
         ["aria2/bin/aria2c"] if aria2c else []
     )
     for tool in tools:
@@ -121,11 +121,12 @@ def test_homebrew_path_is_fixed_before_formula_checks(tmp_path: Path) -> None:
     fixed = f"/opt/homebrew/bin:{GUI_PATH}"
     calls = brew_calls(lines)
     assert calls[:2] == [
-        ("brew list --versions mpv", "/opt/homebrew/bin/brew", fixed),
-        ("brew install mpv", "/opt/homebrew/bin/brew", fixed),
+        ("brew list --versions ffmpeg", "/opt/homebrew/bin/brew", fixed),
+        ("brew install ffmpeg", "/opt/homebrew/bin/brew", fixed),
     ]
+    # mpv is optional (about 1 GB with its dependencies): the first-run guide offers it.
     assert [call for call, _ran, _path in calls if call.startswith("brew install")] == [
-        f"brew install {name}" for name in FORMULAS
+        f"brew install {name}" for name in FORMULAS if name != "mpv"
     ]
     assert all(path == fixed for _call, _ran, path in calls)
     python = [line for line in lines if line.startswith("python3.12 ")]

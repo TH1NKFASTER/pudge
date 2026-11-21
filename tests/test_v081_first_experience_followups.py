@@ -207,7 +207,8 @@ def test_downloads_open_from_the_card_menu_and_from_debug(page) -> None:
     out = result.value
     assert out["menuItem"] == out["expected"]
     assert out["center"]["title"] == f"{out['downloads']} · Show"
-    assert "8 / 3 · Nyaa 22 / 4" in out["center"]["body"]  # live peers, then what Nyaa listed
+    # Live peers, then what the release source listed.
+    assert "8 / 3 · listed 22 / 4" in out["center"]["body"]
     assert result.calls_of("torrent_download_action") == [["abc", "pause", False, "aria2"]]
     assert out["modalAfterClose"] is False
     assert out["debugOpen"] is True and out["debugClosed"] is True

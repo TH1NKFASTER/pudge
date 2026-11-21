@@ -219,8 +219,11 @@ class _SmallApi:
         self.config = SimpleNamespace(tools=SimpleNamespace(manga_mokuro_python=""))
         self.logger = SimpleNamespace(info=lambda *a: None, warning=lambda *a: None)
 
-    def ping(self, value):
+    def get_state(self, value):
         return {"pong": value}
+
+    def set_window(self, window):  # public, but only Python calls it: never exposed
+        raise AssertionError("not reachable from a page")
 
     def _private(self):
         raise AssertionError("never exposed")
@@ -243,8 +246,8 @@ def test_secondary_windows_expose_only_api_methods(monkeypatch):
     assert len(created) == 3
     for window in created:
         assert window.kwargs.get("js_api") is None
-        assert set(window.exposed) == {"ping"}
-        assert window.exposed["ping"]("hi") == {"pong": "hi"}
+        assert set(window.exposed) == {"get_state"}
+        assert window.exposed["get_state"]("hi") == {"pong": "hi"}
 
 
 def test_page_declares_a_policy_without_remote_scripts_or_plugins(page):

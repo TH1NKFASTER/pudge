@@ -93,3 +93,61 @@ def test_parser_crash_falls_back(monkeypatch):
         assert release_episode("[Grp] Show - 07 [1080p].mkv") == 7
     finally:
         rp.parse_release_name.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "[SubsPlease] 2.5-jigen no Ririsa - 05 (1080p) [ABCD1234].mkv",
+        "[Erai-raws] 2.5-jigen no Ririsa - 05 [1080p CR WEB-DL AVC AAC][MultiSub][ABCDEF12]",
+        "[HorribleSubs] 22-7 - 05 [1080p].mkv",
+        "[SubsPlease] Ranma1-2 (2024) - 05 (1080p) [ABCD1234].mkv",
+        "[ASW] Dandadan - 05 [1080p HEVC x265 10Bit][AAC 2.0]",
+        "[Moxie] Dandadan - 05 (1080p WEB HEVC 10-bit Opus 2.0)",
+        "[XYZ] Dandadan - 05 [1080p WEB-DL DD+ 5.1]",
+        "[Kametsu] Dandadan (BD 1080p Hi10 FLAC 2.0) [Batch]",
+    ],
+)
+def test_decimals_pairs_and_audio_channels_are_no_season(title):
+    from pudge.providers.nyaa import _season_number
+
+    assert _season_number(title) is None
+
+
+@pytest.mark.parametrize(
+    "title, season",
+    [
+        ("[Erai-raws] Otomege Sekai wa Mob ni Kibishii Sekai Desu 2 - 05 [1080p]", 2),
+        ("[Erai-raws] Cyberpunk: Edgerunners 2 - 01 [1080p NF WEB-DL AVC EAC3]", 2),
+        ("[SubsPlease] Kono Subarashii Sekai ni Shukufuku wo! 3 - 05 (1080p)", 3),
+        ("[SubsPlease] Kaiju No. 8 - 05 (1080p) [ABCD1234].mkv", 8),
+        ("Youjo Senki II - 03 [1080p]", 2),
+        ("[Grp] Show 2 [1080p]", 2),
+        ("[Grp] Show 2 (2024) - 05", 2),
+    ],
+)
+def test_bare_sequel_numbers_stay_seasons(title, season):
+    from pudge.providers.nyaa import _season_number
+
+    assert _season_number(title) == season
+
+
+def test_decimal_title_is_found_and_auto_downloadable(tmp_path):
+    from test_fix_number_dash_episode_not_pack import make_manager, search
+
+    from pudge.manager_models import LibraryAnime
+
+    ririsa = LibraryAnime(
+        media_id=166216,
+        title="2.5-jigen no Ririsa",
+        titles=["2.5-jigen no Ririsa", "2.5 Dimensional Seduction"],
+        synonyms=["Ririsa"],
+        episodes=24,
+        format="TV",
+        relations=[],
+    )
+    title = "[SubsPlease] 2.5-jigen no Ririsa - 05 (1080p) [ABCD1234].mkv"
+    manager = make_manager(tmp_path)
+    found = search(manager, ririsa, [(title, "1.4 GiB", 300, True)], episode=5)
+    assert [item.title for item in found] == [title]
+    assert manager._release_is_allowed_for_auto(found[0]), found[0].reasons

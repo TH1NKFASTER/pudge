@@ -1,6 +1,6 @@
 # Pudge iPhone — first Xcode verification
 
-The iPhone client currently targets iOS 18 and is verified structurally on non-macOS environments. The first Apple SDK typecheck and Simulator run must be done on a Mac with full Xcode installed.
+The iPhone client currently targets iOS 17 (iPhone and iPad; iPads that stop at iPadOS 17 included) and is verified structurally on non-macOS environments. The first Apple SDK typecheck and Simulator run must be done on a Mac with full Xcode installed.
 
 ## One-command check
 

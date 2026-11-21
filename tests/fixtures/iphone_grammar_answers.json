@@ -1,0 +1,38 @@
+{
+ "_comment": "Answers of media/grammar/... (pudge/iphone_grammar.py) as the phone decodes them (GrammarJob in ios/PudgeCore); tests/test_fix_iphone_grammar_chat.py checks the Mac sends exactly these, GrammarChatTests.swift that the phone reads them.",
+ "explained": {
+  "job": "JOB",
+  "state": "done",
+  "kind": "explain",
+  "explanation": {
+   "translation": "Я люблю кошек.",
+   "points": [
+    {
+     "pattern": "～が好き",
+     "meaning": "нравится",
+     "explanation": "が отмечает объект чувства.",
+     "form": "",
+     "certainty": "high"
+    }
+   ],
+   "partial": false,
+   "summary": "Перевод: Я люблю кошек.\n- ～が好き — нравится"
+  }
+ },
+ "answered": {
+  "job": "JOB",
+  "state": "done",
+  "kind": "ask",
+  "reply": "Потому что **が** отмечает [объект](https://example.com) чувства."
+ },
+ "running": {
+  "job": "JOB",
+  "state": "running"
+ },
+ "failed": {
+  "job": "JOB",
+  "state": "failed",
+  "error": "The LLM on the Mac did not answer. Try again; the reason is in Pudge's log on the Mac.",
+  "detail": ""
+ }
+}

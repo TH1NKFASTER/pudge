@@ -6,6 +6,7 @@ from pudge.config import LLMConfig
 from pudge.llm import OllamaClient
 from pudge.manager import _localize_preparation_detail
 from pudge.syncing import _apply_robust_semantic_activity_gate
+from repository_files import in_repository
 
 
 def _write_srt(path: Path, prefix: str) -> None:
@@ -127,4 +128,4 @@ def test_english_preparation_diagnostics_translate_sync_messages() -> None:
 
 
 def test_handoff_is_not_repo_content() -> None:
-    assert not Path("docs/LLM_HANDOFF.md").exists()
+    assert not in_repository("docs/LLM_HANDOFF.md")

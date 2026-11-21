@@ -177,26 +177,6 @@ class JobCenter:
             )
             conn.execute("UPDATE app_jobs SET updated_at=? WHERE id=?", (now, str(job_id)))
 
-    def resume_candidates(self, *, kind: str = "") -> list[dict[str, Any]]:
-        sql = (
-            "SELECT j.*,c.checkpoint_json FROM app_jobs j "
-            "LEFT JOIN app_job_checkpoints c ON c.job_id=j.id "
-            "WHERE j.resumable=1 AND j.state='queued'"
-        )
-        values: list[Any] = []
-        if kind:
-            sql += " AND j.kind=?"
-            values.append(str(kind))
-        sql += " ORDER BY j.updated_at"
-        with self.db.connect() as conn:
-            rows = conn.execute(sql, values).fetchall()
-        result: list[dict[str, Any]] = []
-        for row in rows:
-            payload = self._payload(row)
-            payload["checkpoint"] = self._decode(row["checkpoint_json"])
-            result.append(payload)
-        return result
-
     def jobs(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             rows = conn.execute(

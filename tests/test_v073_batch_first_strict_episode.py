@@ -37,8 +37,8 @@ def _release(
 ) -> NyaaRelease:
     return NyaaRelease(
         title=title,
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text=f"{size_gib:.1f} GiB",
         size_bytes=int(size_gib * 1024**3),
@@ -285,13 +285,20 @@ def test_planning_auto_download_falls_back_to_episodes_without_batch() -> None:
         @staticmethod
         def search_and_add_best(_media_id: int, **kwargs):
             calls.append((kwargs["episode"], bool(kwargs["batch"])))
-            if kwargs["batch"]:
-                return None
+            return None
+
+        # Episodes are searched first, then started (all or nothing).
+        @staticmethod
+        def release_candidates(_media_id: int, **kwargs):
+            calls.append((kwargs["episode"], bool(kwargs["batch"])))
             episode = int(kwargs["episode"])
-            return _release(
-                f"[Group] Ansatsu Kyoushitsu - {episode:02d} [1080p]",
-                info_hash=f"ep-{episode}",
-            )
+            return [
+                _release(f"[Group] Ansatsu Kyoushitsu - {episode:02d} [1080p]", info_hash=f"ep-{episode}")
+            ]
+
+        @staticmethod
+        def add_release_candidates(_media_id: int, eligible, **_kwargs):
+            return eligible[0]
 
     api = _api_without_init()
     api._run_planning_episode_download(Manager(), ANSATSU, 3)

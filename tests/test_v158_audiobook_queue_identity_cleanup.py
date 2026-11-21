@@ -175,6 +175,7 @@ def test_foreground_marker_drops_reused_pid(monkeypatch: pytest.MonkeyPatch, tmp
     assert not marker.exists()
 
 
+@pytest.mark.real_process_scan
 def test_orphan_player_cleanup_targets_only_dead_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

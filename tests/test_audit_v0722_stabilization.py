@@ -10,15 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from pudge.alignment_replay import evaluate_alignment_trace, replay_file
 from pudge.cache_registry import CachePolicy, CacheRegistry
 from pudge.database import Database, LATEST_SCHEMA_VERSION
 from pudge.diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from pudge.identity import IdentityResolver, MediaIdentity
-from pudge.job_center import JobCenter
 from pudge.manager_models import LibraryAnime
-from pudge.providers.base import CircuitBreaker, TorrentBackend
-from pudge.providers.qbittorrent import QBittorrentClient
+from pudge.providers.base import CircuitBreaker
 from pudge.safe_mode import SafeModeController
 from pudge.task_supervisor import TaskSupervisor
 from pudge.web_app import WebAppApi
@@ -93,20 +90,6 @@ def test_task_supervisor_cancels_owned_worker() -> None:
     assert supervisor.status()[0]["running"] is False
 
 
-def test_resumable_job_keeps_checkpoint_after_interruption(tmp_path: Path) -> None:
-    database = Database(tmp_path / "library.sqlite3")
-    center = JobCenter(database)
-    job_id = center.start("stt", "Transcribe", resumable=True, correlation_id="audio:7")
-    center.update(job_id, state="running", current=4, total=10)
-    center.checkpoint(job_id, {"file": 2})
-
-    recovered = JobCenter(database).resume_candidates(kind="stt")
-
-    assert recovered[0]["id"] == job_id
-    assert recovered[0]["state"] == "queued"
-    assert recovered[0]["checkpoint"] == {"file": 2}
-
-
 def test_locked_media_identity_cannot_be_reassigned(tmp_path: Path) -> None:
     database = Database(tmp_path / "library.sqlite3")
     database.upsert_anime(LibraryAnime(media_id=1, title="One", status="CURRENT"))
@@ -150,42 +133,6 @@ def test_circuit_breaker_opens_and_recovers() -> None:
     assert breaker.allow(now=17) is True
     breaker.success()
     assert breaker.failures == 0
-
-
-def test_alignment_replay_reports_jumps_and_error_percentiles() -> None:
-    metrics = evaluate_alignment_trace(
-        [
-            {"sourceOffset": 0, "renderedOffset": 0},
-            {"sourceOffset": 1, "renderedOffset": 1.2},
-            {"sourceOffset": 2, "renderedOffset": 0.8},
-            {"sourceOffset": 6, "renderedOffset": 6},
-        ]
-    )
-    assert metrics.samples == 4
-    assert metrics.backward_jumps == 1
-    assert metrics.large_forward_jumps == 1
-    assert metrics.maximum_error == 1.2
-
-
-def test_alignment_golden_replay_stays_inside_error_budget() -> None:
-    fixture = Path(__file__).parent / "fixtures" / "alignment_traces" / "silence_transition.json"
-
-    metrics = replay_file(fixture)
-
-    assert metrics.samples == 8
-    assert metrics.median_error <= 0.08
-    assert metrics.p95_error <= 0.15
-    assert metrics.backward_jumps == 0
-    assert metrics.large_forward_jumps == 0
-
-
-def test_qbittorrent_implements_torrent_backend_protocol() -> None:
-    backend = QBittorrentClient("http://127.0.0.1:8080", auto_start_app=False)
-    try:
-        assert isinstance(backend, TorrentBackend)
-        assert backend.backend_name == "qbittorrent"
-    finally:
-        backend.close()
 
 
 def test_debug_bundle_redacts_secrets_and_includes_final_subtitle(tmp_path: Path) -> None:
@@ -313,4 +260,3 @@ def test_ui_snapshot_cache_returns_only_matching_version() -> None:
     cache.store("7", payload)
     assert cache.get("7") is payload
     assert cache.get("8") is None
-    assert cache.delta("7")["changed"] is False

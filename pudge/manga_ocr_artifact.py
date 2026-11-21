@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import hashlib
 import json
 import math
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -265,29 +267,60 @@ def build_artifact(
     }
 
 
+def _legacy_artifact_path(path: Path) -> Path | None:
+    """The uncompressed ``<name>.json`` an older Pudge wrote for ``<name>.json.gz``."""
+    return path.with_name(path.name[: -len(".gz")]) if path.name.endswith(".json.gz") else None
+
+
+def artifact_file(path: Path) -> Path:
+    """The file holding the artifact: ``path``, or the older uncompressed copy while there is no other."""
+    path = Path(path)
+    legacy = _legacy_artifact_path(path)
+    if legacy is not None and not path.exists() and legacy.is_file():
+        return legacy
+    return path
+
+
+def remove_artifact(path: Path) -> None:
+    """Delete the artifact, compressed or the older uncompressed copy."""
+    path = Path(path)
+    path.unlink(missing_ok=True)
+    legacy = _legacy_artifact_path(path)
+    if legacy is not None:
+        legacy.unlink(missing_ok=True)
+
+
 def write_artifact(path: Path, artifact: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(artifact, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if path.name.endswith(".gz"):
+        # A volume's OCR is several MB of JSON (the cache grew to 400 MB); gzip keeps
+        # about a sixth. Level 1: every published page rewrites the whole file.
+        data = gzip.compress(data, compresslevel=1, mtime=0)
     # Every publisher gets a unique staging file.  Shared ``artifact.json.tmp``
     # allowed concurrent writers to delete/replace each other's temporary file.
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
+            mode="wb",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
         ) as temporary:
-            temporary.write(json.dumps(artifact, ensure_ascii=False, separators=(",", ":")))
-            temporary.flush()
+            # Named before writing: a failed write (disk full) used to leave the .tmp behind.
             temporary_path = Path(temporary.name)
+            temporary.write(data)
+            temporary.flush()
         temporary_path.replace(path)
         temporary_path = None
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+    legacy = _legacy_artifact_path(path)
+    if legacy is not None:
+        legacy.unlink(missing_ok=True)
 
 
 def _upgrade_legacy_artifact(payload: dict[str, Any]) -> dict[str, Any]:
@@ -323,8 +356,11 @@ def _upgrade_legacy_artifact(payload: dict[str, Any]) -> dict[str, Any]:
 
 def read_artifact(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        raw = artifact_file(Path(path)).read_bytes()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, TypeError, ValueError, EOFError, zlib.error, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None

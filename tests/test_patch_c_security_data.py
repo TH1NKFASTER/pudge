@@ -57,6 +57,7 @@ class FakeKeychain:
 
 def test_google_fallback_can_be_turned_off(tmp_path, monkeypatch):
     service = _ln(tmp_path)
+    service.save_settings({"google_translate": True})  # Google Translate is opt-in for a new install
     service.config.llm.enabled = True
     monkeypatch.setattr(
         service, "_translate_local_llm", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ollama down"))
@@ -339,16 +340,19 @@ def test_daily_prune_also_removes_debug_jsonl_and_old_migration_backups(tmp_path
     fresh.write_text("{}")
     os.utime(stale, (time.time() - 6 * 86400,) * 2)
     database = Path(manager.config.library.database_path)
+    # Migration copies go after 14 days (they used to stay forever, two kept).
     for index in range(4):
         backup = database.with_name(f"{database.name}.pre-v{index}.backup")
         backup.write_text("x")
-        os.utime(backup, (time.time() - 100 + index,) * 2)
+        os.utime(backup, (time.time() - (17 - 2 * index) * 86400,) * 2)
+    from pudge.backup import make_daily_snapshot
+
+    daily = make_daily_snapshot(database)
     removed = manager.prune_history_if_due()
     assert removed["subtitle_debug_files"] == 1 and fresh.exists() and not stale.exists()
-    assert sorted(path.name for path in database.parent.glob("*.backup")) == [
-        f"{database.name}.pre-v2.backup",
-        f"{database.name}.pre-v3.backup",
-    ]
+    assert sorted(path.name for path in database.parent.glob("*.backup")) == sorted(
+        [daily.name, f"{database.name}.pre-v2.backup", f"{database.name}.pre-v3.backup"]
+    )
     assert manager.prune_history_if_due() == {}  # once a day
 
 

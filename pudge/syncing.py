@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import bisect
 import hashlib
 import io
+import itertools
 import json
 import logging
 import math
+import operator
 import os
 import re
 import shutil
@@ -15,11 +18,13 @@ import time
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from rapidfuzz import fuzz
 
+from . import audio_timeline
 from .branding import APP_SLUG
+from .fsutil import temporary_sibling
 from .cache_management import (
     cleanup_segment_audio_cache,
     mark_segment_audio_active,
@@ -28,9 +33,9 @@ from .cache_management import (
 from .config import SyncConfig
 from .i18n import err
 from .language import TEXT_SUBTITLE_EXTENSIONS
-from .llm import OllamaClient
 from .logging_utils import configure_logging, timed_step
 from .alignment_guard import GUARD_VERSION, stabilize_music_marker_pairs, validate_alignment_output
+from .pipeline_cache import tool_identity_key
 from .models import SubtitleCandidate
 from .reading_audio_alignment import (
     align_light_novel_to_transcript,
@@ -38,10 +43,15 @@ from .reading_audio_alignment import (
     normalize_reading_text,
 )
 from .pgs import build_time_mapper, onset_match_score, onset_times, parse_pgs_cues, retime_sup
-from .subtitle_formats import convert_to_plain_srt, parse_srt, write_srt
+from .subtitle_formats import convert_to_plain_srt, merge_layered_cues, parse_srt, write_exact_srt, write_srt
 from .subtitles.video_segments import choose_edit_boundary, probe_container_edit_points
 from .subtitles.stt import prepare_japanese_stt_reference
 from .subtitles.timeline_alignment import align_subtitle_timelines
+from .subtitles import onset_lead as _onset_lead_module
+from .subtitles import staircase_check as _staircase_check
+
+if TYPE_CHECKING:  # annotations only: importing it pulls in httpx (~0.1 s) for every worker
+    from .llm import OllamaClient
 
 _SCORE_RE = re.compile(r"\bscore:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 _ALASS_SHIFT_RE = re.compile(r"shifted block .*? by\s+([+-]?\d+:\d{2}:\d{2}(?:\.\d+)?)", re.IGNORECASE)
@@ -63,10 +73,36 @@ def _matching_release_crc(video: Path, subtitle: Path) -> str | None:
     return shared[0] if len(shared) == 1 else None
 
 
-def _exact_release_zero_offset_result(video: Path, subtitle: Path, output: Path) -> dict[str, object] | None:
+# A shared CRC only says the subtitle was named after this release: a file timed
+# to another source and renamed so players load it carries the same CRC. The
+# zero offset is taken only when the cues already line up with the embedded track.
+_EXACT_RELEASE_MIN_REFERENCE_ACTIVITY = 0.80
+
+
+def _exact_release_zero_offset_result(
+    video: Path,
+    subtitle: Path,
+    output: Path,
+    timing_reference: Path | None = None,
+) -> dict[str, object] | None:
     crc = _matching_release_crc(video, subtitle)
     if crc is None:
         return None
+    activity_weighted: float | None = None
+    if timing_reference is not None:
+        activity = compare_timing_activity(output, timing_reference)
+        try:
+            activity_weighted = float(activity.get("weighted") or 0.0) if activity.get("available") else 0.0
+        except (TypeError, ValueError):
+            activity_weighted = 0.0
+        if activity_weighted < _EXACT_RELEASE_MIN_REFERENCE_ACTIVITY:
+            configure_logging().info(
+                "SKIP step=subtitle.exact_release_crc video=%s subtitle=%s reason=reference_activity weighted=%.3f",
+                video.name,
+                subtitle.name,
+                activity_weighted,
+            )
+            return None
     return {
         "reason": "exact_release_crc_zero_offset",
         "sync_was_successful": True,
@@ -93,6 +129,7 @@ def _exact_release_zero_offset_result(video: Path, subtitle: Path, output: Path)
             "crc": crc.upper(),
             "video_name": video.name,
             "subtitle_name": subtitle.name,
+            "reference_activity": None if activity_weighted is None else round(activity_weighted, 4),
         },
         "timeline_early_edit_audio_verification": {
             "required": False,
@@ -499,6 +536,400 @@ def _prefer_embedded_timeline_over_conflicting_speech(
     }
 
 
+_LATE_CUT_MIN_SOURCE_SECONDS = 420.0
+_LATE_CUT_MIN_JUMP_SECONDS = 2.0
+_LATE_CUT_WINDOW_SECONDS = 180.0
+_LATE_CUT_CLOCK_TOLERANCE_SECONDS = 1.0
+
+
+def _pair_cues_by_text(
+    first: list[tuple[float, float, str]],
+    second: list[tuple[float, float, str]],
+    *,
+    lookahead: int = 6,
+) -> dict[int, int]:
+    """Pair two timings of one subtitle file (same lines, same order)."""
+    pairs: dict[int, int] = {}
+    position = 0
+    for index, (_start, _end, text) in enumerate(first):
+        key = text.strip()
+        for other in range(position, min(len(second), position + lookahead)):
+            if second[other][2].strip() == key:
+                pairs[index] = other
+                position = other + 1
+                break
+    return pairs
+
+
+def _speech_moves_cold_open_off_a_stable_timeline(
+    timeline_result: dict[str, object],
+    timeline_aligned: Path | None,
+    speech_aligned: Path | None,
+    timing_reference: Path | None,
+) -> tuple[bool, dict[str, object]]:
+    """True when speech carries the cold open across the OP while the same-video timeline
+    keeps one clock for the whole episode and the embedded reference has the cold open's
+    lines on that clock.
+
+    Madougushi Dahlia E02: the subtitle timeline put the whole episode on -1.0 s (22
+    windows); the early-edit check asked Japanese speech, whose ALASS map moved the 16
+    cold-open lines 72 s later, into the OP (its 80 s gap became 7 s) while every later
+    line kept -1.0 s. The English track of the video has the cold open where the timeline
+    put it, not where speech did: there the timeline is kept.
+    """
+    meta: dict[str, object] = {"reason": "not_applicable"}
+    if timeline_aligned is None or speech_aligned is None or timing_reference is None:
+        return False, meta
+    segments = timeline_result.get("timeline_segments")
+    if not isinstance(segments, list) or not segments:
+        return False, meta
+    try:
+        offsets = [float(row.get("offset_seconds")) for row in segments if isinstance(row, dict)]
+        support = sum(max(0, int(row.get("support") or 0)) for row in segments if isinstance(row, dict))
+    except (TypeError, ValueError):
+        return False, meta
+    if not offsets or max(offsets) - min(offsets) > 1.5 or support < 10:
+        meta["reason"] = "timeline_not_one_clock"
+        return False, meta
+    try:
+        timeline = parse_srt(timeline_aligned)
+        speech = parse_srt(speech_aligned)
+        reference = parse_srt(timing_reference)
+    except (OSError, UnicodeError, ValueError):
+        meta["reason"] = "read_error"
+        return False, meta
+    if len(timeline) < 20 or not reference:
+        return False, meta
+    moved, meta = _cold_open_block_moved(timeline, speech, reference, meta)
+    if moved:
+        return True, meta
+    epilogue_moved, epilogue = _speech_moves_epilogue_off_the_reference(timeline, speech, reference)
+    meta["epilogue"] = epilogue
+    if epilogue_moved:
+        meta["reason"] = str(epilogue["reason"])
+        meta["selection_reason"] = "embedded_timeline_over_speech_epilogue_move"
+    return epilogue_moved, meta
+
+
+def _reference_start_coverage(reference: list[tuple[float, float, str]], starts: list[float]) -> float:
+    """Share of ``starts`` with a reference line start within 1 s."""
+    reference_starts = sorted(float(start) for start, _end, _text in reference)
+    hits = 0
+    for value in starts:
+        position = bisect.bisect_left(reference_starts, value)
+        near = [reference_starts[i] for i in (position - 1, position) if 0 <= i < len(reference_starts)]
+        hits += bool(near and min(abs(item - value) for item in near) <= 1.0)
+    return hits / max(1, len(starts))
+
+
+def _speech_moves_epilogue_off_the_reference(
+    timeline: list[tuple[float, float, str]],
+    speech: list[tuple[float, float, str]],
+    reference: list[tuple[float, float, str]],
+) -> tuple[bool, dict[str, object]]:
+    """The cold-open check's mirror for the lines after the ending song.
+
+    Non Non Biyori Nonstop E07: the timeline kept the whole episode on one clock (0.0 s);
+    the speech map kept it too (+0.15 s) except the six epilogue lines after the ED, which it
+    moved 36 s earlier, into the song and before its closing mark. The English track of the
+    video has those lines where the timeline put them. Music-mark-only cues (the ED's
+    ``♪～`` / ``～♪``) do not end the gap before the epilogue.
+    """
+    from .subtitles.timeline_alignment import _music_mark_only
+
+    meta: dict[str, object] = {"reason": "not_applicable"}
+    spoken = [index for index, cue in enumerate(timeline) if not _music_mark_only(str(cue[2]))]
+    if len(spoken) < 20:
+        return False, meta
+    last_end = float(timeline[spoken[-1]][1])
+    split = next(
+        (
+            position
+            # From three lines before the end: a line or two after a later gap (the next
+            # episode's title after its preview) hid the gap of the ending song.
+            for position in range(len(spoken) - 3, 0, -1)
+            if float(timeline[spoken[position]][0]) - float(timeline[spoken[position - 1]][1]) >= 45.0
+            and last_end - float(timeline[spoken[position]][0]) <= 300.0
+        ),
+        None,
+    )
+    if split is None or len(spoken) - split < 3:
+        meta["reason"] = "no_epilogue_after_a_long_gap"
+        return False, meta
+    pairs = _pair_cues_by_text(timeline, speech)
+    tail = [index for index in spoken[split:] if index in pairs]
+    body = [index for index in spoken[max(0, split - 40) : split] if index in pairs]
+    if len(tail) < 3 or len(body) < 10:
+        meta["reason"] = "too_few_paired_lines"
+        return False, meta
+    tail_delta = float(statistics.median(float(speech[pairs[i]][0]) - float(timeline[i][0]) for i in tail))
+    body_delta = float(statistics.median(float(speech[pairs[i]][0]) - float(timeline[i][0]) for i in body))
+    meta.update(
+        {
+            "epilogue_lines": len(spoken) - split,
+            "speech_epilogue_delta_seconds": round(tail_delta, 3),
+            "speech_body_delta_seconds": round(body_delta, 3),
+        }
+    )
+    if abs(body_delta) > 3.0 or abs(tail_delta - body_delta) < 20.0:
+        meta["reason"] = "speech_keeps_the_epilogue_clock"
+        return False, meta
+    timeline_cover = _reference_start_coverage(reference, [float(timeline[i][0]) for i in tail])
+    speech_cover = _reference_start_coverage(reference, [float(speech[pairs[i]][0]) for i in tail])
+    meta.update(
+        {
+            "timeline_reference_coverage": round(timeline_cover, 4),
+            "speech_reference_coverage": round(speech_cover, 4),
+        }
+    )
+    contradicted = timeline_cover >= 0.5 and timeline_cover >= speech_cover + 0.3
+    meta["reason"] = (
+        "speech_moved_epilogue_off_the_reference" if contradicted else "reference_does_not_decide"
+    )
+    return contradicted, meta
+
+
+def _cold_open_block_moved(
+    timeline: list[tuple[float, float, str]],
+    speech: list[tuple[float, float, str]],
+    reference: list[tuple[float, float, str]],
+    meta: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    from .subtitles.timeline_alignment import _music_mark_only
+
+    # Music-mark-only cues (the opening's ``♪～``) do not end or fill the gap after the cold
+    # open, as in the epilogue check: a mark over the song hid the gap and the check.
+    spoken = [index for index, cue in enumerate(timeline) if not _music_mark_only(str(cue[2]))]
+    if len(spoken) < 2:
+        meta["reason"] = "no_cold_open_before_a_long_gap"
+        return False, meta
+    first = float(timeline[spoken[0]][0])
+    split = next(
+        (
+            position
+            for position in range(1, len(spoken))
+            if float(timeline[spoken[position]][0]) - float(timeline[spoken[position - 1]][1]) >= 45.0
+            and float(timeline[spoken[position - 1]][1]) - first <= 300.0
+        ),
+        None,
+    )
+    if split is None or split < 3:
+        meta["reason"] = "no_cold_open_before_a_long_gap"
+        return False, meta
+    pairs = _pair_cues_by_text(timeline, speech)
+    cold_lines = [i for i in spoken[:split] if i in pairs]
+    cold = [(float(speech[pairs[i]][0]) - float(timeline[i][0])) for i in cold_lines]
+    post = [
+        (float(speech[pairs[i]][0]) - float(timeline[i][0])) for i in spoken[split : split + 40] if i in pairs
+    ]
+    if len(cold) < 3 or len(post) < 10:
+        meta["reason"] = "too_few_paired_lines"
+        return False, meta
+    cold_delta = float(statistics.median(cold))
+    post_delta = float(statistics.median(post))
+    meta.update(
+        {
+            "cold_open_lines": split,
+            "speech_cold_open_delta_seconds": round(cold_delta, 3),
+            "speech_post_opening_delta_seconds": round(post_delta, 3),
+        }
+    )
+    if abs(post_delta) > 3.0 or abs(cold_delta - post_delta) < 20.0:
+        meta["reason"] = "speech_keeps_the_cold_open_clock"
+        return False, meta
+    reference_starts = sorted(float(start) for start, _end, _text in reference)
+
+    def coverage(starts: list[float]) -> float:
+        hits = 0
+        for value in starts:
+            position = bisect.bisect_left(reference_starts, value)
+            near = [reference_starts[i] for i in (position - 1, position) if 0 <= i < len(reference_starts)]
+            hits += bool(near and min(abs(item - value) for item in near) <= 1.0)
+        return hits / max(1, len(starts))
+
+    timeline_cover = coverage([float(timeline[i][0]) for i in cold_lines])
+    speech_cover = coverage([float(speech[pairs[i]][0]) for i in cold_lines])
+    meta.update(
+        {
+            "timeline_reference_coverage": round(timeline_cover, 4),
+            "speech_reference_coverage": round(speech_cover, 4),
+        }
+    )
+    contradicted = timeline_cover >= 0.5 and timeline_cover >= speech_cover + 0.3
+    meta["reason"] = (
+        "speech_moved_cold_open_off_the_reference" if contradicted else "reference_does_not_decide"
+    )
+    if contradicted:
+        meta["selection_reason"] = "embedded_timeline_over_speech_cold_open_move"
+    return contradicted, meta
+
+
+def _keep_late_timeline_cut_after_speech(
+    speech_aligned: Path,
+    timeline_aligned: Path,
+    timeline_result: dict[str, object],
+    timing_reference: Path,
+    cache_dir: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Keep a late cut the subtitle timeline found and the accepted speech map lacks.
+
+    FX Senshi Kurumi-chan E03: the early-edit check asked Japanese speech about the cold
+    open and accepted its map (0 s before the OP, -4.67 s after it) for the whole
+    episode. The timeline against the embedded subtitles of the same video also had a
+    cut at 17:02 (source 1022.5 s, -5.0 s -> +1.5 s) which the constant speech map does
+    not have: every line after it came 6 s early. Speech keeps the part it was asked
+    about; from the late cut on the timeline's clock is used, when speech agreed with the
+    timeline right before the cut, kept that clock after it, the later clock has its own
+    support, and the result fits the reference better than speech alone.
+    """
+    if speech_aligned.parent.name == "stt-timeline-late-cut":
+        return speech_aligned, {"applied": False, "reason": "already_applied"}
+    boundaries = timeline_result.get("timeline_boundaries")
+    segments = timeline_result.get("timeline_segments")
+    if not isinstance(boundaries, list) or not isinstance(segments, list):
+        return speech_aligned, {"applied": False, "reason": "timeline_metrics_unavailable"}
+    late: list[tuple[float, float, float]] = []
+    for row in boundaries:
+        if not isinstance(row, dict):
+            continue
+        try:
+            source_time = float(row["source_time"])
+            left = float(row["left_offset_seconds"])
+            right = float(row["right_offset_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if source_time >= _LATE_CUT_MIN_SOURCE_SECONDS and abs(right - left) >= _LATE_CUT_MIN_JUMP_SECONDS:
+            late.append((source_time, left, right))
+    if not late:
+        return speech_aligned, {"applied": False, "reason": "no_late_timeline_cut"}
+    boundary, left_offset, right_offset = min(late)
+    jump = right_offset - left_offset
+    meta: dict[str, object] = {
+        "boundary_source_time": round(boundary, 3),
+        "left_offset_seconds": round(left_offset, 3),
+        "right_offset_seconds": round(right_offset, 3),
+        "jump_seconds": round(jump, 3),
+    }
+    later = next(
+        (
+            row
+            for row in segments
+            if isinstance(row, dict)
+            and row.get("source_start") is not None
+            and abs(float(row.get("source_start") or 0.0) - boundary) <= 0.75
+        ),
+        None,
+    )
+    try:
+        later_support = int((later or {}).get("support") or 0)
+        later_coverage = float((later or {}).get("mean_coverage") or 0.0)
+    except (TypeError, ValueError):
+        later_support, later_coverage = 0, 0.0
+    meta.update({"later_clock_support": later_support, "later_clock_coverage": round(later_coverage, 4)})
+    if later_support < 3 or later_coverage < 0.7:
+        return speech_aligned, {**meta, "applied": False, "reason": "later_clock_weak"}
+
+    try:
+        speech = parse_srt(speech_aligned)
+        timeline = parse_srt(timeline_aligned)
+    except OSError:
+        return speech_aligned, {**meta, "applied": False, "reason": "read_error"}
+    pairs = _pair_cues_by_text(speech, timeline)
+    if not speech or len(pairs) < 0.8 * min(len(speech), len(timeline)):
+        return speech_aligned, {**meta, "applied": False, "reason": "lines_do_not_pair"}
+
+    # Timeline output before ``boundary + min`` can only come from the earlier clock,
+    # after ``boundary + max`` only from the later one.
+    surely_left = boundary + min(left_offset, right_offset)
+    surely_right = boundary + max(left_offset, right_offset)
+    before = [
+        timeline[other][0] - speech[index][0]
+        for index, other in pairs.items()
+        if surely_left - _LATE_CUT_WINDOW_SECONDS <= timeline[other][0] < surely_left
+    ]
+    after = [
+        timeline[other][0] - speech[index][0]
+        for index, other in pairs.items()
+        if surely_right <= timeline[other][0] < surely_right + _LATE_CUT_WINDOW_SECONDS
+    ]
+    if len(before) < 3 or len(after) < 3:
+        return speech_aligned, {**meta, "applied": False, "reason": "too_few_lines_near_cut"}
+    difference_before = statistics.median(before)
+    difference_after = statistics.median(after)
+    meta.update(
+        {
+            "timeline_minus_speech_before_seconds": round(difference_before, 3),
+            "timeline_minus_speech_after_seconds": round(difference_after, 3),
+        }
+    )
+    if abs(difference_before) > _LATE_CUT_CLOCK_TOLERANCE_SECONDS:
+        return speech_aligned, {**meta, "applied": False, "reason": "speech_disagrees_before_cut"}
+    if abs(difference_after - difference_before) <= _LATE_CUT_CLOCK_TOLERANCE_SECONDS:
+        return speech_aligned, {**meta, "applied": False, "reason": "speech_has_the_cut"}
+    if abs(difference_after - (difference_before + jump)) > _LATE_CUT_CLOCK_TOLERANCE_SECONDS:
+        return speech_aligned, {**meta, "applied": False, "reason": "speech_clock_unclear_after_cut"}
+
+    first_after: int | None = None
+    for index in sorted(pairs):
+        start = timeline[pairs[index]][0]
+        if start < surely_left:
+            continue
+        difference = start - speech[index][0]
+        if start >= surely_right or abs(difference - (difference_before + jump)) < abs(
+            difference - difference_before
+        ):
+            first_after = index
+            break
+    if first_after is None or first_after == 0:
+        return speech_aligned, {**meta, "applied": False, "reason": "cut_not_located"}
+
+    output: list[tuple[float, float, str]] = list(speech[:first_after])
+    shift = difference_before + jump
+    for index in range(first_after, len(speech)):
+        start, end, text = speech[index]
+        other = pairs.get(index)
+        if other is not None:
+            shift = timeline[other][0] - start
+            output.append((timeline[other][0], timeline[other][1], text))
+        else:
+            output.append((start + shift, end + shift, text))
+    previous_start, previous_end, previous_text = output[first_after - 1]
+    cut_start = output[first_after][0]
+    if cut_start <= previous_start + 0.3:
+        return speech_aligned, {**meta, "applied": False, "reason": "cut_reorders_lines"}
+    if previous_end > cut_start:
+        output[first_after - 1] = (previous_start, max(previous_start + 0.3, cut_start - 0.05), previous_text)
+
+    digest = hashlib.sha1(
+        f"{speech_aligned}|{timeline_aligned}|{boundary:.3f}|late-cut-1".encode("utf-8")
+    ).hexdigest()[:20]
+    target = Path(cache_dir) / "stt-timeline-late-cut" / f"{digest}.srt"
+    write_srt(output, target, preserve_order=True)
+    speech_activity = compare_timing_activity(speech_aligned, timing_reference)
+    spliced_activity = compare_timing_activity(target, timing_reference)
+    try:
+        speech_full = float(speech_activity.get("full") or 0.0)
+        spliced_full = float(spliced_activity.get("full") or 0.0)
+        speech_weighted = float(speech_activity.get("weighted") or 0.0)
+        spliced_weighted = float(spliced_activity.get("weighted") or 0.0)
+    except (TypeError, ValueError):
+        speech_full = spliced_full = speech_weighted = spliced_weighted = 0.0
+    meta.update(
+        {
+            "cut_output_time": round(cut_start, 3),
+            "lines_after_cut": len(speech) - first_after,
+            "speech_activity_full": round(speech_full, 4),
+            "spliced_activity_full": round(spliced_full, 4),
+            "speech_activity_weighted": round(speech_weighted, 4),
+            "spliced_activity_weighted": round(spliced_weighted, 4),
+        }
+    )
+    if spliced_full <= speech_full or spliced_weighted < speech_weighted - 0.005:
+        target.unlink(missing_ok=True)
+        return speech_aligned, {**meta, "applied": False, "reason": "reference_prefers_speech"}
+    return target, {**meta, "applied": True, "reason": "late_timeline_cut_kept", "output": str(target)}
+
+
 def _record_timeline_debug_attempt(
     cache_dir: Path,
     video: Path,
@@ -851,7 +1282,10 @@ def _onset_candidate_shifts(
     """Find shift hypotheses from dense peaks of pairwise onset differences."""
     bins: dict[int, int] = {}
     for source_time in source_starts:
-        for reference_time in reference_starts:
+        # The (sorted) onsets more than ``limit`` + 1 s before this one would only be skipped
+        # below: start after them (the same pairs in the same order, not every pair per onset).
+        first = bisect.bisect_left(reference_starts, source_time - limit - 1.0)
+        for reference_time in itertools.islice(reference_starts, first, None):
             shift = reference_time - source_time
             if shift < -limit:
                 continue
@@ -902,25 +1336,17 @@ def _activity_correlation_for_shift(
             right = max(left + 1, min(count, int(end / step) + 1))
             diff[left] += 1
             diff[right] -= 1
-        active = 0
-        result: list[bool] = []
-        for index in range(count):
-            active += diff[index]
-            result.append(active > 0)
-        return result
+        # Running sum in C (itertools.accumulate): the same integers as the old loop.
+        return [active > 0 for active in itertools.accumulate(diff[:count])]
 
     source_mask = mask(shifted)
     reference_mask = mask(reference_cues)
-    n11 = n10 = n01 = n00 = 0
-    for source_active, reference_active in zip(source_mask, reference_mask):
-        if source_active and reference_active:
-            n11 += 1
-        elif source_active:
-            n10 += 1
-        elif reference_active:
-            n01 += 1
-        else:
-            n00 += 1
+    # The same four integer counts as the old per-bin if/elif loop (both masks have
+    # ``count`` bins), counted in C: this runs hundreds of times per alignment window.
+    n11 = sum(map(operator.and_, source_mask, reference_mask))
+    n10 = sum(source_mask) - n11
+    n01 = sum(reference_mask) - n11
+    n00 = count - n11 - n10 - n01
     denominator = ((n11 + n10) * (n11 + n01) * (n00 + n10) * (n00 + n01)) ** 0.5
     if denominator <= 0.0:
         return 0.0
@@ -1260,23 +1686,6 @@ def estimate_constant_subtitle_offsets(
     return selected or [{"available": False, "reason": "no_candidates"}]
 
 
-def estimate_constant_subtitle_offset(
-    source: Path,
-    reference: Path,
-    *,
-    max_offset_seconds: float = 120.0,
-    onset_tolerance_seconds: float = 0.45,
-) -> dict[str, object]:
-    """Backward-compatible best-candidate wrapper."""
-    return estimate_constant_subtitle_offsets(
-        source,
-        reference,
-        max_offset_seconds=max_offset_seconds,
-        onset_tolerance_seconds=onset_tolerance_seconds,
-        maximum_results=1,
-    )[0]
-
-
 def _shift_subtitle_for_semantic_validation(
     source: Path,
     cache_dir: Path,
@@ -1320,10 +1729,23 @@ def _write_metadata(output: Path, result: dict[str, object]) -> None:
         for key, value in result.items()
         if isinstance(value, (str, int, float, bool)) or value is None
     }
-    _metadata_path(output).write_text(
-        json.dumps(serializable, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # Atomic: a half-written file read by another candidate worker parsed as "{}".
+    target = _metadata_path(output)
+    temporary = temporary_sibling(target)
+    try:
+        temporary.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _file_key(path: Path) -> str:
+    """Identity of a file for a cache key: where it is, its size and modification time."""
+    try:
+        stat = path.stat()
+        return f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        return str(path)
 
 
 def _read_metadata(output: Path) -> dict[str, object]:
@@ -1383,7 +1805,13 @@ def prepare_speech_reference(
 ) -> tuple[Path | None, dict[str, object]]:
     """Extract VAD speech once and reuse it for every subtitle candidate."""
     video_stat = video.stat()
+    audio_stream = _ffsubsync_audio_stream(video, ffmpeg_path, config.vad)
     raw = f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:{config.vad}:{ffmpeg_path or ''}"
+    if audio_stream:
+        raw += f":audio={audio_stream}"
+    delay = _ffsubsync_audio_delay(video, ffmpeg_path, audio_stream)
+    if delay:
+        raw += f":playback-delay={delay:.3f}"
     digest = hashlib.sha1(raw.encode()).hexdigest()[:20]
     output_dir = cache_dir / "speech"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1402,6 +1830,8 @@ def prepare_speech_reference(
     arguments = [str(video)]
     if config.vad and config.vad != "default":
         arguments.extend(["--vad", config.vad])
+    if audio_stream:
+        arguments.extend(["--reference-stream", audio_stream])
     if ffmpeg_path:
         resolved = shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path
         if resolved:
@@ -1411,8 +1841,40 @@ def prepare_speech_reference(
     try:
         args = ffsubsync_impl.make_parser().parse_args(arguments)
         reference_pipe = ffsubsync_impl.make_reference_pipe(args)
+        watched = _watch_embedded_subtitle_reference(reference_pipe)
         reference_pipe.fit(str(video))
-        np.savez_compressed(output, speech=reference_pipe.transform(str(video)))
+        speech = reference_pipe.transform(str(video))
+        if delay:
+            if watched is not None:
+                from_subtitles = bool(watched["used"])
+            else:  # an ffsubsync whose speech step is unknown: predict its choice
+                detector = str(config.vad or "").strip().casefold()
+                from_subtitles = (
+                    (not detector or detector == "default" or "subs" in detector)
+                    and audio_stream is None
+                    and _has_embedded_text_subtitle(video, ffmpeg_path)
+                )
+            if not from_subtitles:
+                # Speech from the decoded track starts at its first sample; an
+                # embedded subtitle track is already on the playback timeline.
+                step = watched["step"] if watched is not None else None
+                rate = float(getattr(step, "sample_rate", 100) or 100)
+                # ffsubsync 0.4.32 keeps it as ``_non_speech_label``.
+                label = getattr(step, "_non_speech_label", getattr(step, "non_speech_label", 0.0))
+                label = float(label or 0.0)
+                values = np.asarray(speech)
+                pad = np.full(int(round(delay * rate)), label, dtype=values.dtype if values.size else float)
+                speech = np.concatenate([pad, values.reshape(-1)])
+        # Written beside and published atomically: a run cut off mid-write (a quit, a
+        # killed candidate worker) left a truncated .npz that every later run took as
+        # the cached speech (ffsubsync then failed on it until a forced rebuild).
+        staged = temporary_sibling(output, ".npz")
+        try:
+            with staged.open("wb") as handle:
+                np.savez_compressed(handle, speech=speech)
+            os.replace(staged, output)
+        finally:
+            staged.unlink(missing_ok=True)
     except (Exception, SystemExit) as exc:
         output.unlink(missing_ok=True)
         return None, _result(
@@ -1422,7 +1884,41 @@ def prepare_speech_reference(
         )
     finally:
         speech_logger.removeFilter(_SPEECH_PROBE_FILTER)
+    if delay:
+        return output, _result("applied", output=str(output), audio_start_offset_seconds=delay)
     return output, _result("applied", output=str(output))
+
+
+def _watch_embedded_subtitle_reference(pipe: object) -> dict[str, object] | None:
+    """Notice whether ffsubsync's speech step took an embedded subtitle track.
+
+    ffsubsync tries the video's text subtitles first (``subs_then_*`` without an
+    audio ``--reference-stream``) and decodes the audio only when that fails.
+    None when the pipeline has no such step (another ffsubsync version).
+    """
+    for item in getattr(pipe, "steps", None) or []:
+        step = item[1] if isinstance(item, tuple) and len(item) == 2 else item
+        method = getattr(step, "try_fit_using_embedded_subs", None)
+        if not callable(method):
+            continue
+        state: dict[str, object] = {"used": False, "step": step}
+
+        def wrapped(*args: object, _method=method, _state=state, **kwargs: object) -> object:
+            value = _method(*args, **kwargs)
+            _state["used"] = True
+            return value
+
+        try:
+            setattr(step, "try_fit_using_embedded_subs", wrapped)
+        except (AttributeError, TypeError):
+            return None
+        return state
+    return None
+
+
+# ffsubsync outputs written (or handed back by a candidate worker) in this
+# process: already fresh for a forced re-preparation.
+_SYNC_OUTPUTS_FROM_THIS_PROCESS: set[str] = set()
 
 
 def synchronize_subtitle(
@@ -1446,8 +1942,38 @@ def synchronize_subtitle(
 
     output_dir = cache_dir / "synced"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{_fingerprint(video, subtitle, config, tag=tag)}{subtitle.suffix.casefold()}"
-    if force:
+    # The candidate check and the later full ffsubsync step of the same
+    # candidate run ffsubsync with identical arguments; engine/compare_engines
+    # do not reach ffsubsync. One cache entry serves both.
+    key_tag = "ffsubsync" if tag == "candidate-eval" else tag
+    key_config = (
+        replace(config, engine="ffsubsync", compare_engines=False) if key_tag == "ffsubsync" else config
+    )
+    audio_stream = _ffsubsync_audio_stream(video, ffmpeg_path, config.vad) if reference is None else None
+    if audio_stream:
+        key_tag = f"{key_tag}:audio={audio_stream}"
+    # A track that starts after the file start: ffsubsync would decode it from its
+    # first sample (early by the delay). The shared speech file is padded onto the
+    # playback timeline instead; results made before that are not reused.
+    delay = 0.0
+    timeline = _media_timeline(video, ffmpeg_path)
+    if timeline is not None and timeline.max_delay():
+        delay = _ffsubsync_audio_delay(
+            video,
+            ffmpeg_path,
+            audio_stream if reference is None else _ffsubsync_audio_stream(video, ffmpeg_path, config.vad),
+        )
+    if delay:
+        key_tag = f"{key_tag}:playback-delay={delay:.3f}"
+    if reference is not None:
+        # Aligned against this reference (a transcript, a speech file): another version of it
+        # is another result, not the cached one.
+        key_tag = f"{key_tag}:reference={_file_key(Path(reference))}"
+    output = (
+        output_dir / f"{_fingerprint(video, subtitle, key_config, tag=key_tag)}{subtitle.suffix.casefold()}"
+    )
+    # A forced re-run recomputes each output once, not once per caller.
+    if force and str(output) not in _SYNC_OUTPUTS_FROM_THIS_PROCESS:
         output.unlink(missing_ok=True)
         _metadata_path(output).unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
@@ -1469,17 +1995,39 @@ def synchronize_subtitle(
     except ImportError:
         return subtitle, _result("ffsubsync_missing", sync_was_successful=False)
 
+    if delay and reference is None:
+        speech, speech_result = prepare_speech_reference(
+            video, cache_dir, config, ffmpeg_path=ffmpeg_path, verbose=verbose
+        )
+        if speech is None:
+            # ffsubsync on the video itself would be early by the delay: no result
+            # rather than an unpadded one kept under the padded result's name.
+            return subtitle, _result(
+                "speech_reference_unavailable",
+                sync_was_successful=False,
+                audio_start_offset_seconds=delay,
+                speech_reference=speech_result,
+            )
+        reference = speech
+        audio_stream = None
+
+    # ffsubsync writes a temporary sibling (same suffix: it picks the format by it); the result
+    # is published only after the checks below, metadata first. A reader in another candidate
+    # worker took a half-written output for a cached success without its offset and score.
+    written = output.with_name(f".{output.stem}.{os.getpid()}-{time.monotonic_ns():x}{output.suffix}")
     arguments = [
         str(reference or video),
         "-i",
         str(subtitle),
         "-o",
-        str(output),
+        str(written),
         "--max-offset-seconds",
         str(config.max_offset_seconds),
     ]
     if reference is None and config.vad and config.vad != "default":
         arguments.extend(["--vad", config.vad])
+    if audio_stream:
+        arguments.extend(["--reference-stream", audio_stream])
     if not config.fix_framerate:
         arguments.append("--no-fix-framerate")
     if config.gss:
@@ -1522,7 +2070,7 @@ def synchronize_subtitle(
             parsed = ffsubsync_impl.make_parser().parse_args(arguments)
             result = dict(ffsubsync_impl.run(parsed))
     except (Exception, SystemExit) as exc:  # argparse reports failures through SystemExit
-        output.unlink(missing_ok=True)
+        written.unlink(missing_ok=True)
         return subtitle, _result(
             "ffsubsync_error",
             sync_was_successful=False,
@@ -1550,17 +2098,18 @@ def synchronize_subtitle(
         offset = None
 
     if not successful:
-        output.unlink(missing_ok=True)
+        written.unlink(missing_ok=True)
         result["reason"] = "alignment_failed"
         return subtitle, result
 
-    if not output.exists() or output.stat().st_size == 0:
+    if not written.exists() or written.stat().st_size == 0:
+        written.unlink(missing_ok=True)
         result["reason"] = "output_missing"
         result["sync_was_successful"] = False
         return subtitle, result
 
     if config.skip_on_low_quality and offset is not None and abs(offset) > config.quality_max_offset_seconds:
-        output.unlink(missing_ok=True)
+        written.unlink(missing_ok=True)
         result["reason"] = "quality_offset_exceeded"
         result["sync_was_successful"] = False
         result["quality_max_offset_seconds"] = config.quality_max_offset_seconds
@@ -1568,7 +2117,23 @@ def synchronize_subtitle(
 
     result["reason"] = "applied"
     result["output"] = str(output)
-    _write_metadata(output, result)
+    if delay:
+        result["audio_start_offset_seconds"] = delay
+    try:
+        _write_metadata(output, result)
+        os.replace(written, output)
+    except OSError as exc:
+        # A failed publish (a full disk): this engine has no result, the others go on.
+        _metadata_path(output).unlink(missing_ok=True)
+        result["reason"] = "output_missing"
+        result["sync_was_successful"] = False
+        result["error"] = str(exc)
+        result.pop("output", None)
+        return subtitle, result
+    finally:
+        # A failed publish leaves no hidden copy behind.
+        written.unlink(missing_ok=True)
+    _SYNC_OUTPUTS_FROM_THIS_PROCESS.add(str(output))
     return output, result
 
 
@@ -1636,9 +2201,37 @@ def synchronize_with_alass(
     if output_suffix not in {".srt", ".ass", ".ssa"}:
         output_suffix = source_suffix
 
+    # ALASS decodes a media reference itself into raw PCM, from the track's first
+    # sample: a track that starts after the file start would be early by that
+    # delay. When any track of the file starts late (ALASS's own choice of track
+    # may be that one), it reads the whole-track FLAC of Pudge's track instead,
+    # padded onto the playback timeline (audio_timeline).
+    use_playback_audio = False
+    reference_delay = 0.0
+    reference_audio_stream: str | None = None
+    # A gap inside the track (a remux seam) collapses the same way: everything after
+    # it would be early by the gap, so such a file is read from that FLAC too.
+    reference_timeline = _media_timeline(video, ffmpeg_path) if not reference_is_subtitle else None
+    reference_gaps: tuple[tuple[float, float], ...] | None = None
+    if reference_timeline is not None:
+        reference_audio_stream = _japanese_audio_stream_spec(video, ffmpeg_path)
+        reference_gaps = _segment_audio_gaps(video, ffmpeg_path, reference_audio_stream)
+        if reference_timeline.max_delay() or reference_gaps:
+            use_playback_audio = True
+            reference_delay = _segment_audio_delay(video, ffmpeg_path, reference_audio_stream)
+    alass_tag = ("alass-direct-v3-fixed-fps" if reference_is_subtitle else "alass-direct-v2") + (
+        f":playback-audio={reference_audio_stream or '0:a:0'}={reference_delay:.3f}"
+        + audio_timeline.gaps_marker(reference_gaps)
+        if use_playback_audio
+        else ""
+    )
+    # Another ALASS build (an upgrade, a different binary configured) maps differently:
+    # its results are not the cached ones.
+    alass_tag += ":binary=" + tool_identity_key(binary)
+
     output_dir = cache_dir / "alass"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{_fingerprint(video, subtitle, config, tag='alass-direct-v2')}{output_suffix}"
+    output = output_dir / f"{_fingerprint(video, subtitle, config, tag=alass_tag)}{output_suffix}"
     if force:
         output.unlink(missing_ok=True)
         _metadata_path(output).unlink(missing_ok=True)
@@ -1666,6 +2259,29 @@ def synchronize_with_alass(
             },
         )
 
+    if use_playback_audio:
+        playback_audio, playback_error = _playback_audio(
+            video,
+            cache_dir,
+            ffmpeg_path=ffmpeg_path,
+            audio_stream=reference_audio_stream,
+            delay=reference_delay,
+        )
+        if playback_audio is None:
+            return subtitle, _result(
+                "alass_prepare_error",
+                sync_was_successful=False,
+                error=str(playback_error or "ffmpeg_audio_extract_failed"),
+                reference_kind="media",
+            )
+        reference_input = playback_audio
+    elif not reference_is_subtitle:
+        decoded = _alass_reference_audio(
+            video, cache_dir, ffmpeg_path=ffmpeg_path, timeline=reference_timeline
+        )
+        if decoded is not None:
+            reference_input = decoded
+
     with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-alass-") as tmp_raw:
         tmp = Path(tmp_raw)
         safe_reference = tmp / (
@@ -1690,7 +2306,8 @@ def synchronize_with_alass(
                 shutil.copy2(reference_input, safe_reference)
             else:
                 try:
-                    os.symlink(reference_input, safe_reference)
+                    # Absolute: a relative target resolves against the temporary folder.
+                    os.symlink(os.path.abspath(reference_input), safe_reference)
                 except OSError:
                     shutil.copy2(reference_input, safe_reference)
 
@@ -1721,6 +2338,13 @@ def synchronize_with_alass(
             "--split-penalty",
             str(config.alass_split_penalty),
         ]
+        if reference_is_subtitle:
+            # A subtitle reference (an embedded track, a Japanese STT transcript) is on the
+            # video's own clock, and every later gate treats an ALASS map as shifts only
+            # (framerate_scale_factor 1.0). ALASS's framerate guess picked 25/23.976 for a
+            # TV-timed subtitle against a noisy STT transcript: a 4 % stretch, +8 s at the
+            # start and +64 s at the end, reported as one block.
+            command.append("--disable-fps-guessing")
         env = os.environ.copy()
         env["ALASS_FFMPEG_PATH"] = ffmpeg_path
         env["ALASS_FFPROBE_PATH"] = ffprobe_path
@@ -1767,22 +2391,51 @@ def synchronize_with_alass(
                 command_output=detail,
                 reference_kind="subtitle" if reference_is_subtitle else "media",
             )
-        shutil.copy2(safe_output, output)
+        # Published only once its metadata is written (atomic, as for ffsubsync): another
+        # candidate worker read a half-copied output as a cached success without its metrics.
+        staged = temporary_sibling(output, output_suffix)
+        try:
+            shutil.copy2(safe_output, staged)
+        except OSError as exc:
+            # A full disk: no hidden half copy left in the cache (its name matches no cleanup).
+            staged.unlink(missing_ok=True)
+            return subtitle, _result(
+                "alass_error",
+                sync_was_successful=False,
+                error=str(exc),
+                reference_kind="subtitle" if reference_is_subtitle else "media",
+            )
 
-    shifts = _ALASS_SHIFT_RE.findall(command_output)
-    shift_summary = _subtitle_shift_summary(source_input, output) if reference_is_subtitle else {}
-    result = _result(
-        "applied",
-        sync_was_successful=True,
-        engine="alass",
-        output=str(output),
-        reference_kind="subtitle" if reference_is_subtitle else "media",
-        alass_blocks=len(shifts),
-        alass_distinct_shifts=len(set(shifts)),
-        **shift_summary,
-        **normalization,
-    )
-    _write_metadata(output, result)
+    try:
+        shifts = _ALASS_SHIFT_RE.findall(command_output)
+        shift_summary = _subtitle_shift_summary(source_input, staged) if reference_is_subtitle else {}
+        result = _result(
+            "applied",
+            sync_was_successful=True,
+            engine="alass",
+            output=str(output),
+            reference_kind="subtitle" if reference_is_subtitle else "media",
+            alass_blocks=len(shifts),
+            alass_distinct_shifts=len(set(shifts)),
+            **shift_summary,
+            **normalization,
+        )
+        if reference_delay:
+            result["audio_start_offset_seconds"] = reference_delay
+        _write_metadata(output, result)
+        os.replace(staged, output)
+    except OSError as exc:
+        # The result could not be published (a full disk): an ALASS failure like any
+        # other, not an exception through the whole candidate comparison.
+        _metadata_path(output).unlink(missing_ok=True)
+        return subtitle, _result(
+            "alass_error",
+            sync_was_successful=False,
+            error=str(exc),
+            reference_kind="subtitle" if reference_is_subtitle else "media",
+        )
+    finally:
+        staged.unlink(missing_ok=True)
     return output, result
 
 
@@ -1791,10 +2444,354 @@ def _resolve_command(command: str) -> str | None:
     return resolved if resolved and Path(resolved).is_file() else None
 
 
+_AUDIO_FILE_SUFFIXES = frozenset({".flac", ".wav", ".npz", ".npy", ".mp3", ".m4a", ".aac", ".opus", ".ogg"})
+_JAPANESE_AUDIO_SPEC_CACHE: dict[tuple[str, int, int], str | None] = {}
+
+
+def _ffprobe_beside(ffmpeg_path: str | None) -> str | None:
+    """The ffprobe installed with the ffmpeg in use (Homebrew installs both together)."""
+    command = str(ffmpeg_path or "ffmpeg")
+    resolved = _resolve_command(command)
+    if resolved is not None:
+        sibling = Path(resolved).with_name("ffprobe")
+        if sibling.is_file():
+            return str(sibling)
+    # Only an ffmpeg found on PATH implies that PATH's ffprobe belongs to it.
+    return _resolve_command("ffprobe") if "/" not in command else None
+
+
+def _japanese_audio_stream_spec(video: Path, ffmpeg_path: str | None) -> str | None:
+    """``0:a:N`` of the Japanese track of a video with several audio tracks, else None.
+
+    ffmpeg maps the most-channel track by default and the segment check took
+    the first one, so on a dual-audio remux (English 5.1 + Japanese 2.0) both
+    listened to the dub. A single track, or several without a Japanese one,
+    keeps the default. Cached per file stat (one ffprobe per video).
+    """
+    if video.suffix.casefold() in _AUDIO_FILE_SUFFIXES:
+        return None
+    try:
+        stat = video.stat()
+        key = (str(video.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return None
+    if key in _JAPANESE_AUDIO_SPEC_CACHE:
+        return _JAPANESE_AUDIO_SPEC_CACHE[key]
+    from .subtitles.stt import _select_japanese_audio_stream
+
+    spec: str | None = None
+    try:
+        index, details = _select_japanese_audio_stream(video, _ffprobe_beside(ffmpeg_path))
+        position = details.get("audio_position")
+        if index is not None and int(details.get("stream_count") or 0) >= 2 and position is not None:
+            spec = f"0:a:{int(position)}"
+    except (OSError, TypeError, ValueError):
+        spec = None
+    if len(_JAPANESE_AUDIO_SPEC_CACHE) >= 256:
+        _JAPANESE_AUDIO_SPEC_CACHE.clear()
+    _JAPANESE_AUDIO_SPEC_CACHE[key] = spec
+    return spec
+
+
+_TEXT_SUBTITLE_STREAM_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
+def _has_embedded_text_subtitle(video: Path, ffmpeg_path: str | None) -> bool:
+    """Whether the container has a text subtitle stream (unknown counts as yes)."""
+    try:
+        stat = video.stat()
+        key = (str(video.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return True
+    if key in _TEXT_SUBTITLE_STREAM_CACHE:
+        return _TEXT_SUBTITLE_STREAM_CACHE[key]
+    ffprobe = _ffprobe_beside(ffmpeg_path)
+    if ffprobe is None:
+        return True
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "json",
+                str(video),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        payload = json.loads(completed.stdout or "{}") if completed.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        payload = None
+    if not isinstance(payload, dict):
+        return True
+    streams = payload.get("streams") if isinstance(payload.get("streams"), list) else []
+    found = any(
+        isinstance(row, dict) and str(row.get("codec_name") or "").casefold() in _TEXT_REFERENCE_CODECS
+        for row in streams
+    )
+    if len(_TEXT_SUBTITLE_STREAM_CACHE) >= 256:
+        _TEXT_SUBTITLE_STREAM_CACHE.clear()
+    _TEXT_SUBTITLE_STREAM_CACHE[key] = found
+    return found
+
+
+def _ffsubsync_audio_stream(video: Path, ffmpeg_path: str | None, vad: str | None) -> str | None:
+    """``--reference-stream`` for ffsubsync's speech detection, or None.
+
+    ffsubsync tries an embedded text subtitle as its reference only while no
+    stream (or a subtitle stream) is named. With a ``subs_then_*`` detector (the
+    default) and such a track in the file, naming the audio stream would switch
+    that off, so the stream is named only when there is no text track to lose.
+    """
+    spec = _japanese_audio_stream_spec(video, ffmpeg_path)
+    if spec is None:
+        return None
+    detector = str(vad or "").strip().casefold()
+    uses_subtitles = not detector or detector == "default" or "subs" in detector
+    if uses_subtitles and _has_embedded_text_subtitle(video, ffmpeg_path):
+        return None
+    return spec
+
+
+def _media_timeline(video: Path, ffmpeg_path: str | None) -> audio_timeline.AudioTimeline | None:
+    """Start times of ``video`` on the playback timeline (cached per file; see audio_timeline)."""
+    return audio_timeline.timeline(video, _ffprobe_beside(ffmpeg_path))
+
+
+def _ffsubsync_audio_delay(video: Path, ffmpeg_path: str | None, audio_stream: str | None) -> float:
+    """Leading silence ffsubsync loses when it decodes ``video`` itself.
+
+    ffsubsync runs ``ffmpeg -i video [-map 0:a:N] -f s16le ... -``: raw PCM from the
+    stream's first sample. Without ``--reference-stream`` FFmpeg takes its own
+    choice of audio track (most channels, then the first).
+    """
+    timeline = _media_timeline(video, ffmpeg_path)
+    if timeline is None:
+        return 0.0
+    position = audio_timeline.spec_position(audio_stream)
+    if position is None:
+        position = timeline.default_position()
+    return timeline.delay(position=position)
+
+
+def _segment_audio_delay(video: Path, ffmpeg_path: str | None, audio_stream: str | None) -> float:
+    """Leading silence of the track the segment extraction maps (``0:a:N`` or the first)."""
+    timeline = _media_timeline(video, ffmpeg_path)
+    if timeline is None:
+        return 0.0
+    return timeline.delay(position=audio_timeline.spec_position(audio_stream) or 0)
+
+
+def _segment_audio_gaps(
+    video: Path, ffmpeg_path: str | None, audio_stream: str | None
+) -> tuple[tuple[float, float], ...] | None:
+    """Timestamp gaps inside the track the segment extraction maps (``0:a:N`` or the first)."""
+    if _media_timeline(video, ffmpeg_path) is None:
+        return None
+    return audio_timeline.inner_gaps(
+        video, _ffprobe_beside(ffmpeg_path), position=audio_timeline.spec_position(audio_stream) or 0
+    )
+
+
+def _playback_audio(
+    video: Path,
+    cache_dir: Path,
+    *,
+    ffmpeg_path: str,
+    audio_stream: str | None,
+    delay: float,
+) -> tuple[Path | None, str | None]:
+    """The whole track as mono 16 kHz FLAC that starts at playback time 0.
+
+    Only for a track that starts after the file start or has timestamp gaps
+    inside: FFmpeg writes its first sample first, so ``delay`` of silence goes in
+    front, and the gaps are filled (``delay_filter``). Windows are then cut
+    from this FLAC (exact seeking, no container quirks: an MPEG-TS ``-ss`` lands
+    0.3-1.8 s off once the audio is mapped alone) and ALASS reads it instead of
+    decoding the video itself. Kept with the segment audio (same cleanup).
+    """
+    binary = _resolve_command(ffmpeg_path)
+    if binary is None:
+        return None, "ffmpeg_missing"
+    stat = video.stat()
+    digest = hashlib.sha1(
+        (
+            f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{audio_stream or '0:a:0'}:"
+            # v1: these copies have filled inner gaps since the first version.
+            f"{delay:.3f}:playback-audio-v1"
+        ).encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "segment-audio"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.playback.flac"
+    if output.exists() and output.stat().st_size > 0:
+        touch_segment_audio(output)
+        return output, None
+    temporary = temporary_sibling(output, ".flac.tmp")
+    command = [
+        binary,
+        "-y",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+        "-map",
+        audio_stream or "0:a:0",
+        "-vn",
+        "-af",
+        audio_timeline.delay_filter(delay),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "flac",
+        "-compression_level",
+        "0",
+        "-f",
+        "flac",
+        str(temporary),
+    ]
+    mark_segment_audio_active(output, True)
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(120.0, _timing_reference_extract_timeout(int(stat.st_size))),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        temporary.unlink(missing_ok=True)
+        return None, str(exc)
+    finally:
+        mark_segment_audio_active(output, False)
+    if completed.returncode != 0 or not temporary.exists() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        return None, (completed.stdout or "ffmpeg_audio_extract_failed")[-1000:]
+    temporary.replace(output)
+    touch_segment_audio(output)
+    return output, None
+
+
+def _alass_reference_audio(
+    video: Path,
+    cache_dir: Path,
+    *,
+    ffmpeg_path: str,
+    timeline: audio_timeline.AudioTimeline | None,
+) -> Path | None:
+    """ALASS's own decode of a media reference, kept as a WAV (None: let ALASS decode it).
+
+    ALASS runs ``ffmpeg -i REF -map 0:N -acodec pcm_s16le -ar 8000 -ac 1 -f s16le -`` on
+    every call: an episode with eight candidates decoded the same audio eight times, most
+    of each ALASS run. The same command written to a WAV keeps exactly those samples, and
+    ALASS reads them back without converting anything, so its result is the same file.
+    Only for a file with one audio track (no doubt which track ALASS takes).
+    """
+    if timeline is None or len(timeline.audio_indexes) != 1:
+        return None
+    index = timeline.audio_indexes[0]
+    if index is None or not timeline.audio_channels or timeline.audio_channels[0] <= 0:
+        return None
+    binary = _resolve_command(ffmpeg_path)
+    if binary is None:
+        return None
+    try:
+        stat = video.stat()
+        digest = hashlib.sha1(
+            f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:0:{int(index)}:alass-reference-8k-v1".encode()
+        ).hexdigest()[:20]
+        output_dir = cache_dir / "segment-audio"
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    output = output_dir / f"{digest}.alass8k.wav"
+    if output.is_file() and output.stat().st_size > 44:
+        touch_segment_audio(output)
+        return output
+    temporary = temporary_sibling(output, ".wav.tmp")
+    command = [
+        binary,
+        "-y",
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        str(video),
+        "-map",
+        f"0:{int(index)}",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "8000",
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        str(temporary),
+    ]
+    mark_segment_audio_active(output, True)
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(120.0, _timing_reference_extract_timeout(int(stat.st_size))),
+            check=False,
+        )
+        if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 44:
+            return None
+        temporary.replace(output)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        temporary.unlink(missing_ok=True)
+        mark_segment_audio_active(output, False)
+    touch_segment_audio(output)
+    return output
+
+
+_PROBED_DURATIONS: dict[tuple[str, int, int, str], float] = {}
+
+
 def _probe_duration(video: Path, ffprobe_path: str) -> float | None:
+    """The container duration (one ffprobe per file stat: every segment check of every
+    candidate asked again). A failed probe is not remembered: the next caller tries again."""
     binary = _resolve_command(ffprobe_path)
     if binary is None:
         return None
+    try:
+        stat = video.stat()
+        key: tuple[str, int, int, str] | None = (
+            str(video.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            binary,
+        )
+    except OSError:
+        key = None
+    if key is not None and key in _PROBED_DURATIONS:
+        return _PROBED_DURATIONS[key]
+    duration = _run_duration_probe(video, binary)
+    if key is not None and duration is not None:
+        if len(_PROBED_DURATIONS) >= 256:
+            _PROBED_DURATIONS.clear()
+        _PROBED_DURATIONS[key] = duration
+    return duration
+
+
+def _run_duration_probe(video: Path, binary: str) -> float | None:
     command = [
         binary,
         "-v",
@@ -1815,9 +2812,47 @@ def _probe_duration(video: Path, ffprobe_path: str) -> float | None:
             check=False,
         )
         duration = float(completed.stdout.strip())
-        return duration if duration > 0 else None
+        # "inf" parses as a float: an endless duration made every window run to it.
+        return duration if math.isfinite(duration) and duration > 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
+
+
+_TIMING_REFERENCE_TITLE_BONUS_RE = re.compile(
+    r"(?<![a-z0-9])(?:cr|crunchyroll|dialog|dialogue|full)(?![a-z0-9])"
+)
+# Sign / song / typesetting tracks by title. "ts" and "titles" only as whole words
+# ("Full Subtitles" is dialogue).
+_TIMING_REFERENCE_SPARSE_TITLE_RE = re.compile(r"(?<![a-z0-9])(?:ts|titles|lyrics|op/ed)(?![a-z0-9])")
+_TIMING_REFERENCE_SPARSE_MARKERS = ("forced", "sign", "song", "karaoke", "s&s", "typeset")
+# A dialogue track has 10-25 lines a minute; a signs/typesetting track that slipped
+# through by title has a few.
+_TIMING_REFERENCE_MIN_CUES_PER_MINUTE = 4.0
+
+
+_TIMING_REFERENCE_MIN_SCORE = 20.0
+_TIMING_REFERENCE_OTHER_LANGUAGE_SCORE = 40.0
+_TIMING_REFERENCE_SCORED_LANGUAGES = frozenset(
+    {
+        "eng",
+        "en",
+        "en-us",
+        "en-gb",
+        "rus",
+        "ru",
+        "spa",
+        "es",
+        "deu",
+        "ger",
+        "de",
+        "fra",
+        "fre",
+        "fr",
+        "jpn",
+        "ja",
+        "jp",
+    }
+)
 
 
 def _select_timing_reference_stream(streams: list[dict[str, object]]) -> dict[str, object] | None:
@@ -1847,16 +2882,25 @@ def _select_timing_reference_stream(streams: list[dict[str, object]]) -> dict[st
             score += 60.0
         elif language in {"jpn", "ja", "jp"}:
             score -= 150.0
+        else:
+            # Any other text track, also an untagged one ("und": SHIROBAKO E12's only
+            # track), is timed to this video; without it the episode went to audio-only
+            # timing, failed it and showed the raw Netflix file 0.47 s off. Such a track is
+            # trusted less (``_timing_other_language``): ALASS never takes it as the clock.
+            score += _TIMING_REFERENCE_OTHER_LANGUAGE_SCORE
         if int(disposition.get("default", 0) or 0):
             score += 25.0
-        if any(marker in lowered for marker in ("cr", "dialog", "dialogue", "full")):
+        # Whole words only: "cr" as a substring matched "Descriptive" and "Screen".
+        if _TIMING_REFERENCE_TITLE_BONUS_RE.search(lowered):
             score += 15.0
         if any(marker in lowered for marker in ("commentary", "comment", "comms")) or int(
             disposition.get("comment", 0) or 0
         ):
             score -= 200.0
-        if any(marker in lowered for marker in ("forced", "sign", "song", "karaoke")) or int(
-            disposition.get("forced", 0) or 0
+        if (
+            any(marker in lowered for marker in _TIMING_REFERENCE_SPARSE_MARKERS)
+            or _TIMING_REFERENCE_SPARSE_TITLE_RE.search(lowered)
+            or int(disposition.get("forced", 0) or 0)
         ):
             score -= 120.0
         if codec in {"subrip", "srt"}:
@@ -1868,32 +2912,192 @@ def _select_timing_reference_stream(streams: list[dict[str, object]]) -> dict[st
         candidate = dict(stream)
         candidate["index"] = index
         candidate["_timing_score"] = score
+        candidate["_timing_other_language"] = bool(
+            language not in _TIMING_REFERENCE_SCORED_LANGUAGES
+            and score - _TIMING_REFERENCE_OTHER_LANGUAGE_SCORE < _TIMING_REFERENCE_MIN_SCORE
+        )
         ranked.append((score, candidate))
     if not ranked:
         return None
     score, stream = max(ranked, key=lambda item: item[0])
-    return stream if score >= 20.0 else None
+    return stream if score >= _TIMING_REFERENCE_MIN_SCORE else None
 
 
-def _write_exact_timing_reference_srt(
-    cues: list[tuple[float, float, str]],
-    path: Path,
+# ffmpeg demuxes the whole container to extract one subtitle track, so the time
+# it needs grows with the file: a BD remux on a USB disk or Wi-Fi NAS needs
+# minutes. Assume a slow 20 MB/s source, at least 90 s, at most 10 minutes.
+_TIMING_REFERENCE_MIN_TIMEOUT_SECONDS = 90.0
+_TIMING_REFERENCE_MAX_TIMEOUT_SECONDS = 600.0
+_TIMING_REFERENCE_SLOW_READ_BYTES_PER_SECOND = 20 * 1024 * 1024
+# A track that ffmpeg reads completely but that has no cues (same file stat
+# and stream) is not extracted again for a day, except by a forced run.
+_TIMING_REFERENCE_FAILURE_TTL_SECONDS = 24 * 3600.0
+# A timeout or an ffmpeg error may be passing (a slow or busy disk): it is only
+# remembered in this process, so the candidates of one preparation do not each
+# pay the timeout, and the next preparation tries again.
+_TIMING_REFERENCE_TRANSIENT_FAILURE_SECONDS = 30 * 60.0
+_TIMING_REFERENCE_TRANSIENT_FAILURES: dict[str, dict[str, object]] = {}
+# Tracks a forced call extracted (or found without cues) in this process, digest -> video:
+# a forced run extracts each track once. Every later forced call (the next candidate's alignment, the
+# next pass) ran ffmpeg over the whole container again, minutes each for a BD remux on a
+# NAS; the copy made a moment before is the same file.
+_TIMING_REFERENCES_FROM_THIS_PROCESS: dict[str, str] = {}
+
+
+def _timing_reference_extract_timeout(size_bytes: int) -> float:
+    return min(
+        _TIMING_REFERENCE_MAX_TIMEOUT_SECONDS,
+        max(
+            _TIMING_REFERENCE_MIN_TIMEOUT_SECONDS,
+            float(max(0, int(size_bytes))) / _TIMING_REFERENCE_SLOW_READ_BYTES_PER_SECOND,
+        ),
+    )
+
+
+def _remembered_timing_reference_failure(
+    marker: Path, digest: str, *, force: bool
+) -> dict[str, object] | None:
+    transient = _TIMING_REFERENCE_TRANSIENT_FAILURES.get(digest)
+    if transient is not None:
+        if (
+            0
+            <= time.time() - float(transient.get("failed_at") or 0.0)
+            <= _TIMING_REFERENCE_TRANSIENT_FAILURE_SECONDS
+        ):
+            return transient
+        _TIMING_REFERENCE_TRANSIENT_FAILURES.pop(digest, None)
+    if force:
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        age = time.time() - float(payload.get("failed_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= age <= _TIMING_REFERENCE_FAILURE_TTL_SECONDS:
+        return None
+    return payload
+
+
+def _remember_transient_timing_reference_failure(
+    digest: str, error: str, timeout: float, *, video: Path | None = None
 ) -> None:
-    """Write reference cues without playback-oriented gap/overlap normalization."""
+    if len(_TIMING_REFERENCE_TRANSIENT_FAILURES) >= 256:
+        _TIMING_REFERENCE_TRANSIENT_FAILURES.clear()
+    _TIMING_REFERENCE_TRANSIENT_FAILURES[digest] = {
+        "failed_at": time.time(),
+        "error": error[-1000:],
+        "timeout": timeout,
+        "video": _video_key(video) if video is not None else "",
+    }
 
-    def timestamp(seconds: float) -> str:
-        milliseconds = max(0, int(round(float(seconds) * 1000.0)))
-        hours, remainder = divmod(milliseconds, 3_600_000)
-        minutes, remainder = divmod(remainder, 60_000)
-        whole_seconds, millis = divmod(remainder, 1000)
-        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{millis:03d}"
 
-    blocks = [
-        f"{index}\n{timestamp(start)} --> {timestamp(end)}\n{text}"
-        for index, (start, end, text) in enumerate(cues, start=1)
-        if text and end > start
-    ]
-    path.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
+def _remember_timing_reference_extracted(digest: str, video: Path, *, forced: bool) -> None:
+    # Only a forced extraction stands for the forced run: a copy made before it (a
+    # non-forced preparation in the same process) is still made again once.
+    if not forced:
+        return
+    if len(_TIMING_REFERENCES_FROM_THIS_PROCESS) >= 256:
+        _TIMING_REFERENCES_FROM_THIS_PROCESS.clear()
+    _TIMING_REFERENCES_FROM_THIS_PROCESS[digest] = _video_key(video)
+
+
+def _video_key(video: Path) -> str:
+    try:
+        return str(Path(video).resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return str(video)
+
+
+def begin_forced_run(video: Path | None) -> None:
+    """A user's forced re-sync really recomputes: forget what this process remembered.
+
+    Called once at the start of a forced run (``cli.process_video`` with ``--resync``), not
+    per ``force`` call: inside the run the other candidates and passes still reuse its fresh
+    alignments and do not each wait for a timing-reference timeout again."""
+    from .subtitles import timeline_alignment
+
+    timeline_alignment._ALIGNMENT_MEMO.clear()
+    if video is None:
+        return
+    key = _video_key(video)
+    for digest, entry in list(_TIMING_REFERENCE_TRANSIENT_FAILURES.items()):
+        if entry.get("video") == key:
+            _TIMING_REFERENCE_TRANSIENT_FAILURES.pop(digest, None)
+    for digest, owner in list(_TIMING_REFERENCES_FROM_THIS_PROCESS.items()):
+        if owner == key:
+            _TIMING_REFERENCES_FROM_THIS_PROCESS.pop(digest, None)
+
+
+def _remember_timing_reference_failure(marker: Path, error: str, timeout: float) -> None:
+    temp = marker.with_name(f".{marker.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temp.write_text(
+            json.dumps({"failed_at": time.time(), "error": error[-1000:], "timeout": timeout}),
+            encoding="utf-8",
+        )
+        os.replace(temp, marker)
+    except OSError:
+        temp.unlink(missing_ok=True)
+
+
+# Typesetting on a timing track: an animated sign is written one letter or syllable per
+# event, dozens starting together (BLUE REFLECTION RAY E07's English track: 6277 events,
+# 5681 of them such fragments around 596 lines). They swamp the line starts every timing
+# step compares, so the track is cut down to its lines when they are a large share.
+_FRAGMENT_CROWD_SECONDS = 0.25
+_FRAGMENT_CROWD_SIZE = 4
+_FRAGMENT_MIN_SHARE = 0.25
+_FRAGMENT_MIN_KEPT_CUES = 20
+
+
+def _visible_subtitle_text(text: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"<[^>]*>|\{[^}]*\}", "", str(text or "")))
+
+
+def _drop_typesetting_fragments(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    """(lines, fragments dropped): a fragment shows at most one glyph, or at most three in
+    a crowd of 4+ events starting within 0.25 s, or lasts at most 0.5 s in such a crowd.
+    The track is kept whole when fragments are under a quarter of it.
+
+    Then layers of one line: events with the same visible text that overlap in time are
+    one line (karaoke draws the whole lyric again for every syllable and glow layer:
+    BLUE REFLECTION RAY E13's English ED, 22000 of 24000 events in 2 minutes)."""
+    kept, dropped = _drop_fragment_events(cues)
+    layered, merged = _merge_layered_events(kept)
+    return layered, dropped + merged
+
+
+def _merge_layered_events(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    """(cues, events merged): overlapping events with one visible text become one cue."""
+    return merge_layered_cues(cues)
+
+
+def _drop_fragment_events(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    starts = sorted(float(start) for start, _end, _text in cues)
+    kept: list[tuple[float, float, str]] = []
+    for start, end, text in cues:
+        glyphs = len(_visible_subtitle_text(text))
+        first = bisect.bisect_left(starts, float(start) - _FRAGMENT_CROWD_SECONDS)
+        last = bisect.bisect_right(starts, float(start) + _FRAGMENT_CROWD_SECONDS)
+        crowded = last - first - 1 >= _FRAGMENT_CROWD_SIZE
+        if glyphs <= 1 or (crowded and (glyphs <= 3 or float(end) - float(start) <= 0.5)):
+            continue
+        kept.append((start, end, text))
+    dropped = len(cues) - len(kept)
+    if dropped < _FRAGMENT_MIN_SHARE * len(cues) or len(kept) < _FRAGMENT_MIN_KEPT_CUES:
+        return cues, 0
+    return kept, dropped
 
 
 def extract_embedded_timing_reference(
@@ -1913,7 +3117,7 @@ def extract_embedded_timing_reference(
         return None, _result("timing_reference_tools_missing")
     try:
         completed = subprocess.run(
-            [ffprobe, "-v", "error", "-show_streams", "-of", "json", str(video)],
+            [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(video)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1927,6 +3131,24 @@ def extract_embedded_timing_reference(
     stream = _select_timing_reference_stream(streams if isinstance(streams, list) else [])
     if stream is None:
         return None, _result("timing_reference_not_found")
+    try:
+        video_minutes = float((payload.get("format") or {}).get("duration") or 0.0) / 60.0
+    except (AttributeError, TypeError, ValueError):
+        video_minutes = 0.0
+    other_language = bool(stream.get("_timing_other_language"))
+
+    def checked(path: Path, result: dict[str, object]) -> tuple[Path | None, dict[str, object]]:
+        result["timing_reference_other_language"] = other_language
+        cues = int(result.get("cue_count") or 0)
+        if video_minutes >= 1.0 and cues < _TIMING_REFERENCE_MIN_CUES_PER_MINUTE * video_minutes:
+            # Signs, songs or typesetting under a dialogue-like name: not a clock.
+            return None, _result(
+                "timing_reference_too_sparse",
+                stream_index=result.get("stream_index"),
+                cue_count=cues,
+                video_minutes=round(video_minutes, 2),
+            )
+        return path, result
 
     index = int(stream["index"])
     tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
@@ -1942,7 +3164,8 @@ def extract_embedded_timing_reference(
     output_dir = cache_dir / "timing-reference"
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"{digest}.srt"
-    if force:
+    fresh = force and digest not in _TIMING_REFERENCES_FROM_THIS_PROCESS
+    if fresh:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
         try:
@@ -1950,16 +3173,38 @@ def extract_embedded_timing_reference(
         except (OSError, UnicodeError, ValueError):
             cached_cues = []
         if cached_cues:
-            return output, _result(
-                "cached",
-                output=str(output),
-                stream_index=index,
-                language=language,
-                title=title,
-                cue_count=len(cached_cues),
-                duplicate_cues_removed=0,
+            # References cached before fragments were dropped keep their key (no
+            # re-extraction, which takes minutes on a NAS): drop them here once.
+            line_cues, fragments = _drop_typesetting_fragments(cached_cues)
+            if fragments:
+                try:
+                    write_exact_srt(line_cues, output)
+                except OSError:
+                    pass
+            return checked(
+                output,
+                _result(
+                    "cached",
+                    output=str(output),
+                    stream_index=index,
+                    language=language,
+                    title=title,
+                    cue_count=len(line_cues),
+                    duplicate_cues_removed=0,
+                    typesetting_fragments_removed=fragments,
+                ),
             )
         output.unlink(missing_ok=True)
+    failure_marker = output_dir / f"{digest}.failed.json"
+    remembered = _remembered_timing_reference_failure(failure_marker, digest, force=fresh)
+    if remembered is not None:
+        return None, _result(
+            "timing_reference_extract_failed",
+            error=str(remembered.get("error") or "") if verbose else err("sync.referenceExtractFailed"),
+            stream_index=index,
+            remembered_failure=True,
+        )
+    timeout = _timing_reference_extract_timeout(int(stat.st_size))
     # Write beside the cache target and publish atomically.  An interrupted
     # ffmpeg must never leave a truncated file that a later run treats as a hit.
     temp_output = output.with_name(f".{output.stem}.{os.getpid()}.{time.time_ns()}.tmp.srt")
@@ -1987,11 +3232,19 @@ def extract_embedded_timing_reference(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=90,
+            timeout=timeout,
             check=False,
         )
         valid_cues = parse_srt(temp_output) if temp_output.exists() and temp_output.stat().st_size > 0 else []
         if extracted.returncode != 0 or not valid_cues:
+            if extracted.returncode != 0:
+                _remember_transient_timing_reference_failure(
+                    digest, str(extracted.stdout or ""), timeout, video=video
+                )
+            else:
+                # Read to the end without one cue: the same file gives the same.
+                _remember_timing_reference_failure(failure_marker, "no valid cues", timeout)
+                _remember_timing_reference_extracted(digest, video, forced=force)
             return None, _result(
                 "timing_reference_extract_failed",
                 error=extracted.stdout[-1000:] if verbose else err("sync.referenceExtractFailed"),
@@ -2008,22 +3261,35 @@ def extract_embedded_timing_reference(
             seen_cues.add(cue)
             deduped_cues.append(cue)
         duplicate_cues_removed = len(valid_cues) - len(deduped_cues)
-        if duplicate_cues_removed:
-            _write_exact_timing_reference_srt(deduped_cues, temp_output)
-            valid_cues = deduped_cues
+        line_cues, typesetting_fragments_removed = _drop_typesetting_fragments(deduped_cues)
+        if duplicate_cues_removed or typesetting_fragments_removed:
+            write_exact_srt(line_cues, temp_output)
+            valid_cues = line_cues
         os.replace(temp_output, output)
-    except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError) as exc:
+        failure_marker.unlink(missing_ok=True)
+        _TIMING_REFERENCE_TRANSIENT_FAILURES.pop(digest, None)
+        _remember_timing_reference_extracted(digest, video, forced=force)
+    except subprocess.TimeoutExpired as exc:
+        _remember_transient_timing_reference_failure(
+            digest, f"timeout after {timeout:.0f} s", timeout, video=video
+        )
+        return None, _result("timing_reference_extract_failed", error=str(exc), timeout_seconds=timeout)
+    except (OSError, UnicodeError, ValueError) as exc:
         return None, _result("timing_reference_extract_failed", error=str(exc))
     finally:
         temp_output.unlink(missing_ok=True)
-    return output, _result(
-        "applied",
-        output=str(output),
-        stream_index=index,
-        language=language,
-        title=title,
-        cue_count=len(valid_cues),
-        duplicate_cues_removed=duplicate_cues_removed,
+    return checked(
+        output,
+        _result(
+            "applied",
+            output=str(output),
+            stream_index=index,
+            language=language,
+            title=title,
+            cue_count=len(valid_cues),
+            duplicate_cues_removed=duplicate_cues_removed,
+            typesetting_fragments_removed=typesetting_fragments_removed,
+        ),
     )
 
 
@@ -2069,10 +3335,32 @@ def _extract_audio_segment(
         return None, "ffmpeg_missing"
     padding = max(0.0, padding_seconds)
     stat = video.stat()
+    audio_stream = _japanese_audio_stream_spec(video, ffmpeg_path)
+    # The window is on the playback timeline (audio_timeline). A track that
+    # starts after the file start is cut from its padded whole-file copy. When
+    # the audio starts before the video, a window from the file start is read
+    # without -ss: in Matroska/MPEG-TS that seek lands on the first video
+    # keyframe and loses the audio before it. Other files keep their command
+    # (and cache) exactly.
+    # A track with timestamp gaps inside is cut from that copy too (an -ss window
+    # across a gap lost it: what followed was early by the gap).
+    timeline = _media_timeline(video, ffmpeg_path)
+    delay = _segment_audio_delay(video, ffmpeg_path, audio_stream)
+    gaps = _segment_audio_gaps(video, ffmpeg_path, audio_stream)
+    video_lead = timeline.video_lead() if timeline is not None else 0.0
+    from_file_start = start <= 0.0005 and bool(delay or video_lead)
+    timeline_marker = ""
+    if delay:
+        timeline_marker = f":playback-delay={delay:.3f}"
+    elif from_file_start:
+        timeline_marker = ":from-file-start"
+    timeline_marker += audio_timeline.gaps_marker(gaps)
     digest = hashlib.sha1(
         (
             f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
             f"{start:.3f}:{duration:.3f}:{padding:.3f}:mono-16k-flac-v3"
+            + (f":audio={audio_stream}" if audio_stream else "")
+            + timeline_marker
         ).encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "segment-audio"
@@ -2086,21 +3374,28 @@ def _extract_audio_segment(
         touch_segment_audio(output)
         return output, None
     output.unlink(missing_ok=True)
-    temporary = output.with_suffix(".flac.tmp")
-    temporary.unlink(missing_ok=True)
+    source = video
+    mapping = f"{audio_stream or '0:a:0'}?"
+    if delay or gaps:
+        source, error = _playback_audio(
+            video, cache_dir, ffmpeg_path=ffmpeg_path, audio_stream=audio_stream, delay=delay
+        )
+        if source is None:
+            return None, error
+        mapping = "0:a:0"
+    temporary = temporary_sibling(output, ".flac.tmp")
     command = [
         binary,
         "-y",
         "-loglevel",
         "error",
-        "-ss",
-        f"{start:.3f}",
+        *([] if from_file_start else ["-ss", f"{start:.3f}"]),
         "-t",
         f"{duration:.3f}",
         "-i",
-        str(video),
+        str(source),
         "-map",
-        "0:a:0?",
+        mapping,
         "-vn",
         "-ac",
         "1",
@@ -2142,23 +3437,6 @@ def _extract_audio_segment(
     touch_segment_audio(output)
     cleanup_segment_audio_cache(cache_dir)
     return output, None
-
-
-def _clip_cues(
-    cues: list[tuple[float, float, str]],
-    start: float,
-    duration: float,
-) -> list[tuple[float, float, str]]:
-    end = start + duration
-    clipped: list[tuple[float, float, str]] = []
-    for cue_start, cue_end, text in cues:
-        if cue_end <= start or cue_start >= end:
-            continue
-        relative_start = max(cue_start, start) - start
-        relative_end = min(cue_end, end) - start
-        if relative_end > relative_start:
-            clipped.append((relative_start, relative_end, text))
-    return clipped
 
 
 def _clip_cues_for_local_alignment(
@@ -2261,6 +3539,48 @@ def _segment_reliability(
         "roughness_seconds": round(roughness, 4),
         "spans_full_search": spans_full_search,
     }
+
+
+# Segment audio whose speech was (re)computed in this process: a forced re-preparation
+# recomputes each one once, not once per candidate.
+_SEGMENT_SPEECH_FROM_THIS_PROCESS: set[str] = set()
+
+
+def _segment_speech_reference(
+    audio: Path,
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    ffmpeg_path: str,
+    force: bool,
+) -> Path | None:
+    """The voice activity of one segment window, computed once per episode.
+
+    The windows depend only on the video (its duration and the segment settings), so
+    every candidate (and the check before and after a piecewise repair) used to decode
+    the same window and run the same VAD again inside ffsubsync. ffsubsync on this
+    speech file gives the same offset, score and output as on the audio itself. The
+    window's audio file is content-addressed by its name (its mtime is touched on every
+    use), so the name keys the speech too. None (ffsubsync then reads the audio, as
+    before) when it cannot be prepared."""
+    tag = hashlib.sha1(f"{audio.name}:{config.vad}:segment-speech-v1".encode()).hexdigest()[:20]
+    target = cache_dir / "speech" / f"segment-{tag}.npz"
+    key = str(target)
+    fresh = key in _SEGMENT_SPEECH_FROM_THIS_PROCESS or not force
+    try:
+        if fresh and target.exists() and target.stat().st_size > 0:
+            _SEGMENT_SPEECH_FROM_THIS_PROCESS.add(key)
+            return target
+        speech, _info = prepare_speech_reference(
+            audio, cache_dir, config, ffmpeg_path=ffmpeg_path, force=True
+        )
+        if speech is None:
+            return None
+        os.replace(speech, target)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    _SEGMENT_SPEECH_FROM_THIS_PROCESS.add(key)
+    return target
 
 
 def evaluate_segment_alignment(
@@ -2373,6 +3693,9 @@ def evaluate_segment_alignment(
             verbose=verbose,
             quiet=True,
             tag=f"segment-eval-{label}",
+            reference=_segment_speech_reference(
+                audio, cache_dir, evaluation_config, ffmpeg_path=ffmpeg_path, force=force
+            ),
         )
         successful = bool(result.get("sync_was_successful"))
         offset_value: float | None = None
@@ -2715,6 +4038,15 @@ def _maybe_repair_piecewise(
         )
         result["segment_diagnostics"] = baseline_diagnostics
 
+    # Before the source's own check: with an unreliable baseline that check (an ffsubsync
+    # run per window, the ASS converted again on a forced run) was made and never read.
+    if baseline_diagnostics.get("reliable", True) is False:
+        result["piecewise_repair_skipped"] = {
+            "reason": "baseline_diagnostics_unreliable",
+            "quality_reason": baseline_diagnostics.get("quality_reason"),
+        }
+        return path, result
+
     repair_source = source_path or path
     if repair_source != path:
         source_diagnostics = evaluate_segment_alignment(
@@ -2730,12 +4062,6 @@ def _maybe_repair_piecewise(
     else:
         source_diagnostics = baseline_diagnostics
 
-    if baseline_diagnostics.get("reliable", True) is False:
-        result["piecewise_repair_skipped"] = {
-            "reason": "baseline_diagnostics_unreliable",
-            "quality_reason": baseline_diagnostics.get("quality_reason"),
-        }
-        return path, result
     if source_diagnostics.get("reliable", True) is False:
         result["piecewise_repair_skipped"] = {
             "reason": "source_diagnostics_unreliable",
@@ -5058,48 +6384,53 @@ def _repair_with_embedded_reference_piecewise_core(
         output.unlink(missing_ok=True)
 
     sequence_safety: dict[str, object] = {"reason": "cached"}
-    edit_boundaries: list[dict[str, float]] = []
-    if not output.exists() or output.stat().st_size <= 0:
-        jump_threshold = max(8.0, float(config.piecewise_jump_threshold_seconds))
-        discontinuity_threshold = max(2.5, float(config.piecewise_jump_threshold_seconds))
+    jump_threshold = max(8.0, float(config.piecewise_jump_threshold_seconds))
+    discontinuity_threshold = max(2.5, float(config.piecewise_jump_threshold_seconds))
 
-        # A long subtitle-free interval usually marks an opening/title-card edit.
-        # Do not interpolate a cold-open residual through that cut: doing so can
-        # leave the first dialogue after the opening one or two seconds late even
-        # when the next broad anchor already says the clocks match.  Instead,
-        # switch from the left anchor to the right anchor at the first cue after
-        # the largest gap overlapping that anchor pair.
-        cue_gaps = [
-            (previous_end, next_start, next_start - previous_end)
-            for (_previous_start, previous_end, _previous_text), (next_start, _next_end, _next_text) in zip(
-                candidate_cues, candidate_cues[1:]
-            )
-            if next_start - previous_end >= 20.0
-        ]
-        for (left_time, left_offset), (right_time, right_offset) in zip(anchors, anchors[1:]):
-            if abs(right_offset - left_offset) < discontinuity_threshold:
-                continue
-            overlapping = [gap for gap in cue_gaps if gap[0] <= right_time and gap[1] >= left_time]
-            midpoint = (left_time + right_time) / 2.0
-            boundary, evidence = choose_edit_boundary(
-                left_time,
-                right_time,
-                midpoint=midpoint,
-                edit_points=edit_points or (),
-                cue_gaps=overlapping,
-            )
-            if evidence.get("kind") == "midpoint":
-                continue
-            edit_boundaries.append(
-                {
-                    "left_time": float(left_time),
-                    "right_time": float(right_time),
-                    "boundary": float(boundary),
-                    "left_offset": float(left_offset),
-                    "right_offset": float(right_offset),
-                    "gap_seconds": float(evidence.get("gap_seconds") or 0.0),
-                }
-            )
+    # A long subtitle-free interval usually marks an opening/title-card edit.
+    # Do not interpolate a cold-open residual through that cut: doing so can
+    # leave the first dialogue after the opening one or two seconds late even
+    # when the next broad anchor already says the clocks match.  Instead,
+    # switch from the left anchor to the right anchor at the first cue after
+    # the largest gap overlapping that anchor pair.
+    # Worked out before the cache check: the output stays on disk also when the
+    # repair is refused below, and a later run on the same files (a non-forced
+    # preparation, the next candidate pass) reported no boundaries, so the
+    # discontinuity gate judged the same ALASS map without the boundary the
+    # first run had confirmed it with.
+    cue_gaps = [
+        (previous_end, next_start, next_start - previous_end)
+        for (_previous_start, previous_end, _previous_text), (next_start, _next_end, _next_text) in zip(
+            candidate_cues, candidate_cues[1:]
+        )
+        if next_start - previous_end >= 20.0
+    ]
+    edit_boundaries: list[dict[str, float]] = []
+    for (left_time, left_offset), (right_time, right_offset) in zip(anchors, anchors[1:]):
+        if abs(right_offset - left_offset) < discontinuity_threshold:
+            continue
+        overlapping = [gap for gap in cue_gaps if gap[0] <= right_time and gap[1] >= left_time]
+        midpoint = (left_time + right_time) / 2.0
+        boundary, evidence = choose_edit_boundary(
+            left_time,
+            right_time,
+            midpoint=midpoint,
+            edit_points=edit_points or (),
+            cue_gaps=overlapping,
+        )
+        if evidence.get("kind") == "midpoint":
+            continue
+        edit_boundaries.append(
+            {
+                "left_time": float(left_time),
+                "right_time": float(right_time),
+                "boundary": float(boundary),
+                "left_offset": float(left_offset),
+                "right_offset": float(right_offset),
+                "gap_seconds": float(evidence.get("gap_seconds") or 0.0),
+            }
+        )
+    if not output.exists() or output.stat().st_size <= 0:
 
         def correction_for_cue(start: float, end: float) -> float:
             midpoint = (start + end) / 2.0
@@ -5131,7 +6462,7 @@ def _repair_with_embedded_reference_piecewise_core(
         # Some Crunchyroll tracks put the same on-screen SFX cue on screen twice
         # around the first spoken line. Activity matching cannot distinguish the
         # repeated sign from dialogue and may anchor a short cold-open several
-        # seconds too early (Hyakkano S03E05: two overlapping "Krrrack!!" cues).
+        # seconds too early (Hyakkano S03E05: two overlapping copies of one sound-effect cue).
         # When a duplicated reference cue overlaps the first unique reference cue,
         # use that unique cue as the cold-open dialogue anchor. Keep the whole
         # pre-opening block rigid so we do not distort Japanese cue durations.
@@ -5810,42 +7141,6 @@ def _validate_embedded_reference_output(
     return True, "ok", details
 
 
-def _embedded_reference_is_better(
-    baseline: dict[str, object],
-    aligned: dict[str, object],
-) -> tuple[bool, str]:
-    if not aligned.get("available"):
-        return False, "aligned_activity_unavailable"
-    if not baseline.get("available"):
-        return True, "baseline_activity_unavailable"
-
-    def value(payload: dict[str, object], key: str) -> float:
-        try:
-            return float(payload.get(key) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    baseline_start = value(baseline, "start")
-    aligned_start = value(aligned, "start")
-    baseline_middle = value(baseline, "middle")
-    aligned_middle = value(aligned, "middle")
-    baseline_weighted = value(baseline, "weighted")
-    aligned_weighted = value(aligned, "weighted")
-
-    # Never fix the cold open by materially breaking the main episode.
-    if aligned_middle + 0.06 < baseline_middle:
-        return False, "middle_degraded"
-    # Prefer a clear cold-open improvement, or a clear whole-episode improvement.
-    if aligned_start >= baseline_start + 0.035:
-        return True, "start_improved"
-    if aligned_weighted >= baseline_weighted + 0.025:
-        return True, "weighted_improved"
-    # If both are already very strong, the embedded track remains the safer clock.
-    if aligned_start >= 0.82 and (aligned_middle >= 0.82 or value(aligned, "full") >= 0.88):
-        return True, "strong_reference_alignment"
-    return False, "no_material_improvement"
-
-
 def _write_onset_pulses(
     starts: list[float],
     destination: Path,
@@ -5989,11 +7284,14 @@ def synchronize_pgs_with_embedded_reference(
     aligned_starts = [start for start, _, _ in aligned_cues]
     knots = list(zip(source_starts, aligned_starts))
     mapper = build_time_mapper(knots)
+    # Retime into a side file: whatever sits at ``output`` is later served as a
+    # cached success, so only an accepted, complete SUP may be moved there.
+    retimed = output.with_name(f".{output.stem}.{os.getpid()}.{time.time_ns()}.tmp.sup")
     try:
-        retime_sup(subtitle, output, mapper)
-        output_starts = onset_times(parse_pgs_cues(output))
+        retime_sup(subtitle, retimed, mapper)
+        output_starts = onset_times(parse_pgs_cues(retimed))
     except (OSError, ValueError) as exc:
-        output.unlink(missing_ok=True)
+        retimed.unlink(missing_ok=True)
         return subtitle, _result("pgs_retime_error", sync_was_successful=False, error=str(exc))
 
     before = onset_match_score(
@@ -6013,7 +7311,7 @@ def synchronize_pgs_with_embedded_reference(
         after_coverage >= 0.55 or improvement >= config.pgs_onset_min_improvement
     ) and after_coverage >= before_coverage
     if not accepted:
-        output.unlink(missing_ok=True)
+        retimed.unlink(missing_ok=True)
         return subtitle, _result(
             "pgs_onset_no_improvement",
             sync_was_successful=False,
@@ -6042,7 +7340,14 @@ def synchronize_pgs_with_embedded_reference(
         timing_reference_title=reference_result.get("title"),
         selection_reason="pgs_onset_reference",
     )
-    _write_metadata(output, result)
+    try:
+        _write_metadata(output, result)
+        os.replace(retimed, output)
+    except OSError as exc:
+        _metadata_path(output).unlink(missing_ok=True)
+        return subtitle, _result("pgs_retime_error", sync_was_successful=False, error=str(exc))
+    finally:
+        retimed.unlink(missing_ok=True)
     return output, result
 
 
@@ -6299,22 +7604,6 @@ def _strong_embedded_timeline_after_unsafe_stt(
     }
 
 
-def _nearest_reference_error(
-    timestamp: float,
-    reference_starts: list[float],
-) -> float:
-    if not reference_starts:
-        return float("inf")
-    best = float("inf")
-    for value in reference_starts:
-        error = abs(value - timestamp)
-        if error < best:
-            best = error
-        if value > timestamp and error > best:
-            break
-    return best
-
-
 def _local_speech_shift_estimate(
     starts: list[float],
     reference_starts: list[float],
@@ -6390,10 +7679,18 @@ def _local_speech_shift_estimate(
         baseline_error - best_error if math.isfinite(baseline_error) and math.isfinite(best_error) else 0.0
     )
 
+    # Two more onsets within the 0.9 s match tolerance are no evidence when the matched
+    # ones sit farther from their Whisper segments: Odd Taxi E06 (40 -> 42 onsets, mean
+    # error 0.15 -> 0.27 s) and Dead Mount Death Play E12 (33 -> 35, 0.20 -> 0.44 s) moved
+    # everything after the OP by -0.3 / +0.5 s off a right clock. A gain of a quarter of
+    # the matches still counts on its own.
+    matched_gain_accepted = matched_gain >= 2 and (
+        error_gain >= -0.05 or matched_gain >= max(4, baseline_matched // 4)
+    )
     accepted = bool(
         abs(best_shift) >= 0.20
         and float(best["coverage"]) >= 0.45
-        and (matched_gain >= 2 or (best_matched >= max(4, baseline_matched - 1) and error_gain >= 0.12))
+        and (matched_gain_accepted or (best_matched >= max(4, baseline_matched - 1) and error_gain >= 0.12))
     )
     return {
         "accepted": accepted,
@@ -8212,6 +9509,40 @@ def _accept_opening_plateau_refinement(
     }
 
 
+# ALASS writes a negative time as 0 s, write_srt as its 0.1 s minimum start.
+_CLAMPED_START_SECONDS = 0.1005
+
+
+def _unclamp_zero_start_cues(
+    source_cues: list[tuple[float, float, str]],
+    aligned_cues: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str]]:
+    """Give cues that were clamped to the file start back their place on their block's clock.
+
+    No subtitle time is negative: when the first cues of an episode get a shift that
+    moves them before the file start, ALASS writes each one at 0 s (write_srt at 0.1 s),
+    so they lose their spacing. A later shift of the whole block (the opening plateau,
+    +9.8 s on a cold open ALASS had put on the episode's -9.5 s clock) then put two lines
+    5 s apart on the same instant, 6 s late. A clamped cue takes the shift of the first
+    unclamped cue after it (ALASS moves a block by one shift); the result may be
+    negative: the caller shifts and clamps again.
+    """
+    if len(source_cues) != len(aligned_cues):
+        return list(aligned_cues)
+    floor = _CLAMPED_START_SECONDS
+    result = list(aligned_cues)
+    follower = next((index for index, cue in enumerate(aligned_cues) if float(cue[0]) > floor), None)
+    if follower is None:
+        return result
+    delta = float(aligned_cues[follower][0]) - float(source_cues[follower][0])
+    for index in range(follower):
+        source_start, source_end, _source_text = source_cues[index]
+        if float(source_start) + delta >= floor:
+            continue  # not a clamp: the map put it at the start on purpose
+        result[index] = (float(source_start) + delta, float(source_end) + delta, aligned_cues[index][2])
+    return result
+
+
 def _refine_stt_opening_plateaus(
     source: Path,
     aligned: Path,
@@ -8341,7 +9672,8 @@ def _refine_stt_opening_plateaus(
         )
 
     repaired: list[tuple[float, float, str]] = []
-    for index, (start, end, text) in enumerate(aligned_cues):
+    unclamped = _unclamp_zero_start_cues(source_cues, aligned_cues)
+    for index, (start, end, text) in enumerate(unclamped):
         shift = pre_shift if index < split_index else post_shift
         repaired.append(
             (
@@ -8355,7 +9687,7 @@ def _refine_stt_opening_plateaus(
     ref_stat = reference.stat()
     digest = hashlib.sha1(
         (
-            f"stt-opening-plateau-v2:"
+            f"stt-opening-plateau-v3:"
             f"{aligned.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
             f"{reference.resolve()}:{ref_stat.st_size}:{ref_stat.st_mtime_ns}:"
             f"{split_index}:{pre_shift:.3f}:{post_shift:.3f}"
@@ -8472,25 +9804,20 @@ def _stt_text_segments(reference: Path) -> list[dict[str, object]]:
     ]
 
 
-def _subtitle_stt_text_score(aligned: Path, reference: Path) -> dict[str, object]:
-    """Score whether subtitle text lands beside the same spoken Japanese text."""
-    try:
-        subtitle_cues = parse_srt(aligned)
-        reference_cues = parse_srt(reference)
-    except OSError as exc:
-        return {"available": False, "reason": "read_error", "error": str(exc)}
-    if not subtitle_cues or not reference_cues:
-        return {"available": False, "reason": "empty_timeline"}
-    weighted_score = 0.0
-    total_weight = 0.0
-    compared = 0
-    eligible = 0
+def _stt_text_cue_scores(
+    subtitle_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+) -> list[tuple[float, float] | None]:
+    """Per subtitle cue: (fuzzy score of the speech beside it, weight); None = not compared.
+
+    Cues with fewer than two normalized characters are not eligible (also None)."""
+    rows: list[tuple[float, float] | None] = []
     reference_index = 0
     for start, end, text in subtitle_cues:
         source_text = normalize_reading_text(str(text))
         if len(source_text) < 2:
+            rows.append(None)
             continue
-        eligible += 1
         left = max(0.0, float(start) - 1.25)
         right = float(end) + 1.25
         while reference_index < len(reference_cues) and float(reference_cues[reference_index][1]) < left:
@@ -8506,10 +9833,9 @@ def _subtitle_stt_text_score(aligned: Path, reference: Path) -> dict[str, object
                 if normalized:
                     nearby.append(normalized)
             cursor += 1
-        if not nearby:
-            continue
         reference_text = "".join(nearby)
         if not reference_text:
+            rows.append(None)
             continue
         score = (
             max(
@@ -8518,10 +9844,24 @@ def _subtitle_stt_text_score(aligned: Path, reference: Path) -> dict[str, object
             )
             / 100.0
         )
-        weight = float(min(36, max(2, len(source_text))))
-        weighted_score += score * weight
-        total_weight += weight
-        compared += 1
+        rows.append((score, float(min(36, max(2, len(source_text))))))
+    return rows
+
+
+def _subtitle_stt_text_score(aligned: Path, reference: Path) -> dict[str, object]:
+    """Score whether subtitle text lands beside the same spoken Japanese text."""
+    try:
+        subtitle_cues = parse_srt(aligned)
+        reference_cues = parse_srt(reference)
+    except OSError as exc:
+        return {"available": False, "reason": "read_error", "error": str(exc)}
+    if not subtitle_cues or not reference_cues:
+        return {"available": False, "reason": "empty_timeline"}
+    eligible = sum(1 for _start, _end, text in subtitle_cues if len(normalize_reading_text(str(text))) >= 2)
+    rows = [row for row in _stt_text_cue_scores(subtitle_cues, reference_cues) if row is not None]
+    compared = len(rows)
+    weighted_score = sum(score * weight for score, weight in rows)
+    total_weight = sum(weight for _score, weight in rows)
     coverage = compared / max(1, eligible)
     if compared < 4 or total_weight <= 0.0:
         return {
@@ -8698,6 +10038,29 @@ def _stt_text_clock_candidate(
     elif activity_score < 0.20:
         gate_failures.append(f"activity_score:{activity_score:.4f}<0.2000")
     accepted = not gate_failures
+    plateau_clock: dict[str, object] | None = None
+    jump_failure = f"transition_safety:{transition_safety.get('reason') or 'rejected'}"
+    if (
+        gate_failures
+        and gate_failures[0] == jump_failure
+        and all(failure.startswith("text_score:") for failure in gate_failures[1:])
+    ):
+        # Only the ALASS-style jump check failed (and maybe the absolute text score: a
+        # small STT model such as whisper-tiny transcribes worse, so a right clock scores
+        # lower; the plateau clock judges its text against displaced chance instead). A TV
+        # capture (pre-roll, a kept break, small cuts) reads as a few constant clocks with
+        # noisy single cues. The caller uses this clock only after the speech ALASS maps
+        # failed.
+        plateau_clock = _text_clock_plateau_output(source_cues, mapped_starts, reference, output)
+        if not bool(plateau_clock.get("accepted")):
+            # A broadcast with scenes cut out (or chunks inserted): only the regions the
+            # text anchors on their own clocks are kept, the lines of a cut are dropped.
+            cut_clock = _text_clock_cut_output(source_cues, mapped_starts, reference, output)
+            if bool(cut_clock.get("accepted")):
+                refused = {key: plateau_clock.get(key) for key in ("reason", "gate_failures", "clocks")}
+                plateau_clock = {**cut_clock, "refused_plateau_clock": refused}
+            else:
+                plateau_clock["cut_clock"] = cut_clock
     shifts_sorted = sorted(shifts)
     median_shift = shifts_sorted[len(shifts_sorted) // 2] if shifts_sorted else 0.0
     spread = (max(shifts_sorted) - min(shifts_sorted)) if shifts_sorted else 0.0
@@ -8735,13 +10098,648 @@ def _stt_text_clock_candidate(
         "text_alignment": text_alignment,
         "activity": activity,
     }
+    if plateau_clock is not None:
+        diagnostics["plateau_clock"] = plateau_clock
     if not accepted:
         # Preserve the rejected clock: it is small and invaluable for benchmark/debug.
         return None, diagnostics
     return output, diagnostics
 
 
+_PLATEAU_TEXT_SCORE = 0.62
+_PLATEAU_CHANCE_SHIFTS = (-60.0, -40.0, -20.0, -12.0, -8.0, 8.0, 12.0, 20.0, 40.0, 60.0)
+_PLATEAU_CHANCE_MARGIN = 0.05
+_PLATEAU_CHANCE_RATIO = 2.0
+_PLATEAU_CHANCE_SIGMAS = 4.0
+_PLATEAU_EDGE_FOLD_CUES = 10
+# ... or this share of the mapped lines when more (a cold open of a long episode).
+_PLATEAU_EDGE_FOLD_FRACTION = 0.05
+_PLATEAU_EDGE_FOLD_SECONDS = 15.0
+
+
+def _weighted_cue_score(rows: list[tuple[float, float] | None]) -> tuple[float, int]:
+    kept = [row for row in rows if row is not None]
+    weight = sum(w for _score, w in kept)
+    return (sum(value * w for value, w in kept) / weight if weight > 0 else 0.0), len(kept)
+
+
+def _plateau_text_support(
+    cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    low: int,
+    high: int,
+) -> dict[str, object]:
+    """Text score of ``cues[low..high]`` against the speech beside it, and against chance.
+
+    Chance is the same lines displaced by 8-20 s (nothing of their own text is there).
+    A large STT model reaches the fixed score; a small one (whisper-tiny) transcribes
+    worse, so a right clock scores lower, but still far above its displaced chance."""
+    score, compared = _weighted_cue_score(_stt_text_cue_scores(cues, reference_cues)[low : high + 1])
+    chances = []
+    for delta in _PLATEAU_CHANCE_SHIFTS:
+        moved = [(start + delta, end + delta, text) for start, end, text in cues]
+        chances.append(_weighted_cue_score(_stt_text_cue_scores(moved, reference_cues)[low : high + 1])[0])
+    chance = max(chances)
+    mean = sum(chances) / len(chances)
+    spread = (sum((value - mean) ** 2 for value in chances) / len(chances)) ** 0.5
+    supported = score >= _PLATEAU_TEXT_SCORE or (
+        score >= chance + _PLATEAU_CHANCE_MARGIN
+        and score >= mean * _PLATEAU_CHANCE_RATIO
+        and score >= mean + _PLATEAU_CHANCE_SIGMAS * spread
+    )
+    return {
+        "first_cue": low,
+        "last_cue": high,
+        "compared_cues": compared,
+        "score": round(score, 4),
+        "chance_score": round(chance, 4),
+        "chance_mean": round(mean, 4),
+        "chance_spread": round(spread, 4),
+        "supported": bool(supported),
+    }
+
+
+# Leading cues the first clock puts before the file start (a TV capture whose pre-roll
+# the release cut): a cold open the release kept elsewhere reads its own text clock; a
+# commercial or the previous programme has no place in the video.
+_PLATEAU_LEADING_OWN_CLOCK_SPREAD_SECONDS = 4.0
+_PLATEAU_LEADING_OWN_CLOCK_CUES = 3
+# Fewer lines than this piled at the start are kept as before (the output guard's
+# collapsed-lines rule starts at five).
+_PLATEAU_LEADING_DROP_CUES = 5
+
+
+def _plateau_leading_cues_before_start(
+    source_cues: list[tuple[float, float, str]],
+    shifts: list[float | None],
+    repaired_shifts: list[float | None],
+    retime: Callable[[list[float | None]], list[tuple[float, float, str]]],
+    reference_cues: list[tuple[float, float, str]],
+) -> dict[str, object]:
+    """The first clock of a plateau map puts the leading cues before 0 s.
+
+    Written at the file start they pile up on one instant (the output guard then rejects
+    an otherwise right two-clock map of a TV capture: Rilu Rilu Fairilu E23, Digimon Ghost
+    Game E66, 90 and 150 s of pre-roll). When the cues' own text-mapped onsets agree on one
+    clock inside the file (within ``_PLATEAU_LEADING_OWN_CLOCK_SPREAD_SECONDS``), before the
+    next cue, and that clock carries their text beside the speech, they take it (the cold
+    open); otherwise, when they would pile up (``_PLATEAU_LEADING_DROP_CUES`` or more), they
+    are dropped: their content is not in the video (``repaired_shifts`` is updated in place
+    for an own clock)."""
+    prefix: list[int] = []
+    for index, (cue, shift) in enumerate(zip(source_cues, repaired_shifts)):
+        if shift is None:
+            prefix.append(index)
+            continue
+        if float(cue[0]) + float(shift) >= 0.0:
+            break
+        prefix.append(index)
+    # Only a prefix that ends at a cue the clock does place in the file.
+    if not prefix or prefix[-1] + 1 >= len(source_cues):
+        return {"cues": 0}
+    while prefix and repaired_shifts[prefix[-1]] is None:
+        prefix.pop()
+    if not prefix:
+        return {"cues": 0}
+    payload: dict[str, object] = {"cues": len(prefix), "own_clock": None}
+    own = [
+        float(shifts[index])  # type: ignore[arg-type]
+        for index in prefix
+        if shifts[index] is not None and float(source_cues[index][0]) + float(shifts[index]) >= 0.0  # type: ignore[arg-type]
+    ]
+    next_start = float(source_cues[prefix[-1] + 1][0]) + float(repaired_shifts[prefix[-1] + 1] or 0.0)
+    if len(own) >= min(_PLATEAU_LEADING_OWN_CLOCK_CUES, len(prefix)) and (
+        max(own) - min(own) <= _PLATEAU_LEADING_OWN_CLOCK_SPREAD_SECONDS
+    ):
+        level = statistics.median(own)
+        trial = list(repaired_shifts)
+        for index in prefix:
+            trial[index] = level
+        rows = retime(trial)
+        first = float(source_cues[prefix[0]][0]) + level
+        last_end = float(source_cues[prefix[-1]][1]) + level
+        if first >= 0.0 and last_end <= next_start + 0.5:
+            support = _plateau_text_support(rows, reference_cues, prefix[0], prefix[-1])
+            payload["own_clock_support"] = support
+            if bool(support["supported"]):
+                for index in prefix:
+                    repaired_shifts[index] = level
+                payload["own_clock"] = round(level, 3)
+                return payload
+    if len(prefix) < _PLATEAU_LEADING_DROP_CUES:
+        # A few lines at the file start were always kept there (the guard accepts them);
+        # dropping them can pair repeated lines differently in the guard's text match.
+        payload["kept_at_start"] = len(prefix)
+        return payload
+    payload["dropped"] = list(prefix)
+    return payload
+
+
+def _plateau_unmapped_shifts(
+    source_cues: list[tuple[float, float, str]],
+    values: list[float | None],
+) -> list[float | None]:
+    """``values`` with the shift of the nearer mapped cue for every cue without one.
+
+    A cue the text clock could not map (no readable text: "…", "！？") has no shift of its
+    own. Written at its source time it stayed where the source had it while the lines
+    around it moved by their clock (a TV capture's two minutes of pre-roll: the "…" of a
+    scene shown two minutes early, in another scene). It takes the shift of the mapped
+    cue nearer in source time (``text_clock_plateaus.nearer_neighbour``); a neighbour
+    whose clock would put it before the file start is passed over for the other one, and
+    without a usable neighbour the cue keeps its place (None)."""
+    from .subtitles.text_clock_plateaus import nearer_neighbour
+
+    mapped = [index for index, value in enumerate(values) if value is not None]
+    if not mapped or len(mapped) == len(values):
+        return list(values)
+    starts = [float(cue[0]) for cue in source_cues]
+    ends = [float(cue[1]) for cue in source_cues]
+    filled = list(values)
+    for index, value in enumerate(values):
+        if value is not None:
+            continue
+        position = bisect.bisect_left(mapped, index)
+        before = mapped[position - 1] if position > 0 else None
+        after = mapped[position] if position < len(mapped) else None
+        nearer = nearer_neighbour(starts, ends, index, before, after)
+        for neighbour in (nearer, after if nearer == before else before):
+            if neighbour is None:
+                continue
+            shift = float(values[neighbour])  # type: ignore[arg-type]
+            if starts[index] + shift >= 0.0:
+                filled[index] = shift
+                break
+    return filled
+
+
+def _text_clock_plateau_output(
+    source_cues: list[tuple[float, float, str]],
+    mapped_starts: list[float | None],
+    reference: Path,
+    rejected_output: Path,
+) -> dict[str, object]:
+    """The text clock read as a few constant clocks (see ``text_clock_plateaus``).
+
+    Accepted only when the fit accepts, every clock beside a large jump lands its own
+    text beside the same speech, and the whole repaired clock passes the text clock's
+    coverage and activity gates and its text score (the fixed score, or well above the
+    score of the same lines displaced, see ``_plateau_text_support``). A short first or
+    last clock (a cold open, the preview: under 10 lines or 5 % of the mapped ones)
+    without text support beside a small jump follows its neighbour instead of failing
+    the whole clock."""
+    from .subtitles.text_clock_plateaus import SIDE_CUES, fit_text_clock_plateaus
+
+    shifts = [
+        None if start is None else float(start) - float(cue[0])
+        for cue, start in zip(source_cues, mapped_starts)
+    ]
+    fit = fit_text_clock_plateaus(
+        [float(cue[0]) for cue in source_cues], [float(cue[1]) for cue in source_cues], shifts
+    )
+    payload = {key: value for key, value in fit.items() if key != "shifts"}
+    if not bool(fit.get("accepted")):
+        return {**payload, "accepted": False}
+    repaired_shifts: list[float | None] = list(fit["shifts"])  # type: ignore[call-overload]
+    try:
+        reference_cues = parse_srt(reference)
+    except OSError:
+        reference_cues = []
+    clocks = list(fit.get("clocks") or [])  # type: ignore[call-overload]
+    first_index = 0
+    clock_ranges: list[tuple[int, int, float]] = []
+    mapped_indices = [index for index, shift in enumerate(shifts) if shift is not None]
+    for clock in clocks:
+        count = int(clock.get("cues") or 0)
+        members = mapped_indices[first_index : first_index + count]
+        first_index += count
+        if members:
+            clock_ranges.append((members[0], members[-1], float(clock.get("shift_seconds") or 0.0)))
+
+    def retime(values: list[float | None]) -> list[tuple[float, float, str]]:
+        starts = [
+            float(cue[0]) + (float(shift) if shift is not None else 0.0)
+            for cue, shift in zip(source_cues, _plateau_unmapped_shifts(source_cues, values))
+        ]
+        rows: list[tuple[float, float, str]] = []
+        for index, (cue, start) in enumerate(zip(source_cues, starts)):
+            end = start + max(0.05, float(cue[1]) - float(cue[0]))
+            later = [value for value in starts[index + 1 : index + 4] if value > start]
+            if later:
+                end = min(end, max(start + 0.05, min(later) - 0.05))
+            rows.append((max(0.0, start), max(0.05, end), str(cue[2])))
+        return rows
+
+    retimed = retime(repaired_shifts)
+    leading = _plateau_leading_cues_before_start(source_cues, shifts, repaired_shifts, retime, reference_cues)
+    if leading.get("own_clock") is not None:
+        retimed = retime(repaired_shifts)
+    dropped_leading: set[int] = set(leading.get("dropped") or [])  # type: ignore[arg-type]
+    folded: list[dict[str, object]] = []
+    if len(clock_ranges) >= 3:
+        for edge, neighbour in ((0, 1), (len(clock_ranges) - 1, len(clock_ranges) - 2)):
+            low, high, level = clock_ranges[edge]
+            members = [
+                float(value)
+                for value in repaired_shifts[clock_ranges[neighbour][0] : clock_ranges[neighbour][1] + 1]
+                if value is not None
+            ]
+            target = statistics.median(members) if members else clock_ranges[neighbour][2]
+            if abs(target - level) < 4.0 or abs(target - level) > _PLATEAU_EDGE_FOLD_SECONDS:
+                continue
+            fold_limit = max(_PLATEAU_EDGE_FOLD_CUES, int(_PLATEAU_EDGE_FOLD_FRACTION * len(mapped_indices)))
+            if sum(1 for index in mapped_indices if low <= index <= high) >= fold_limit:
+                continue
+            if bool(_plateau_text_support(retimed, reference_cues, low, high)["supported"]):
+                continue
+            for index in range(low, high + 1):
+                if repaired_shifts[index] is not None:
+                    repaired_shifts[index] = target
+            # The lines the fit squeezed between both clocks (kept on their own text map)
+            # follow too: without the jump there is nothing to squeeze them into.
+            n_low, n_high = clock_ranges[neighbour][0], clock_ranges[neighbour][1]
+            for index in range(n_low, n_high + 1):
+                value = repaired_shifts[index]
+                if value is not None and abs(float(value) - target) > 1.0:
+                    repaired_shifts[index] = target
+            clock_ranges[edge] = (low, high, target)
+            folded.append({"first_cue": low, "last_cue": high, "from_shift": level, "to_shift": target})
+        if folded:
+            retimed = retime(repaired_shifts)
+    output = rejected_output.with_name(f"{rejected_output.stem}-plateaus.srt")
+    kept = [row for index, row in enumerate(retimed) if index not in dropped_leading]
+    write_srt(kept, output, preserve_order=True)
+    text_alignment = _subtitle_stt_text_score(output, reference)
+    activity = compare_timing_activity(output, reference)
+    try:
+        text_coverage = float(text_alignment.get("coverage") or 0.0)
+        activity_score = float(activity.get("weighted") or 0.0)
+    except (TypeError, ValueError):
+        text_coverage = activity_score = 0.0
+    whole = _plateau_text_support(kept, reference_cues, 0, len(kept) - 1)
+    failures: list[str] = []
+    if not bool(text_alignment.get("available")) or not bool(whole["supported"]):
+        failures.append(f"text_score:{whole['score']:.4f}(chance {whole['chance_score']:.4f})")
+    if text_coverage < 0.35:
+        failures.append(f"text_coverage:{text_coverage:.4f}<0.3500")
+    if not bool(activity.get("available")) or activity_score < 0.20:
+        failures.append(f"activity_score:{activity_score:.4f}<0.2000")
+    # Each clock beside a large jump must carry its own text match (both sides of a
+    # break, not only the half the whole-file score is made of).
+    sides: list[dict[str, object]] = []
+    for left, right in zip(clock_ranges, clock_ranges[1:]):
+        if abs(right[2] - left[2]) < 4.0:
+            continue
+        for low, high in ((left[0], left[1]), (right[0], right[1])):
+            side = _plateau_text_support(retimed, reference_cues, low, high)
+            sides.append(side)
+            if int(side["compared_cues"]) < SIDE_CUES or not bool(side["supported"]):
+                failures.append(f"clock_text_support:{low}-{high}:{float(side['score']):.4f}")
+    accepted = not failures
+    return {
+        **payload,
+        "accepted": accepted,
+        "reason": "ok" if accepted else "plateau_clock_gate_failed",
+        "gate_failures": failures,
+        "output": str(output) if accepted else None,
+        "rejected_output": None if accepted else str(output),
+        "text_alignment": text_alignment,
+        "text_support": whole,
+        "activity": activity,
+        "clock_text_support": sides,
+        "folded_edge_clocks": folded,
+        "leading_cues_before_start": {key: value for key, value in leading.items() if key != "dropped"}
+        | {"dropped_cues": len(dropped_leading)},
+        # The final clocks (after folding): cue index range and the shift its mapped
+        # cues take; the ALASS cross-check compares a speech map against these.
+        "clock_ranges": [
+            {
+                "first_cue": low,
+                "last_cue": high,
+                "shift_seconds": round(
+                    statistics.median(
+                        [float(value) for value in repaired_shifts[low : high + 1] if value is not None]
+                        or [level]
+                    ),
+                    3,
+                ),
+            }
+            for low, high, level in clock_ranges
+        ],
+    }
+
+
+# Refits of the cut clock without anchors that carry no text (at most).
+_CUT_CLOCK_REFITS = 3
+
+
+def _text_clock_cut_output(
+    source_cues: list[tuple[float, float, str]],
+    mapped_starts: list[float | None],
+    reference: Path,
+    rejected_output: Path,
+) -> dict[str, object]:
+    """The text clock read as the kept regions of a cut broadcast (see ``cut_clocks``).
+
+    Tried only after the plateau fit refused the clock. The lines of a cut scene are
+    dropped; the kept lines take their region's clock. Accepted only when the fit accepts
+    (several strong clocks, several large jumps), the kept lines pass the text clock's
+    coverage and activity gates and score well above the same lines displaced, and every
+    anchor clock lands its own text beside the speech."""
+    from .subtitles.cut_clocks import STRONG_CLOCK_CUES as _CUT_CLOCK_STRONG_CUES
+    from .subtitles.cut_clocks import fit_text_clock_cuts
+    from .subtitles.text_clock_plateaus import SIDE_CUES
+
+    shifts = [
+        None if start is None else float(start) - float(cue[0])
+        for cue, start in zip(source_cues, mapped_starts)
+    ]
+    try:
+        reference_cues = parse_srt(reference)
+    except OSError:
+        reference_cues = []
+    rejected: set[int] = set()
+    for _round in range(_CUT_CLOCK_REFITS + 1):
+        fit = fit_text_clock_cuts(
+            [float(cue[0]) for cue in source_cues],
+            [float(cue[1]) for cue in source_cues],
+            shifts,
+            rejected_anchors=frozenset(rejected),
+        )
+        if not bool(fit.get("accepted")):
+            break
+        # A small anchor whose lines do not land their text beside the speech (a flat
+        # stretch of the ramp through a cut) is no anchor: fit again without it.
+        weak: list[int] = []
+        for clock in list(fit.get("anchor_ranges") or []):  # type: ignore[call-overload]
+            low, high = int(clock["first_cue"]), int(clock["last_cue"])
+            moved = [
+                (
+                    float(cue[0]) + float(clock["shift_seconds"]),
+                    float(cue[1]) + float(clock["shift_seconds"]),
+                    cue[2],
+                )
+                for cue in source_cues[low : high + 1]
+            ]
+            side = _plateau_text_support(moved, reference_cues, 0, len(moved) - 1)
+            if int(clock.get("agreeing_cues") or 0) < _CUT_CLOCK_STRONG_CUES and (
+                int(side["compared_cues"]) < SIDE_CUES or not bool(side["supported"])
+            ):
+                weak.append(low)
+        if not weak:
+            break
+        rejected.update(weak)
+    payload = {key: value for key, value in fit.items() if key not in {"shifts", "dropped"}}
+    payload["kind"] = "cuts"
+    payload["rejected_anchors"] = sorted(rejected)
+    if not bool(fit.get("accepted")):
+        return {**payload, "accepted": False}
+    repaired: list[float | None] = list(fit["shifts"])  # type: ignore[call-overload]
+    # Lines the first clock puts before the file start are not in the video (a cut recap).
+    before_start = 0
+    for index, value in enumerate(repaired):
+        if value is None:
+            continue
+        if float(source_cues[index][0]) + float(value) >= 0.0:
+            break
+        repaired[index] = None
+        before_start += 1
+    payload["dropped_before_start"] = before_start
+    kept_indices = [index for index, value in enumerate(repaired) if value is not None]
+    starts = [float(source_cues[index][0]) + float(repaired[index]) for index in kept_indices]  # type: ignore[arg-type]
+    kept: list[tuple[float, float, str]] = []
+    for position, index in enumerate(kept_indices):
+        cue = source_cues[index]
+        start = starts[position]
+        end = start + max(0.05, float(cue[1]) - float(cue[0]))
+        later = [value for value in starts[position + 1 : position + 4] if value > start]
+        if later:
+            end = min(end, max(start + 0.05, min(later) - 0.05))
+        kept.append((max(0.0, start), max(0.05, end), str(cue[2])))
+    if len(kept) < 2:
+        return {**payload, "accepted": False, "reason": "no_kept_lines"}
+    output = rejected_output.with_name(f"{rejected_output.stem}-cuts.srt")
+    write_srt(kept, output, preserve_order=True)
+    text_alignment = _subtitle_stt_text_score(output, reference)
+    activity = compare_timing_activity(output, reference)
+    try:
+        text_coverage = float(text_alignment.get("coverage") or 0.0)
+        activity_score = float(activity.get("weighted") or 0.0)
+    except (TypeError, ValueError):
+        text_coverage = activity_score = 0.0
+    whole = _plateau_text_support(kept, reference_cues, 0, len(kept) - 1)
+    failures: list[str] = []
+    if not bool(text_alignment.get("available")) or not bool(whole["supported"]):
+        failures.append(f"text_score:{whole['score']:.4f}(chance {whole['chance_score']:.4f})")
+    if text_coverage < 0.35:
+        failures.append(f"text_coverage:{text_coverage:.4f}<0.3500")
+    if not bool(activity.get("available")) or activity_score < 0.20:
+        failures.append(f"activity_score:{activity_score:.4f}<0.2000")
+    position_of = {index: position for position, index in enumerate(kept_indices)}
+    sides: list[dict[str, object]] = []
+    ranges: list[dict[str, object]] = []
+    for clock in list(fit.get("anchor_ranges") or []):  # type: ignore[call-overload]
+        low, high = position_of.get(int(clock["first_cue"])), position_of.get(int(clock["last_cue"]))
+        if low is None or high is None:
+            failures.append(f"clock_before_file_start:{clock['first_cue']}-{clock['last_cue']}")
+            continue
+        side = _plateau_text_support(kept, reference_cues, low, high)
+        sides.append(side)
+        if int(side["compared_cues"]) < SIDE_CUES or not bool(side["supported"]):
+            failures.append(
+                f"clock_text_support:{clock['first_cue']}-{clock['last_cue']}:{float(side['score']):.4f}"
+            )
+        ranges.append(dict(clock))
+    accepted = not failures
+    return {
+        **payload,
+        "accepted": accepted,
+        "reason": "ok" if accepted else "cut_clock_gate_failed",
+        "gate_failures": failures,
+        "output": str(output) if accepted else None,
+        "rejected_output": None if accepted else str(output),
+        "text_alignment": text_alignment,
+        "text_support": whole,
+        "activity": activity,
+        "clock_text_support": sides,
+        "dropped_cues": len(source_cues) - len(kept),
+        "anchor_ranges": ranges,
+    }
+
+
+# An accepted speech ALASS map and an accepted text-clock plateau map of the same file
+# that disagree: the plateau map wins when the ALASS map moves a text-supported clock
+# piece (a cold open, the part after a kept break) by a second or more, or when it sits
+# a constant fraction of a second off the plateau clocks' onsets. ALASS fits interval
+# overlap with the transcript's segments; a TV caption file (cues longer than the voice,
+# ending late) reads ~0.2-0.25 s early that way, while the plateau clocks are the median
+# text-mapped onset of hundreds of cues (The Fable E6/E9/E17 TV files against the exact
+# DSNP track: 61-87 % of the windows within 0.3 s with ALASS, 97-98 % with the plateaus).
+_PLATEAU_CHECK_MISSED_SECONDS = 1.0
+_PLATEAU_CHECK_MISSED_CUES = 5
+_PLATEAU_CHECK_MISSED_FRACTION = 0.02
+_PLATEAU_CHECK_OFFSET_SECONDS = 0.15
+_PLATEAU_CHECK_MIN_CUES = 40
+# The moved lines must read their own text beside the speech clearly better at the
+# plateau times than at the ALASS times (an ALASS piece that a pause, a shortened ending
+# or a cut supports, and the text cannot tell apart, stays).
+_PLATEAU_CHECK_TEXT_MARGIN = 0.08
+
+
+def _alass_plateau_disagreement(
+    source: Path,
+    aligned: Path,
+    reference: Path,
+    stt_text_alignment: object,
+) -> dict[str, object]:
+    """Compare an ALASS output with the accepted plateau clock, cue by cue.
+
+    Only cues that took their plateau clock's shift count (not the unmapped ones, which
+    the plateau map leaves where they were, nor the lines squeezed between two clocks)."""
+    plateau_clock = stt_text_alignment.get("plateau_clock") if isinstance(stt_text_alignment, dict) else None
+    plateau_output = _stt_plateau_clock_output(stt_text_alignment)
+    ranges = plateau_clock.get("clock_ranges") if isinstance(plateau_clock, dict) else None
+    if plateau_output is None or not isinstance(ranges, list) or not ranges:
+        return {"available": False, "reason": "no_plateau_clock"}
+    try:
+        source_cues = parse_srt(source)
+        aligned_cues = parse_srt(aligned)
+        plateau_cues = parse_srt(plateau_output)
+        reference_cues = parse_srt(reference)
+    except OSError:
+        return {"available": False, "reason": "read_error"}
+    if not source_cues or not (len(source_cues) == len(aligned_cues) == len(plateau_cues)):
+        return {"available": False, "reason": "cue_count_mismatch"}
+    differences: list[float] = []
+    indices: list[int] = []
+    for clock in ranges:
+        try:
+            low, high, level = int(clock["first_cue"]), int(clock["last_cue"]), float(clock["shift_seconds"])
+        except (KeyError, TypeError, ValueError):
+            return {"available": False, "reason": "bad_clock_ranges"}
+        for index in range(max(0, low), min(high, len(source_cues) - 1) + 1):
+            source_start = float(source_cues[index][0])
+            plateau_shift = float(plateau_cues[index][0]) - source_start
+            # A cue clamped at zero, unmapped (kept in place) or squeezed between clocks.
+            if abs(plateau_shift - level) > 0.005 or float(plateau_cues[index][0]) <= 0.0:
+                continue
+            differences.append(float(aligned_cues[index][0]) - source_start - plateau_shift)
+            indices.append(index)
+    compared = len(differences)
+    if compared < _PLATEAU_CHECK_MIN_CUES:
+        return {"available": False, "reason": "too_few_clock_cues", "compared_cues": compared}
+    moved = [
+        index for index, value in zip(indices, differences) if abs(value) >= _PLATEAU_CHECK_MISSED_SECONDS
+    ]
+    missed = len(moved)
+    close = [value for value in differences if abs(value) < _PLATEAU_CHECK_MISSED_SECONDS]
+    offset = statistics.median(close) if close else 0.0
+    missed_limit = max(_PLATEAU_CHECK_MISSED_CUES, _PLATEAU_CHECK_MISSED_FRACTION * compared)
+    reasons: list[str] = []
+    moved_text: dict[str, float] = {}
+    if missed >= missed_limit:
+        alass_rows = _stt_text_cue_scores(aligned_cues, reference_cues)
+        plateau_rows = _stt_text_cue_scores(plateau_cues, reference_cues)
+        alass_score, _count = _weighted_cue_score([alass_rows[index] for index in moved])
+        plateau_score, _count = _weighted_cue_score([plateau_rows[index] for index in moved])
+        moved_text = {"alass": round(alass_score, 4), "plateau": round(plateau_score, 4)}
+        if plateau_score >= alass_score + _PLATEAU_CHECK_TEXT_MARGIN:
+            reasons.append("alass_moves_plateau_clock")
+    if len(close) >= _PLATEAU_CHECK_MIN_CUES and abs(offset) >= _PLATEAU_CHECK_OFFSET_SECONDS:
+        reasons.append("alass_offset_from_plateau_onsets")
+    return {
+        "available": True,
+        "disagrees": bool(reasons),
+        "reasons": reasons,
+        "compared_cues": compared,
+        "missed_cues": missed,
+        "missed_text_score": moved_text,
+        "median_offset_seconds": round(offset, 3),
+    }
+
+
+def _stt_plateau_clock_output(stt_text_alignment: object) -> Path | None:
+    plateau_clock = stt_text_alignment.get("plateau_clock") if isinstance(stt_text_alignment, dict) else None
+    if (
+        isinstance(plateau_clock, dict)
+        and bool(plateau_clock.get("accepted"))
+        and plateau_clock.get("output")
+    ):
+        return Path(str(plateau_clock["output"]))
+    return None
+
+
+def _speech_source_without_english_lines(
+    subtitle: Path, cache_dir: Path, *, ffmpeg_path: str, verbose: bool
+) -> tuple[Path, int]:
+    """A JP+EN file's Japanese lines only, for the Japanese speech clock.
+
+    The speech clock reads the subtitle text against a Japanese transcript; a bilingual
+    file's English lines (about half of them, at their own times) match nothing and
+    break the clock into unsupported pieces. Only a file the bilingual-English profile
+    flags is changed; the speech-clocked output then shows its Japanese lines."""
+    from .subtitle_formats import english_lines_removed, subtitle_bilingual_english_profile
+
+    if subtitle.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS:
+        return subtitle, 0
+    try:
+        if not subtitle_bilingual_english_profile(subtitle).get("suspected_bilingual_english"):
+            return subtitle, 0
+        source = subtitle
+        if source.suffix.casefold() in {".ass", ".ssa"}:
+            source, _conversion = convert_to_plain_srt(
+                source, cache_dir, ffmpeg_path=ffmpeg_path, force=False, verbose=verbose
+            )
+            if source.suffix.casefold() != ".srt":
+                return subtitle, 0
+        stat = source.stat()
+        cues, removed = english_lines_removed(parse_srt(source))
+        if not removed or len(cues) < 20:
+            return subtitle, 0
+        digest = hashlib.sha1(
+            f"speech-japanese-lines-1:{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+        ).hexdigest()[:20]
+        output = cache_dir / "speech-japanese-lines" / f"{digest}.srt"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_srt(cues, output, preserve_overlaps=True)
+        return output, removed
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return subtitle, 0
+
+
 def _try_japanese_stt_fallback(
+    video: Path,
+    subtitle: Path,
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    alass_path: str,
+    verbose: bool,
+) -> tuple[Path | None, dict[str, object]]:
+    if not config.japanese_stt_fallback:
+        return None, _result("stt_disabled", sync_was_successful=False)
+    source, removed = _speech_source_without_english_lines(
+        subtitle, cache_dir, ffmpeg_path=ffmpeg_path, verbose=verbose
+    )
+    path, result = _try_japanese_stt_fallback_lines(
+        video,
+        source,
+        cache_dir,
+        config,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        alass_path=alass_path,
+        verbose=verbose,
+    )
+    if removed:
+        result["speech_source_english_lines_removed"] = removed
+        result["speech_source"] = str(source)
+    return path, result
+
+
+def _try_japanese_stt_fallback_lines(
     video: Path,
     subtitle: Path,
     cache_dir: Path,
@@ -8790,20 +10788,12 @@ def _try_japanese_stt_fallback(
                 source_conversion=conversion,
             )
 
-    if config.japanese_stt_text_clock:
-        text_aligned, stt_text_alignment = _stt_text_clock_candidate(
-            source,
-            reference,
-            cache_dir,
-            model=config.japanese_stt_model,
-        )
-    else:
-        text_aligned = None
-        stt_text_alignment = {
-            "attempted": False,
-            "accepted": False,
-            "reason": "text_clock_disabled",
-        }
+    text_aligned, stt_text_alignment = _stt_text_clock_candidate(
+        source,
+        reference,
+        cache_dir,
+        model=config.japanese_stt_model,
+    )
     if text_aligned is not None and bool(stt_text_alignment.get("accepted")):
         text_activity = stt_text_alignment.get("activity")
         try:
@@ -8906,6 +10896,14 @@ def _try_japanese_stt_fallback(
 
         if not accepted:
             continue
+        if attempts[0] is not attempt_payload and _stt_plateau_clock_output(stt_text_alignment) is not None:
+            # The finest ALASS map was unsafe and only a coarser split penalty passed:
+            # a forced compromise between clocks. The text clock's plateaus (constant
+            # clocks whose jumps the source's pauses and the text both support) are
+            # the better map then (Blue Reflection Ray E07: all lines within 0.3 s
+            # instead of 76 %).
+            attempt_payload["superseded_by"] = "stt_text_clock_plateaus"
+            break
 
         refined, plateau_refinement = _refine_stt_opening_plateaus(
             source,
@@ -8920,6 +10918,11 @@ def _try_japanese_stt_fallback(
                 score = float(activity.get("weighted") or 0.0)
             except (TypeError, ValueError):
                 score = 0.0
+        plateau_check = _alass_plateau_disagreement(source, aligned, reference, stt_text_alignment)
+        attempt_payload["plateau_check"] = plateau_check
+        if bool(plateau_check.get("disagrees")):
+            attempt_payload["superseded_by"] = "stt_text_clock_plateaus"
+            break
 
         result.update(
             {
@@ -8940,6 +10943,45 @@ def _try_japanese_stt_fallback(
             }
         )
         return aligned, result
+
+    plateau_output = _stt_plateau_clock_output(stt_text_alignment)
+    if plateau_output is not None:
+        # No speech ALASS map was safe (or only a coarse one), but the text clock reads
+        # as a few constant clocks whose jumps the source's own pauses and both sides'
+        # text support.
+        plateau_clock = stt_text_alignment["plateau_clock"]
+        plateau_activity = plateau_clock.get("activity")
+        try:
+            plateau_activity_score = (
+                float(plateau_activity.get("weighted") or 0.0) if isinstance(plateau_activity, dict) else 0.0
+            )
+        except (TypeError, ValueError):
+            plateau_activity_score = 0.0
+        configure_logging().info(
+            "ACCEPT step=subtitle.stt_text_clock_plateaus video=%s subtitle=%s jumps=%s",
+            video.name,
+            subtitle.name,
+            plateau_clock.get("jumps"),
+        )
+        return plateau_output, _result(
+            "applied",
+            sync_was_successful=True,
+            engine=(
+                "japanese-stt+text-clock-cuts"
+                if plateau_clock.get("kind") == "cuts"
+                else "japanese-stt+text-clock-plateaus"
+            ),
+            selection_reason="last_resort_stt_text_clock_plateaus",
+            timing_reference=str(reference),
+            timing_reference_language="ja",
+            reference_activity=plateau_activity,
+            reference_activity_score=plateau_activity_score,
+            reference_alignment_reliable=True,
+            stt=stt,
+            stt_text_alignment=stt_text_alignment,
+            stt_alass_attempts=attempts,
+            output=str(plateau_output),
+        )
 
     last_result.update(
         {
@@ -8999,6 +11041,102 @@ def _verify_extreme_reference_map_with_speech(
         "result": speech_result,
     }
     return (speech_path if accepted else None), diagnostics
+
+
+def _check_staircase_map_with_speech(
+    video: Path,
+    subtitle: Path,
+    aligned: Path,
+    timing_reference: Path,
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    alass_path: str,
+    verbose: bool,
+) -> tuple[Path | None, dict[str, object]]:
+    """A map on clocks a few seconds apart against the Japanese speech clock
+    (``subtitles.staircase_check``): the speech map's path when its lines sit clearly better
+    on the English line starts and the audio's speech onsets, else ``None``. The decision
+    and both counts are in the diagnostics (the speech result under ``result``)."""
+    diagnostics: dict[str, object] = {
+        "version": _staircase_check.VERSION,
+        "attempted": False,
+        "decision": "alass",
+    }
+    onsets = _episode_speech_onsets(video, cache_dir, config, ffmpeg_path=ffmpeg_path)
+    if not onsets:
+        diagnostics["reason"] = "speech_onsets_unavailable"
+        return None, diagnostics
+    try:
+        reference_path = timing_reference
+        if reference_path.suffix.casefold() in {".ass", ".ssa"}:
+            reference_path, _ = convert_to_plain_srt(reference_path, cache_dir, ffmpeg_path=ffmpeg_path)
+        reference = [
+            float(start) for start, end, _text in parse_srt(reference_path) if float(end) > float(start)
+        ]
+        current = _staircase_check.line_hits(parse_srt(aligned), reference, onsets)
+    except (OSError, ValueError):
+        diagnostics["reason"] = "unreadable"
+        return None, diagnostics
+    diagnostics["alass"] = current
+    if not current.get("available"):
+        diagnostics["reason"] = "signal_unavailable"
+        return None, diagnostics
+    speech_path, speech_result = _try_japanese_stt_fallback(
+        video,
+        subtitle,
+        cache_dir,
+        config,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        alass_path=alass_path,
+        verbose=verbose,
+    )
+    diagnostics.update(
+        attempted=True, engine=speech_result.get("engine"), stt_reason=speech_result.get("reason")
+    )
+    if (
+        speech_path is None
+        or speech_path.suffix.casefold() != ".srt"
+        or not speech_result.get("sync_was_successful")
+        or not speech_result.get("reference_alignment_reliable")
+    ):
+        diagnostics["reason"] = "speech_map_unavailable"
+        return None, diagnostics
+    try:
+        speech = _staircase_check.line_hits(parse_srt(speech_path), reference, onsets)
+    except (OSError, ValueError):
+        diagnostics["reason"] = "unreadable"
+        return None, diagnostics
+    diagnostics["speech"] = speech
+    wins, reason = _staircase_check.speech_map_wins(current, speech)
+    diagnostics["reason"] = reason
+    configure_logging().info(
+        "CHECK step=subtitle.staircase_map video=%s decision=%s reason=%s alass=%s/%s/%s speech=%s/%s/%s engine=%s",
+        video.name,
+        "speech" if wins else "alass",
+        reason,
+        current.get("both"),
+        current.get("reference"),
+        current.get("speech"),
+        speech.get("both"),
+        speech.get("reference"),
+        speech.get("speech"),
+        speech_result.get("engine"),
+    )
+    if verbose:
+        print(
+            "  Staircase map check: "
+            f"{'speech clock' if wins else 'ALASS kept'} ({reason}; lines on both signals "
+            f"{current.get('both')} -> {speech.get('both')})"
+        )
+    if not wins:
+        return None, diagnostics
+    diagnostics["decision"] = "speech"
+    diagnostics["result"] = speech_result
+    return speech_path, diagnostics
 
 
 def _optimize_subtitle_unguarded(
@@ -9406,7 +11544,11 @@ def _optimize_subtitle_unguarded(
                     verbose=verbose,
                 )
 
-            exact_release_result = _exact_release_zero_offset_result(video, subtitle, timeline_source)
+            exact_release_result = (
+                _exact_release_zero_offset_result(video, subtitle, timeline_source, timing_reference)
+                if timing_reference is not None
+                else None
+            )
             if timing_reference is not None and exact_release_result is not None:
                 alass_out = timeline_source
                 alass_result = exact_release_result
@@ -9447,6 +11589,13 @@ def _optimize_subtitle_unguarded(
 
             if not bool(alass_result.get("timeline_alignment_reliable")):
                 timeline_attempt = dict(alass_result)
+                if timing_reference is not None and timing_reference_result.get(
+                    "timing_reference_other_language"
+                ):
+                    # An untagged/other-language track is a clock only when the line
+                    # timelines agree; ALASS could fit the subtitle to a signs track.
+                    alass_reference = video
+                    timing_reference = None
                 alass_out, alass_result = synchronize_with_alass(
                     alass_reference,
                     subtitle,
@@ -9477,10 +11626,22 @@ def _optimize_subtitle_unguarded(
                 alass_path=alass_path,
                 verbose=verbose,
             )
+            cold_open_moved, cold_open_meta = False, {}
             if (
                 speech_path is not None
                 and speech_result.get("sync_was_successful")
                 and speech_result.get("reference_alignment_reliable")
+            ):
+                # As in the multi-candidate path: speech that carries the cold open off a
+                # one-clock timeline the embedded reference confirms does not replace it.
+                cold_open_moved, cold_open_meta = _speech_moves_cold_open_off_a_stable_timeline(
+                    alass_result, alass_out, speech_path, timing_reference
+                )
+            if (
+                speech_path is not None
+                and speech_result.get("sync_was_successful")
+                and speech_result.get("reference_alignment_reliable")
+                and not cold_open_moved
             ):
                 speech_result["embedded_timeline_audio_verification"] = {
                     "accepted": True,
@@ -9488,24 +11649,31 @@ def _optimize_subtitle_unguarded(
                     "timeline_segments": alass_result.get("timeline_segments"),
                 }
                 return speech_path, speech_result
-            use_embedded, unsafe_stt_meta = _strong_embedded_timeline_after_unsafe_stt(
-                alass_result, speech_result
-            )
-            if use_embedded:
-                alass_result["unsafe_stt_map"] = unsafe_stt_meta
+            if cold_open_moved:
+                alass_result["speech_clock_conflict"] = cold_open_meta
                 alass_result["speech_verification"] = {
-                    "reason": speech_result.get("reason"),
-                    "attempts": speech_result.get("stt_alass_attempts"),
+                    "engine": speech_result.get("engine"),
+                    "offset_seconds": speech_result.get("offset_seconds"),
                 }
             else:
-                alass_result.update(
-                    sync_was_successful=False,
-                    reference_alignment_reliable=False,
-                    reason="timeline_edit_requires_audio_verification",
-                    unverified_timeline_edit=True,
-                    speech_verification=speech_result,
+                use_embedded, unsafe_stt_meta = _strong_embedded_timeline_after_unsafe_stt(
+                    alass_result, speech_result
                 )
-                return subtitle, alass_result
+                if use_embedded:
+                    alass_result["unsafe_stt_map"] = unsafe_stt_meta
+                    alass_result["speech_verification"] = {
+                        "reason": speech_result.get("reason"),
+                        "attempts": speech_result.get("stt_alass_attempts"),
+                    }
+                else:
+                    alass_result.update(
+                        sync_was_successful=False,
+                        reference_alignment_reliable=False,
+                        reason="timeline_edit_requires_audio_verification",
+                        unverified_timeline_edit=True,
+                        speech_verification=speech_result,
+                    )
+                    return subtitle, alass_result
         if bool(alass_result.get("sync_was_successful")):
             base_engine = (
                 str(alass_result.get("engine") or "embedded-reference+alass")
@@ -9635,6 +11803,36 @@ def _optimize_subtitle_unguarded(
                         successful.append((speech_path, speech_result))
                         speech_replacement = True
 
+                staircase_replacement = False
+                if (
+                    reference_ok
+                    and not speech_replacement
+                    and _staircase_check.is_staircase_map(alass_result)
+                    and str(timing_reference_result.get("language") or "").casefold()
+                    not in {"ja", "jp", "jpn"}
+                ):
+                    staircase_path, staircase = _check_staircase_map_with_speech(
+                        video,
+                        subtitle,
+                        activity_path,
+                        timing_reference,
+                        cache_dir,
+                        config,
+                        ffmpeg_path=ffmpeg_path,
+                        ffprobe_path=ffprobe_path,
+                        alass_path=alass_path,
+                        verbose=verbose,
+                    )
+                    staircase_result = staircase.pop("result", None)
+                    alass_result["staircase_speech_check"] = staircase
+                    if staircase_path is not None and isinstance(staircase_result, dict):
+                        speech_result = dict(staircase_result)
+                        speech_result["selection_reason"] = "staircase_map_japanese_speech"
+                        speech_result["staircase_speech_check"] = dict(staircase)
+                        successful.append((staircase_path, speech_result))
+                        speech_replacement = staircase_replacement = True
+                        reference_ok = False
+
                 if not reference_ok and discontinuity_gate.get("reason") in {
                     "extreme_unconfirmed_alass_discontinuity",
                     "extreme_map_requires_speech_verification",
@@ -9665,7 +11863,9 @@ def _optimize_subtitle_unguarded(
                     successful.append((alass_out, alass_result))
                 else:
                     alass_result["reason"] = (
-                        "embedded_reference_extreme_replaced_by_speech"
+                        "embedded_reference_staircase_replaced_by_speech"
+                        if staircase_replacement
+                        else "embedded_reference_extreme_replaced_by_speech"
                         if speech_replacement
                         else "embedded_reference_output_invalid"
                     )
@@ -9882,7 +12082,10 @@ def _optimize_subtitle_unguarded(
             reference_aligned,
             key=lambda item: float(item[1].get("alignment_score") or float("-inf")),
         )
-        if "embedded_reference_extreme_map" not in best_result:
+        staircase = best_result.get("staircase_speech_check")
+        if "embedded_reference_extreme_map" not in best_result and not (
+            isinstance(staircase, dict) and staircase.get("decision") == "speech"
+        ):
             best_result["selection_reason"] = "embedded_timing_reference"
         return best_path, best_result
 
@@ -10050,20 +12253,15 @@ _CONTENT_MISMATCH_MARKERS = (
 )
 
 
-def raw_fallback_disqualified(result: dict[str, object]) -> bool:
-    """Whether a rejected automatic candidate must not be exposed as raw.
-
-    Raw playback is useful when synchronization merely failed or no reliable clock
-    was available.  It is unsafe after a hard negative that says the candidate or
-    produced time map is incompatible with the current video.
-    """
+def _raw_fallback_reasons(result: dict[str, object]) -> list[str]:
+    reasons: list[str] = []
     guard = result.get("alignment_output_guard")
     if isinstance(guard, dict) and guard.get("status") == "rejected":
-        return True
+        reasons.append("alignment_output_guard")
     if bool(result.get("alignment_output_rejected")):
-        return True
+        reasons.append("alignment_output_rejected")
     if bool(result.get("reference_discontinuity_rejected")):
-        return True
+        reasons.append("reference_discontinuity")
     if bool(result.get("unverified_timeline_edit")):
         from .subtitles.verification import verification_failure
 
@@ -10071,20 +12269,40 @@ def raw_fallback_disqualified(result: dict[str, object]) -> bool:
         # Missing STT is not negative evidence about the original subtitle's
         # identity. Let the caller apply its episode/language identity checks.
         if not failure or failure["reason"] not in {"stt_unavailable", "stt_disabled"}:
-            return True
+            reasons.append("unverified_timeline_edit")
 
     reason = str(result.get("reason") or "").casefold()
     normalized_reason = reason.replace("_", " ").replace("-", " ")
     if any(marker in normalized_reason for marker in _CONTENT_MISMATCH_MARKERS):
-        return True
+        reasons.append("content_mismatch")
 
     validation = result.get("timing_reference_validation")
     if isinstance(validation, dict) and validation.get("accepted") is False:
         validation_reason = str(validation.get("reason") or "").casefold()
         normalized_validation_reason = validation_reason.replace("_", " ").replace("-", " ")
         if any(marker in normalized_validation_reason for marker in _CONTENT_MISMATCH_MARKERS):
-            return True
-    return False
+            reasons.append("content_mismatch")
+    return reasons
+
+
+def raw_fallback_disqualified(result: dict[str, object]) -> bool:
+    """Whether a rejected automatic candidate must not be exposed as raw.
+
+    Raw playback is useful when synchronization merely failed or no reliable clock
+    was available.  It is unsafe after a hard negative that says the candidate or
+    produced time map is incompatible with the current video.
+
+    A rejected discontinuous ALASS map alone says only that no trustworthy *map* was
+    found (TV-cut subtitles for a BD video: BLUE REFLECTION RAY E07 then showed nothing).
+    The raw file is then offered as "not aligned", but only for an exact episode identity
+    (``raw_fallback_needs_exact_identity``; the caller checks the candidate).
+    """
+    reasons = _raw_fallback_reasons(result)
+    return bool(reasons) and reasons != ["reference_discontinuity"]
+
+
+def raw_fallback_needs_exact_identity(result: dict[str, object]) -> bool:
+    return _raw_fallback_reasons(result) == ["reference_discontinuity"]
 
 
 def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
@@ -10358,6 +12576,7 @@ def _rank_embedded_reference_candidates(
         return {
             "japanese_only": 2,
             "unknown": 1,
+            "mixed_japanese_english": 0,
             "mixed_japanese_chinese": 0,
             "chinese_only": 0,
         }.get(language_purity(item), 1)
@@ -10381,6 +12600,7 @@ def _rank_embedded_reference_candidates(
         key=lambda value: {
             "japanese_only": 2,
             "unknown": 1,
+            "mixed_japanese_english": 0,
             "mixed_japanese_chinese": 0,
             "chinese_only": 0,
         }.get(value, 1),
@@ -10469,6 +12689,8 @@ def _exact_jimaku_timing_consensus(
             dict[str, object],
         ]
     ],
+    *,
+    cache_dir: Path | None = None,
 ) -> tuple[
     tuple[
         tuple[float, ...],
@@ -10501,12 +12723,15 @@ def _exact_jimaku_timing_consensus(
         details = candidate.details
         # Files aligned to the same reference agree with each other by
         # construction: a destroyed map must not become "consensus".
-        verdict = validate_alignment_output(candidate.path, _aligned, cache_dir=Path(_aligned).parent)
+        # ASS conversions go to the real cache root's converted/, not a nested
+        # converted/ inside the aligned output's folder (invisible to eviction).
+        conversion_root = Path(cache_dir) if cache_dir is not None else Path(_aligned).parent
+        verdict = validate_alignment_output(candidate.path, _aligned, cache_dir=conversion_root)
         if verdict.get("status") == "rejected":
             guard_rejected.append(f"{candidate.name}: {verdict.get('reason')}")
             continue
         # Copies of one translation (SRT+ASS, re-uploads) are one voice.
-        source_key = _subtitle_text_fingerprint(candidate.path, Path(_aligned).parent)
+        source_key = _subtitle_text_fingerprint(candidate.path, conversion_root)
         if source_key and source_key in seen_sources:
             duplicates += 1
             continue
@@ -10667,7 +12892,10 @@ def _exact_jimaku_audio_clock_consensus(
         qualified,
         key=lambda item: (
             int(item[1].details.get("language_purity") == "japanese_only"),
-            int(item[1].details.get("language_purity") != "mixed_japanese_chinese"),
+            int(
+                item[1].details.get("language_purity")
+                not in {"mixed_japanese_chinese", "mixed_japanese_english"}
+            ),
             int(prefer_srt and item[1].path.suffix.casefold() == ".srt"),
             float(item[1].score),
             -abs(item[0]),
@@ -10745,6 +12973,65 @@ def _embedded_rank_regression_guard(
     return (winner if accepted else None), meta
 
 
+def _candidate_language_rank(candidate: SubtitleCandidate) -> int:
+    details = candidate.details if isinstance(candidate.details, dict) else {}
+    purity = str(details.get("language_purity") or "unknown")
+    return {
+        "japanese_only": 2,
+        "unknown": 1,
+        "mixed_japanese_english": 0,
+        "mixed_japanese_chinese": 0,
+        "chinese_only": 0,
+    }.get(purity, 1)
+
+
+def _weak_mixed_language_successes(
+    evaluated: list[tuple[SubtitleCandidate, Path, dict[str, object]]],
+) -> set[Path]:
+    """Mixed-language candidates whose audio "success" the Japanese-only sources contradict.
+
+    A bilingual file (two text tracks, many duplicate cues) can pass the audio check
+    with a wrong small offset while at least two Japanese-only files of the same episode
+    agree on an offset beyond the search limit and fail only on that limit, with a
+    comparable alignment score (KonoSuba TV captures: -9 s against +119 s). Such a
+    success must not make the bilingual file the only candidate."""
+    weak: set[Path] = set()
+
+    def number(result: dict[str, object], key: str) -> float | None:
+        try:
+            return float(result[key])  # type: ignore[arg-type]
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    for candidate, _path, result in evaluated:
+        if not bool(result.get("sync_was_successful")) or _candidate_language_rank(candidate) > 0:
+            continue
+        own_score = number(result, "alignment_score")
+        own_offset = number(result, "offset_seconds")
+        if own_score is None or own_offset is None:
+            continue
+        limited = [
+            (offset, value)
+            for other, _other_path, other_result in evaluated
+            if _candidate_language_rank(other) > _candidate_language_rank(candidate)
+            and not bool(other_result.get("sync_was_successful"))
+            and str(other_result.get("reason") or "") == "quality_offset_exceeded"
+            and (offset := number(other_result, "offset_seconds")) is not None
+            and (value := number(other_result, "alignment_score")) is not None
+        ]
+        if len(limited) < 2:
+            continue
+        center = statistics.median(offset for offset, _value in limited)
+        cluster = [value for offset, value in limited if abs(offset - center) <= 3.0]
+        if (
+            len(cluster) >= 2
+            and abs(own_offset - center) > 5.0
+            and statistics.median(cluster) >= 0.75 * own_score
+        ):
+            weak.add(candidate.path)
+    return weak
+
+
 def _optimize_candidates_unguarded(
     video: Path,
     candidates: Iterable[SubtitleCandidate],
@@ -10761,6 +13048,7 @@ def _optimize_candidates_unguarded(
     srt_tolerance_absolute: float = 50.0,
     llm: OllamaClient | None = None,
     validate_embedded_reference_with_llm: bool = False,
+    quality_attempt_limit: int = 8,
 ) -> tuple[SubtitleCandidate | None, Path | None, dict[str, object]]:
     """Score every candidate with one shared audio analysis, then optimize the winner."""
     all_candidates = list(candidates)
@@ -10895,7 +13183,7 @@ def _optimize_candidates_unguarded(
                     aligned_cue_sets.append((cue_set, candidate.name, None))
 
                 exact_release_result = _exact_release_zero_offset_result(
-                    video, candidate.path, semantic_source
+                    video, candidate.path, semantic_source, timing_reference
                 )
                 if exact_release_result is not None:
                     aligned = semantic_source
@@ -10920,6 +13208,17 @@ def _optimize_candidates_unguarded(
                     timeline_attempt,
                     stage=debug_stage,
                 )
+                if not bool(alass_result.get("timeline_alignment_reliable")) and timing_reference_result.get(
+                    "timing_reference_other_language"
+                ):
+                    # Not a clock for ALASS (see ``_optimize_subtitle_unguarded``): this
+                    # candidate is timed later from the audio.
+                    if verbose:
+                        print(
+                            f"  Subtitle candidate {index}/{len(candidate_list)}: "
+                            "untagged reference not used without a timeline match"
+                        )
+                    continue
                 if not bool(alass_result.get("timeline_alignment_reliable")):
                     aligned, alass_result = synchronize_with_alass(
                         timing_reference,
@@ -11280,6 +13579,15 @@ def _optimize_candidates_unguarded(
                             speech_result,
                             opening_scaffold,
                         )
+                        if not prefer_embedded:
+                            cold_open_moved, cold_open_meta = _speech_moves_cold_open_off_a_stable_timeline(
+                                risky_timeline_result,
+                                _embedded_aligned,
+                                speech_aligned,
+                                timing_reference,
+                            )
+                            if cold_open_moved:
+                                prefer_embedded, conflict_meta = True, cold_open_meta
                         if prefer_embedded and not risky_timeline_salvaged:
                             final_result = dict(risky_timeline_result)
                             final_result.update(
@@ -11324,6 +13632,26 @@ def _optimize_candidates_unguarded(
                             )
                             return risky_candidate, _embedded_aligned, final_result
 
+                        late_cut: dict[str, object] = {"applied": False, "reason": "salvaged_timeline"}
+                        if not risky_timeline_salvaged:
+                            speech_aligned, late_cut = _keep_late_timeline_cut_after_speech(
+                                speech_aligned,
+                                _embedded_aligned,
+                                risky_timeline_result,
+                                timing_reference,
+                                cache_dir,
+                            )
+                        if late_cut.get("applied"):
+                            configure_logging().warning(
+                                "REPAIR step=subtitle.early_edit_speech_late_cut video=%s candidate=%r "
+                                "boundary=%s jump=%s activity=%s->%s",
+                                video.name,
+                                risky_candidate.name,
+                                late_cut.get("boundary_source_time"),
+                                late_cut.get("jump_seconds"),
+                                late_cut.get("speech_activity_weighted"),
+                                late_cut.get("spliced_activity_weighted"),
+                            )
                         speech_activity = compare_timing_activity(
                             speech_aligned,
                             timing_reference,
@@ -11393,6 +13721,11 @@ def _optimize_candidates_unguarded(
                                 f"{final_result.get('engine') or 'japanese-stt+alass'}"
                                 "+embedded-opening-scaffold"
                             )
+                        if late_cut.get("applied"):
+                            final_result["engine"] = (
+                                # Not "timeline": an engine with it counts as an unverified timeline edit.
+                                f"{final_result.get('engine') or 'japanese-stt+alass'}+late-cut"
+                            )
                         final_result.update(
                             {
                                 "reason": "applied",
@@ -11402,6 +13735,7 @@ def _optimize_candidates_unguarded(
                                 "embedded_timeline_attempt": dict(risky_timeline_result),
                                 "timeline_early_edit_audio_verification": risk_payload,
                                 "embedded_opening_clock_scaffold": opening_scaffold,
+                                "timeline_late_cut": late_cut,
                                 "candidate_selection": {
                                     "mode": "early_edit_japanese_speech_verification",
                                     "candidate_count": len(candidate_list),
@@ -11479,7 +13813,9 @@ def _optimize_candidates_unguarded(
             embedded_consensus_pool = [
                 item for item in sorted_prealigned if not _timeline_needs_audio_verification(item[3])
             ]
-            consensus_item, consensus = _exact_jimaku_timing_consensus(embedded_consensus_pool)
+            consensus_item, consensus = _exact_jimaku_timing_consensus(
+                embedded_consensus_pool, cache_dir=cache_dir
+            )
             if consensus_item is not None:
                 _rank, candidate, aligned, alass_result, activity, structure = consensus_item
 
@@ -11836,6 +14172,14 @@ def _optimize_candidates_unguarded(
             )
 
     successful_evaluated = [item for item in evaluated if bool(item[2].get("sync_was_successful"))]
+    weak_mixed_paths = _weak_mixed_language_successes(evaluated)
+    if weak_mixed_paths:
+        configure_logging().info(
+            "REJECT step=subtitle.weak_mixed_language_success video=%s candidates=%s",
+            video.name,
+            [item[0].name for item in evaluated if item[0].path in weak_mixed_paths],
+        )
+        successful_evaluated = [item for item in successful_evaluated if item[0].path not in weak_mixed_paths]
     audio_consensus_item, audio_consensus = _exact_jimaku_audio_clock_consensus(
         evaluated, prefer_srt=prefer_srt
     )
@@ -11883,6 +14227,7 @@ def _optimize_candidates_unguarded(
         return {
             "japanese_only": 2,
             "unknown": 1,
+            "mixed_japanese_english": 0,
             "mixed_japanese_chinese": 0,
             "chinese_only": 0,
         }.get(purity, 1)
@@ -11926,7 +14271,7 @@ def _optimize_candidates_unguarded(
             and candidate.details.get("episode_match") in {"exact", "range", "absolute"}
             and _candidate_has_exact_anilist_identity(candidate)
         )
-        successful = int(bool(result.get("sync_was_successful")))
+        successful = int(bool(result.get("sync_was_successful")) and candidate.path not in weak_mixed_paths)
         native_srt = int(prefer_srt and candidate.path.suffix.casefold() == ".srt")
         return (
             exact_identity,
@@ -11943,7 +14288,10 @@ def _optimize_candidates_unguarded(
     # source-diverse alternatives until one passes the full quality gate.
     ordered_items = [primary_item]
     seen_candidate_paths = {primary_item[0].path}
-    for item in sorted(selection_pool, key=fallback_score, reverse=True):
+    # Every evaluated candidate stays in the queue (successful ones first): a source
+    # whose audio check failed only on its offset limit (a TV capture with minutes of
+    # pre-roll) still gets the full alignment, with its speech fallbacks.
+    for item in sorted(evaluated, key=fallback_score, reverse=True):
         if item[0].path in seen_candidate_paths:
             continue
         ordered_items.append(item)
@@ -11977,7 +14325,7 @@ def _optimize_candidates_unguarded(
     # sources while still preventing pathological entries from causing an
     # unbounded cold-start loop.
     for attempt_index, (candidate, _, evaluation_result) in enumerate(
-        ordered_items[:8],
+        ordered_items[: max(1, quality_attempt_limit)],
         start=1,
     ):
         final_path, final_result = optimize_subtitle(
@@ -12004,7 +14352,7 @@ def _optimize_candidates_unguarded(
             "preferred_language_count": len(preferred_language_pool),
             "prefer_srt": prefer_srt,
             "quality_attempt": attempt_index,
-            "quality_attempt_limit": min(8, len(ordered_items)),
+            "quality_attempt_limit": min(max(1, quality_attempt_limit), len(ordered_items)),
         }
         final_result["candidate_results"] = candidate_results
         final_result["candidate_context"] = {
@@ -12035,6 +14383,7 @@ def _optimize_candidates_unguarded(
                 "accepted": accepted,
                 "reason": quality_reason,
                 "raw_fallback_disqualified": raw_fallback_disqualified(final_result),
+                "raw_fallback_needs_exact_identity": raw_fallback_needs_exact_identity(final_result),
                 "alignment_score": final_result.get("alignment_score"),
                 "engine": final_result.get("engine"),
             }
@@ -12043,7 +14392,7 @@ def _optimize_candidates_unguarded(
             "RESULT step=subtitle.quality_fallback video=%s attempt=%s/%s accepted=%s reason=%r candidate=%r source=%s",
             video.name,
             attempt_index,
-            min(8, len(ordered_items)),
+            min(max(1, quality_attempt_limit), len(ordered_items)),
             accepted,
             quality_reason,
             candidate.name,
@@ -12055,7 +14404,7 @@ def _optimize_candidates_unguarded(
             if attempt_index > 1:
                 final_result["selection_reason"] = "quality_fallback_candidate"
             return candidate, final_path, final_result
-        if verbose and attempt_index < min(8, len(ordered_items)):
+        if verbose and attempt_index < min(max(1, quality_attempt_limit), len(ordered_items)):
             print(f"  Candidate {attempt_index} rejected ({quality_reason}); checking the next source…")
 
     last_result["speech_verification_attempts"] = verification_attempts
@@ -12128,6 +14477,9 @@ def _evaluate_candidates_in_processes(
             for future in concurrent.futures.as_completed(futures):
                 try:
                     results[futures[future]] = future.result()
+                    worker_output, worker_result = results[futures[future]]
+                    if worker_result.get("sync_was_successful") and worker_result.get("output"):
+                        _SYNC_OUTPUTS_FROM_THIS_PROCESS.add(str(worker_output))
                 except Exception as exc:  # noqa: BLE001 - retried serially by the caller
                     configure_logging().warning(
                         "RETRY step=subtitle.parallel_candidate video=%s error=%r", video.name, exc
@@ -12197,6 +14549,10 @@ def _guard_alignment_result(
     """Run the mandatory output guard on a successful alignment; reject destroyed maps."""
     if not isinstance(result, dict) or not bool(result.get("sync_was_successful")):
         return result
+    speech_source = str(result.get("speech_source") or "")
+    if speech_source and Path(speech_source).is_file():
+        # The speech clock aligned the file's Japanese lines only: that is its input.
+        raw = Path(speech_source)
     if output is None:
         return result
     output = Path(output)
@@ -12207,15 +14563,29 @@ def _guard_alignment_result(
             return result
     except OSError:
         pass
-    music_stabilization = stabilize_music_marker_pairs(Path(raw), output, cache_dir=Path(cache_dir))
-    if music_stabilization.get("applied"):
-        result["alignment_music_marker_stabilization"] = music_stabilization
-    verdict = validate_alignment_output(Path(raw), output, cache_dir=Path(cache_dir))
+    # The repaired track goes to a side file and replaces the (possibly cached)
+    # output only once the guard has not rejected it.
+    stabilized = output.with_name(f".{output.stem}.{os.getpid()}.{time.time_ns()}.music.srt")
+    try:
+        music_stabilization = stabilize_music_marker_pairs(
+            Path(raw), output, cache_dir=Path(cache_dir), destination=stabilized
+        )
+        if music_stabilization.get("applied"):
+            music_stabilization["output"] = str(output)
+            result["alignment_music_marker_stabilization"] = music_stabilization
+            verdict = validate_alignment_output(Path(raw), stabilized, cache_dir=Path(cache_dir))
+            verdict["final"] = str(output)
+            if verdict.get("status") != "rejected":
+                os.replace(stabilized, output)
+        else:
+            verdict = validate_alignment_output(Path(raw), output, cache_dir=Path(cache_dir))
+    finally:
+        stabilized.unlink(missing_ok=True)
     result["alignment_output_guard"] = verdict
     try:
         from .subtitles.timing_runs import final_timing_runs
 
-        result["final_timing_runs"] = final_timing_runs(Path(raw), output)
+        result["final_timing_runs"] = final_timing_runs(Path(raw), output, cache_dir=Path(cache_dir))
     except (OSError, ValueError):
         result["final_timing_runs"] = []
     if verdict.get("status") == "rejected":
@@ -12327,6 +14697,27 @@ def _recover_rejected_clock(
     return recovered, accepted_result
 
 
+def _webvtt_as_srt(subtitle: Path, cache_dir: Path) -> Path:
+    """The plain SRT of a WebVTT file; the file itself when it is not one or cannot be read.
+
+    Every engine takes .srt/.ass/.ssa only: a .vtt candidate ended as
+    ``alass_unsupported_format`` (no subtitles, or the raw file "not aligned") although
+    it is a text subtitle like the others."""
+    if Path(subtitle).suffix.casefold() != ".vtt":
+        return subtitle
+    try:
+        converted, _conversion = convert_to_plain_srt(Path(subtitle), Path(cache_dir), force=False)
+    except OSError:
+        return subtitle
+    return converted
+
+
+def _webvtt_candidate_as_srt(candidate: SubtitleCandidate, cache_dir: Path) -> SubtitleCandidate:
+    """``candidate`` on the converted SRT of its WebVTT file (name, score and details kept)."""
+    converted = _webvtt_as_srt(candidate.path, cache_dir)
+    return candidate if converted == candidate.path else replace(candidate, path=converted)
+
+
 def optimize_subtitle(
     video: Path,
     subtitle: Path,
@@ -12335,13 +14726,395 @@ def optimize_subtitle(
     **kwargs: object,
 ) -> tuple[Path, dict[str, object]]:
     """Every alignment path (and every cached result) passes the output guard."""
+    subtitle = _webvtt_as_srt(subtitle, cache_dir)
     path, result = _optimize_subtitle_unguarded(video, subtitle, cache_dir, config, **kwargs)  # type: ignore[arg-type]
     _guard_alignment_result(subtitle, path, result, cache_dir)
     path, result = _recover_rejected_clock(video, subtitle, path, result, cache_dir, config, **kwargs)
     from .subtitles.verification import annotate_verification
 
     annotate_verification(result)
+    # Made with audio on the playback timeline (the late-audio rebuild rule skips it) -
+    # only when the file could be probed: without ffprobe nothing was compensated.
+    if _media_timeline(video, str(kwargs.get("ffmpeg_path") or "ffmpeg")) is not None:
+        result.setdefault("audio_timeline", audio_timeline.VERSION)
     return path, result
+
+
+_LAST_RESORT_STT_CANDIDATES = 3
+
+
+def _last_resort_stt_clock(
+    video: Path,
+    candidates: list[SubtitleCandidate],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> tuple[SubtitleCandidate, Path, dict[str, object]] | None:
+    """After every candidate failed: the Japanese speech clock of the best text sources.
+
+    The per-candidate speech fallback runs only when no audio engine produced a map; an
+    engine "success" that the local check then rejects (TV captures with minutes of
+    pre-roll and a kept break) never reached speech. Japanese-only, exact-episode
+    sources first; the result passes the same output guard and quality gate."""
+    text_candidates = [c for c in candidates if c.path.suffix.casefold() in {".srt", ".ass", ".ssa"}]
+    if not text_candidates:
+        return None
+
+    def rank(candidate: SubtitleCandidate) -> tuple[int, int, float]:
+        exact = int(
+            candidate.details.get("episode_match") in {"exact", "range", "absolute"}
+            and _candidate_has_exact_anilist_identity(candidate)
+        )
+        return _candidate_language_rank(candidate), exact, float(candidate.score or 0.0)
+
+    seen: set[Path] = set()
+    ordered: list[SubtitleCandidate] = []
+    for candidate in sorted(text_candidates, key=rank, reverse=True):
+        if candidate.path in seen:
+            continue
+        seen.add(candidate.path)
+        ordered.append(candidate)
+    attempts: list[dict[str, object]] = []
+    for candidate in ordered[:_LAST_RESORT_STT_CANDIDATES]:
+        try:
+            speech_path, speech_result = _try_japanese_stt_fallback(
+                video,
+                candidate.path,
+                cache_dir,
+                config,
+                ffmpeg_path=str(kwargs.get("ffmpeg_path") or "ffmpeg"),
+                ffprobe_path=str(kwargs.get("ffprobe_path") or "ffprobe"),
+                alass_path=str(kwargs.get("alass_path") or "alass"),
+                verbose=bool(kwargs.get("verbose")),
+            )
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
+            attempts.append({"name": candidate.name, "accepted": False, "reason": f"error: {exc}"[:300]})
+            continue
+        if speech_path is None or not bool(speech_result.get("sync_was_successful")):
+            attempts.append(
+                {"name": candidate.name, "accepted": False, "reason": speech_result.get("reason")}
+            )
+            if speech_result.get("reason") in {"stt_disabled", "stt_reference_unavailable"}:
+                break
+            continue
+        speech_result = dict(speech_result)
+        _guard_alignment_result(candidate.path, speech_path, speech_result, cache_dir)
+        accepted, reason = subtitle_quality_accepted(speech_result)
+        attempts.append({"name": candidate.name, "accepted": accepted, "reason": reason})
+        if not accepted:
+            continue
+        speech_result["selection_reason"] = "last_resort_stt_after_all_candidates_failed"
+        speech_result["last_resort_stt_attempts"] = attempts
+        speech_result["candidate_quality_accepted"] = True
+        speech_result["candidate_quality_reason"] = reason
+        speech_result["candidate_context"] = {
+            "source": candidate.source,
+            "name": candidate.name,
+            "filename_score": candidate.score,
+            "episode_match": candidate.details.get("episode_match"),
+            "subtitle_suffix": candidate.path.suffix.casefold(),
+        }
+        configure_logging().info(
+            "ACCEPT step=subtitle.last_resort_stt video=%s candidate=%r engine=%s",
+            video.name,
+            candidate.name,
+            speech_result.get("engine"),
+        )
+        if kwargs.get("verbose"):
+            print(f"  Japanese speech clock after all candidates failed: {candidate.name}")
+        return candidate, speech_path, speech_result
+    configure_logging().info(
+        "REJECT step=subtitle.last_resort_stt video=%s attempts=%s", video.name, attempts
+    )
+    return None
+
+
+_ONSET_LEAD_VERSION = _onset_lead_module.VERSION
+_ONSET_LEAD_SKIP_ENGINES = {"exact-release-crc"}
+
+
+def _audio_speech_activity(
+    video: Path, cache_dir: Path, config: SyncConfig, *, ffmpeg_path: str | None
+) -> list[float] | None:
+    """The audio's own voice activity (100 Hz), never an embedded subtitle track.
+
+    The shared speech reference reads an embedded text track first (``subs_then_*``);
+    here the detector is the audio one, so a video with subtitles decodes its audio
+    once more (cached like the shared reference)."""
+    detector = str(config.vad or "").strip().casefold()
+    uses_subtitles = not detector or detector == "default" or "subs" in detector
+    audio_config = config
+    if uses_subtitles and _has_embedded_text_subtitle(video, ffmpeg_path):
+        audio_config = replace(config, vad="webrtc")
+    speech, _info = prepare_speech_reference(video, cache_dir, audio_config, ffmpeg_path=ffmpeg_path)
+    if speech is None:
+        return None
+    try:
+        import zipfile
+
+        import numpy as np
+
+        with np.load(speech) as payload:
+            values = np.asarray(payload["speech"], dtype=float).reshape(-1)
+    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile):
+        # A damaged speech file is "no speech" (the callers skip the onset step),
+        # never an exception that ends the whole subtitle preparation.
+        return None
+    # Python floats, as before (tolist of a float64 array: the same values, ~20x faster).
+    return values.tolist()
+
+
+def _correct_onset_lead(
+    video: Path,
+    path: Path,
+    result: dict[str, object],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> Path:
+    """Move a late-reading timing earlier to the usual Japanese lead (``onset_lead``).
+
+    Only text subtitles, never a file timed for this exact release; the measurement
+    and the decision are kept in ``result["onset_lead_correction"]``."""
+    from .subtitles import onset_lead
+
+    if (
+        not isinstance(config, SyncConfig)
+        or path.suffix.casefold() != ".srt"
+        or str(result.get("engine") or "") in _ONSET_LEAD_SKIP_ENGINES
+    ):
+        return path
+    try:
+        cues = parse_srt(path)
+    except OSError:
+        return path
+    if len(cues) < onset_lead.MIN_MATCHED_CUES:
+        return path
+    try:
+        activity = _audio_speech_activity(
+            video, cache_dir, config, ffmpeg_path=str(kwargs.get("ffmpeg_path") or "ffmpeg")
+        )
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
+        result["onset_lead_correction"] = {"applied": False, "reason": f"speech_unavailable: {exc}"[:200]}
+        return path
+    if not activity:
+        result["onset_lead_correction"] = {"applied": False, "reason": "speech_unavailable"}
+        return path
+    # Lines the cold-open check just moved do not vote: they would tip the episode's lead.
+    opening = result.get("cold_open_check")
+    moved = opening.get("moved_cues") if isinstance(opening, dict) and opening.get("applied") else None
+    skip = (
+        range(int(moved[0]), int(moved[1]) + 1) if isinstance(moved, list) and len(moved) == 2 else range(0)
+    )
+    measurement = onset_lead.onset_lead(
+        [start for index, (start, _end, _text) in enumerate(cues) if index not in skip],
+        onset_lead.speech_onsets(activity),
+    )
+    shift = onset_lead.lead_correction(measurement)
+    diagnostics: dict[str, object] = {
+        "version": _ONSET_LEAD_VERSION,
+        **measurement,
+        "target_lead_seconds": onset_lead.TARGET_LEAD_SECONDS,
+        "shift_seconds": -shift,
+        "applied": shift != 0.0,
+    }
+    result["onset_lead_correction"] = diagnostics
+    if shift == 0.0:
+        return path
+    stat = path.stat()
+    digest = hashlib.sha1(
+        f"{_ONSET_LEAD_VERSION}:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{shift:.3f}".encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "onset-lead"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+    write_srt(onset_lead.shift_earlier(cues, shift), output, preserve_order=True)
+    result["output"] = str(output)
+    configure_logging().info(
+        "APPLY step=subtitle.onset_lead video=%s lead=%s shift=%+.3f",
+        video.name,
+        measurement.get("lead_seconds"),
+        -shift,
+    )
+    return output
+
+
+def _episode_speech_onsets(
+    video: Path, cache_dir: Path, config: SyncConfig, *, ffmpeg_path: str | None
+) -> list[float] | None:
+    """Speech onsets of the episode's own audio (the onset-lead step's voice activity)."""
+    from .subtitles import onset_lead
+
+    try:
+        activity = _audio_speech_activity(video, cache_dir, config, ffmpeg_path=ffmpeg_path)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return None
+    return onset_lead.speech_onsets(activity) if activity else None
+
+
+def _output_onset_signal(
+    path: Path | None, result: dict[str, object], onsets: list[float] | None
+) -> dict[str, object]:
+    """``candidate_choice.onset_signal`` of one finished output, under the onset-lead step's
+    own conditions (an SRT output, not a file timed for this exact release)."""
+    from .subtitles import candidate_choice
+
+    if path is None or path.suffix.casefold() != ".srt":
+        return {"available": False, "reason": "not_srt", "matched_fraction": None}
+    if str(result.get("engine") or "") in _ONSET_LEAD_SKIP_ENGINES:
+        return {"available": False, "reason": "exact_release", "matched_fraction": None}
+    if onsets is None:
+        return {"available": False, "reason": "speech_unavailable", "matched_fraction": None}
+    try:
+        cues = parse_srt(path)
+    except (OSError, ValueError):
+        return {"available": False, "reason": "unreadable", "matched_fraction": None}
+    return candidate_choice.onset_signal([start for start, _end, _text in cues], onsets)
+
+
+def _sync_candidate_pass(
+    video: Path,
+    candidates: list[SubtitleCandidate],
+    cache_dir: Path,
+    config: SyncConfig,
+    onsets: list[float] | None,
+    **kwargs: object,
+) -> tuple[SubtitleCandidate | None, Path | None, dict[str, object], dict[str, object] | None, str]:
+    """One more selection pass over ``candidates`` (one quality attempt, shared analyses kept), the
+    output guard, clock recovery, quality gate and the onset signal of an accepted output."""
+    # The first pass refreshed the shared audio analyses (as the guard fallbacks above).
+    pass_kwargs = {**kwargs, "force": False, "quality_attempt_limit": 1}
+    chosen, path, result = _optimize_candidates_unguarded(
+        video,
+        candidates,
+        cache_dir,
+        config,
+        **pass_kwargs,  # type: ignore[arg-type]
+    )
+    signal: dict[str, object] | None = None
+    quality = ""
+    if chosen is not None and path is not None:
+        _guard_alignment_result(chosen.path, path, result, cache_dir)
+        path, result = _recover_rejected_clock(video, chosen.path, path, result, cache_dir, config, **kwargs)
+        accepted, quality = subtitle_quality_accepted(result)
+        if accepted and path is not None:
+            signal = _output_onset_signal(path, result, onsets)
+    return chosen, path, result, signal, quality
+
+
+def _second_candidate_check(
+    video: Path,
+    first: SubtitleCandidate,
+    first_path: Path,
+    first_result: dict[str, object],
+    others: list[SubtitleCandidate],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> tuple[SubtitleCandidate, Path, dict[str, object]]:
+    """A second synced file decides between two (``subtitles.candidate_choice``).
+
+    When the accepted file is the preferred source (``candidate_choice.preferred_key``: a WEB,
+    then BD, then TV timing, an SRT, the higher score), the second file is the one Pudge would
+    choose without it, and it wins only with clearly more cues on speech onsets. Otherwise the
+    preferred file is synced instead and wins unless the accepted file has clearly more cues on
+    onsets. Every synced file passes the same output guard and quality gate; any failure keeps
+    the accepted file. The decision is in the winner's ``candidate_onset_selection``."""
+    from .subtitles import candidate_choice
+
+    if not others or not isinstance(config, SyncConfig):
+        return first, first_path, first_result
+    started = time.monotonic()
+    ffmpeg_path = str(kwargs.get("ffmpeg_path") or "ffmpeg")
+    onsets = _episode_speech_onsets(video, cache_dir, config, ffmpeg_path=ffmpeg_path)
+    first_signal = _output_onset_signal(first_path, first_result, onsets)
+    preferred = candidate_choice.preferred_candidate([first, *others])
+    preferred_other = preferred is not None and preferred.path != first.path
+    record: dict[str, object] = {
+        "version": candidate_choice.VERSION,
+        "first": {
+            "name": first.name,
+            "selection_reason": first_result.get("selection_reason"),
+            "source": candidate_choice.source_rank(first.name),
+            **first_signal,
+        },
+        "second": None,
+        "mode": "preferred_source" if preferred_other else "next_choice",
+    }
+    if preferred_other:
+        go, reason = (
+            (False, "first_signal_missing")
+            if candidate_choice.matched_fraction(first_signal) is None
+            else (True, "check_preferred")
+        )
+    else:
+        go, reason = candidate_choice.needs_second(first_signal)
+    if not go:
+        record.update({"decision": "first", "reason": reason, "elapsed_seconds": 0.0})
+        first_result["candidate_onset_selection"] = record
+        return first, first_path, first_result
+    second: SubtitleCandidate | None = None
+    second_path: Path | None = None
+    second_result: dict[str, object] = {}
+    second_signal: dict[str, object] | None = None
+    second_quality = ""
+    try:
+        second, second_path, second_result, second_signal, second_quality = _sync_candidate_pass(
+            video,
+            [preferred] if preferred_other else others,
+            cache_dir,
+            config,
+            onsets,
+            **kwargs,  # type: ignore[list-item]
+        )
+    except Exception as exc:  # noqa: BLE001 - a second opinion never costs the first file
+        second_quality = f"error: {exc}"[:200]
+        second_signal = None
+        # Kept and logged even when it failed before a second file was chosen: a mismatch
+        # here silently disabled the whole check.
+        record["second_error"] = second_quality
+        configure_logging().warning(
+            "FALLBACK step=subtitle.onset_second_candidate video=%s error=%r",
+            video.name,
+            second_quality,
+            exc_info=True,
+        )
+    if second is not None:
+        record["second"] = {
+            "name": second.name,
+            "selection_reason": second_result.get("selection_reason"),
+            "quality_reason": second_quality,
+            "source": candidate_choice.source_rank(second.name),
+            **(second_signal or {"available": False, "reason": "rejected", "matched_fraction": None}),
+        }
+    if preferred_other:
+        take_second, reason = candidate_choice.choose_preferred(second_signal, first_signal)
+    else:
+        index, reason = candidate_choice.choose(first_signal, second_signal)
+        take_second = bool(index)
+    record.update(
+        {
+            "decision": "second" if take_second else "first",
+            "reason": reason,
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+        }
+    )
+    configure_logging().info(
+        "SELECT step=subtitle.onset_second_candidate video=%s mode=%s decision=%s reason=%s first=%r(%s) second=%r(%s)",
+        video.name,
+        record["mode"],
+        record["decision"],
+        reason,
+        first.name,
+        candidate_choice.matched_fraction(first_signal),
+        second.name if second is not None else None,
+        candidate_choice.matched_fraction(second_signal),
+    )
+    if take_second and second is not None and second_path is not None:
+        second_result["candidate_onset_selection"] = record
+        return second, second_path, second_result
+    first_result["candidate_onset_selection"] = record
+    return first, first_path, first_result
 
 
 def optimize_candidates(
@@ -12353,7 +15126,8 @@ def optimize_candidates(
 ) -> tuple[SubtitleCandidate | None, Path | None, dict[str, object]]:
     """Guarded candidate choice: no early-return branch can hand out a file
     that fails the output guard or the quality gate; the next candidate is tried."""
-    remaining = list(candidates)
+    remaining = [_webvtt_candidate_as_srt(candidate, cache_dir) for candidate in candidates]
+    candidates_for_rescue = list(remaining)
     initial_identity_rejected = [
         {
             "name": c.name,
@@ -12398,6 +15172,7 @@ def optimize_candidates(
                 "path": str(selected.path),
                 "reason": str(result.get("candidate_quality_reason") or result.get("reason") or ""),
                 "raw_fallback_disqualified": raw_fallback_disqualified(result),
+                "raw_fallback_needs_exact_identity": raw_fallback_needs_exact_identity(result),
                 "rejected_output": str(path),
                 "alignment_output_guard": result.get("alignment_output_guard"),
                 "speech_constant_recovery": result.get("speech_constant_recovery"),
@@ -12418,6 +15193,45 @@ def optimize_candidates(
         kwargs["force"] = False
     else:
         selected, path = None, None
+    if (
+        selected is not None
+        and path is not None
+        and selected.path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
+    ):
+        selected, path, last_result = _second_candidate_check(
+            video,
+            selected,
+            path,
+            last_result,
+            [
+                c
+                for c in remaining
+                if c.path != selected.path
+                and c.path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
+                and not _candidate_explicit_anilist_mismatch(c)
+                # Language purity is a hard tier of the choice: a mixed-language file never
+                # replaces a Japanese-only one on onsets alone.
+                and _language_purity_rank(c) >= _language_purity_rank(selected)
+            ],
+            cache_dir,
+            config,
+            **kwargs,
+        )
+    if (selected is None or path is None) and getattr(config, "japanese_stt_fallback", False):
+        rescued = _last_resort_stt_clock(
+            video,
+            [c for c in candidates_for_rescue if not _candidate_explicit_anilist_mismatch(c)],
+            cache_dir,
+            config,
+            **kwargs,
+        )
+        if rescued is not None:
+            selected, path, rescue_result = rescued
+            rescue_result["last_resort_after"] = {
+                "reason": last_result.get("reason"),
+                "candidate_quality_reason": last_result.get("candidate_quality_reason"),
+            }
+            last_result = rescue_result
     if rejected:
         last_result["guard_rejected_candidates"] = rejected
         if selected is None or path is None:
@@ -12430,6 +15244,259 @@ def optimize_candidates(
 
     annotate_verification(last_result)
     last_result.setdefault("alignment_guard_version", GUARD_VERSION)
+    if _media_timeline(video, str(kwargs.get("ffmpeg_path") or "ffmpeg")) is not None:
+        last_result.setdefault("audio_timeline", audio_timeline.VERSION)
     if selected is None or path is None:
         return None, None, last_result
+    path = _apply_onset_lead(video, path, last_result, cache_dir, config, source=selected.path, **kwargs)
     return selected, path, last_result
+
+
+def _language_purity_rank(candidate: SubtitleCandidate) -> int:
+    """The language tier ``optimize_candidates`` prefers (Japanese only > unknown > mixed)."""
+    details = candidate.details if isinstance(candidate.details, dict) else {}
+    purity = str(details.get("language_purity") or "unknown")
+    return {
+        "japanese_only": 2,
+        "unknown": 1,
+        "mixed_japanese_english": 0,
+        "mixed_japanese_chinese": 0,
+        "chinese_only": 0,
+    }.get(purity, 1)
+
+
+def _transcript_text_score(
+    result: dict[str, object],
+    cache_dir: Path | None = None,
+) -> Callable[[list[tuple[float, float, str]]], float | None] | None:
+    """How well the episode's Japanese transcript (a speech-clocked result's ``stt``) sits
+    beside given lines: the weighted ``_stt_text_cue_scores``; ``None`` without a transcript.
+    A result made in another cache (a copied result) finds the transcript under this one."""
+    stt = result.get("stt")
+    reference = str(stt.get("reference_path") or "") if isinstance(stt, dict) else ""
+    if not reference:
+        return None
+    if not Path(reference).is_file() and cache_dir is not None:
+        moved = Path(cache_dir) / "stt" / Path(reference).parent.name / Path(reference).name
+        reference = str(moved) if moved.is_file() else ""
+    if not reference or not Path(reference).is_file():
+        return None
+    try:
+        transcript = parse_srt(Path(reference))
+    except (OSError, ValueError):
+        return None
+    if not transcript:
+        return None
+
+    def score(cues: list[tuple[float, float, str]]) -> float | None:
+        rows = [row for row in _stt_text_cue_scores(cues, transcript) if row is not None]
+        weight = sum(value for _score, value in rows)
+        return sum(score * value for score, value in rows) / weight if weight > 0.0 else None
+
+    return score
+
+
+def _correct_clock_blocks(
+    video: Path,
+    source: Path,
+    path: Path,
+    result: dict[str, object],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> Path:
+    """Put a block of lines on a stray clock back on its neighbours' (``clock_blocks``), by the
+    audio's own speech onsets; the decision is kept in ``result["clock_block_correction"]``."""
+    from .alignment_guard import _load, _match
+    from .subtitles import clock_blocks, cold_open, onset_lead, scale_check, small_cuts
+
+    if (
+        not isinstance(config, SyncConfig)
+        or path.suffix.casefold() != ".srt"
+        or str(result.get("engine") or "") in _ONSET_LEAD_SKIP_ENGINES
+    ):
+        return path
+    speech_source = str(result.get("speech_source") or "")
+    if speech_source and Path(speech_source).is_file():
+        source = Path(speech_source)
+    try:
+        if path.resolve() == Path(source).resolve():
+            return path
+        raw = _load(Path(source), cache_dir)
+        output = parse_srt(path)
+    except (OSError, ValueError):
+        return path
+    if len(output) < onset_lead.MIN_MATCHED_CUES:
+        return path
+    activity = _audio_speech_activity(
+        video, cache_dir, config, ffmpeg_path=str(kwargs.get("ffmpeg_path") or "ffmpeg")
+    )
+    if not activity:
+        result["clock_block_correction"] = {"applied": False, "reason": "speech_unavailable"}
+        return path
+    onsets = onset_lead.speech_onsets(activity)
+    # A stretch the source never had (``scale_check``) first: the blocks are clocks of one map.
+    output, stretch = scale_check.check_stretch(
+        output, [(j, float(raw[i][0])) for i, j in _match(raw, output)], onsets
+    )
+    result["stretch_check"] = stretch
+    pairs = [(i, j, float(output[j][0]) - float(raw[i][0])) for i, j in _match(raw, output)]
+    corrected, diagnostics = clock_blocks.correct_clock_blocks(output, pairs, onsets)
+    result["clock_block_correction"] = diagnostics
+    # Then the small cuts no clock of the map has, where the reference track and the speech
+    # agree (``small_cuts``); the clocks are read off the lines as the blocks left them.
+    reference_onsets = _small_cut_reference_onsets(result)
+    if reference_onsets:
+        corrected, small_cut = small_cuts.correct_small_cuts(
+            corrected,
+            [(i, j, float(corrected[j][0]) - float(raw[i][0])) for i, j, _shift in pairs],
+            reference_onsets,
+            onsets,
+        )
+    else:
+        small_cut = {"version": small_cuts.VERSION, "applied": False, "reason": "no_reference_track"}
+    result["small_cut_correction"] = small_cut
+    corrected, opening = cold_open.check_cold_open(
+        corrected, onsets, _transcript_text_score(result, cache_dir)
+    )
+    result["cold_open_check"] = opening
+    if (
+        not diagnostics.get("applied")
+        and not stretch.get("applied")
+        and not small_cut.get("applied")
+        and not opening.get("applied")
+    ):
+        return path
+    stat = path.stat()
+    digest = hashlib.sha1(
+        f"{clock_blocks.VERSION}:{scale_check.VERSION}:{small_cuts.VERSION}:{cold_open.VERSION}:"
+        f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "clock-blocks"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    corrected_path = output_dir / f"{digest}.srt"
+    write_srt(corrected, corrected_path, preserve_order=True)
+    result["output"] = str(corrected_path)
+    configure_logging().info(
+        "APPLY step=subtitle.clock_blocks video=%s moved_cues=%s small_cut_cues=%s",
+        video.name,
+        diagnostics.get("moved_cues"),
+        small_cut.get("moved_cues"),
+    )
+    return corrected_path
+
+
+def _small_cut_reference_onsets(result: dict[str, object]) -> list[float]:
+    """Line starts of the embedded track the result was timed to, for ``small_cuts``; none for
+    a Japanese speech transcript (its segments come from the same audio as the onsets)."""
+    reference = str(result.get("timing_reference") or "")
+    language = str(result.get("timing_reference_language") or "").casefold()
+    if (
+        not reference
+        or language in {"ja", "jp", "jpn"}
+        or str(result.get("engine") or "").startswith("japanese-stt")
+    ):
+        return []
+    try:
+        cues = parse_srt(Path(reference))
+    except (OSError, ValueError):
+        return []
+    return sorted({round(float(start), 3) for start, end, _text in cues if float(end) > float(start)})
+
+
+def _apply_onset_lead(
+    video: Path,
+    path: Path,
+    result: dict[str, object],
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    source: Path | None = None,
+    **kwargs: object,
+) -> Path:
+    if "onset_lead_correction" in result:
+        # Measured already for this result (the single-file wrapper, a reused result): a
+        # second pass would shift the file again by up to the cap.
+        return path
+    if source is not None and "clock_block_correction" not in result:
+        try:
+            path = _correct_clock_blocks(video, source, path, result, cache_dir, config, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - a refinement never costs the alignment itself
+            result["clock_block_correction"] = {"applied": False, "reason": f"error: {exc}"[:200]}
+    try:
+        return _correct_onset_lead(video, path, result, cache_dir, config, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - a refinement never costs the alignment itself
+        result["onset_lead_correction"] = {"applied": False, "reason": f"error: {exc}"[:200]}
+        return path
+
+
+def finalize_single_subtitle(
+    video: Path,
+    subtitle: Path,
+    path: Path,
+    result: dict[str, object],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> Path:
+    """The onset-lead step ``optimize_candidates`` ends with, for one file aligned alone.
+
+    ``optimize_subtitle`` is also the per-candidate step inside ``optimize_candidates``,
+    so the correction lives at the outer boundary and runs once per prepared file:
+    only for an output ``optimize_candidates`` would have accepted."""
+    if "onset_lead_correction" in result:
+        return path
+    if subtitle.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS:
+        if not subtitle_quality_accepted(result)[0]:
+            return path
+    elif result.get("alignment_output_rejected") or not result.get("sync_was_successful"):
+        return path
+    return _apply_onset_lead(video, path, result, cache_dir, config, source=subtitle, **kwargs)
+
+
+def rescue_single_candidate(
+    video: Path,
+    candidate: SubtitleCandidate,
+    result: dict[str, object],
+    cache_dir: Path,
+    config: SyncConfig,
+    **kwargs: object,
+) -> tuple[Path, dict[str, object]] | None:
+    """The last-resort Japanese speech clock for one text file aligned alone.
+
+    ``optimize_candidates`` ends with ``_last_resort_stt_clock`` when every candidate
+    failed; an episode with a single Jimaku file (or a file chosen by hand) went through
+    ``optimize_subtitle`` only, so a rejected audio map (TV captures with minutes of
+    pre-roll and a kept break) ended as the raw file or no subtitles at all, while the
+    same file next to a second candidate was rescued. Same rescue, same output guard,
+    quality gate and onset-lead step; ``None`` when it does not apply or fails."""
+    candidate = _webvtt_candidate_as_srt(candidate, cache_dir)
+    if (
+        not isinstance(config, SyncConfig)
+        or not getattr(config, "japanese_stt_fallback", False)
+        or candidate.path.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS
+        or _candidate_explicit_anilist_mismatch(candidate)
+        or subtitle_quality_accepted(result)[0]
+    ):
+        return None
+    rescued = _last_resort_stt_clock(video, [candidate], cache_dir, config, **kwargs)
+    if rescued is None:
+        return None
+    _selected, path, rescue_result = rescued
+    rescue_result["last_resort_after"] = {
+        "reason": result.get("reason"),
+        "candidate_quality_reason": subtitle_quality_accepted(result)[1],
+    }
+    rescue_result["single_candidate_rejected_result"] = {
+        key: result.get(key)
+        for key in ("reason", "engine", "selection_reason", "offset_seconds")
+        if key in result
+    }
+    from .subtitles.verification import annotate_verification
+
+    annotate_verification(rescue_result)
+    rescue_result.setdefault("alignment_guard_version", GUARD_VERSION)
+    if _media_timeline(video, str(kwargs.get("ffmpeg_path") or "ffmpeg")) is not None:
+        rescue_result.setdefault("audio_timeline", audio_timeline.VERSION)
+    path = _apply_onset_lead(video, path, rescue_result, cache_dir, config, source=candidate.path, **kwargs)
+    return path, rescue_result

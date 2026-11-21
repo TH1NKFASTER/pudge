@@ -209,11 +209,6 @@ def test_import_generates_audiobooks_only_for_books_without_one(tmp_path: Path, 
     api.choose_light_novel_file()
     assert generated == ["Alone"]
 
-    # Retrying a failed import job.
-    api, generated, files = _import_api(tmp_path / "retry", monkeypatch)
-    api._retry_import_worker("job", "light_novel", [str(path) for path in files], threading.Event())
-    assert generated == ["Alone"]
-
     # Dropping files on the window (linking and generation run a moment later).
     api, generated, files = _import_api(tmp_path / "drop", monkeypatch)
 

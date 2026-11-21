@@ -27,8 +27,8 @@ def _config(tmp_path: Path) -> AppConfig:
 def _release(title: str, info_hash: str) -> NyaaRelease:
     return NyaaRelease(
         title=title,
-        link=f"https://nyaa.si/view/{info_hash}",
-        torrent_url=f"https://nyaa.si/download/{info_hash}.torrent",
+        link=f"https://releases.invalid/view/{info_hash}",
+        torrent_url=f"https://releases.invalid/download/{info_hash}.torrent",
         info_hash=info_hash,
         size_text="1.2 GiB",
         size_bytes=1_200_000_000,

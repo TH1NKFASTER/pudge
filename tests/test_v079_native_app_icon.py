@@ -83,6 +83,7 @@ def test_managed_app_names_itself_and_sets_the_icon_before_the_window_starts(mon
     for name, module in _cocoa(events).items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("PUDGE_NO_DOCK_CHANGES", raising=False)  # the stand-in Cocoa is the Dock here
     monkeypatch.setenv("PUDGE_APP_ICON", str(tmp_path / "AppIcon.icns"))
     monkeypatch.setenv("PUDGE_CONFIG", str(tmp_path / "config.toml"))
     assert app_entry.main([]) == 0

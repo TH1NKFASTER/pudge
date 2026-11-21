@@ -157,7 +157,7 @@ def _import_illustrated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tupl
     assert "PUDGE_EPUB_IMAGE" in chapters[0][1]
 
     service = _ln_service(tmp_path)
-    monkeypatch.setattr(service, "_store_cover_bytes", lambda raw, suffix: "/covers/inline.jpg")
+    monkeypatch.setattr(service, "_store_cover_bytes", lambda raw, suffix, **_kw: "/covers/inline.jpg")
     monkeypatch.setattr(service, "queue_auto_bind_anilist", lambda *_a, **_k: None)
     monkeypatch.setattr(service, "_inherit_series_anilist", lambda *_a, **_k: None)
     book = service.import_file(epub)
@@ -304,14 +304,15 @@ def test_long_stt_is_chunked_with_offsets_and_resumes_completed_chunks(
     assert all(request["words"] for request in calls)
     assert all(not destination.exists() for _start, _duration, destination in extracted)
 
-    # Final-output loss/restart reuses the per-chunk JSON checkpoints and does
-    # not run MLX a second time.
+    # The finished transcript replaces its per-chunk JSON checkpoints (they only
+    # duplicated it); interrupted runs keep them (test_patch_d3_structural).
+    assert not service._transcription_checkpoint_dir(output).exists()
     output.unlink()
     event2 = threading.Event()
     service._transcription_cancel_events[book_id] = threading.Event()
     service._transcribe_worker(book_id, output, event2)
     assert event2.is_set() and output.is_file()
-    assert len(calls) == 3 and len(starts) == 1
+    assert len(calls) == 6 and len(starts) == 2
 
 
 def test_short_stt_keeps_original_source_and_cancel_is_controlled(tmp_path: Path) -> None:
@@ -361,15 +362,9 @@ def _fake_mlx(monkeypatch: pytest.MonkeyPatch, calls: list, *, fail: bool = Fals
             raise MemoryError("out of memory")
         return {"segments": [{"start": 0.0, "end": 1.0, "text": "x"}]}
 
-    whisper = types.ModuleType("mlx_whisper")
+    whisper = types.ModuleType("pudge.whisper_mlx")
     whisper.transcribe = transcribe
-    progress = types.ModuleType("tqdm")
-    progress.tqdm = type(
-        "tqdm",
-        (),
-        {"total": 0, "n": 0, "__init__": lambda self, *a, **k: None, "update": lambda self, n=1: None},
-    )
-    for name, module in (("mlx", package), ("mlx.core", core), ("mlx_whisper", whisper), ("tqdm", progress)):
+    for name, module in (("mlx", package), ("mlx.core", core), ("pudge.whisper_mlx", whisper)):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.delenv("PUDGE_BACKGROUND_PRIORITY", raising=False)
     monkeypatch.setenv("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(6 * 1024**3))

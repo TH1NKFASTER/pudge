@@ -8,7 +8,7 @@ from pudge.reading_audio_alignment import (
 
 
 def _parsed_opening() -> dict:
-    text = "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
+    text = "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。"
     return {
         "paragraphs": [text],
         "tokens": [
@@ -18,7 +18,7 @@ def _parsed_opening() -> dict:
                     "readingIndex": 1,
                     "start": 0,
                     "end": 4,
-                    "card": {"reading": "小[こ]高[だか]い丘[おか]"},
+                    "card": {"reading": "白[しろ]い砂[すな]浜[はま]"},
                 },
                 {"wordId": 2, "readingIndex": 1, "start": 4, "end": 5, "card": {"reading": "が"}},
                 {
@@ -42,7 +42,7 @@ def _kana_precision_segments() -> list[dict]:
             "start": 38.0,
             "end": 41.0,
             "words": [
-                {"word": "こだかいおか", "start": 38.0, "end": 39.5},
+                {"word": "しろいすなはま", "start": 38.0, "end": 39.5},
                 {"word": "が", "start": 39.5, "end": 39.7},
                 {"word": "えんえんと", "start": 39.7, "end": 40.5},
                 {"word": "つづく", "start": 40.5, "end": 41.0},
@@ -54,7 +54,7 @@ def _kana_precision_segments() -> list[dict]:
 def test_cached_jiten_parse_produces_spoken_chapter_start_hints() -> None:
     hints = _reading_hints_from_cached_parse(_parsed_opening())
     assert hints[:4] == [
-        {"offset_start": 0, "offset_end": 4, "surface": "小高い丘", "reading": "こだかいおか"},
+        {"offset_start": 0, "offset_end": 4, "surface": "白い砂浜", "reading": "しろいすなはま"},
         {"offset_start": 4, "offset_end": 5, "surface": "が", "reading": "が"},
         {"offset_start": 5, "offset_end": 8, "surface": "延々と", "reading": "えんえんと"},
         {"offset_start": 8, "offset_end": 10, "surface": "続く", "reading": "つづく"},
@@ -80,7 +80,7 @@ def test_phonetic_prefix_matches_kana_stt_without_consuming_chapter_marker() -> 
 
 def test_phonetic_prefix_repairs_real_0_to_411_failure_shape() -> None:
     chapter = (
-        "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。道は丘と丘の間を縫って作られている。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。細い道は浜に沿って北へと伸びている。"
     ) * 4
     hints = _reading_hints_from_cached_parse(_parsed_opening())
     old_clock = [

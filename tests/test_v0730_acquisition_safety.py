@@ -183,6 +183,13 @@ def test_cleanup_uses_recorded_backend_and_retains_rows_until_removal_confirmed(
 
 @pytest.mark.parametrize("failure", ["delete", "status"])
 def test_aria2_unknown_candidate_state_stops_switching(tmp_path, monkeypatch, failure):
+    from test_v073_torrent_race import Clock
+    from pudge import manager as manager_module
+
+    # The candidate's 40-second metadata window passes on a test clock, not in real time.
+    clock = Clock()
+    monkeypatch.setattr(manager_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(manager_module.time, "sleep", clock.sleep)
     manager = manager_for(tmp_path, backend="aria2")
     client = Backend("aria2", fail_delete=failure == "delete", fail_status=failure == "status")
     monkeypatch.setattr(manager, "qbt_client", lambda: client)

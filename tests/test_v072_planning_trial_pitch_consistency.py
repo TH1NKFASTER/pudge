@@ -45,7 +45,7 @@ def test_jimaku_bundled_key_is_runtime_only_and_expires(tmp_path: Path, monkeypa
     expired = load_config(config.config_path)
     assert expired.jimaku.api_key == ""
     assert expired.jimaku.trial_active is False
-    assert expired.jimaku.trial_expires_at == 1.0 + 48 * 60 * 60
+    assert expired.jimaku.trial_expires_at == 1.0 + 7 * 24 * 60 * 60  # the trial lasts a week
 
 
 def test_direct_app_config_jimaku_key_remains_a_personal_key(tmp_path: Path) -> None:
@@ -97,8 +97,8 @@ def test_library_scan_preserves_confirmed_bitmap_state(tmp_path: Path) -> None:
 def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path) -> None:
     release = NyaaRelease(
         title="[ToonsHub] Goodbye Lara S01E05 1080p WEB-DL",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="abc123",
         size_text="1.4 GiB",
         size_bytes=1_503_238_553,
@@ -113,10 +113,12 @@ def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path
         downloads_enabled=lambda: True,
         sync_downloads=lambda: None,
         scan_library=lambda **_kwargs: [],
-        search_and_add_best=lambda _media_id, **kwargs: (
+        # Episodes are searched first, then started (all or nothing).
+        release_candidates=lambda _media_id, **kwargs: (
             calls.append((int(kwargs["episode"]), bool(kwargs["automatic"])))
-            or (release if int(kwargs["episode"]) == 5 else None)
+            or ([release] if int(kwargs["episode"]) == 5 else [])
         ),
+        add_release_candidates=lambda _media_id, eligible, **_kwargs: eligible[0],
     )
     api = object.__new__(WebAppApi)
     api.logger = SimpleNamespace(
@@ -275,11 +277,17 @@ def test_reader_text_never_shows_inline_pitch_and_has_no_switch_for_it(page) -> 
 
 def test_background_planning_download_is_picked_up_after_a_restart(page) -> None:
     # The window was reopened while the search for released episodes still runs in Python:
-    # it keeps checking and shows the result when the search is done.
+    # it keeps checking and shows the result when the search is done. Since the search
+    # dialog is closed after the reload, the result goes to the sidebar line (it used to
+    # pop the dialog open); a click on the line opens it.
     result = page.run(
         """
         await __tick(2000);
-        return {title: __text('#modalTitle'), body: __text('#modalBody'), open: $('modalBackdrop').classList.contains('open'),
+        const out = {line: __text('#statusTask'), open: $('modalBackdrop').classList.contains('open')};
+        await __click('#statusTask'); await __tick(20);
+        return {...out, title: __text('#modalTitle'), body: __text('#modalBody'), opened: $('modalBackdrop').classList.contains('open'),
+                lineAfter: __visible('#statusTask'),
+                done: PudgeI18n.t('planned.searchStatusDone', {title: 'Planned', added: 2, missing: 0}),
                 complete: PudgeI18n.t('ui.searchComplete'), added: PudgeI18n.t('ui.added'), episode: t('table.episode')};
         """,
         before="""
@@ -290,7 +298,9 @@ def test_background_planning_download_is_picked_up_after_a_restart(page) -> None
     )
     out = result.value
     assert result.calls_of("planning_episode_download_status") == [[], [], []]
-    assert out["open"] is True and out["title"] == f"{out['complete']} — Planned"
+    assert out["open"] is False and out["line"] == out["done"]
+    assert out["opened"] is True and out["title"] == f"{out['complete']} — Planned"
+    assert out["lineAfter"] is False
     assert out["body"].splitlines()[1:] == [
         f"{out['episode']} 1",
         out["added"],

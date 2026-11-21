@@ -262,7 +262,8 @@
   function rubyReading(value) {
     const text = String(value || '');
     let out = '', last = 0;
-    const pattern = /([\u3400-\u9fff々〆ヵヶ]+)\[([^\]\r\n]+)\]/g;
+    // Digits right before a kanji run share its reading (１０万[じゅうまん]); digits alone too (2[に]).
+    const pattern = /([0-9０-９]*[\u3400-\u9fff々〆ヵヶ]+|[0-9０-９]+)\[([^\]\r\n]+)\]/g;
     let match;
     while ((match = pattern.exec(text)) !== null) {
       out += esc(text.slice(last, match.index));
@@ -274,7 +275,7 @@
   }
 
   function annotatedStudySpelling(value) {
-    return String(value || '').replace(/([\u3400-\u9fff々〆ヵヶ]+)\[[^\]\r\n]+\]/g, '$1').replace(/\s+/g, '');
+    return String(value || '').replace(/([0-9０-９]*[\u3400-\u9fff々〆ヵヶ]+|[0-9０-９]+)\[[^\]\r\n]+\]/g, '$1').replace(/\s+/g, '');
   }
 
   function kanjiOnlyStudyTerm(spelling, reading) {
@@ -310,7 +311,7 @@
   function plainStudyReading(value) {
     const text = String(value || '').trim();
     if (!text) return '';
-    const replaced = text.replace(/[\u3400-\u9fff々〆ヵヶ]+\[([^\]\r\n]+)\]/g, (_match, reading) => reading);
+    const replaced = text.replace(/(?:[0-9０-９]*[\u3400-\u9fff々〆ヵヶ]+|[0-9０-９]+)\[([^\]\r\n]+)\]/g, (_match, reading) => reading);
     return replaced.replace(/\s+/g, '');
   }
 
@@ -604,10 +605,15 @@
     // element's static position near the top-left, which looked like a giant
     // empty outlined card before the real Jiten popup jumped into place.
     const r = el.getBoundingClientRect();
+    // A word of the book: the card stays clear of the chat docked next to it.
+    const whole = {left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight};
+    const free = window.PudgeAssistant?.freeArea?.();
+    const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    const area = free && cx >= free.left && cx <= free.right && cy >= free.top && cy <= free.bottom ? free : whole;
     let left = rect.left + rect.width / 2 - r.width / 2;
-    left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
+    left = Math.max(area.left + 8, Math.min(left, area.right - r.width - 8));
     let top = rect.bottom + 10;
-    if (top + r.height > window.innerHeight - 8) top = Math.max(8, rect.top - r.height - 10);
+    if (top + r.height > area.bottom - 8) top = Math.max(area.top + 8, rect.top - r.height - 10);
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;
     popupLayoutChanged();
@@ -816,12 +822,23 @@
   function queueLiveStateHydration(payload, backend = 'jiten') {
     const selected = String(backend || payload?.settings?.study_backend || 'jiten').toLowerCase();
     if (selected !== 'jiten' && selected !== 'jpdb') return;
+    // Only the words the rendered paragraphs show: a window of a chapter (the audiobook
+    // live text) keeps the chapter's whole vocabulary, but asks only for its own words.
+    const shown = new Set();
+    for (const group of Array.isArray(payload?.tokens) ? payload.tokens : []) {
+      for (const token of Array.isArray(group) ? group : []) {
+        const wordId = Number(token?.wordId ?? token?.word_id ?? 0);
+        const readingIndex = Number(token?.readingIndex ?? token?.reading_index ?? -1);
+        if (wordId > 0 && readingIndex >= 0) shown.add(`${wordId}:${readingIndex}`);
+      }
+    }
     for (const item of payload?.vocabulary || []) {
       // jpdb: only native vid/sid; cached parses carry a card_state snapshot.
       if (selected === 'jpdb' && String(item?.idNamespace || '').toLowerCase() !== 'jpdb') continue;
       const wordId = Number(item?.wordId ?? item?.word_id ?? 0);
       const readingIndex = Number(item?.readingIndex ?? item?.reading_index ?? -1);
       if (!Number.isInteger(wordId) || wordId <= 0 || !Number.isInteger(readingIndex) || readingIndex < 0) continue;
+      if (shown.size && !shown.has(`${wordId}:${readingIndex}`)) continue;
       const key = selected === 'jiten' ? `${wordId}:${readingIndex}` : `${selected}|${wordId}:${readingIndex}`;
       liveStateHydrationPairs.set(key, {backend:selected, pair:[wordId, readingIndex]});
     }
@@ -1522,6 +1539,9 @@
     empty_selection: 'reading.grammar.emptySelection',
     invalid_structure: 'reading.grammar.invalidStructure',
     llm_no_json: 'reading.grammar.llmNoJson',
+    llm_auth: 'reading.grammar.llmAuth',
+    llm_rate_limited: 'reading.grammar.llmRateLimited',
+    llm_service_unavailable: 'reading.grammar.llmUnavailable',
   };
 
   // Pure renderer (tested in tests/js/grammar_analysis.cjs). Spans are Unicode

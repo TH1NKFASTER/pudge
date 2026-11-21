@@ -1,0 +1,267 @@
+{
+ "about": "Manga page alignment: how a page's transform (pudge/manga_align.py) draws it, the cases the Mac reader (manga_reader_v2.js alignPoint/alignmentStyle) and the iPhone/iPad (PudgeCore MangaPageTransform) must agree on. A transform turns the page `angle` degrees clockwise and scales it by `scale` around its centre, then moves it by `dx` of its width and `dy` of its height. Points are fractions of the page's box (x across, y down); `aspect` is the box's width / height; `drawn` is where each point is drawn; `backing` (pairs: `gutter` is the side facing the gutter) is the band painted behind it.",
+ "cases": [
+  {
+   "name": "a page shown alone, straightened",
+   "transform": {
+    "angle": -0.62,
+    "scale": 1.0,
+    "dx": 0.0,
+    "dy": 0.0
+   },
+   "aspect": 0.7,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.25,
+     0.8
+    ]
+   ],
+   "drawn": [
+    [
+     -0.0077,
+     0.003817
+    ],
+    [
+     0.992242,
+     -0.003758
+    ],
+    [
+     0.007758,
+     1.003758
+    ],
+    [
+     1.0077,
+     0.996183
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.254652,
+     0.801876
+    ]
+   ]
+  },
+  {
+   "name": "the left page of a pair: turned, smaller, moved to the gutter and down",
+   "transform": {
+    "angle": 0.41,
+    "scale": 0.98302,
+    "dx": 0.02676,
+    "dy": 0.00739,
+    "gutter": "right"
+   },
+   "aspect": 0.678,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.25,
+     0.8
+    ]
+   ],
+   "drawn": [
+    [
+     0.04045,
+     0.013508
+    ],
+    [
+     1.023445,
+     0.018277
+    ],
+    [
+     0.030075,
+     0.996503
+    ],
+    [
+     1.01307,
+     1.001272
+    ],
+    [
+     0.52676,
+     0.50739
+    ],
+    [
+     0.277899,
+     0.801096
+    ]
+   ],
+   "backing": [
+    1.0,
+    0.018277,
+    1.0,
+    1.001272
+   ]
+  },
+  {
+   "name": "the right page of a pair: turned the other way, larger, moved up",
+   "transform": {
+    "angle": -1.2,
+    "scale": 1.012,
+    "dx": -0.01513,
+    "dy": -0.0091,
+    "gutter": "left"
+   },
+   "aspect": 0.7,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.25,
+     0.8
+    ]
+   ],
+   "drawn": [
+    [
+     -0.036157,
+     -0.007571
+    ],
+    [
+     0.975621,
+     -0.022407
+    ],
+    [
+     -0.005881,
+     1.004207
+    ],
+    [
+     1.005897,
+     0.989371
+    ],
+    [
+     0.48487,
+     0.4909
+    ],
+    [
+     0.241009,
+     0.798142
+    ]
+   ],
+   "backing": [
+    0.0,
+    -0.007571,
+    0.0,
+    1.004207
+   ]
+  },
+  {
+   "name": "no change",
+   "transform": {
+    "angle": 0.0,
+    "scale": 1.0,
+    "dx": 0.0,
+    "dy": 0.0
+   },
+   "aspect": 0.7,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     1,
+     0
+    ],
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.25,
+     0.8
+    ]
+   ],
+   "drawn": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0
+    ],
+    [
+     0.0,
+     1.0
+    ],
+    [
+     1.0,
+     1.0
+    ],
+    [
+     0.5,
+     0.5
+    ],
+    [
+     0.25,
+     0.8
+    ]
+   ]
+  }
+ ]
+}

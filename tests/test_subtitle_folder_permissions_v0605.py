@@ -134,7 +134,7 @@ def test_settings_edit_optional_subtitle_folders(page) -> None:
 
 def test_first_start_guide_offers_an_optional_subtitle_folder(page) -> None:
     assert en("settings.subtitleFolder") == "Subtitle Inbox"
-    assert ru("settings.subtitleFolder") == "Subtitle Inbox"
+    assert ru("settings.subtitleFolder") == "Папка входящих субтитров"
     assert en("onboarding.subtitleFolderTitle") == "Choose a subtitle files folder (optional)"
     assert ru("onboarding.subtitleFolderTitle") == "Выберите папку с файлами субтитров (необязательно)"
     code = """

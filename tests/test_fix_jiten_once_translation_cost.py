@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -274,6 +275,7 @@ def test_llm_translates_without_context_and_google_only_when_the_fallback_is_on(
     tmp_path, monkeypatch
 ) -> None:
     service = _service(tmp_path)
+    service.save_settings({"google_translate": True})  # Google Translate is opt-in for a new install
     service.config.llm.enabled = True
     service.config.llm.model = "local-model"
     llm: list[tuple[str, str]] = []
@@ -362,6 +364,17 @@ def _player(monkeypatch, states):
     monkeypatch.setattr(mpv_study, "socket", SimpleNamespace(AF_UNIX=0, SOCK_STREAM=0, socket=Player))
     monkeypatch.setattr(mpv_study.time, "sleep", lambda _s: None)
     return polls
+
+
+class _NoPause:
+    """``time`` for pudge.mpv_study whose ``sleep`` returns at once."""
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    @staticmethod
+    def sleep(_seconds: float) -> None:
+        return None
 
 
 def _fake_api(llm=None, **settings):
@@ -455,7 +468,11 @@ def test_on_demand_translation_uses_the_prewarmed_cache(tmp_path, monkeypatch) -
         ("http://studio.local:1234/v1", "", False, True),
     ],
 )
-def test_prewarm_is_off_for_paid_llms_unless_turned_on(tmp_path, base_url, api_key, allowed, runs) -> None:
+def test_prewarm_is_off_for_paid_llms_unless_turned_on(
+    tmp_path, monkeypatch, base_url, api_key, allowed, runs
+) -> None:
+    # The pause between two prepared cues (at least 0.25 s) is not what this test is about.
+    monkeypatch.setattr(mpv_study, "time", _NoPause())
     subtitles = _srt(tmp_path / "ep.ja.srt", 3)
     llm = SimpleNamespace(enabled=True, provider="openai", base_url=base_url, api_key=api_key)
     api, calls = _fake_api(llm, translation_prewarm_remote=allowed)

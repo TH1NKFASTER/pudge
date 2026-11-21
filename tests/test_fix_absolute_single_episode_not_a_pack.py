@@ -10,8 +10,8 @@ from pudge.providers.nyaa import score_release
 def _release(title: str, size_gib: float) -> NyaaRelease:
     return NyaaRelease(
         title=title,
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="b" * 40,
         size_text=f"{size_gib} GiB",
         size_bytes=int(size_gib * 1024**3),

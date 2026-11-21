@@ -8,7 +8,7 @@ import pytest
 
 from pudge.database import Database, LATEST_SCHEMA_VERSION
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from pudge.personal_schedule import materialize_weekly_items
+from pudge.personal_schedule import PersonalReleaseRule, materialize_schedule_items
 from pudge.review_gate import EpisodeReviewIdentity, ReviewGateStore
 from pudge.web_app import WebAppApi
 
@@ -39,10 +39,11 @@ def _api(db: Database) -> WebAppApi:
 
 
 def test_weekly_materialization_preserves_wall_clock_across_dst_and_resolves_gap() -> None:
-    rows = materialize_weekly_items(
+    rows = materialize_schedule_items(
         [1, 2, 3],
         start_local_datetime="2026-03-01T02:30",
         timezone_iana="America/New_York",
+        rule=PersonalReleaseRule(),
     )
     assert rows[0].nominal_local_datetime == "2026-03-01T02:30"
     assert rows[1].nominal_local_datetime == "2026-03-08T02:30"

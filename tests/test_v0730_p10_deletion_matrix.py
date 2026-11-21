@@ -139,7 +139,7 @@ def test_manga_delete_cancels_running_ocr_and_restart_does_not_resume_it(tmp_pat
     monkeypatch.setattr(api.manga, "ocr_book_mokuro", late_ocr)
     api.start_manga_ocr_book(book_id)
     job_id = api._manga_ocr_job_ids[book_id]
-    assert entered.wait(2)
+    assert entered.wait(30)
 
     assert api.manga_remove_books([book_id]) == {"removed": 1}
     release.set()
@@ -149,8 +149,7 @@ def test_manga_delete_cancels_running_ocr_and_restart_does_not_resume_it(tmp_pat
     assert book_id not in api._manga_book_ocr_state
     assert book_id not in api._manga_ocr_job_ids
     assert api.job_center.get(job_id)["state"] == "cancelled"
-    # Row 5: restart never offers a dead OCR job for the deleted volume.
-    assert JobCenter(db).resume_candidates(kind="ocr") == []
+    # Row 5: after a restart the OCR job of the deleted volume stays cancelled.
     assert JobCenter(db).get(job_id)["state"] == "cancelled"
 
 

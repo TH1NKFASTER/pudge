@@ -74,7 +74,22 @@ class TorrentClient:
         self.fail_delete = fail_delete
 
     def torrent_status(self, torrent_hash):
-        return {"hash": torrent_hash, "progress": 1.0} if torrent_hash in self.payloads else None
+        if torrent_hash not in self.payloads:
+            return None
+        return {"hash": torrent_hash, "progress": 1.0, "save_path": str(self.payloads[torrent_hash].parent)}
+
+    def files(self, torrent_hash):
+        payload = self.payloads.get(torrent_hash)
+        if payload is None:
+            return []
+        paths = [payload] if not payload.is_dir() else sorted(p for p in payload.rglob("*") if p.is_file())
+        return [
+            {"index": index, "name": str(path.relative_to(payload.parent)), "priority": 1, "progress": 1.0}
+            for index, path in enumerate(paths)
+        ]
+
+    def set_file_priority(self, torrent_hash, indices, priority):
+        self.priorities = getattr(self, "priorities", []) + [(torrent_hash, list(indices), priority)]
 
     def delete(self, torrent_hash, *, delete_files=True):
         if self.fail_delete:
@@ -415,6 +430,7 @@ class Aria2Sidecar:
         self.running = False
         self.calls: list[str] = []
         self.starts = 0
+        self.secret = ""  # Pudge starts aria2 with its secret; a wrong token is refused
 
     def popen(self, real_popen):
         def start(command, *args, **kwargs):
@@ -431,6 +447,9 @@ class Aria2Sidecar:
             raise httpx.ConnectError("Connection refused", request=request)
         body = json.loads(request.content)
         method, params = body["method"], body["params"][1:]
+        if self.secret and body["params"][:1] != [f"token:{self.secret}"]:
+            error = {"code": 1, "message": "Unauthorized"}
+            return httpx.Response(400, json={"jsonrpc": "2.0", "id": body["id"], "error": error})
         self.calls.append(method)
         if method in {"aria2.tellStatus", "aria2.forceRemove", "aria2.removeDownloadResult"}:
             error = {"code": 1, "message": f"GID {params[0]} is not found"}
@@ -453,6 +472,7 @@ def _idle_stopped_aria2(tmp_path: Path, monkeypatch, *, records: dict) -> tuple[
     state = tmp_path / "aria2-state"
     client = Aria2Client(state_dir=state, binary=sys.executable, auto_start=True)
     client._http = httpx.Client(transport=httpx.MockTransport(sidecar.handle))
+    sidecar.secret = client._secret
     (state / "metadata.json").write_text(json.dumps(records), encoding="utf-8")
     (state / "idle-stopped").write_text("1\n", encoding="utf-8")  # stopped after 10 idle minutes
     monkeypatch.setattr(aria2.subprocess, "Popen", sidecar.popen(aria2.subprocess.Popen))

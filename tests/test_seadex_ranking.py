@@ -77,7 +77,9 @@ def test_without_seadex_entry_the_fast_rss_path_is_unchanged(monkeypatch):
     )
     monkeypatch.setattr("pudge.manager.search_ranked", lambda *a, **k: calls.append(("nyaa", True)) or [])
     _manager(None).search_releases(135865, episode=5)
-    assert calls == [("rss", False)]
+    # No SeaDex lookup is passed on; Find episode (manual) always asks Nyaa too now
+    # (tests/test_fix_manual_search_asks_nyaa.py).
+    assert calls == [("rss", False), ("nyaa", True)]
 
 
 def test_automatic_search_does_not_use_seadex_yet(monkeypatch):

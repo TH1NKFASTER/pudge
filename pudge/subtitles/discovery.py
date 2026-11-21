@@ -15,17 +15,18 @@ def content_fingerprint(
     ffmpeg_path: str,
 ) -> str | None:
     path = candidate.path
-    if path.suffix.casefold() in {".ass", ".ssa"}:
-        path, _ = convert_to_plain_srt(
-            path,
-            cache_dir,
-            ffmpeg_path=ffmpeg_path,
-            force=False,
-            verbose=False,
-        )
-    if path.suffix.casefold() != ".srt":
-        return None
     try:
+        if path.suffix.casefold() in {".ass", ".ssa", ".vtt"}:
+            # Raises OSError for a file gone since discovery: kept as it is (no fingerprint).
+            path, _ = convert_to_plain_srt(
+                path,
+                cache_dir,
+                ffmpeg_path=ffmpeg_path,
+                force=False,
+                verbose=False,
+            )
+        if path.suffix.casefold() != ".srt":
+            return None
         cues = parse_srt(path)
     except OSError:
         return None
@@ -37,17 +38,6 @@ def content_fingerprint(
         clean_text = re.sub(r"<[^>]+>|\{\\[^}]+\}", "", clean_text)
         normalized.append(f"{round(start, 2):.2f}|{round(end, 2):.2f}|{clean_text}")
     return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
-
-
-def _content_fingerprint(
-    candidate: SubtitleCandidate,
-    cache_dir: Path,
-    *,
-    ffmpeg_path: str,
-) -> str | None:
-    """Compatibility wrapper for the pre-consolidation private helper."""
-
-    return content_fingerprint(candidate, cache_dir, ffmpeg_path=ffmpeg_path)
 
 
 def deduplicate_candidates(

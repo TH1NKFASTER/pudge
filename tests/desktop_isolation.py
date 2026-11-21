@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import webbrowser
@@ -14,6 +16,11 @@ from types import SimpleNamespace
 
 REQUESTS: list[object] = []
 _GUI_TOOLS = {"open", "xdg-open", "osascript"}
+# Torrent helpers a test never starts for real. Pudge starts aria2c in its own session, so a
+# copy a test started outlives the test run and holds the port of the user's own Pudge (6801):
+# Torrents Off then never confirms. It fails as when aria2 is not installed. A stand-in script
+# a test wrote itself (a file that starts with "#!") still runs.
+_REAL_HELPERS = {"aria2c"}
 _REAL_POPEN = subprocess.Popen
 
 
@@ -51,19 +58,40 @@ def stop_started_energy_monitors(monkeypatch):
             monitor.stop()
 
 
-def _desktop_request(command, executable=None, shell=False):
+def _program(command, executable=None, shell=False):
     if isinstance(command, (str, bytes, os.PathLike)):
         parts = shlex.split(os.fsdecode(command)) if shell else [command]
     else:
         parts = list(command)
     program = os.fsdecode(executable or parts[0]) if executable or parts else ""
+    return program, parts
+
+
+def _desktop_request(command, executable=None, shell=False):
+    program, parts = _program(command, executable, shell)
     return Path(program).name in _GUI_TOOLS or "--pudge-native-notification" in parts
+
+
+def _real_helper(command, executable=None, shell=False) -> str:
+    """The path of a real torrent helper this launch would start, or ""."""
+    program, _parts = _program(command, executable, shell)
+    if Path(program).name not in _REAL_HELPERS:
+        return ""
+    found = program if os.sep in program else shutil.which(program)
+    try:
+        with open(found, "rb") as handle:
+            return "" if handle.read(2) == b"#!" else found
+    except (OSError, TypeError):
+        return ""  # missing: Popen fails on its own, as without this guard
 
 
 class QuietPopen(_REAL_POPEN):
     """Retain the real Popen protocol while substituting only desktop launches."""
 
     def __init__(self, args, *positional, **kwargs):
+        helper = _real_helper(args, kwargs.get("executable"), kwargs.get("shell", False))
+        if helper:
+            raise FileNotFoundError(errno.ENOENT, "a real aria2c is never started in Pudge tests", helper)
         desktop = _desktop_request(args, kwargs.get("executable"), kwargs.get("shell", False))
         if desktop:
             REQUESTS.append(args)

@@ -142,7 +142,7 @@ def test_headphone_badge_sits_next_to_the_title_and_is_never_clamped_away(page) 
         r"""
         setPage('lightnovels'); await __tick(50);
         const heading = document.querySelector('#lightNovelsContent [data-ln-book="6"] h3');
-        return {children: [...heading.children].map(el => el.className), badge: heading.querySelector('.ln-paired-audio-badge').textContent,
+        return {children: [...heading.children].filter(el => !el.hidden).map(el => el.className), badge: heading.querySelector('.ln-paired-audio-badge').textContent,
                 inTitle: Boolean(heading.querySelector('.ln-card-title .ln-paired-audio-badge'))};
         """,
         api={

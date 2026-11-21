@@ -14,8 +14,8 @@ from test_v0711_gui_homebrew_path import FORMULAS, brew_calls, run_installer
 def release() -> NyaaRelease:
     return NyaaRelease(
         title="[Group] Example - 01 [1080p]",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="0123456789abcdef0123456789abcdef01234567",
         size_text="1 GiB",
         size_bytes=1024**3,

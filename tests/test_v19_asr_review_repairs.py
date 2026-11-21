@@ -19,24 +19,30 @@ from pudge.providers.nyaa import release_identity_mismatch_reason, release_title
 from pudge.subtitle_formats import convert_to_plain_srt, parse_srt
 from pudge.subtitles.speech_recovery import recover_constant_speech_clock
 
+# A synthetic corpus (invented vocabulary and timings, see fixtures/asr_review_v19/generate.py
+# and its README): ``seirei`` has one constant speech clock, ``solo`` a piecewise one plus a
+# positioned ASS with ruby, ``tokyo`` the transcript of another episode of the same show.
 FIXTURES = Path(__file__).parent / "fixtures" / "asr_review_v19"
 
 
 @pytest.mark.parametrize(
     "name,count,digest",
     [
-        ("seirei-asr.json", 400, "ffa3242c126e4998ce61d0e4a4795e128fdd9e136c08cefcc5f588f7496fd0e4"),
-        ("solo-asr.json", 285, "81f1cfa4c31f2dd8775767d5b4c5d9bb44616d76a32988889ed48264b9aba222"),
-        ("tokyo-asr.json", 384, "db920c8f48a1d5aa96f0653b52d1013d2fad8bf17a719918df578c8962364291"),
-        ("seirei-source.srt", 489, "6a1268b7f77406ec65087ba867c2a2b9b1ae4b8043870b1d734013c4f13db9ca"),
-        ("solo-native.srt", 298, "d65b19f92d9243bc71ffa5eeb7c981e26681267e601a1ffc33a0ca0699fcbfce"),
-        ("tokyo-source.srt", 331, "a31e584cbce9777647d28d38af779db57b2aee199158bd1ac7664a48011f615d"),
-        ("solo-original.ass", 1319, "0ff42d8fa393dc995f6ff212f38a01c8d223c960d450d67bcbd609b34990ce99"),
+        ("seirei-asr.json", 360, "0f9f673052e3d25e491cfae6adbeef72d58342811c487a10fbd391a3f3e7dc70"),
+        ("solo-asr.json", 381, "4253f56c24de325047e7a7dcca34db7919019678ee57cc5645ecff46eb6b5551"),
+        ("tokyo-asr.json", 354, "6f3bf9deacb1a6cec5ac2ab7f280afc1da9e285a1da5d28541ab53a221ed1e06"),
+        ("seirei-source.srt", 376, "c9a9517c3b9b6a2971a63f08cfb4555b3d86dff1f8e113cbede488809832ee38"),
+        ("solo-native.srt", 392, "8962206293f22ce874c5dea1a4111a0440d9eacfa6cc10b8232cbd5552a4840b"),
+        ("tokyo-source.srt", 379, "f388e2cf09bd89d2cc205e0f31e62694f724ef1247e3917d891b9cde673ec13d"),
+        ("solo-original.ass", 1971, "aaf89be6f539c5d20a25be019143faff772a4d207141a5b3a04d61c0c127ad0a"),
     ],
 )
-def test_sanitized_corpus_retains_independent_regression_geometry(name, count, digest):
-    # These fingerprints were measured independently from snapshot 37cd773;
-    # caption and word text are deliberately absent from the signature.
+def test_synthetic_corpus_geometry_is_pinned(name, count, digest):
+    # The fingerprints pin the generated timing and layout (segment ids and times, ASR
+    # metrics and flags, word times and probabilities, cue times, ASS fields and override
+    # tags) that every regression test below runs on: changing the generator changes those
+    # inputs, so it has to be a deliberate change of these values too. Caption and word
+    # text are deliberately absent from the signature.
     text = gzip.decompress((FIXTURES / (name + ".gz")).read_bytes()).decode()
     if name.endswith(".json"):
         geometry = [
@@ -64,10 +70,10 @@ def test_sanitized_corpus_retains_independent_regression_geometry(name, count, d
 
 
 def test_generator_recreates_corpus_without_the_original_sources(tmp_path):
+    # The generator needs nothing but itself (no snapshot, no original sources).
     generator = tmp_path / "generator"
     generator.mkdir()
-    for name in ("generate.py", "geometry.json.gz"):
-        shutil.copy2(FIXTURES / name, generator / name)
+    shutil.copy2(FIXTURES / "generate.py", generator / "generate.py")
     output = tmp_path / "output"
     subprocess.run(
         [sys.executable, "-I", str(generator / "generate.py"), "--output", str(output)],
@@ -75,7 +81,8 @@ def test_generator_recreates_corpus_without_the_original_sources(tmp_path):
         capture_output=True,
         timeout=30,
     )
-    expected = {path.name for path in FIXTURES.glob("*.gz") if path.name != "geometry.json.gz"}
+    expected = {path.name for path in FIXTURES.glob("*.gz")}
+    assert len(expected) == 7
     assert {path.name for path in output.iterdir()} == expected
     for name in expected:
         # Compare the content: the gzip header OS byte and deflate stream depend
@@ -97,17 +104,21 @@ def test_synthetic_ass_keeps_all_native_dialogue(tmp_path: Path) -> None:
     converted, metadata = convert_to_plain_srt(ass, tmp_path / "cache")
     assert metadata["method"] == "ass-geometry"
     assert metadata["bilingual_removed"] == 0
-    assert metadata["geometry"]["ruby_removed"] == 468
-    assert metadata["geometry"]["positioned_events"] == 1261
-    assert metadata["geometry"]["fragments_joined"] == 495
+    # generate.py: 1971 events, of which 1946 have one position and one line (the rest are
+    # plain captions and positioned two-line events); 272 half-size readings sit above a
+    # kanji run; the fragments of each multi-fragment caption are joined into its lines
+    # (outline-layer copies of a fragment are dropped before joining).
+    assert metadata["geometry"]["ruby_removed"] == 272
+    assert metadata["geometry"]["positioned_events"] == 1946
+    assert metadata["geometry"]["fragments_joined"] == 1242
     actual, expected = parse_srt(converted), parse_srt(native)
-    assert len(actual) == len(expected) == 298
-    # The independently stored SRT is the expected ruby-free caption stream.
+    assert len(actual) == len(expected) == 392
+    # The separately written SRT is the expected ruby-free caption stream.
     assert [re.sub(r"\s+", "", c[2]) for c in actual] == [re.sub(r"\s+", "", c[2]) for c in expected]
-    # Retain the original two whole-kanji/ruby regression cases as synthetic
-    # literals; short base captions must not disappear with their readings.
-    assert actual[57][2] == "当峰。"
-    assert actual[253][2] == "「痈擈螁脜鷊」？"
+    # The two whole-kanji/ruby regression cases (generate.py puts them at these places):
+    # short base captions must not disappear with their readings.
+    assert actual[57][2] == "霜雀。"
+    assert actual[253][2] == "「鷺橋灯楼」？"
     cached, result = convert_to_plain_srt(ass, tmp_path / "cache")
     assert cached == converted and result["reason"] == "cached"
 
@@ -135,13 +146,18 @@ def test_seirei_constant_clock_is_distributed_and_structurally_safe(tmp_path: Pa
     asr = materialize(tmp_path, "seirei-asr.json")
     output, result = recover_constant_speech_clock(source, asr, tmp_path / "cache")
     assert output is not None and result["accepted"]
-    assert result["anchor_count"] == 141
+    # generate.py puts the speech SHIFT = -1.16 s before the captions (the real case's
+    # -1.162 s median) with 60 ms jitter; ~7% of the captions are timed 0.9-2 s off and one
+    # stock line also matches elsewhere, which gives the inlier fraction. The opening song
+    # (90-180 s, music marks only) leaves the first quarter with the fewest anchors.
+    assert result["anchor_count"] == 174
     assert -1.25 < result["shift_seconds"] < -1.10
+    assert result["shift_seconds"] == -1.159
     assert result["inlier_fraction"] > 0.9
     assert min(result["quarter_anchor_counts"]) >= 20
-    assert result["quarter_anchor_counts"] == [34, 35, 48, 24]
-    assert result["inlier_fraction"] == 0.9362
-    assert result["quarter_shift_spread_seconds"] == 0.049
+    assert result["quarter_anchor_counts"] == [30, 44, 47, 53]
+    assert result["inlier_fraction"] == 0.9195
+    assert result["quarter_shift_spread_seconds"] == 0.019
     anchors = [
         {key: value for key, value in anchor.items() if key != "mean_word_probability"}
         for anchor in result["anchors"]
@@ -149,12 +165,12 @@ def test_seirei_constant_clock_is_distributed_and_structurally_safe(tmp_path: Pa
     encoded = json.dumps(anchors, sort_keys=True, separators=(",", ":")).encode()
     assert (
         hashlib.sha256(encoded).hexdigest()
-        == "15160f9d71555b1c77fdd7775424ec0b1b7e6167598216e952351349313262cb"
+        == "a219f3e22a62f24421816530a3e04d27e4e57f1b46202e38661bcf7ed3730c4e"
     )
     assert result["alignment_output_guard"]["status"] == "accepted"
     assert result["alignment_output_guard"]["diagnostics"]["new_overlaps"] == 0
     before, after = parse_srt(source), parse_srt(output)
-    assert len(before) == len(after) == 489
+    assert len(before) == len(after) == 376
     assert [c[2] for c in before] == [c[2] for c in after]
     assert max(abs((b[1] - b[0]) - (a[1] - a[0])) for a, b in zip(before, after)) < 0.002
 
@@ -162,8 +178,12 @@ def test_seirei_constant_clock_is_distributed_and_structurally_safe(tmp_path: Pa
 @pytest.mark.parametrize(
     "source_name,asr_name,reason,anchor_count",
     [
-        ("solo-native.srt", "solo-asr.json", "speech_clock_not_constant", 68),
-        ("tokyo-source.srt", "tokyo-asr.json", "insufficient_distributed_word_anchors", 0),
+        # solo: the speech moves by 2.6 s at a video edit (generate.py EDIT_AT): anchors in
+        # every quarter, but two clocks.
+        ("solo-native.srt", "solo-asr.json", "speech_clock_not_constant", 160),
+        # tokyo: another episode of the same show; three short stock lines happen to be in
+        # its transcript (at unrelated times), far too few to be a clock.
+        ("tokyo-source.srt", "tokyo-asr.json", "insufficient_distributed_word_anchors", 3),
     ],
 )
 def test_recovery_refuses_piecewise_clock_and_wrong_content(
@@ -194,7 +214,7 @@ def test_recovery_requires_broad_evidence_not_a_small_cluster(
     payload = json.loads(transcript.read_text())
     if mutation == "sparse":
         payload["segments"] = payload["segments"][:10]
-    elif mutation == "late_only":
+    elif mutation == "late_only":  # the last quarter of the 1425 s episode only
         payload["segments"] = [s for s in payload["segments"] if s["start"] > 1080]
     elif mutation == "shift_40":
         for s in payload["segments"]:
@@ -218,10 +238,10 @@ def test_guard_wrapper_recovers_using_independent_words(
     asr = materialize(tmp_path, "seirei-asr.json")
     # Reproduce a transformed output introducing many new overlaps.
     damaged = tmp_path / "damaged.srt"
-    from pudge.alignment_guard import _write_exact_srt
+    from pudge.subtitle_formats import write_exact_srt
 
     cues = parse_srt(source)
-    _write_exact_srt([(a, b + 3.0, t) for a, b, t in cues], damaged)
+    write_exact_srt([(a, b + 3.0, t) for a, b, t in cues], damaged)
     monkeypatch.setattr(
         syncing,
         "_optimize_subtitle_unguarded",
@@ -281,10 +301,10 @@ def test_final_identity_failure_does_not_mask_valid_candidate_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = materialize(tmp_path, "seirei-source.srt")
-    from pudge.alignment_guard import _write_exact_srt
+    from pudge.subtitle_formats import write_exact_srt
 
     damaged = tmp_path / "damaged.srt"
-    _write_exact_srt([(a, b + 3.0, t) for a, b, t in parse_srt(source)], damaged)
+    write_exact_srt([(a, b + 3.0, t) for a, b, t in parse_srt(source)], damaged)
     correct = SubtitleCandidate(path=source, name="S1", source="jimaku", score=100, details={})
     wrong = SubtitleCandidate(
         path=tmp_path / "s2.srt",

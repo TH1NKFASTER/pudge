@@ -1,7 +1,7 @@
 """Hyakkano S03E12 (CR WEB-DL vs AT-X Jimaku): early ~10 s edit.
 
-Shape from the real debug bundle: shincaps cue 4 ends at 49.116, cue 5 starts
-at 62.095 (12.979 s gap). Coarse timeline windows find -22 s then -32 s with a
+Shape from the real debug bundle (timings only; the cue text is invented): shincaps cue 4
+ends at 49.116, cue 5 starts at 62.095 (12.979 s gap). Coarse timeline windows find -22 s then -32 s with a
 transition near ~97.5 s. Forward-only monotonic repair used to drag the switch
 to ~482 s (cues 1..133 on -22 s).
 """
@@ -16,9 +16,9 @@ EDIT_GAP = (49.116, 62.095)
 def _cues() -> list[tuple[float, float, str]]:
     cues = [
         (34.568, 36.0, "（雷鳴）"),
-        (38.071, 41.0, "静？　誰を連れてきたの？"),
-        (44.578, 46.8, "静ちゃんのお母さんですか？"),
-        (46.914, 49.116, "お話ししたいことがあります。"),
+        (38.071, 41.0, "雪？　誰と話していたの？"),
+        (44.578, 46.8, "隣のクラスの先生ですか？"),
+        (46.914, 49.116, "少しお時間をいただけますか。"),
     ]
     t = 62.095
     index = 0

@@ -16,8 +16,23 @@ from urllib.parse import urljoin
 
 import httpx
 
+from ..archive_limits import (
+    IMAGE_MEMBER_LIMIT,
+    SUBTITLE_ARCHIVE_LIMIT,
+    TEXT_MEMBER_LIMIT,
+    ArchiveBudget,
+    ArchiveTooLargeError,
+    extract_member,
+    run_extraction,
+)
 from ..filename import normalize_title, parse_anime_filename, release_tokens, title_similarity
-from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_japanese_subtitle
+from ..fsutil import atomic_write_json
+from ..language import (
+    IMAGE_SUBTITLE_EXTENSIONS,
+    TEXT_SUBTITLE_EXTENSIONS,
+    is_japanese_subtitle,
+    is_macos_metadata_path,
+)
 from ..logging_utils import configure_logging, timed_step
 from ..branding import APP_SLUG
 from ..models import JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
@@ -30,8 +45,8 @@ from ..jimaku_trial import (
 )
 from ..subtitle_formats import (
     format_preference_bonus,
-    subtitle_bilingual_cjk_profile,
     subtitle_filename_language_profile,
+    subtitle_language_profiles,
 )
 
 
@@ -45,10 +60,12 @@ ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar"}
 JIMAKU_LOCAL_REQUESTS_PER_MINUTE = 20.0
 JIMAKU_LOCAL_BURST_CAPACITY = 4.0
 ARCHIVE_EXTRACT_CACHE_SCHEMA = 1
+# A download larger than this stops (an archive is never unpacked past this size either).
+JIMAKU_DOWNLOAD_LIMIT = SUBTITLE_ARCHIVE_LIMIT
 
 
 def find_7zip() -> str | None:
-    """Resolve 7-Zip even inside a Finder-launched macOS app.
+    """Resolve 7-Zip even inside a Finder-launched macOS app (only a fallback for bsdtar now).
 
     GUI applications do not inherit the interactive shell PATH, so Homebrew's
     /opt/homebrew/bin is commonly absent despite sevenzip being installed.
@@ -73,6 +90,140 @@ def find_7zip() -> str | None:
     return None
 
 
+def find_bsdtar() -> str | None:
+    """macOS's own bsdtar (libarchive): it reads zip, 7z, rar4 and rar5.
+
+    install.sh no longer installs the Homebrew 7-Zip just for .7z/.rar archives.
+    PUDGE_BSDTAR names another bsdtar (tests).
+    """
+    for value in (os.environ.get("PUDGE_BSDTAR", "").strip(), "/usr/bin/bsdtar"):
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+class ArchiveToolMissingError(RuntimeError):
+    """Neither bsdtar nor 7-Zip is there to unpack a .7z/.rar archive."""
+
+
+class ArchiveUnreadableError(RuntimeError):
+    """No archive tool could unpack the archive; ``detail`` is the end of their output."""
+
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+_ENCRYPTED_ARCHIVE_RE = re.compile(r"(?i)encrypt|passphrase|password")
+
+
+def _empty_folder(root: Path) -> None:
+    for child in root.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+
+def _bsdtar_pattern(name: str) -> str:
+    # bsdtar reads member arguments as patterns: "[Group] Title 01.epub" must match itself.
+    return re.sub(r"([*?\[\]\\])", r"\\\1", name)
+
+
+def list_archive(path: Path, *, timeout: float = 120.0) -> list[str]:
+    """Member names of a .7z/.rar archive (files and folders): bsdtar first, then 7-Zip.
+
+    Raises ArchiveToolMissingError, ArchiveUnreadableError (encrypted names or an
+    unreadable archive) or subprocess.TimeoutExpired.
+    """
+    env = {**os.environ, "LC_ALL": "en_US.UTF-8"}
+    outputs: list[str] = []
+    tried = False
+    bsdtar = find_bsdtar()
+    if bsdtar:
+        tried = True
+        completed = subprocess.run(
+            [bsdtar, "-tf", str(path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+        if completed.returncode == 0:
+            text = completed.stdout.decode("utf-8", errors="replace")
+            return [line for line in text.splitlines() if line.strip()]
+        outputs.append(completed.stderr.decode("utf-8", errors="replace").strip())
+    sevenzip = find_7zip()
+    if sevenzip:
+        tried = True
+        completed = subprocess.run(
+            [sevenzip, "l", "-ba", "-slt", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+        if completed.returncode == 0:
+            text = completed.stdout.decode("utf-8", errors="replace")
+            return [line[7:] for line in text.splitlines() if line.startswith("Path = ") and line[7:].strip()]
+        outputs.append((completed.stdout + completed.stderr).decode("utf-8", errors="replace").strip())
+    if not tried:
+        raise ArchiveToolMissingError(path.name)
+    detail = "\n".join(outputs)
+    key = "archive.encrypted" if _ENCRYPTED_ARCHIVE_RE.search(detail) else "archive.unreadable"
+    raise ArchiveUnreadableError(err(key), detail[-1000:])
+
+
+def unpack_archive(
+    path: Path,
+    root: Path,
+    *,
+    limit: int | None,
+    timeout: float,
+    members: list[str] | None = None,
+) -> None:
+    """Unpack a .7z/.rar archive into the empty folder ``root``: bsdtar first, then 7-Zip.
+
+    7zz is tried only when bsdtar cannot read the archive and 7zz is installed.
+    Without -P, bsdtar refuses absolute paths, ".." and writing through a link,
+    like 7-Zip; the size limit and timeout apply to both. ``members`` (names from
+    ``list_archive``) unpacks only those. Raises ArchiveToolMissingError,
+    ArchiveUnreadableError (encrypted or unreadable), ArchiveTooLargeError or
+    subprocess.TimeoutExpired.
+    """
+    commands: list[list[str]] = []
+    bsdtar = find_bsdtar()
+    if bsdtar:
+        selected = [_bsdtar_pattern(name) for name in members] if members is not None else []
+        commands.append([bsdtar, "-xf", str(path), "-C", str(root), *selected])
+    sevenzip = find_7zip()
+    if sevenzip:
+        if members is None:
+            commands.append([sevenzip, "x", "-y", f"-o{root}", str(path)])
+        else:
+            # -spd: member names are names, not wildcards.
+            commands.append([sevenzip, "x", "-y", "-spd", f"-o{root}", "--", str(path), *members])
+    if not commands:
+        raise ArchiveToolMissingError(path.name)
+    # A Finder-launched app has no LANG: in the C locale libarchive cannot write the
+    # Japanese member names of a .7z/.rar.
+    env = {**os.environ, "LC_ALL": "en_US.UTF-8"}
+    outputs: list[str] = []
+    for command in commands:
+        _empty_folder(root)
+        returncode, output = run_extraction(command, root, limit=limit, timeout=timeout, env=env)
+        if returncode == 0:
+            return
+        outputs.append(output.strip())
+    _empty_folder(root)
+    detail = "\n".join(outputs)
+    key = "archive.encrypted" if _ENCRYPTED_ARCHIVE_RE.search(detail) else "archive.unreadable"
+    raise ArchiveUnreadableError(err(key), detail[-1000:])
+
+
 _SEASON_TOKEN_RE = re.compile(r"(?i)(?:^|[\s._-])s(?:eason\s*)?0*(?P<season>\d{1,2})(?=$|[\s._-])")
 _ORDINAL_SEASON_RE = re.compile(r"(?i)\b(?P<season>\d{1,2})(?:st|nd|rd|th)\s+season\b")
 _ROMAN_SEASONS = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9}
@@ -87,12 +238,21 @@ def explicit_season_hint(name: str, identity_title: str = "") -> int | None:
     requested identity.
     """
     parsed = parse_anime_filename(name)
-    if parsed.season is not None:
-        return int(parsed.season)
-    for pattern in (_SEASON_TOKEN_RE, _ORDINAL_SEASON_RE):
-        match = pattern.search(name)
-        if match:
-            return int(match.group("season"))
+    # "2nd Season 05": the ordinal is the season and "Season 05" right after it is
+    # the episode. Hints that still disagree make the season unknown, not a reject.
+    hints: set[int] = set()
+    masked = name
+    for match in _ORDINAL_SEASON_RE.finditer(name):
+        hints.add(int(match.group("season")))
+        masked = masked[: match.start()] + " " * (match.end() - match.start()) + masked[match.end() :]
+    for match in _SEASON_TOKEN_RE.finditer(masked):
+        hints.add(int(match.group("season")))
+    if parsed.season is not None and not hints:
+        hints.add(int(parsed.season))
+    if len(hints) > 1:
+        return None
+    if hints:
+        return hints.pop()
     base = normalize_title(identity_title)
     parsed_title = normalize_title(parsed.title)
     if not base or not parsed_title.startswith(base + " "):
@@ -119,6 +279,19 @@ _EPISODE_RANGE_PATTERNS = (
 )
 
 
+_DATE_RE = re.compile(r"(?<!\d)(?:\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{4})(?!\d)")
+_RANGE_BRACKET_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _range_starts_in_title(name: str, match: re.Match[str], title: str) -> bool:
+    """``Kaiju No. 8 - 02``: the 8 ends the title, so "8 - 02" is no episode range."""
+    wanted = normalize_title(title)
+    if not wanted:
+        return False
+    prefix = _RANGE_BRACKET_RE.sub(" ", name[: match.start("start")])
+    return normalize_title(prefix + " " + match.group("start")) == wanted
+
+
 def explicit_episode_range(name: str) -> tuple[int, int] | None:
     """Return an explicit episode span from a release filename.
 
@@ -126,21 +299,34 @@ def explicit_episode_range(name: str) -> tuple[int, int] | None:
     accepts realistic episode numbers. It is used as a hard sanity check so a
     pack labelled ``01-02`` cannot be considered for episode 6 merely because
     the generic filename parser returned no single episode.
+
+    A span is never read backwards (``Mob Psycho 100 - 03``), from a date
+    (``[2023-10-06]``) or from a number that ends the title (``Steins;Gate 0 - 05``).
     """
-    for pattern in _EPISODE_RANGE_PATTERNS:
-        for match in pattern.finditer(name):
+    masked = _DATE_RE.sub(lambda match: " " * len(match.group(0)), name)
+    title = ""
+    for index, pattern in enumerate(_EPISODE_RANGE_PATTERNS):
+        position = 0
+        while (match := pattern.search(masked, position)) is not None:
+            position = match.start() + 1
             start = int(match.group("start"))
             end = int(match.group("end"))
-            if not (0 <= start <= 500 and 0 <= end <= 500):
+            if not (0 <= start <= 500 and 0 <= end <= 500) or start > end:
                 continue
-            if start > end:
-                start, end = end, start
+            if index == len(_EPISODE_RANGE_PATTERNS) - 1:
+                title = title or parse_anime_filename(name).title
+                if _range_starts_in_title(masked, match, title):
+                    continue
             return start, end
     return None
 
 
 class JimakuError(RuntimeError):
     pass
+
+
+class JimakuRateLimited(JimakuError):
+    """Jimaku answered 429, or its cooldown from an earlier 429 is still running."""
 
 
 class JimakuKeyRejected(JimakuError):
@@ -171,6 +357,29 @@ def _safe_name(value: str) -> str:
     return value[:220] or "subtitle"
 
 
+def jimaku_download_dir(cache_dir: Path, item: JimakuFile) -> Path:
+    """The cache folder of one Jimaku file.
+
+    The URL comes from the file name: a file replaced under the same name is a new
+    upload only by its date and size, so both are part of the key.
+    """
+    key = "\0".join(
+        (item.url, str(getattr(item, "last_modified", "") or ""), str(getattr(item, "size", 0) or 0))
+    )
+    return cache_dir / "jimaku" / hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
+def _api_rows(payload: object, path: str) -> list[dict]:
+    """The rows of a list answer; another answer is a Jimaku error, not a crash.
+
+    An error object, a string or a row without its fields raised TypeError/KeyError,
+    which the subtitle search does not catch (only JimakuError): the whole job failed.
+    """
+    if not isinstance(payload, list):
+        raise JimakuError(err("jimaku.api", error=f"{path}: unexpected answer {str(payload)[:120]!r}"))
+    return [item for item in payload if isinstance(item, dict)]
+
+
 class JimakuClient:
     def __init__(
         self,
@@ -178,12 +387,24 @@ class JimakuClient:
         api_key: str,
         cache_dir: Path | None = None,
         cache_ttl_seconds: float = 2 * 60,
+        *,
+        search_cache_ttl_seconds: float | None = None,
+        empty_search_cache_ttl_seconds: float = 0.0,
     ) -> None:
         if not api_key:
             raise JimakuError(err("jimaku.apiKeyMissing"))
         self.base_url = base_url.rstrip("/")
         self.cache_dir = cache_dir
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        # Entry searches change rarely (a new title, a new AniList link); file lists
+        # change with every upload and keep the short TTL. An empty search is kept
+        # only briefly, so a newly created entry is still found soon.
+        self.search_cache_ttl_seconds = (
+            self.cache_ttl_seconds
+            if search_cache_ttl_seconds is None
+            else max(0.0, float(search_cache_ttl_seconds))
+        )
+        self.empty_search_cache_ttl_seconds = max(0.0, float(empty_search_cache_ttl_seconds))
         self._api_key_hash = jimaku_key_fingerprint(api_key)
         self.logger = configure_logging()
         self.client = httpx.Client(
@@ -200,9 +421,10 @@ class JimakuClient:
         self.client.close()
 
     def _request_budget_file(self) -> Path | None:
-        if self.cache_dir is None:
+        cache_dir = getattr(self, "cache_dir", None)  # bare instances (tests) have none
+        if cache_dir is None:
             return None
-        return self.cache_dir / "jimaku-api" / "request-budget.json"
+        return cache_dir / "jimaku-api" / "request-budget.json"
 
     def _reserve_request_slot(self, *, now: float | None = None) -> float:
         """Reserve one shared Jimaku request slot and return required wait seconds.
@@ -296,9 +518,10 @@ class JimakuClient:
         time.sleep(wait_seconds)
 
     def _rate_limit_file(self) -> Path | None:
-        if self.cache_dir is None:
+        cache_dir = getattr(self, "cache_dir", None)
+        if cache_dir is None:
             return None
-        return self.cache_dir / "jimaku-api" / "rate-limit.json"
+        return cache_dir / "jimaku-api" / "rate-limit.json"
 
     def _rate_limit_remaining(self) -> float:
         marker = self._rate_limit_file()
@@ -351,6 +574,13 @@ class JimakuClient:
             record_jimaku_key_rejection(self.cache_dir, self._api_key_hash, status_code)
         raise JimakuKeyRejected(err("jimaku.keyRejected", status=status_code), status_code)
 
+    def _cache_ttl(self, path: str, payload: object) -> float:
+        if path == "/api/entries/search":
+            return self.empty_search_cache_ttl_seconds if payload == [] else self.search_cache_ttl_seconds
+        if payload == [] and path.endswith("/files"):
+            return 0.0
+        return self.cache_ttl_seconds
+
     def _get_json(self, path: str, params: dict[str, object] | None = None):
         safe_params = dict(params or {})
         cache_path: Path | None = None
@@ -372,17 +602,13 @@ class JimakuClient:
                     )
                     if not empty_dynamic_result:
                         stale_payload = cached_payload
-                    if time.time() - cache_path.stat().st_mtime <= self.cache_ttl_seconds:
+                    ttl = self._cache_ttl(path, cached_payload)
+                    if time.time() - cache_path.stat().st_mtime <= ttl:
                         count = len(cached_payload) if isinstance(cached_payload, list) else 1
-                        if empty_dynamic_result:
-                            self.logger.info(
-                                "SKIP step=jimaku.http path=%s count=0 cache=empty_dynamic", path
-                            )
-                        else:
-                            self.logger.info(
-                                "RESULT step=jimaku.http path=%s count=%s cache=hit", path, count
-                            )
-                            return cached_payload
+                        self.logger.info("RESULT step=jimaku.http path=%s count=%s cache=hit", path, count)
+                        return cached_payload
+                    if empty_dynamic_result:
+                        self.logger.info("SKIP step=jimaku.http path=%s count=0 cache=empty_dynamic", path)
             except (OSError, ValueError, json.JSONDecodeError):
                 stale_payload = None
 
@@ -397,7 +623,7 @@ class JimakuClient:
                     rate_limit_remaining,
                 )
                 return stale_payload
-            raise JimakuError(self._rate_limit_message(rate_limit_remaining))
+            raise JimakuRateLimited(self._rate_limit_message(rate_limit_remaining))
 
         last_network_error: httpx.HTTPError | None = None
         max_attempts = 2
@@ -426,7 +652,7 @@ class JimakuClient:
                                 cooldown,
                             )
                             return stale_payload
-                        raise JimakuError(self._rate_limit_message(cooldown))
+                        raise JimakuRateLimited(self._rate_limit_message(cooldown))
                     if status_code in {401, 403} and jimaku_rejects_key(
                         status_code, response.headers.get("content-type", "")
                     ):
@@ -437,18 +663,16 @@ class JimakuClient:
                 self.logger.info("RESULT step=jimaku.http path=%s count=%s cache=miss", path, count)
                 if self.cache_dir is not None:
                     clear_jimaku_key_rejection(self.cache_dir, self._api_key_hash)
-                empty_dynamic_result = payload == [] and (
-                    path == "/api/entries/search" or path.endswith("/files")
-                )
-                if cache_path is not None and not empty_dynamic_result:
+                # Both endpoints answer a list: anything else (an error object sent with
+                # HTTP 200) is not kept for the hours an entry search stays cached.
+                if (
+                    cache_path is not None
+                    and isinstance(payload, list)
+                    and self._cache_ttl(path, payload) > 0
+                ):
                     try:
                         cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        temporary = cache_path.with_suffix(".tmp")
-                        temporary.write_text(
-                            json.dumps(payload, ensure_ascii=False),
-                            encoding="utf-8",
-                        )
-                        temporary.replace(cache_path)
+                        atomic_write_json(cache_path, payload, ensure_ascii=False)
                     except OSError:
                         pass
                 return payload
@@ -502,31 +726,38 @@ class JimakuClient:
             params["query"] = query
         payload = self._get_json("/api/entries/search", params=params)
         result: list[JimakuEntry] = []
-        for item in payload:
-            result.append(
-                JimakuEntry(
+        for item in _api_rows(payload, "/api/entries/search"):
+            try:
+                entry = JimakuEntry(
                     id=int(item["id"]),
-                    name=str(item["name"]),
+                    name=str(item.get("name") or ""),
                     english_name=item.get("english_name"),
                     japanese_name=item.get("japanese_name"),
                     anilist_id=int(item["anilist_id"]) if item.get("anilist_id") else None,
                     flags=dict(item.get("flags") or {}),
                 )
-            )
+            except (KeyError, TypeError, ValueError):
+                continue  # one malformed entry, not the whole subtitle search
+            result.append(entry)
         return result
 
     def files(self, entry_id: int, episode: int | None) -> list[JimakuFile]:
         params = {"episode": episode} if episode is not None else None
         payload = self._get_json(f"/api/entries/{entry_id}/files", params=params)
-        return [
-            JimakuFile(
-                url=str(item["url"]),
-                name=str(item["name"]),
-                size=int(item.get("size", 0)),
-                last_modified=str(item.get("last_modified", "")),
-            )
-            for item in payload
-        ]
+        result: list[JimakuFile] = []
+        for item in _api_rows(payload, "/files"):
+            try:
+                result.append(
+                    JimakuFile(
+                        url=str(item["url"]),
+                        name=str(item["name"]),
+                        size=int(item.get("size") or 0),  # null when Jimaku does not know it
+                        last_modified=str(item.get("last_modified", "")),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue  # a file without an address or name cannot be downloaded
+        return result
 
     def files_for_episode(
         self,
@@ -602,7 +833,8 @@ class JimakuClient:
         file whose name carries the episode, or a range covering it. Jimaku's
         server-side episode index can know a file whose name hides the episode,
         so with fewer than three such files the per-episode filter is asked as
-        well and both are merged (server results first, as before).
+        well and both are merged (server results first, as before). Files whose
+        name has no episode join only when neither list found anything.
         """
         aliases = {int(value) for value in alternative_episodes if int(value) > 0}
         if episode is not None:
@@ -651,8 +883,12 @@ class JimakuClient:
                 if all(existing.url != item.url for existing in filtered):
                     filtered.append(item)
         merged: dict[str, JimakuFile] = {item.url: item for item in filtered}
-        for item in [*local.values(), *unknown.values()]:
+        for item in local.values():
             merged.setdefault(item.url, item)
+        if not merged:
+            # A name without a readable episode fits any episode: only a last resort,
+            # or every file of the entry would be downloaded and aligned for each one.
+            merged.update((url, item) for url, item in unknown.items())
         result = list(merged.values())
         getattr(self, "logger", configure_logging()).info(
             "RESULT step=jimaku.files entry_id=%s episode=%s filtered=%s exact=%s unfiltered=%s merged=%s server_filter=true",
@@ -672,7 +908,8 @@ class JimakuClient:
             if anilist_id and entry.anilist_id == anilist_id:
                 return 1000.0
             names = [entry.name, entry.english_name or "", entry.japanese_name or ""]
-            return max(title_similarity(identity.title, name) for name in names if name)
+            # An entry without any name ranks last instead of raising ValueError.
+            return max((title_similarity(identity.title, name) for name in names if name), default=0.0)
 
         return sorted(entries, key=score, reverse=True)
 
@@ -753,6 +990,7 @@ class JimakuClient:
             language_purity_bonus = {
                 "japanese_only": 35.0,
                 "unknown": 0.0,
+                "mixed_japanese_english": -60.0,
                 "mixed_japanese_chinese": -120.0,
                 "chinese_only": -180.0,
             }.get(language_purity, 0.0)
@@ -814,8 +1052,7 @@ class JimakuClient:
         return sorted(files, key=lambda item: item.score, reverse=True)
 
     def download(self, item: JimakuFile, cache_dir: Path) -> Path:
-        digest = hashlib.sha1(item.url.encode()).hexdigest()[:16]
-        target_dir = cache_dir / "jimaku" / digest
+        target_dir = jimaku_download_dir(cache_dir, item)
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / _safe_name(Path(item.name).name)
         expected = int(getattr(item, "size", 0) or 0)
@@ -824,17 +1061,53 @@ class JimakuClient:
             and target.stat().st_size > 0
             and (expected <= 0 or target.stat().st_size >= expected)
         ):
+            # The cache keeps recently used downloads (cache_management): mark this one
+            # used. Touch the folder, not the archive: the archive's mtime keys its
+            # unpacked members.
+            try:
+                os.utime(target_dir)
+            except OSError:
+                pass
             return target
+        # Downloads use the same shared request budget and 429 cooldown as the API.
+        rate_limit_remaining = self._rate_limit_remaining()
+        if rate_limit_remaining > 0:
+            raise JimakuRateLimited(self._rate_limit_message(rate_limit_remaining))
         try:
-            response = self.client.get(item.url)
-            response.raise_for_status()
-            data = response.content
-            if expected > 0 and len(data) < expected:
-                raise OSError(f"incomplete download: {len(data)} of {expected} bytes")
+            self._acquire_request_slot("download")
             # Atomic: an interrupted write never becomes a cached subtitle.
-            temporary = target.with_name(target.name + ".part")
-            temporary.write_bytes(data)
-            os.replace(temporary, target)
+            # A per-call name: two workers fetching the same file never write into one.
+            temporary = target.with_name(f".{target.name}.{os.getpid()}-{time.monotonic_ns():x}.part")
+            try:
+                # Streamed to disk with a cap: an archive (or a wrong answer) is never held
+                # in memory whole, and a huge one is not downloaded to the end.
+                with self.client.stream("GET", item.url) as response:
+                    if int(getattr(response, "status_code", 200) or 200) == 429:
+                        headers = getattr(response, "headers", None) or {}
+                        cooldown = self._set_rate_limit(
+                            self._retry_after_seconds(headers.get("Retry-After", ""))
+                        )
+                        raise JimakuRateLimited(self._rate_limit_message(cooldown))
+                    response.raise_for_status()
+                    received = 0
+                    with temporary.open("wb") as handle:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            received += len(chunk)
+                            if received > JIMAKU_DOWNLOAD_LIMIT:
+                                raise JimakuError(
+                                    err(
+                                        "jimaku.downloadTooLarge",
+                                        name=item.name,
+                                        limit=JIMAKU_DOWNLOAD_LIMIT // (1024 * 1024),
+                                    )
+                                )
+                            handle.write(chunk)
+                if expected > 0 and received < expected:
+                    raise OSError(f"incomplete download: {received} of {expected} bytes")
+                os.replace(temporary, target)
+            finally:
+                # A failed write (a full disk) leaves no partial file in the download folder.
+                temporary.unlink(missing_ok=True)
             return target
         except (httpx.HTTPError, OSError) as exc:
             raise JimakuError(err("jimaku.downloadFailed", name=item.name, error=exc)) from exc
@@ -857,6 +1130,7 @@ def _archive_member_score(
     score += {
         "japanese_only": 35.0,
         "unknown": 0.0,
+        "mixed_japanese_english": -60.0,
         "mixed_japanese_chinese": -120.0,
         "chinese_only": -180.0,
     }.get(str(language_profile.get("purity") or "unknown"), 0.0)
@@ -888,7 +1162,14 @@ def _extract_archive_all(
     extracted: list[tuple[Path, str, float]] = []
     try:
         with zipfile.ZipFile(path) as zf:
-            names = [name for name in zf.namelist() if Path(name).suffix.casefold() in SUBTITLE_EXTENSIONS]
+            budget = ArchiveBudget(SUBTITLE_ARCHIVE_LIMIT)
+            # Unpacked members belong to this exact archive: a replaced archive unpacks anew.
+            archive_size, archive_mtime_ns = _archive_signature(path)
+            names = [
+                name
+                for name in zf.namelist()
+                if Path(name).suffix.casefold() in SUBTITLE_EXTENSIONS and not is_macos_metadata_path(name)
+            ]
             ranked = sorted(
                 (
                     (_archive_member_score(name, identity, video, prefer_srt, allowed_episodes), name)
@@ -904,17 +1185,29 @@ def _extract_archive_all(
                     and parsed.episode not in aliases
                 ):
                     continue
-                digest = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+                member_key = f"{name}\0{archive_size}\0{archive_mtime_ns}"
+                digest = hashlib.sha1(member_key.encode("utf-8", errors="ignore")).hexdigest()[:8]
                 output = output_dir / f"{digest}_{_safe_name(Path(name).name)}"
                 if not output.exists() or output.stat().st_size == 0:
-                    with zf.open(name) as src, output.open("wb") as dst:
-                        dst.write(src.read())
+                    # Members were read whole: a tiny archive could unpack to gigabytes.
+                    extract_member(zf, name, output, limit=_subtitle_member_limit(name), budget=budget)
                 suffix = output.suffix.casefold()
                 if suffix in IMAGE_SUBTITLE_EXTENSIONS or is_japanese_subtitle(output):
                     extracted.append((output, name, score))
+    except ArchiveTooLargeError as exc:
+        print(t("error.jimaku.extractFailedDetail", file=path.name, error=exc))
+        return []
     except (OSError, zipfile.BadZipFile, RuntimeError):
         return []
     return extracted
+
+
+def _subtitle_member_limit(name: str) -> int:
+    # Bitmap subtitles (and VobSub .sub streams) are much larger than text ones.
+    suffix = Path(name).suffix.casefold()
+    return (
+        IMAGE_MEMBER_LIMIT if suffix in IMAGE_SUBTITLE_EXTENSIONS or suffix == ".sub" else TEXT_MEMBER_LIMIT
+    )
 
 
 def _copy_extracted_subtitles(
@@ -930,9 +1223,12 @@ def _copy_extracted_subtitles(
         aliases.add(int(identity.episode))
     extracted: list[tuple[Path, str, float]] = []
     for source in root.rglob("*"):
-        if not source.is_file() or source.suffix.casefold() not in SUBTITLE_EXTENSIONS:
+        # A link in the archive could point at any file on the Mac: never copy through one.
+        if source.is_symlink() or not source.is_file() or source.suffix.casefold() not in SUBTITLE_EXTENSIONS:
             continue
         display_name = str(source.relative_to(root))
+        if is_macos_metadata_path(display_name):
+            continue
         parsed = parse_anime_filename(display_name)
         if identity.episode is not None and parsed.episode is not None and parsed.episode not in aliases:
             continue
@@ -967,7 +1263,7 @@ def _cached_archive_result_rows(
     """Return cached archive members, or ``None`` when extraction is required.
 
     Jimaku downloads are cached in a directory unique to the download URL.  Keep
-    the expensive external 7-Zip materialization persistent as well.  The
+    the expensive external unpacking (bsdtar/7-Zip) persistent as well.  The
     archive stat is part of the manifest so a replaced archive invalidates the
     extracted members automatically.
     """
@@ -1049,9 +1345,7 @@ def _write_archive_extract_manifest(path: Path, members: list[dict[str, str]]) -
             "archive_mtime_ns": mtime_ns,
             "members": members,
         }
-        temp = manifest.with_suffix(manifest.suffix + ".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(manifest)
+        atomic_write_json(manifest, payload, ensure_ascii=False, indent=2)
     except OSError:
         # Cache persistence must never make subtitle discovery fail.
         return
@@ -1070,24 +1364,12 @@ def _extract_7z_all(
         configure_logging().info("CACHE step=jimaku.archive_extract path=%s members=%s", path, len(cached))
         return cached
 
-    tool = find_7zip()
-    if tool is None:
-        print(t("error.jimaku.sevenZipMissing"))
-        return []
     try:
         with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-archive-") as temp_dir:
             root = Path(temp_dir)
-            completed = subprocess.run(
-                [tool, "x", "-y", f"-o{root}", str(path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-            if completed.returncode != 0:
-                print(t("error.jimaku.extractFailedDetail", file=path.name, error=completed.stdout[-500:]))
-                return []
+            # The whole archive is unpacked here, so the tool is stopped once the
+            # folder outgrows the limit; the temporary folder is removed either way.
+            unpack_archive(path, root, limit=SUBTITLE_ARCHIVE_LIMIT, timeout=120)
             results = _copy_extracted_subtitles(
                 root, identity, video, output_dir, prefer_srt, allowed_episodes
             )
@@ -1102,7 +1384,16 @@ def _extract_7z_all(
                 len(members),
             )
             return results
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except ArchiveToolMissingError:
+        print(t("error.jimaku.sevenZipMissing"))
+        return []
+    except ArchiveUnreadableError as exc:
+        configure_logging().warning(
+            "FAIL step=jimaku.archive_extract path=%s error=%r detail=%r", path, str(exc), exc.detail[-500:]
+        )
+        print(t("error.jimaku.extractFailedDetail", file=path.name, error=exc))
+        return []
+    except (OSError, subprocess.TimeoutExpired, ArchiveTooLargeError) as exc:
         print(t("error.jimaku.extractFailedDetail", file=path.name, error=exc))
         return []
 
@@ -1142,10 +1433,19 @@ def materialize_jimaku_files(
         )
         filename_language = subtitle_filename_language_profile(display_name)
         language_purity = str(filename_language.get("purity") or "unknown")
-        bilingual_profile = subtitle_bilingual_cjk_profile(path)
+        bilingual_profile, english_profile = subtitle_language_profiles(path)
         filename_bilingual = language_purity == "mixed_japanese_chinese"
         bilingual_detected = bool(filename_bilingual or bilingual_profile.get("suspected_bilingual_cjk"))
-        bilingual_penalty = -85.0 if bilingual_detected else 0.0
+        # Japanese + English in one file (Dororo "[SFSM] ... 03.jp-en.ass" beside the same
+        # group's "03.jp.ass"): its English lines also match an English timing track, so it
+        # won on timing while the viewer read English. A language suffix or the lines tell
+        # (a "[JPN, ENG]" release tag alone is dual audio).
+        bilingual_english = bool(
+            language_purity == "mixed_japanese_english" or english_profile.get("suspected_bilingual_english")
+        )
+        if bilingual_english and language_purity in {"japanese_only", "unknown"}:
+            language_purity = "mixed_japanese_english"
+        bilingual_penalty = -85.0 if bilingual_detected or bilingual_english else 0.0
         candidates.append(
             SubtitleCandidate(
                 path=path,
@@ -1163,31 +1463,11 @@ def materialize_jimaku_files(
                     "language_purity_priority": int(filename_language.get("priority") or 0),
                     "filename_bilingual_cjk": filename_bilingual,
                     "bilingual_cjk": bilingual_detected,
+                    "bilingual_english": bilingual_english,
                     "bilingual_penalty": bilingual_penalty,
                     "bilingual_profile": bilingual_profile,
+                    "bilingual_english_profile": english_profile,
                 },
             )
         )
     return candidates
-
-
-def materialize_jimaku_file(
-    client: JimakuClient,
-    item: JimakuFile,
-    identity: VideoIdentity,
-    video: Path,
-    cache_dir: Path,
-    prefer_srt: bool = True,
-    allowed_episodes: tuple[int, ...] = (),
-) -> SubtitleCandidate | None:
-    """Backward-compatible helper returning the highest-ranked extracted file."""
-    candidates = materialize_jimaku_files(
-        client,
-        item,
-        identity,
-        video,
-        cache_dir,
-        prefer_srt=prefer_srt,
-        allowed_episodes=allowed_episodes,
-    )
-    return max(candidates, key=lambda candidate: candidate.score, default=None)

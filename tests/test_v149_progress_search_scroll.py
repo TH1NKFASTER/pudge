@@ -100,8 +100,9 @@ def test_read_up_to_here_saves_the_character_position_of_the_word(page) -> None:
             state={"settings": {"review_gate_ln_enabled": False}},
         )
         assert [result.value["label"], result.value["toast"]] == result.value["expected"]
-        [[book, chapter, offset, source]] = result.calls_of("light_novel_bookmark")
-        assert (book, chapter, source) == (6, 0, "manual")
+        [[book, chapter, offset, source, char]] = result.calls_of("light_novel_bookmark")
+        # The read marker's character too (tests/test_fix_ln_read_marker_page.py).
+        assert (book, chapter, source, char) == (6, 0, "manual", 8)
         assert abs(offset - 8 / 13) < 1e-9
 
 
@@ -170,7 +171,7 @@ def test_global_search_uses_cached_aliases_and_never_waits_for_anilist(tmp_path:
     api.light_novels = SimpleNamespace(
         state=lambda: {"books": []}, _anilist_post=lambda *args, **kwargs: asked.append(args) or {}
     )
-    api.manga = SimpleNamespace(state=lambda: {"books": []})
+    api.manga = SimpleNamespace(search_catalog=lambda: [])
     api.audiobooks = SimpleNamespace(search_catalog=lambda: [])
     api.config = SimpleNamespace(anilist=SimpleNamespace(enabled=True, access_token="token"))
     api.logger = SimpleNamespace(

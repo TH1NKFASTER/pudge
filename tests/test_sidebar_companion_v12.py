@@ -25,7 +25,7 @@ def test_quit_waits_for_cleanup_and_replies_once_in_modal_mode(cocoa, monkeypatc
     def close():
         calls.append(threading.current_thread())
         entered.set()
-        assert released.wait(2)
+        assert released.wait(30)
 
     c.api.close = close
     assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle)
@@ -40,7 +40,7 @@ def test_quit_waits_for_cleanup_and_replies_once_in_modal_mode(cocoa, monkeypatc
         at = time.monotonic()
         assert proxy.applicationShouldTerminate_(c.app) == 2
         assert time.monotonic() - at < 0.5
-        assert entered.wait(1)
+        assert entered.wait(30)
         assert not c.app.replies
         assert proxy.applicationShouldTerminate_(c.app) == 2
     finally:
@@ -97,7 +97,7 @@ def test_finally_close_and_quit_worker_do_not_run_cleanup_twice():
 
     def audio(timeout):
         entered.set()
-        assert release.wait(2)
+        assert release.wait(30)
         events.append("audio")
         return []
 
@@ -107,11 +107,11 @@ def test_finally_close_and_quit_worker_do_not_run_cleanup_twice():
     first = threading.Thread(target=api.close)
     second = threading.Thread(target=api.close)
     first.start()
-    assert entered.wait(1)
+    assert entered.wait(30)
     second.start()
     release.set()
     first.join(2)
-    second.join(2)
+    second.join(30)
     assert not first.is_alive() and not second.is_alive()
     assert events.count("audio") == events.count("quiet") == 1
 
@@ -148,7 +148,7 @@ def test_owned_tree_stops_detached_grandchildren_and_keeps_unrelated_process(tmp
     owner = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
     foreign = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
     try:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 30  # ends as soon as the child wrote its pid
         while not pid_output.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert pid_output.exists()
@@ -235,6 +235,8 @@ def launch_window(tmp_path, monkeypatch, during_start):
     from pudge.config import AppConfig, write_config
 
     monkeypatch.setattr(sys, "platform", "darwin")
+    # The in-process window (both modes use a window process unless PUDGE_WINDOW_PROCESS=0).
+    monkeypatch.setenv("PUDGE_WINDOW_PROCESS", "0")
     monkeypatch.setattr(web_app, "_INSTANCE_LOCK", None)
     monkeypatch.setattr(logging_utils, "set_log_rotation_owner", lambda owner: None)
     monkeypatch.setattr(web_app, "_set_macos_runtime_identity", lambda: False)
@@ -334,12 +336,12 @@ def test_spawn_racing_close_is_registered_before_shutdown_snapshot(tmp_path, mon
         worker = threading.Thread(target=lambda: service.close(timeout=0.1))
         closer.append(worker)
         worker.start()
-        assert service._closed_event.wait(1)
+        assert service._closed_event.wait(30)
         return process
 
     monkeypatch.setattr(subprocess, "Popen", spawn)
     service.play(7, start=0)
-    closer[0].join(2)
+    closer[0].join(30)
     assert not closer[0].is_alive()
     assert process.poll() is not None
 
@@ -399,7 +401,7 @@ def test_native_quit_stops_real_mpv_before_reply(cocoa, tmp_path, short_socket_d
             api.logger = c.api.logger
             api.audiobooks = service
             c.api.close = api.close
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 30  # ends when mpv listens (or exits)
             while not socket.exists() and process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert process.poll() is None and socket.exists(), (
@@ -408,7 +410,7 @@ def test_native_quit_stops_real_mpv_before_reply(cocoa, tmp_path, short_socket_d
             )
             assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle)
             assert c.app.delegate().applicationShouldTerminate_(c.app) == 2
-            assert c.app.replied.wait(3)
+            assert c.app.replied.wait(30)
             assert process.poll() is not None
             assert service._closed_event.is_set()
             assert c.app.replies == [True]

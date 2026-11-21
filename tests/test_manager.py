@@ -11,15 +11,16 @@ from pudge.providers.nyaa import (
     release_episode_range,
     score_release,
 )
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 RSS = """<?xml version="1.0"?>
-<rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa">
+<rss version="2.0" xmlns:nyaa="https://releases.invalid/xmlns/nyaa">
 <channel>
   <item>
     <title>[Erai-raws] Example Anime - 06 [1080p][Multiple Subtitle]</title>
-    <link>https://nyaa.si/download/1.torrent</link>
-    <guid>https://nyaa.si/view/1</guid>
+    <link>https://releases.invalid/download/1.torrent</link>
+    <guid>https://releases.invalid/view/1</guid>
     <pubDate>Sun, 02 Aug 2026 12:00:00 +0000</pubDate>
     <nyaa:seeders>81</nyaa:seeders>
     <nyaa:leechers>12</nyaa:leechers>
@@ -36,9 +37,9 @@ RSS = """<?xml version="1.0"?>
 
 def test_nyaa_rss_accepts_compatible_mirror_namespace() -> None:
     mirror_rss = RSS.replace(
-        'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
-        'xmlns:nyaa="https://nyaa.net/xmlns/nyaa"',
-    ).replace("https://nyaa.si/", "https://nyaa.net/")
+        'xmlns:nyaa="https://releases.invalid/xmlns/nyaa"',
+        'xmlns:nyaa="https://mirror-a.invalid/xmlns/nyaa"',
+    ).replace("https://releases.invalid/", "https://mirror-a.invalid/")
     releases = parse_rss(mirror_rss)
     assert len(releases) == 1
     assert releases[0].seeders == 81
@@ -48,20 +49,20 @@ def test_nyaa_rss_accepts_compatible_mirror_namespace() -> None:
 
 
 def test_default_nyaa_client_falls_back_to_read_only_mirror() -> None:
-    from pudge.providers.nyaa import NyaaClient
+    from sources_support import release_search_client
 
     requested: list[str] = []
-    client = NyaaClient(proxy_mode="direct", timeout=0.01)
+    client = release_search_client(proxy_mode="direct", timeout=0.01)
 
     def fake_get(url: str, _proxy: str | None) -> str:
         requested.append(url)
-        if url.startswith("https://nyaa.si/"):
+        if url.startswith("https://releases.invalid/"):
             raise NyaaError("primary timeout")
-        if url.startswith("https://nyaa.net/"):
+        if url.startswith("https://mirror-a.invalid/"):
             return RSS.replace(
-                'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
-                'xmlns:nyaa="https://nyaa.net/xmlns/nyaa"',
-            ).replace("https://nyaa.si/", "https://nyaa.net/")
+                'xmlns:nyaa="https://releases.invalid/xmlns/nyaa"',
+                'xmlns:nyaa="https://mirror-a.invalid/xmlns/nyaa"',
+            ).replace("https://releases.invalid/", "https://mirror-a.invalid/")
         raise AssertionError(f"unexpected route: {url}")
 
     client._get = fake_get  # type: ignore[method-assign]
@@ -72,9 +73,9 @@ def test_default_nyaa_client_falls_back_to_read_only_mirror() -> None:
 
     assert len(releases) == 1
     assert releases[0].info_hash == "abcdef0123456789"
-    assert requested[0].startswith("https://nyaa.si/")
-    assert requested[1].startswith("https://nyaa.net/")
-    assert client.search_base_urls[0] == "https://nyaa.net"
+    assert requested[0].startswith("https://releases.invalid/")
+    assert requested[1].startswith("https://mirror-a.invalid/")
+    assert client.search_base_urls[0] == "https://mirror-a.invalid"
 
     requested.clear()
     client._get = fake_get  # type: ignore[method-assign]
@@ -82,27 +83,27 @@ def test_default_nyaa_client_falls_back_to_read_only_mirror() -> None:
         client.search("Example Anime 07")
     finally:
         client.close()
-    assert requested[0].startswith("https://nyaa.net/")
+    assert requested[0].startswith("https://mirror-a.invalid/")
 
 
 def test_default_nyaa_client_continues_after_empty_mirror_response() -> None:
-    from pudge.providers.nyaa import NyaaClient
+    from sources_support import release_search_client
 
     empty_rss = """<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>"""
     requested: list[str] = []
-    client = NyaaClient(proxy_mode="direct", timeout=0.01)
+    client = release_search_client(proxy_mode="direct", timeout=0.01)
 
     def fake_get(url: str, _proxy: str | None) -> str:
         requested.append(url)
-        if url.startswith("https://nyaa.si/"):
+        if url.startswith("https://releases.invalid/"):
             raise NyaaError("primary timeout")
-        if url.startswith("https://nyaa.net/"):
+        if url.startswith("https://mirror-a.invalid/"):
             return empty_rss
-        if url.startswith("https://cn.nyaa.net/"):
+        if url.startswith("https://mirror-b.invalid/"):
             return RSS.replace(
-                'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
-                'xmlns:nyaa="https://cn.nyaa.net/xmlns/nyaa"',
-            ).replace("https://nyaa.si/", "https://cn.nyaa.net/")
+                'xmlns:nyaa="https://releases.invalid/xmlns/nyaa"',
+                'xmlns:nyaa="https://mirror-b.invalid/xmlns/nyaa"',
+            ).replace("https://releases.invalid/", "https://mirror-b.invalid/")
         raise AssertionError(f"unexpected route: {url}")
 
     client._get = fake_get  # type: ignore[method-assign]
@@ -114,11 +115,11 @@ def test_default_nyaa_client_continues_after_empty_mirror_response() -> None:
     assert len(releases) == 1
     assert releases[0].info_hash == "abcdef0123456789"
     assert [url.split("/?", 1)[0] for url in requested] == [
-        "https://nyaa.si",
-        "https://nyaa.net",
-        "https://cn.nyaa.net",
+        "https://releases.invalid",
+        "https://mirror-a.invalid",
+        "https://mirror-b.invalid",
     ]
-    assert client.search_base_urls[0] == "https://cn.nyaa.net"
+    assert client.search_base_urls[0] == "https://mirror-b.invalid"
 
 
 def test_custom_nyaa_base_url_returns_empty_without_public_fallback() -> None:
@@ -253,8 +254,8 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
     )
     release = NyaaRelease(
         title="[Erai-raws] Example - 01",
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="abcdef",
         size_text="1 GiB",
         size_bytes=1024**3,
@@ -697,8 +698,7 @@ def test_manager_requeues_old_generated_subtitle_once(tmp_path: Path) -> None:
     assert manager._requeue_legacy_generated_subtitles() == 1
     refreshed = manager.db.episode_by_path(video)
     assert refreshed is not None
-    assert refreshed.subtitle_path is None
-    assert refreshed.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert len(manager.db.subtitle_jobs()) == 1
     assert manager._requeue_legacy_generated_subtitles() == 0
 
@@ -990,7 +990,7 @@ def _upgrade_release(info_hash: str, score: float):
     return NyaaRelease(
         title=f"[Group] Upgrade - 05 [1080p] [{info_hash[:8]}]",
         link="",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash=info_hash,
         size_text="1.4 GiB",
         size_bytes=1400 * 1024 * 1024,
@@ -1438,8 +1438,9 @@ def test_manager_generation_four_from_two_requeues_only_direct_alass_outputs(tmp
     assert manager._requeue_legacy_generated_subtitles() == 1
     alass_item = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv")
     synced_item = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
-    assert alass_item is not None and alass_item.subtitle_path is None
-    assert synced_item is not None and synced_item.subtitle_path is not None
+    assert alass_item is not None and synced_item is not None
+    assert_rebuilding_with_subtitles_kept(manager, alass_item.video_path)  # kept meanwhile
+    assert_not_prepared_again(manager, synced_item.video_path)
 
 
 def test_failed_subtitle_validation_clears_stale_prepared_path(tmp_path: Path, monkeypatch) -> None:
@@ -1595,9 +1596,10 @@ def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) 
         )
 
     assert manager._requeue_legacy_generated_subtitles() == 2
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
+    # Kept while they are prepared again.
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 05.mkv")
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 06.mkv")
+    assert_not_prepared_again(manager, cfg.library.root_dir / "Anime - 07.mkv")
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 
@@ -1804,9 +1806,10 @@ def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: 
         )
 
     assert manager._requeue_legacy_generated_subtitles() == 2
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
-    assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
+    # Kept while they are prepared again.
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 05.mkv")
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 06.mkv")
+    assert_not_prepared_again(manager, cfg.library.root_dir / "Anime - 07.mkv")
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 

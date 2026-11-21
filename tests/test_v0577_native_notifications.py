@@ -7,7 +7,6 @@ from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.notifications import maybe_handle_notification_helper, send_native_notification
-from pudge.web_app import WebAppApi
 from source_policy import source
 
 
@@ -88,31 +87,6 @@ def test_failed_ready_notification_is_not_marked_delivered(tmp_path: Path, monke
     assert manager.db.get_state("ready_notification:episode:77:1", "") == ""
 
 
-def test_test_notification_api_requests_permission_and_sends(tmp_path: Path, monkeypatch) -> None:
-    cfg = AppConfig()
-    cfg.config_path = tmp_path / "config.toml"
-    cfg.library.database_path = tmp_path / "library.sqlite3"
-    cfg.library.root_dir = tmp_path / "library"
-    from pudge.config import write_config
-
-    write_config(cfg, cfg.config_path)
-    api = WebAppApi(cfg.config_path)
-    monkeypatch.setattr(
-        "pudge.web_app.request_notification_permission",
-        lambda timeout=4.0: {"supported": True, "granted": True, "error": ""},
-    )
-    sent: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "pudge.web_app.send_native_notification",
-        lambda subtitle, message: sent.append((subtitle, message)) or True,
-    )
-
-    result = api.test_notification()
-
-    assert result["delivered"] is True
-    assert sent
-
-
 def test_installer_routes_helper_mode_through_app_bundle() -> None:
     # policy: the app launcher is Objective-C that install.sh generates and compiles with
     # clang against the macOS frameworks; nothing of it can run on the test machine.
@@ -136,7 +110,7 @@ def test_settings_have_no_notification_test_button(page) -> None:
           await __click(`#settingsContent .settings-categories [data-settings-category=${tab.dataset.settingsCategory}]`);
           labels.push(...[...document.querySelectorAll('#settingsContent button')].filter(b => b.checkVisibility()).map(b => b.innerText.trim()));
         }
-        return {labels, test: PudgeI18n.t('notify.test'), byId: Boolean(document.getElementById('testNotification'))};
+        return {labels, test: 'Проверка уведомлений', byId: Boolean(document.getElementById('testNotification'))};
         """,
         lang="ru",
         api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},

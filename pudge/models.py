@@ -45,6 +45,7 @@ class AniListAnime:
     episodes: int | None
     format: str | None
     score: float = 0.0
+    status: str | None = None  # AniList media status (FINISHED, RELEASING...), when known
 
 
 @dataclass(slots=True)

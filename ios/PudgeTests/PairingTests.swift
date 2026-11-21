@@ -31,6 +31,16 @@ final class PairingTests: XCTestCase {
         // Older Macs send one address.
         XCTAssertEqual(try PairingPayload.parse(String(decoding: try payload(), as: UTF8.self)).candidates, ["https://192.168.1.2:8766"])
     }
+    func testPairingLinkSaysWhatChangesBeforeConnecting() {
+        // A link from outside the app asks first; it names a new certificate or another Mac.
+        let changed = PairingLinkOffer(text: "", serverName: "Mac", hosts: "192.168.1.2", pairedName: "Mac", sameMac: true, certificateChanges: true)
+        XCTAssertTrue(changed.explanation(device: "iPhone").contains("another certificate"))
+        let same = PairingLinkOffer(text: "", serverName: "Mac", hosts: "192.168.1.2", pairedName: nil, sameMac: true, certificateChanges: false)
+        XCTAssertTrue(same.explanation(device: "iPhone").contains("This is the paired Mac"))
+        let other = PairingLinkOffer(text: "", serverName: "New", hosts: "10.0.0.4", pairedName: "Old", sameMac: false, certificateChanges: false)
+        XCTAssertTrue(other.explanation(device: "iPhone").contains("not the paired Mac “Old”"))
+        XCTAssertTrue(other.explanation(device: "iPhone").contains("10.0.0.4"))
+    }
     func testKeychainCredentialCanBeUpdatedWithoutAnotherEntry() throws {
         let key = "test-" + UUID().uuidString
         defer { try? KeychainStore.delete(key) }

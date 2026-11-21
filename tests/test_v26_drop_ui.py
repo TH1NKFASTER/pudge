@@ -31,6 +31,6 @@ listeners.dragenter(event('dragenter',['a.epub']));listeners.keydown({key:'Escap
 """
     # Interface strings (audit 68Б): catalogs + PudgeI18n first; the window is in Russian.
     expected = json.dumps({"label": ru("lnDrop.dropEpubTxtHere"), "notice": ru("lnDrop.epubAndTxtFilesAre")})
-    assert ru("lnDrop.epubAndTxtFilesAre") == "Поддерживаются EPUB и TXT"
+    assert ru("lnDrop.epubAndTxtFilesAre") == "Поддерживаются EPUB, TXT и аудиокниги"
     script = setup + f"const EXPECTED={expected};\n;" + i18n_source() + "\n;\n" + source + checks
     subprocess.run(["node", "-"], input=script, text=True, check=True)

@@ -16,9 +16,10 @@ public enum ReadingPackage {
     }
 
     /// Unpacks a downloaded package into `folder`, replacing an earlier copy only when every
-    /// file was written. Returns the file names.
+    /// file was written. Returns the file names. `beforeReplacing` adds files to the new copy
+    /// (its temporary folder) first: the copy never takes the old one's place without them.
     @discardableResult
-    public static func unpack(_ file: URL, into folder: URL) throws -> [String] {
+    public static func unpack(_ file: URL, into folder: URL, beforeReplacing: ((URL) throws -> Void)? = nil) throws -> [String] {
         let damaged = PudgeError.invalid("The download is damaged; download it again")
         let manager = FileManager.default
         let handle = try FileHandle(forReadingFrom: file)
@@ -51,6 +52,7 @@ public enum ReadingPackage {
                     remaining -= Int64(count)
                 }
             }
+            try beforeReplacing?(temporary)
             try? manager.removeItem(at: folder)
             try manager.moveItem(at: temporary, to: folder)
             return header.files.map(\.name)
@@ -58,6 +60,21 @@ public enum ReadingPackage {
             try? manager.removeItem(at: temporary)
             throw error
         }
+    }
+}
+
+extension ReadingPackage {
+    /// Gives an unpacked volume another id: its `package.json` names the Mac's id in `book`
+    /// and `item` (see DownloadOwner). Everything else stays as it is.
+    public static func renumber(_ folder: URL, id: Int) throws {
+        let file = folder.appendingPathComponent("package.json")
+        guard var json = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any] else {
+            throw PudgeError.invalid("The download is damaged; download it again")
+        }
+        for key in ["book", "item"] {
+            if var part = json[key] as? [String: Any] { part["id"] = id; json[key] = part }
+        }
+        try JSONSerialization.data(withJSONObject: json).write(to: file, options: .atomic)
     }
 }
 
@@ -140,6 +157,14 @@ public struct MangaPackage: Codable {
     public let ocr: Bool?
     public let pagesRevision: String?
     public let ocrRevision: String?
+    /// Pages that are one wide picture (the files are renamed page-<n>, so their "012-013" names
+    /// are lost) and "Shift pairs by one page" when it was packed; nil from older Macs.
+    public let widePages: [Int]?
+    public let pairShift: Bool?
+    /// "Align scanned pages" and the pages' transforms as far as the Mac had worked them out
+    /// when it was packed; nil from older Macs.
+    public let pageAlign: Bool?
+    public let alignment: MangaAlignment?
 }
 
 /// `parsed.json` of a manga volume: each OCR text box split into words on the Mac.

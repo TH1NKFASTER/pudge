@@ -88,9 +88,12 @@ def test_jiten_manual_refresh_invalidates_metadata_and_only_parses_existing_text
             (str(tmp_path / "manga.cbz"), "Manga", 1, 0, "rtl", now, now),
         )
         manga_id = int(conn.execute("SELECT id FROM manga_books WHERE title='Manga'").fetchone()[0])
+        # The cache holds each page's recognized regions as JSON (as the reader stores them).
+        from pudge.manga import _REGION_CACHE_KEY
+
         conn.execute(
             "INSERT INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) VALUES(?,?,?,?,?)",
-            (manga_id, 0, "region-1", "既にOCRされた漫画本文", now),
+            (manga_id, 0, _REGION_CACHE_KEY, json.dumps([{"text": "既にOCRされた漫画本文"}]), now),
         )
 
     api.light_novels._jiten_media_cache.put({"media": 1}, {"coverage": 90})
@@ -99,6 +102,12 @@ def test_jiten_manual_refresh_invalidates_metadata_and_only_parses_existing_text
         api.light_novels,
         "jiten_preparse",
         lambda text, digest=None: parsed.append((str(text), digest)) or {"tokens": []},
+    )
+    # Manga bubbles are parsed as arrays (Jiten audit JITEN-6), each under its own study key.
+    monkeypatch.setattr(
+        api.light_novels,
+        "parse_study_texts",
+        lambda texts: parsed.extend((str(text), None) for text in texts) or len(texts),
     )
     # If manual refresh accidentally launches OCR, this test must fail.  It should
     # consume only manga_ocr_cache rows that already exist.

@@ -84,6 +84,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "1E016D5E07279555C7637920";
 		};
+		"C7D50B2784386896E7713D79" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "Pudge/Networking/MacVideoStream.swift";
+			"sourceTree" = "<group>";
+		};
+		"BEE3B791C1EE2C4F86D9ACD6" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "C7D50B2784386896E7713D79";
+		};
 		"89076A87F9F27607BC65D6D8" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -124,6 +134,26 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "EEB89AEDED0EEEB450D160AC";
 		};
+		"E6385BAD4F7230A04FEBC7FF" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "Pudge/UI/FinaleSheet.swift";
+			"sourceTree" = "<group>";
+		};
+		"57AAA7BB005E7F58D3BDA68E" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "E6385BAD4F7230A04FEBC7FF";
+		};
+		"6511A74816B583F6B4F389E1" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "Pudge/UI/GrammarChat.swift";
+			"sourceTree" = "<group>";
+		};
+		"AA1C36A8F4A37B0CE2BAC283" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "6511A74816B583F6B4F389E1";
+		};
 		"D89CF3BF5018AE0F6B6A7D85" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -149,6 +179,16 @@
 			"lastKnownFileType" = "sourcecode.swift";
 			"path" = "Pudge/UI/StatsScreen.swift";
 			"sourceTree" = "<group>";
+		};
+		"C14492E533B5180B9F94D4F9" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "Pudge/UI/LibraryGrid.swift";
+			"sourceTree" = "<group>";
+		};
+		"29A57F9D3F42D4FB71ED914F" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "C14492E533B5180B9F94D4F9";
 		};
 		"BF720F2E93B81EB7C4FCFB57" = {
 			"isa" = "PBXBuildFile";
@@ -200,13 +240,17 @@
 				"BAB698F5E1F45D9BD9EDE4E2",
 				"0B677C4A027B572A803275BE",
 				"3391EEB88F9F2BE6B11DEB96",
+				"BEE3B791C1EE2C4F86D9ACD6",
 				"763BBD25BFD9311758D2C4B0",
 				"FA9268B4CB2D66963D178616",
 				"CFB5981C1DD948E81FF51F5E",
 				"7C40B9F021AF76C4438B6939",
+				"AA1C36A8F4A37B0CE2BAC283",
+				"57AAA7BB005E7F58D3BDA68E",
 				"E1C7D8D795A24905E8AD5836",
 				"4A5347A74879B4415070ECB7",
 				"BF720F2E93B81EB7C4FCFB57",
+				"29A57F9D3F42D4FB71ED914F",
 				"114C2EAF386335C7FF2F7E3D",
 				"BBCE502810695C71C9C7B976",
 			);
@@ -228,12 +272,33 @@
 			);
 			"runOnlyForDeploymentPostprocessing" = "0";
 		};
+		"FB8CDE8C231488530EDE1892" = {
+			"isa" = "PBXShellScriptBuildPhase";
+			"alwaysOutOfDate" = "1";
+			"buildActionMask" = "2147483647";
+			"files" = (
+			);
+			"inputFileListPaths" = (
+			);
+			"inputPaths" = (
+				"$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",
+			);
+			"name" = "Record git commit";
+			"outputFileListPaths" = (
+			);
+			"outputPaths" = (
+			);
+			"runOnlyForDeploymentPostprocessing" = "0";
+			"shellPath" = "/bin/sh";
+			"shellScript" = "plist=\"$TARGET_BUILD_DIR/$INFOPLIST_PATH\"\ncommit=$(git -C \"$SRCROOT\" rev-parse --short=12 HEAD 2>/dev/null || true)\nif [ -n \"$commit\" ] && [ -n \"$(git -C \"$SRCROOT\" status --porcelain --untracked-files=no 2>/dev/null)\" ]; then commit=\"$commit-dirty\"; fi\n/usr/libexec/PlistBuddy -c \"Set :PudgeGitCommit ${commit:-unknown}\" \"$plist\" 2>/dev/null || true\n";
+			"showEnvVarsInLog" = "0";
+		};
 		"0BD55FE50F90864FC57F8D66" = {
 			"isa" = "XCBuildConfiguration";
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -243,9 +308,10 @@
 				"INFOPLIST_FILE" = "Pudge/Info.plist";
 				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
 				"CURRENT_PROJECT_VERSION" = "1";
-				"MARKETING_VERSION" = "0.7.30";
+				"MARKETING_VERSION" = "0.8.1";
 				"LD_RUNPATH_SEARCH_PATHS" = "$(inherited) @executable_path/Frameworks";
 				"ENABLE_TESTABILITY" = "YES";
+				"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
 				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
 			};
 			"name" = "Debug";
@@ -256,7 +322,7 @@
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -266,9 +332,10 @@
 				"INFOPLIST_FILE" = "Pudge/Info.plist";
 				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
 				"CURRENT_PROJECT_VERSION" = "1";
-				"MARKETING_VERSION" = "0.7.30";
+				"MARKETING_VERSION" = "0.8.1";
 				"LD_RUNPATH_SEARCH_PATHS" = "$(inherited) @executable_path/Frameworks";
 				"ENABLE_TESTABILITY" = "YES";
+				"ENABLE_USER_SCRIPT_SANDBOXING" = "NO";
 				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
 			};
 			"name" = "Release";
@@ -290,6 +357,7 @@
 				"0FC98DEBDD7582833AF5B330",
 				"F2AAD5C87F03289CB10B647F",
 				"BA8072CD89D74BF16C952304",
+				"FB8CDE8C231488530EDE1892",
 			);
 			"buildRules" = (
 			);
@@ -358,7 +426,7 @@
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -380,7 +448,7 @@
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -481,7 +549,7 @@
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -501,7 +569,7 @@
 			"buildSettings" = {
 				"PRODUCT_NAME" = "$(TARGET_NAME)";
 				"SWIFT_VERSION" = "5.0";
-				"IPHONEOS_DEPLOYMENT_TARGET" = "18.0";
+				"IPHONEOS_DEPLOYMENT_TARGET" = "17.0";
 				"TARGETED_DEVICE_FAMILY" = "1,2";
 				"CODE_SIGN_STYLE" = "Automatic";
 				"SDKROOT" = "iphoneos";
@@ -554,13 +622,17 @@
 				"2620A7555BB4C03B54E49B7B",
 				"35FA71EF9CFE0A96D9B93502",
 				"1E016D5E07279555C7637920",
+				"C7D50B2784386896E7713D79",
 				"89076A87F9F27607BC65D6D8",
 				"0FDFB18039AEC4064EDBB4C7",
 				"67D4EE83BBF2889BABA815DA",
 				"EEB89AEDED0EEEB450D160AC",
+				"6511A74816B583F6B4F389E1",
+				"E6385BAD4F7230A04FEBC7FF",
 				"D89CF3BF5018AE0F6B6A7D85",
 				"E8B073E2E89AD6CE0D01D063",
 				"13F68A6AB164D1B0C487990D",
+				"C14492E533B5180B9F94D4F9",
 				"4BAAD4D8FF8EEEA922D6E2DF",
 				"F0A2A4EBFBDB9F1C58A1D3AA",
 				"8BF729FFE074CAEE622C0292",

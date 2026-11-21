@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -30,16 +31,54 @@ def test_isolated_runner_recurses_continues_and_times_out(tmp_path: Path) -> Non
         "def test_failure():\n    assert False\n",
         encoding="utf-8",
     )
-    (tests / "test_e_timeout.py").write_text(
-        "import time\n\ndef test_timeout():\n    time.sleep(5)\n",
-        encoding="utf-8",
-    )
-
     results = tmp_path / "results"
     shared_log = tmp_path / "must-not-be-used.log"
     env = dict(os.environ)
     env["PUDGE_RUNTIME_LOG_PATH"] = str(shared_log)
-    completed = subprocess.run(
+    # A per-file timeout far above a pytest start on a busy Mac: these files must finish.
+    completed = _run_batch(tmp_path, results, timeout=120, env=env)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
+    rows = {row["path"]: row for row in summary["files"]}
+    assert set(rows) == {
+        "tests/test_a_writer.py",
+        "tests/test_b_reader.py",
+        "tests/nested/test_c_nested.py",
+        "tests/test_d_failure.py",
+    }
+    assert rows["tests/test_a_writer.py"]["returncode"] == 0
+    assert rows["tests/test_b_reader.py"]["returncode"] == 0
+    assert rows["tests/nested/test_c_nested.py"]["returncode"] == 0
+    assert rows["tests/test_d_failure.py"]["returncode"] != 0
+    assert summary["totals"]["timeouts"] == 0
+    assert summary["totals"]["failed_files"] == 1
+    assert not shared_log.exists()
+
+    # The timeout: a file that never ends is stopped at the per-file timeout (1 s, far below its
+    # hour) and the next file still runs. Load can only make the first file time out sooner.
+    later = tmp_path / "later"
+    (later / "tests").mkdir(parents=True)
+    (later / "tests" / "test_e_timeout.py").write_text(
+        "import time\n\ndef test_timeout():\n    time.sleep(3600)\n",
+        encoding="utf-8",
+    )
+    (later / "tests" / "test_f_after.py").write_text("def test_after():\n    assert True\n", encoding="utf-8")
+    started = time.monotonic()
+    completed = _run_batch(later, later / "results", timeout=1, env=env)
+    assert time.monotonic() - started < 600
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    summary = json.loads((later / "results" / "summary.json").read_text(encoding="utf-8"))
+    rows = {row["path"]: row for row in summary["files"]}
+    assert set(rows) == {"tests/test_e_timeout.py", "tests/test_f_after.py"}
+    assert rows["tests/test_e_timeout.py"]["timeout"] is True
+    assert rows["tests/test_e_timeout.py"]["returncode"] == 124
+    assert rows["tests/test_e_timeout.py"]["duration_seconds"] < 600
+    assert summary["totals"]["timeouts"] >= 1 and summary["totals"]["failed_files"] >= 1
+    assert not shared_log.exists()
+
+
+def _run_batch(cwd: Path, results: Path, *, timeout: float, env: dict | None = None):
+    return subprocess.run(
         [
             sys.executable,
             str(RUNNER),
@@ -50,33 +89,15 @@ def test_isolated_runner_recurses_continues_and_times_out(tmp_path: Path) -> Non
             "--results-dir",
             str(results),
             "--timeout",
-            "1",
+            str(timeout),
         ],
-        cwd=tmp_path,
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=900,
         check=False,
     )
-    assert completed.returncode == 1
-    summary = json.loads((results / "summary.json").read_text(encoding="utf-8"))
-    rows = {row["path"]: row for row in summary["files"]}
-    assert set(rows) == {
-        "tests/test_a_writer.py",
-        "tests/test_b_reader.py",
-        "tests/nested/test_c_nested.py",
-        "tests/test_d_failure.py",
-        "tests/test_e_timeout.py",
-    }
-    assert rows["tests/test_a_writer.py"]["returncode"] == 0
-    assert rows["tests/test_b_reader.py"]["returncode"] == 0
-    assert rows["tests/nested/test_c_nested.py"]["returncode"] == 0
-    assert rows["tests/test_d_failure.py"]["returncode"] != 0
-    assert rows["tests/test_e_timeout.py"]["timeout"] is True
-    assert summary["totals"]["timeouts"] == 1
-    assert summary["totals"]["failed_files"] == 2
-    assert not shared_log.exists()
 
 
 def test_isolated_runner_neuters_macos_open_command(tmp_path: Path) -> None:
@@ -88,23 +109,5 @@ def test_isolated_runner_neuters_macos_open_command(tmp_path: Path) -> None:
     )
 
     results = tmp_path / "results"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--batch",
-            "0",
-            "--batches",
-            "1",
-            "--results-dir",
-            str(results),
-            "--timeout",
-            "10",
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    completed = _run_batch(tmp_path, results, timeout=120)
     assert completed.returncode == 0, completed.stdout + completed.stderr

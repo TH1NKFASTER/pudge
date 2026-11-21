@@ -10,6 +10,7 @@
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+<key>PudgeGitCommit</key><string>unknown</string>
 <key>NSCameraUsageDescription</key><string>The camera scans the pairing QR code shown on your Mac.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Pudge downloads audiobooks and syncs positions with your Mac on the local network.</string>
 <key>NSBonjourServices</key><array><string>_pudge-audio._tcp</string></array>

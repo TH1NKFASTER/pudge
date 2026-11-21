@@ -69,7 +69,7 @@ def test_running_update_status_does_not_reenter_lock() -> None:
     result: list[dict[str, object]] = []
     thread = threading.Thread(target=lambda: result.append(updater.start()))
     thread.start()
-    thread.join(timeout=1)
+    thread.join(timeout=30)
     assert not thread.is_alive()
     assert result[0]["running"] is True
 
@@ -198,7 +198,7 @@ def test_update_script_keeps_a_rollback_copy_of_the_app_while_the_installer_runs
     assert result.calls("installer") == [["working app"]]
     # A successful update drops the copy and reopens the app; the checkout stays.
     assert not rollback.exists() and project.is_dir()
-    assert result.calls("open") == [["-n", str(sim.app)]]
+    assert result.calls("open") == [["-n", str(sim.app), "--args", "--pudge-after-update"]]
 
 
 def test_jiten_finished_media_uses_exact_anilist_link_and_private_coverage(

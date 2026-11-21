@@ -43,7 +43,7 @@ def _mappings(tmp_path, hub=None, clock=None):
 def test_without_index_everything_is_empty_and_harmless(tmp_path):
     m = _mappings(tmp_path)
     assert m.available is False
-    assert m.lookup_anilist(21) == [] and m.anilist_ids_for_tvdb(81797) == []
+    assert m.lookup_anilist(21) == []
 
 
 def test_build_and_lookup_with_real_schema(tmp_path):
@@ -59,15 +59,6 @@ def test_build_and_lookup_with_real_schema(tmp_path):
     assert one_piece.provenance["ids"] == "Fribb/anime-lists"
     [bebop] = m.lookup_anilist(1)
     assert bebop.tvdb_id == 76885 and bebop.tvdb_season == 1
-
-
-def test_one_tvdb_series_keeps_several_anilist_entries_apart(tmp_path):
-    m = _mappings(tmp_path)
-    m.refresh_if_due()
-    ids = m.anilist_ids_for_tvdb(70973)  # 3x3 Eyes OVA 1 and 2 share one TVDB series
-    assert len(ids) == 2 and len(set(ids)) == 2
-    seasons = {mapping.tvdb_season for i in ids for mapping in m.lookup_anilist(i)}
-    assert seasons == {1, 2}
 
 
 def test_sentinel_and_offset_values(tmp_path):
@@ -198,3 +189,15 @@ def test_manager_maintenance_kicks_refresh_without_blocking(tmp_path, monkeypatc
     AnimeManager._kick_anime_mappings_refresh(fake)
     AnimeManager._kick_anime_mappings_refresh(fake)
     assert len(kicked) == 2 and kicked[0] is kicked[1]
+
+
+def test_lookups_work_in_a_folder_whose_name_has_uri_characters(tmp_path):
+    # The index was opened as "file:<path>?mode=ro": a "#" or "?" in the cache path
+    # made SQLite read another (empty) file, so every lookup came back empty.
+    folder = tmp_path / "Cache #2 ?x"
+    folder.mkdir()
+    m = _mappings(folder)
+    assert m.refresh_if_due()["status"] == "rebuilt"
+    [one_piece] = m.lookup_anilist(21)
+    assert one_piece.mal_id == 21
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["Cache #2 ?x"]

@@ -378,8 +378,8 @@ def test_post_precision_bridge_uses_reading_mora_instead_of_raw_characters() -> 
     chapter = {
         "_runtime_reading_hints": [
             {"offset_start": 142, "offset_end": 143, "reading": "を"},
-            {"offset_start": 143, "offset_end": 145, "reading": "とおり"},
-            {"offset_start": 145, "offset_end": 148, "reading": "つうこうしょう"},
+            {"offset_start": 143, "offset_end": 145, "reading": "さがし"},
+            {"offset_start": 145, "offset_end": 148, "reading": "とうろくしょう"},
             {"offset_start": 148, "offset_end": 149, "reading": "を"},
             {"offset_start": 149, "offset_end": 153, "reading": "もらって"},
         ]

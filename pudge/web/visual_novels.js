@@ -11,8 +11,18 @@
   function shell() {
     const root = $('visualNovelsContent');
     if (!root) return null;
-    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${PudgeI18n.t('vn.gameTitle')}<input id="vnGameTitle" type="text" placeholder="${esc(PudgeI18n.t('vn.visualNovel'))}"></label><label>${PudgeI18n.t('vn.dialogueArea')}<select id="vnRegion"><option value="lower62">${PudgeI18n.t('vn.lower62')}</option><option value="lower50">${PudgeI18n.t('vn.lower50')}</option><option value="lower40">${PudgeI18n.t('vn.lower40')}</option><option value="full">${PudgeI18n.t('vn.fullWindow')}</option></select></label><button id="vnStart" class="primary">${PudgeI18n.t('vn.chooseGameWindow')}</button><button id="vnStop" hidden>${PudgeI18n.t('vn.stop')}</button></div><div id="vnStatus" class="vn-status"></div><div id="vnGrid" class="vn-grid" hidden><section class="vn-live"><h3>${PudgeI18n.t('vn.currentLine')}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3>${PudgeI18n.t('vn.transcript')}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
+    // Built once (it holds the running capture's state); its labels carry data-i18n, so a
+    // language switch relabels them in place (applyStaticLanguage, and relabel() on load).
+    const label = key => `<span data-i18n="${key}">${esc(PudgeI18n.t(key))}</span>`;
+    const option = (value, key) => `<option value="${value}" data-i18n="${key}">${esc(PudgeI18n.t(key))}</option>`;
+    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${label('vn.gameTitle')}<input id="vnGameTitle" type="text" placeholder="${esc(PudgeI18n.t('vn.visualNovel'))}" data-i18n-placeholder="vn.visualNovel"></label><label>${label('vn.dialogueArea')}<select id="vnRegion">${option('lower62','vn.lower62')}${option('lower50','vn.lower50')}${option('lower40','vn.lower40')}${option('full','vn.fullWindow')}</select></label><button id="vnStart" class="primary" data-i18n="vn.chooseGameWindow">${esc(PudgeI18n.t('vn.chooseGameWindow'))}</button><button id="vnStop" hidden data-i18n="vn.stop">${esc(PudgeI18n.t('vn.stop'))}</button></div><div id="vnStatus" class="vn-status"></div><div id="vnGrid" class="vn-grid" hidden><section class="vn-live"><h3 data-i18n="vn.currentLine">${esc(PudgeI18n.t('vn.currentLine'))}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3 data-i18n="vn.transcript">${esc(PudgeI18n.t('vn.transcript'))}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
+    else relabel(root);
     return root;
+  }
+
+  function relabel(root) {
+    for (const node of root.querySelectorAll('[data-i18n]')) node.textContent = PudgeI18n.t(node.dataset.i18n);
+    for (const node of root.querySelectorAll('[data-i18n-placeholder]')) node.setAttribute('placeholder', PudgeI18n.t(node.dataset.i18nPlaceholder));
   }
 
   function studyContextOptions(text,lineId){

@@ -24,182 +24,267 @@ func macCurrent<Item>(_ shelf: Shelf<Item>, finished: (Item) -> Bool) -> Item? {
     return shelf.series.last?.items.last
 }
 
-/// Light novels from the Mac, grouped by franchise → series → volumes like the Mac library.
+/// Light novels from the Mac, grouped by franchise → series → volumes like the Mac library,
+/// as a grid of cover cards (one per shelf; a shelf of several volumes opens its volumes).
 struct NovelsScreen: View {
     @ObservedObject var media: MediaModel
-    @State private var search = ""
+    /// The pull-down header: search (title, series, franchise) and "Only on iPhone/iPad".
+    @State private var filter = LibraryFilter()
     @State private var path = NavigationPath()
+    @State private var width: CGFloat = 390
     var shelves: [Shelf<LightNovelItem>] {
-        let items = media.novels.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)
-            || ($0.franchiseTitle ?? "").localizedCaseInsensitiveContains(search) }
+        let items = media.novels.filter {
+            filter.matches([$0.title, $0.seriesTitle, $0.franchiseTitle], onDevice: media.isDownloaded("ln", $0.id))
+        }
         return Shelves.group(items, franchise: { $0.franchiseInfo }, series: { $0.seriesInfo },
                              volume: { $0.volume ?? 0 }, updated: { $0.updatedAt })
     }
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                if let error = media.readingError { Label(error, systemImage: "wifi.slash").font(.subheadline).foregroundStyle(.secondary) }
-                ReadingNote(media: media)
-                if shelves.isEmpty && !media.loadingReading {
-                    ContentUnavailableView("No light novels", systemImage: "book", description: Text("Light novels from the Mac's library appear here. Download a volume to read it without the Mac."))
-                }
-                ForEach(shelves) { shelf in
-                    let items = shelf.items
-                    let target = macCurrent(shelf, finished: { $0.finished })
-                    Section {
-                        if items.count == 1, let book = items.first {
-                            NavigationLink(value: NovelRoute(id: book.id, title: book.title)) { NovelRow(media: media, book: book, showTitle: true) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let error = media.readingError { Label(error, systemImage: "wifi.slash").font(.subheadline).foregroundStyle(.secondary) }
+                    ReadingNote(media: media)
+                    if shelves.isEmpty && !media.loadingReading {
+                        if filter.isActive {
+                            ContentUnavailableView.search(text: filter.search)
                         } else {
-                            NavigationLink(value: ShelfRoute(key: shelf.key)) {
-                                HStack(spacing: 14) {
-                                    RemoteCover(media: media, path: "cover/ln/\((target ?? items[0]).id)", width: 58, symbol: "book")
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(shelf.title).font(.headline).lineLimit(2)
-                                        Text("\(items.count) volumes · \(items.filter(\.finished).count) finished").font(.caption).foregroundStyle(.secondary)
-                                        if items.contains(where: \.hasAudio) { Label("Audiobook linked", systemImage: "headphones").font(.caption2).foregroundStyle(PudgeTheme.accent) }
-                                    }
-                                }
-                            }
-                            if let target, !target.finished {
-                                PillButton(title: "Continue " + (target.volume.map { "vol. \($0)" } ?? target.title), systemImage: "book.fill") {
-                                    path.append(NovelRoute(id: target.id, title: target.title))
-                                }
-                            }
+                            ContentUnavailableView("No light novels", systemImage: "book", description: Text("Light novels from the Mac's library appear here. Download a volume to read it without the Mac."))
                         }
                     }
+                    let layout = LibraryLayout(width: width)
+                    LazyVGrid(columns: layout.columns, alignment: .leading, spacing: CGFloat(LibraryGrid.spacing)) {
+                        ForEach(shelves) { shelf in
+                            let items = shelf.items
+                            if items.count == 1, let book = items.first {
+                                NovelCard(media: media, book: book, showTitle: true, width: layout.card) { path.append(NovelRoute(id: book.id, title: book.title)) }
+                            } else {
+                                NovelShelfCard(media: media, shelf: shelf, width: layout.card,
+                                               open: { path.append(ShelfRoute(key: shelf.key)) },
+                                               read: { book in path.append(NovelRoute(id: book.id, title: book.title)) })
+                            }
+                        }
+                    }.libraryGridIdentity(layout)
                 }
+                .padding(.horizontal, CGFloat(LibraryGrid.padding)).padding(.bottom, 24)
             }
-            .scrollContentBackground(.hidden).background(PudgeTheme.background)
-            .navigationTitle("Light Novels").searchable(text: $search, prompt: "Title")
+            .libraryWidth($width)
+            .background(PudgeTheme.background)
+            .navigationTitle("Light Novels").libraryFilterHeader($filter, prompt: "Title", device: PudgeTheme.device)
             .navigationDestination(for: NovelRoute.self) { route in NovelReaderScreen(media: media, bookId: route.id, title: route.title) }
             .navigationDestination(for: ShelfRoute.self) { route in
-                if let shelf = shelves.first(where: { $0.key == route.key }) { NovelShelfScreen(media: media, shelf: shelf) }
+                if let shelf = shelves.first(where: { $0.key == route.key }) {
+                    NovelShelfScreen(media: media, shelf: shelf) { book in path.append(NovelRoute(id: book.id, title: book.title)) }
+                }
             }
             .toolbar { ToolbarItem(placement: .primaryAction) { SettingsButton(model: media.app) } }
             .overlay { if media.loadingReading && media.novels.isEmpty { ProgressView() } }
             .refreshable { await media.refreshReading(forceUpdates: true) }
-            .task { if media.novels.isEmpty { await media.refreshReading() } }
+            // Not loaded from the Mac yet (the volumes on this device may be listed meanwhile).
+            .task { if !media.novelsFromMac { await media.refreshReading() } }
+            .popsToRootOnReselect($path)
         }
     }
 }
 
-struct NovelRow: View {
+/// A light-novel volume as a cover card; ⋯ has its download menu.
+struct NovelCard: View {
     @ObservedObject var media: MediaModel
     let book: LightNovelItem
     var showTitle = false
+    let width: CGFloat
+    let open: () -> Void
     var body: some View {
-        HStack(spacing: 14) {
-            RemoteCover(media: media, path: "cover/ln/\(book.id)", symbol: "book")
-            VStack(alignment: .leading, spacing: 4) {
-                Text(showTitle || book.volume == nil ? book.title : "Volume \(book.volume!)").font(.headline).lineLimit(2)
-                Text(book.finished ? "Finished" : "Chapter \(min(book.chapters, book.chapter + 1)) of \(book.chapters)")
-                    .font(.caption).foregroundStyle(.secondary)
-                if let progress = book.progress, progress > 0, !book.finished { ProgressView(value: progress) }
-                if book.hasAudio { Label("Audiobook linked", systemImage: "headphones").font(.caption2).foregroundStyle(PudgeTheme.accent) }
-                ReadingDownloadStatus(media: media, kind: "ln", id: book.id)
-            }
+        // The Mac's lnBookCard: alone (showTitle) its title and chips; inside a series "Volume N" and the compact chips.
+        LibraryCard(title: showTitle || book.volume == nil ? book.title : "Volume \(book.volume!)",
+                    titleSymbol: book.hasAudio ? "headphones" : nil,
+                    status: CardStatusText.novel(volume: book.volume, characters: book.characters, year: book.year,
+                                                 progress: book.progress, finished: book.finished, compact: !showTitle,
+                                                 download: media.cardDownload("ln", book.id)),
+                    badge: media.cardBadge("ln", book.id), width: width, identifier: "ln-card", open: open) {
+            CardCover(media: media, path: "cover/ln/\(book.id)", symbol: "book")
+        } actions: {
+            Button(action: open) { Label(book.started && !book.finished ? "Continue reading" : "Read", systemImage: "book.fill") }
+            ReadingDownloadMenu(media: media, kind: "ln", id: book.id, title: book.title)
+            DeletedOnMacNote(media: media, kind: "ln", id: book.id)
         }
-        .contextMenu { ReadingDownloadMenu(media: media, kind: "ln", id: book.id, title: book.title) }
     }
 }
 
-/// Volumes of one franchise or series.
+/// A franchise or series of several volumes: the volume the Mac would continue on the cover.
+struct NovelShelfCard: View {
+    @ObservedObject var media: MediaModel
+    let shelf: Shelf<LightNovelItem>
+    let width: CGFloat
+    let open: () -> Void
+    let read: (LightNovelItem) -> Void
+    var body: some View {
+        let items = shelf.items
+        let target = macCurrent(shelf, finished: { $0.finished })
+        // The Mac: a franchise tile ("Volume 3 · 42%", "Franchise · 2 series") or a series card's head.
+        let status = shelf.series.count > 1
+            ? CardStatusText.franchise(series: shelf.series.count, currentVolume: target?.volume, currentProgress: target?.progress,
+                                       currentFinished: target?.finished ?? true, allFinished: items.allSatisfy(\.finished))
+            : CardStatusText.series(volumes: items.count, continueVolume: target.flatMap { $0.finished ? nil : ($0.volume ?? 1) })
+        LibraryCard(title: shelf.title,
+                    status: status,
+                    badge: media.cardBadge("ln", ids: items.map(\.id)), count: items.count, width: width,
+                    identifier: "ln-shelf-card", open: open) {
+            CardCover(media: media, path: "cover/ln/\((target ?? items[0]).id)", symbol: "book")
+        } actions: {
+            if let target, !target.finished {
+                Button { read(target) } label: {
+                    Label("Continue " + (target.volume.map { "vol. \($0)" } ?? target.title), systemImage: "book.fill")
+                }
+            }
+            Button(action: open) { Label("All \(items.count) volumes", systemImage: "square.grid.2x2") }
+            if let target {
+                ReadingDownloadMenu(media: media, kind: "ln", id: target.id, title: target.title)
+            }
+        }
+    }
+}
+
+/// Volumes of one franchise or series, a grid per series.
 struct NovelShelfScreen: View {
     @ObservedObject var media: MediaModel
     let shelf: Shelf<LightNovelItem>
+    let read: (LightNovelItem) -> Void
+    @State private var width: CGFloat = 390
     var body: some View {
-        List {
-            ForEach(shelf.series) { series in
-                Section(shelf.series.count > 1 ? series.title : "") {
-                    ForEach(series.items) { book in
-                        NavigationLink(value: NovelRoute(id: book.id, title: book.title)) { NovelRow(media: media, book: book) }
-                    }
+        let layout = LibraryLayout(width: width)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(shelf.series) { series in
+                    if shelf.series.count > 1 { LibrarySectionHeader(title: series.title, count: series.items.count) }
+                    LazyVGrid(columns: layout.columns, alignment: .leading, spacing: CGFloat(LibraryGrid.spacing)) {
+                        ForEach(series.items) { book in NovelCard(media: media, book: book, width: layout.card) { read(book) } }
+                    }.libraryGridIdentity(layout)
                 }
             }
+            .padding(.horizontal, CGFloat(LibraryGrid.padding)).padding(.vertical, 12)
         }
-        .scrollContentBackground(.hidden).background(PudgeTheme.background)
-        .navigationTitle(shelf.title).navigationBarTitleDisplayMode(.inline)
+        .libraryWidth($width)
+        .background(PudgeTheme.background)
+        .japaneseNavigationTitle(shelf.title)
     }
 }
 
-/// Manga grouped by series → volumes like the Mac library.
+/// Manga grouped by series → volumes like the Mac library, as a grid of cover cards.
 struct MangaScreen: View {
     @ObservedObject var media: MediaModel
-    @State private var search = ""
+    /// The pull-down header: search (title, series) and "Only on iPhone/iPad".
+    @State private var filter = LibraryFilter()
     @State private var path = NavigationPath()
+    @State private var width: CGFloat = 390
     var shelves: [Shelf<MangaItem>] {
-        let items = media.manga.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) }
+        let items = media.manga.filter {
+            filter.matches([$0.title, $0.seriesTitle], onDevice: media.isDownloaded("manga", $0.id))
+        }
         return Shelves.group(items, franchise: { _ in nil }, series: { ($0.seriesKey ?? "book:\($0.id)", $0.seriesTitle ?? $0.title) },
                              volume: { $0.volume ?? 0 }, updated: { $0.updatedAt })
     }
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                if let error = media.readingError { Label(error, systemImage: "wifi.slash").font(.subheadline).foregroundStyle(.secondary) }
-                ReadingNote(media: media)
-                if shelves.isEmpty && !media.loadingReading {
-                    ContentUnavailableView("No manga", systemImage: "book.pages", description: Text("Manga from the Mac's library appear here. Download a volume to read it without the Mac."))
-                }
-                ForEach(shelves) { shelf in
-                    let items = shelf.items
-                    let target = macCurrent(shelf, finished: { $0.pages > 0 && $0.readPages >= $0.pages })
-                    Section {
-                        if items.count == 1, let book = items.first {
-                            NavigationLink(value: MangaRoute(id: book.id)) { MangaRow(media: media, book: book, showTitle: true) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let error = media.readingError { Label(error, systemImage: "wifi.slash").font(.subheadline).foregroundStyle(.secondary) }
+                    ReadingNote(media: media)
+                    if shelves.isEmpty && !media.loadingReading {
+                        if filter.isActive {
+                            ContentUnavailableView.search(text: filter.search)
                         } else {
-                            NavigationLink(value: ShelfRoute(key: shelf.key)) {
-                                HStack(spacing: 14) {
-                                    RemoteCover(media: media, path: "cover/manga/\((target ?? items[0]).id)", width: 58, symbol: "book.pages")
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(shelf.title).font(.headline).lineLimit(2)
-                                        Text("\(items.count) volumes · \(items.filter { $0.pages > 0 && $0.readPages >= $0.pages }.count) read")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            if let target, !(target.pages > 0 && target.readPages >= target.pages) {
-                                PillButton(title: "Continue vol. \(target.volume ?? 1)", systemImage: "book.pages.fill") {
-                                    path.append(MangaRoute(id: target.id))
-                                }
-                            }
+                            ContentUnavailableView("No manga", systemImage: "book.pages", description: Text("Manga from the Mac's library appear here. Download a volume to read it without the Mac."))
                         }
                     }
+                    let layout = LibraryLayout(width: width)
+                    LazyVGrid(columns: layout.columns, alignment: .leading, spacing: CGFloat(LibraryGrid.spacing)) {
+                        ForEach(shelves) { shelf in
+                            let items = shelf.items
+                            if items.count == 1, let book = items.first {
+                                MangaCard(media: media, book: book, showTitle: true, width: layout.card) { path.append(MangaRoute(id: book.id)) }
+                            } else {
+                                MangaShelfCard(media: media, shelf: shelf, width: layout.card,
+                                               open: { path.append(ShelfRoute(key: shelf.key)) },
+                                               read: { book in path.append(MangaRoute(id: book.id)) })
+                            }
+                        }
+                    }.libraryGridIdentity(layout)
                 }
+                .padding(.horizontal, CGFloat(LibraryGrid.padding)).padding(.bottom, 24)
             }
-            .scrollContentBackground(.hidden).background(PudgeTheme.background)
-            .navigationTitle("Manga").searchable(text: $search, prompt: "Title")
+            .libraryWidth($width)
+            .background(PudgeTheme.background)
+            .navigationTitle("Manga").libraryFilterHeader($filter, prompt: "Title", device: PudgeTheme.device)
             .navigationDestination(for: MangaRoute.self) { route in
                 if let book = media.manga.first(where: { $0.id == route.id }) { MangaReaderScreen(media: media, book: book) }
             }
             .navigationDestination(for: ShelfRoute.self) { route in
-                if let shelf = shelves.first(where: { $0.key == route.key }) { MangaShelfScreen(media: media, shelf: shelf) }
+                if let shelf = shelves.first(where: { $0.key == route.key }) {
+                    MangaShelfScreen(media: media, shelf: shelf) { book in path.append(MangaRoute(id: book.id)) }
+                }
             }
             .toolbar { ToolbarItem(placement: .primaryAction) { SettingsButton(model: media.app) } }
             .overlay { if media.loadingReading && media.manga.isEmpty { ProgressView() } }
             .refreshable { await media.refreshReading(forceUpdates: true) }
             .task { if media.manga.isEmpty { await media.refreshReading() } }
+            .popsToRootOnReselect($path)
         }
     }
 }
 
-struct MangaRow: View {
+extension MangaItem {
+    var isRead: Bool { pages > 0 && readPages >= pages }
+}
+
+/// A manga volume as a cover card; ⋯ has its download menu and Get OCR.
+struct MangaCard: View {
     @ObservedObject var media: MediaModel
     let book: MangaItem
     var showTitle = false
+    let width: CGFloat
+    let open: () -> Void
     var body: some View {
-        HStack(spacing: 14) {
-            RemoteCover(media: media, path: "cover/manga/\(book.id)", symbol: "book.pages")
-            VStack(alignment: .leading, spacing: 4) {
-                Text(showTitle || book.volume == nil ? book.title : "Volume \(book.volume!)").font(.headline).lineLimit(2)
-                Text("Page \(min(book.pages, book.position + 1)) of \(book.pages)").font(.caption).foregroundStyle(.secondary)
-                ProgressView(value: Double(book.readPages), total: Double(max(1, book.pages)))
-                if book.ocrPages > 0 { Label("Text on \(book.ocrPages) pages", systemImage: "text.viewfinder").font(.caption2).foregroundStyle(.secondary) }
-                ReadingDownloadStatus(media: media, kind: "manga", id: book.id)
-            }
-        }
-        .contextMenu {
+        // The Mac's mangaLibraryCard: alone its chips; inside a series "Volume N" and the compact chips.
+        LibraryCard(title: showTitle || book.volume == nil ? book.title : "Volume \(book.volume!)",
+                    status: CardStatusText.manga(volume: book.volume, pages: book.pages, readPages: book.readPages,
+                                                 compact: !showTitle, download: media.cardDownload("manga", book.id)),
+                    badge: media.cardBadge("manga", book.id), width: width, identifier: "manga-card", open: open) {
+            CardCover(media: media, path: "cover/manga/\(book.id)", symbol: "book.pages")
+        } actions: {
+            Button(action: open) { Label(book.position > 0 && !book.isRead ? "Continue reading" : "Read", systemImage: "book.pages.fill") }
             ReadingDownloadMenu(media: media, kind: "manga", id: book.id, title: book.title)
             if media.needsOCR(book) { GetOCRMenuItem(media: media, book: book) }
+            DeletedOnMacNote(media: media, kind: "manga", id: book.id)
+        }
+    }
+}
+
+/// A manga series of several volumes.
+struct MangaShelfCard: View {
+    @ObservedObject var media: MediaModel
+    let shelf: Shelf<MangaItem>
+    let width: CGFloat
+    let open: () -> Void
+    let read: (MangaItem) -> Void
+    var body: some View {
+        let items = shelf.items
+        let target = macCurrent(shelf, finished: { $0.isRead })
+        LibraryCard(title: shelf.title,
+                    status: CardStatusText.series(volumes: items.count,
+                                                  continueVolume: target.flatMap { $0.isRead ? nil : ($0.volume ?? 1) }),
+                    badge: media.cardBadge("manga", ids: items.map(\.id)), count: items.count, width: width,
+                    identifier: "manga-shelf-card", open: open) {
+            CardCover(media: media, path: "cover/manga/\((target ?? items[0]).id)", symbol: "book.pages")
+        } actions: {
+            if let target, !target.isRead {
+                Button { read(target) } label: { Label("Continue vol. \(target.volume ?? 1)", systemImage: "book.pages.fill") }
+            }
+            Button(action: open) { Label("All \(items.count) volumes", systemImage: "square.grid.2x2") }
+            if let target {
+                ReadingDownloadMenu(media: media, kind: "manga", id: target.id, title: target.title)
+                if media.needsOCR(target) { GetOCRMenuItem(media: media, book: target) }
+            }
         }
     }
 }
@@ -331,14 +416,19 @@ struct ReadingDownloadButton: View {
 struct MangaShelfScreen: View {
     @ObservedObject var media: MediaModel
     let shelf: Shelf<MangaItem>
+    let read: (MangaItem) -> Void
+    @State private var width: CGFloat = 390
     var body: some View {
-        List {
-            ForEach(shelf.items) { book in
-                NavigationLink(value: MangaRoute(id: book.id)) { MangaRow(media: media, book: book) }
-            }
+        let layout = LibraryLayout(width: width)
+        ScrollView {
+            LazyVGrid(columns: layout.columns, alignment: .leading, spacing: CGFloat(LibraryGrid.spacing)) {
+                ForEach(shelf.items) { book in MangaCard(media: media, book: book, width: layout.card) { read(book) } }
+            }.libraryGridIdentity(layout)
+            .padding(.horizontal, CGFloat(LibraryGrid.padding)).padding(.vertical, 12)
         }
-        .scrollContentBackground(.hidden).background(PudgeTheme.background)
-        .navigationTitle(shelf.title).navigationBarTitleDisplayMode(.inline)
+        .libraryWidth($width)
+        .background(PudgeTheme.background)
+        .japaneseNavigationTitle(shelf.title)
     }
 }
 
@@ -462,7 +552,6 @@ struct NovelReaderScreen: View {
     @State private var followRequest = 0
     /// A finger is on the text; following resumes unless it really scrolled.
     @State private var dragging = false
-    @State private var dragStart: CGFloat?
     /// Blurred illustrations the reader has opened in this chapter.
     @State private var revealed = Set<Int>()
     @State private var illustration: IllustrationRoute?
@@ -474,9 +563,25 @@ struct NovelReaderScreen: View {
     @State private var tracker = VisibleParagraphs()
     @State private var restoreParagraph: Int?
     @State private var lookup: WordLookup?
+    /// What "Explain grammar" in the word card explains: the word's sentence and the text before it.
+    @State private var lookupSource: GrammarSource?
+    /// The grammar chat of this volume (hidden and shown again with its button).
+    @StateObject private var grammar = GrammarChatModel()
     @State private var finishedPrompt = false
     @State private var listenProblem: String?
     @State private var pendingListen: (paragraph: Int, utf16: Int)?
+    /// The volume's "read up to here" marker (pudge/ln_read_marker.py), its line once drawn,
+    /// whether its paragraph is on screen, the label a tap shows, and a pulse when it moves.
+    @State private var marker: ReadMarker?
+    @State private var markerLine: MarkerLine?
+    /// The spoken word's line once drawn: following the audio keeps this line in the middle.
+    @State private var spokenLine: SpokenLine?
+    @State private var markerShown = false
+    @State private var markerNote: String?
+    @State private var markerFlash = 0
+    @State private var markerAudioAt = Date.distantPast
+    /// The text selection over the chapter's paragraphs (handles, menu, across paragraphs).
+    @State private var textSelection = TextSelectionController(acrossParagraphs: true)
     @AppStorage("pudge.readerFontSize") private var fontSize = 21.0
     @AppStorage("pudge.readerMarkStyle") private var marks = "mac"
     @AppStorage("pudge.readerFurigana") private var furigana = "mac"
@@ -507,7 +612,17 @@ struct NovelReaderScreen: View {
         if let audio = follower.audioChapter, audio != chapterIndex, detail?.chapters.contains(where: { $0.index == audio }) == true {
             Task { await open(audio, fraction: 0) }
         } else if let paragraph = follower.spoken?.paragraph {
-            withAnimation { proxy.scrollTo(paragraph, anchor: .center) }
+            if spokenLine?.paragraph == paragraph, tracker.visible.contains(paragraph) {
+                withAnimation { proxy.scrollTo(SpokenLineAnchor.id, anchor: .center) }
+            } else {
+                // Off screen: brought in without animation (a lazy stack only estimates the rows
+                // it has not drawn), then centred on its line once that is drawn.
+                proxy.scrollTo(paragraph, anchor: .center)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    guard spokenLine?.paragraph == paragraph else { return }
+                    withAnimation { proxy.scrollTo(SpokenLineAnchor.id, anchor: .center) }
+                }
+            }
         }
     }
 
@@ -542,17 +657,41 @@ struct NovelReaderScreen: View {
                                         else if let id = paragraph.imageId { illustration = IllustrationRoute(id: id) }
                                     }
                                 } else {
+                                    // One selection over the chapter's paragraphs (textSelection).
                                     JapaneseText(paragraph: paragraph, style: style,
                                                  current: follower.spoken?.paragraph == index ? follower.spoken?.token : nil,
                                                  onTap: { token in interacted(); open(word: token, paragraph: index) },
                                                  onTapEmpty: { tappedEmpty() },
-                                                 onSelect: { interacted(); if follower.active { follow = false } },
-                                                 onListenFrom: detail?.audioAssetId == nil ? nil : { utf16 in listen(paragraph: index, utf16: utf16) })
+                                                 marker: markerOffset(index),
+                                                 onMarkerLine: { line in placeMarker(index, line) },
+                                                 selection: textSelection, paragraphIndex: index,
+                                                 onCurrentLine: { line in placeSpokenLine(index, line) })
+                                }
+                            }
+                            // The marker's ribbon in the margin by its line; a tap says who set it and when.
+                            .overlay(alignment: .topLeading) {
+                                if let line = markerLine, line.paragraph == index, markerOffset(index) != nil {
+                                    ReadMarkerRibbon(flash: markerFlash)
+                                        .frame(width: 22, height: max(14, line.rect.height))
+                                        .offset(x: -24, y: line.rect.minY)
+                                        .onTapGesture { interacted(); showMarkerNote() }
+                                        .accessibilityLabel(markerLabel)
+                                        .accessibilityAddTraits(.isButton)
+                                }
+                            }
+                            // Where the spoken line is in this paragraph: following the audio centres
+                            // the line itself (a paragraph can be taller than the screen).
+                            .background(alignment: .topLeading) {
+                                if let line = spokenLine, line.paragraph == index {
+                                    Color.clear.frame(width: 1, height: max(1, line.rect.height))
+                                        .id(SpokenLineAnchor.id)
+                                        .padding(.top, max(0, line.rect.minY))
+                                        .allowsHitTesting(false)
                                 }
                             }
                             .id(index)
-                            .onAppear { tracker.visible.insert(index); remember() }
-                            .onDisappear { tracker.visible.remove(index) }
+                            .onAppear { tracker.visible.insert(index); remember(); if isMarkerParagraph(index) { markerShown = true } }
+                            .onDisappear { tracker.visible.remove(index); if isMarkerParagraph(index) { markerShown = false } }
                         }
                         footer
                     } else if let failure {
@@ -564,32 +703,74 @@ struct NovelReaderScreen: View {
                     // iPad: a readable column, centred (the iPhone is narrower than this anyway).
                     .frame(maxWidth: PudgeTheme.readingWidth).frame(maxWidth: .infinity)
             }
-            .onScrollPhaseChange { old, phase, context in
-                let offset = context.geometry.contentOffset.y
-                if phase == .interacting {
-                    dragging = true
-                    dragStart = offset
-                    interacted()
-                } else if old == .interacting {
-                    dragging = false
-                    // Only a real scroll by hand stops following the audio (a touch or a tiny
-                    // drag does not); the bars stay so the reader can use the arrow to go back.
-                    if follower.active, abs(offset - (dragStart ?? offset)) > 24 { follow = false }
-                    dragStart = nil
-                }
-            }
+            .modifier(ManualScrollWatch(began: {
+                dragging = true
+                interacted()
+            }, ended: { moved in
+                dragging = false
+                // Only a real scroll by hand stops following the audio (a touch or a tiny
+                // drag does not); the bars stay so the reader can use the arrow to go back.
+                if follower.active, moved > 24 { follow = false }
+            }))
             .onChange(of: restoreParagraph) { _, value in
                 guard let value else { return }
                 DispatchQueue.main.async { proxy.scrollTo(value, anchor: .top); restoreParagraph = nil }
             }
             .onChange(of: follower.spoken?.paragraph) { _, value in
                 guard follow, !dragging, let value else { return }
-                DispatchQueue.main.async { withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(value, anchor: .center) } }
+                if follower.spoken?.token == nil {
+                    // No word to follow (sentence timing only): the paragraph, as before.
+                    DispatchQueue.main.async { withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(value, anchor: .center) } }
+                    return
+                }
+                // The spoken line is centred when its paragraph has drawn it (spokenLine below). A
+                // paragraph off screen is brought in first, without animation: a lazy stack only
+                // estimates the rows it has not drawn, and an animated scroll there landed beside
+                // the line and jerked back.
+                if !tracker.visible.contains(value) { DispatchQueue.main.async { proxy.scrollTo(value, anchor: .center) } }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    // No line drawn (a word without a box): the paragraph, as before.
+                    guard follow, !dragging, follower.spoken?.paragraph == value, spokenLine?.paragraph != value else { return }
+                    withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(value, anchor: .center) }
+                }
+            }
+            .onChange(of: spokenLine) { _, line in
+                // Once per line, not per word, and onto the line itself: in a paragraph taller than
+                // the screen the spoken line no longer runs out of view, and each step is one line.
+                guard follow, !dragging, let line, line.paragraph == follower.spoken?.paragraph else { return }
+                DispatchQueue.main.async { withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(SpokenLineAnchor.id, anchor: .center) } }
+            }
+            .onChange(of: chrome) { _, _ in
+                // The bars coming or going move the text by their height: the line back to the middle.
+                guard autoScrolling, !dragging, let line = spokenLine, line.paragraph == follower.spoken?.paragraph else { return }
+                DispatchQueue.main.async { withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(SpokenLineAnchor.id, anchor: .center) } }
             }
             .onChange(of: follow) { _, value in
                 if value { scrollToAudio(proxy) }
             }
             .onChange(of: followRequest) { _, _ in scrollToAudio(proxy) }
+            .onChange(of: follower.spoken) { _, value in followMarker(value) }
+            // Back to the marker when it is off screen (like the audio bar's arrow back to the audio).
+            .overlay(alignment: .bottomTrailing) {
+                if marker != nil, chapter != nil, !markerShown {
+                    Button { jumpToMarker(proxy) } label: {
+                        Label("Back to bookmark", systemImage: "bookmark.fill").labelStyle(.iconOnly)
+                            .font(.title3).foregroundStyle(Color.red).frame(width: 44, height: 44)
+                            .background(PudgeTheme.panel.opacity(0.92), in: Circle())
+                    }
+                    .padding(.trailing, 16).padding(.bottom, 12)
+                    .accessibilityLabel("Back to bookmark")
+                }
+            }
+            // The hidden grammar chat comes back with this button.
+            .overlay(alignment: .bottomLeading) { GrammarChatButton(chats: grammar) { lookup = nil } }
+            .overlay(alignment: .top) {
+                if let markerNote {
+                    Text(markerNote).font(.footnote).padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(.thinMaterial, in: Capsule()).padding(.top, 8)
+                        .transition(.opacity).allowsHitTesting(false)
+                }
+            }
         }
         .background(background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -609,23 +790,36 @@ struct NovelReaderScreen: View {
             guard !Task.isCancelled, autoScrolling else { return }
             withAnimation { idleHidden = true }
         }
+        // A word graded in the word card: every occurrence in the chapter takes its new state at once.
+        .onChange(of: media.gradedWords) { _, graded in
+            guard let value = chapter?.updating(graded.rows) else { return }
+            chapter = value
+            follower.chapter = value
+        }
         .onChange(of: follower.audioChapter) { _, value in
             // The audio moved to another chapter: the reader follows it.
             guard follow, let value, value != chapterIndex, detail?.chapters.contains(where: { $0.index == value }) == true else { return }
             Task { await open(value, fraction: 0) }
         }
         .fullScreenCover(item: $illustration) { item in IllustrationViewer(media: media, imageId: item.id) }
-        .sheet(item: $lookup, onDismiss: {
-            // After the word sheet is gone, so the alert can appear.
+        // The grammar chat and the word card open small at the bottom: the text stays readable.
+        // A tap outside the word card only closes it; around the chat the text stays usable. The
+        // word card comes after the chat, so a word tapped while the chat is open shows on top of
+        // it (the chat's button closes the card).
+        .bottomPanel(isPresented: $grammar.shown, title: "Explain grammar", compact: 380, keyboard: true) {
+            GrammarChatPanel(chats: grammar, media: media)
+        }
+        .bottomPanel(item: $lookup, onDismiss: {
+            // After the word card is gone.
             if let target = pendingListen { pendingListen = nil; listen(paragraph: target.paragraph, utf16: target.utf16) }
-        }) { item in WordSheet(media: media, lookup: item) }
+        }) { item in WordSheet(media: media, lookup: item, onExplain: explainAction(lookupSource)) }
         .alert("Listen", isPresented: Binding(get: { listenProblem != nil }, set: { if !$0 { DispatchQueue.main.async { listenProblem = nil } } })) {
             if let book = audioBook, (try? media.app.store.ready(book)) != true {
                 Button("Download the audiobook") { media.app.download(book) }
             }
             Button("OK", role: .cancel) {}
         } message: { Text(listenProblem ?? "") }
-        .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+        .japaneseNavigationTitle(title)
         .toolbar {
             ToolbarItem(placement: .primaryAction) { ReadingDownloadButton(media: media, kind: "ln", id: bookId, title: title) }
             if detail?.audioAssetId != nil && !follower.active {
@@ -672,13 +866,14 @@ struct NovelReaderScreen: View {
             do {
                 let value = try await media.novel(bookId)
                 detail = value
+                marker = value.marker
                 attachAudio()
                 // With the audiobook playing, open the chapter being read aloud.
                 if follower.active, let spoken = follower.audioChapter, value.chapters.contains(where: { $0.index == spoken }) {
                     await open(spoken, fraction: 0)
                 } else {
                     let start = media.startPosition(bookId, value)
-                    await open(start.chapter, fraction: start.offset)
+                    await open(start.chapter, fraction: start.offset, initial: true)
                 }
             } catch { failure = error.localizedDescription }
         }
@@ -693,8 +888,41 @@ struct NovelReaderScreen: View {
         .onDisappear {
             save(force: true); player.embeddedControls = max(0, player.embeddedControls - 1)
             observeReading(); media.app.activity.stop(kind: "light_novel", item: bookId)
+            textSelection.forgetActions()  // its closures hold this screen's state
+            grammar.stop()
         }
-        .onAppear { player.embeddedControls += 1 }
+        .onAppear {
+            player.embeddedControls += 1; configureSelection()
+            grammar.open(book: GrammarChat.book(server: media.app.paired?.serverId, kind: "ln", id: bookId))
+        }
+    }
+
+    /// The selection menu over the chapter: Copy (its paragraphs' text), Look Up (the first word
+    /// with an entry), Listen from here and Read up to here at the selection's start.
+    private func configureSelection() {
+        textSelection.paragraph = { index in chapter?.paragraphs[safe: index] }
+        textSelection.onSelect = { interacted(); if follower.active { follow = false } }
+        textSelection.onLookUp = { word in interacted(); open(word: word.token, paragraph: word.paragraph) }
+        textSelection.canListen = { detail?.audioAssetId != nil }
+        textSelection.onListenFrom = { place in listen(paragraph: place.paragraph, utf16: place.offset) }
+        textSelection.onMarkHere = { place in markHere(paragraph: place.paragraph, utf16: place.offset) }
+        textSelection.onExplain = { range in interacted(); explain(selection: range) }
+    }
+
+    /// "Explain grammar" of the selected text, with the 200 characters before it (as on the Mac).
+    private func explain(selection range: TextSelectionRange) {
+        let paragraph: (Int) -> TextParagraph? = { index in chapter?.paragraphs[safe: index] }
+        explain(GrammarSource(sentence: range.text(paragraph), context: GrammarContext.preceding(paragraph, before: range.start)))
+    }
+
+    private func explain(_ source: GrammarSource) {
+        lookup = nil
+        grammar.explain(source, media: media)
+    }
+
+    private func explainAction(_ source: GrammarSource?) -> (() -> Void)? {
+        guard let source else { return nil }
+        return { explain(source) }
     }
 
     @ViewBuilder private var footer: some View {
@@ -722,6 +950,10 @@ struct NovelReaderScreen: View {
         guard let paragraph = chapter?.paragraphs[safe: number], let token = paragraph.tokens[safe: index] else { return }
         let surface = StudyText.segments(paragraph.text, tokens: paragraph.tokens).first { $0.token == index }?.text ?? ""
         var item = WordLookup(token: token, surface: surface, sentence: StudyText.sentence(paragraph.text, around: token))
+        let sentenceStart = TextUnits.sentence(paragraph.text, at: token.start)?.lowerBound ?? 0
+        lookupSource = GrammarSource(sentence: item.sentence,
+                                     context: GrammarContext.preceding({ index in chapter?.paragraphs[safe: index] },
+                                                                       before: TextPosition(paragraph: number, offset: sentenceStart)))
         if detail?.audioAssetId != nil {
             item.playLabel = "Listen from here"
             item.playFromHere = { pendingListen = (number, token.start); lookup = nil }
@@ -754,9 +986,13 @@ struct NovelReaderScreen: View {
         }
     }
 
-    private func open(_ index: Int, fraction: Double) async {
+    /// `initial`: the place the volume opens at (saving it again is not news); `target`: the
+    /// paragraph to show instead of the fraction's.
+    private func open(_ index: Int, fraction: Double, initial: Bool = false, paragraph target: Int? = nil) async {
         save(force: true)
-        chapterIndex = index; chapter = nil; failure = nil; tracker.visible = []; tracker.lastSaved = Date(); revealed = []
+        textSelection.clear()  // its places are this chapter's paragraphs
+        chapterIndex = index; chapter = nil; failure = nil; tracker.visible = []; tracker.lastSaved = Date(); revealed = []; spokenLine = nil
+        markerShown = false; markerLine = nil
         follower.chapter = nil
         do {
             var restored = false
@@ -764,7 +1000,12 @@ struct NovelReaderScreen: View {
                 guard chapterIndex == index else { return }  // the reader moved to another chapter
                 chapter = value
                 follower.chapter = value
-                if !restored && !(follow && follower.active) { restored = true; restoreParagraph = value.paragraph(atFraction: fraction) }
+                if !restored && !(follow && follower.active) {
+                    restored = true
+                    let paragraph = target ?? value.paragraph(atFraction: fraction)
+                    restoreParagraph = paragraph
+                    if initial { tracker.opened = OpenedPlace(chapter: index, position: Double(paragraph), tolerance: 2) }
+                }
             }
         } catch { if chapterIndex == index && chapter == nil { failure = error.localizedDescription } }
         // Fresh Jiten states (the chapter's parse cache keeps the states of its parse time).
@@ -791,9 +1032,128 @@ struct NovelReaderScreen: View {
 
     private func save(force: Bool) {
         guard let chapter, let index = chapterIndex, let top = tracker.visible.min() else { return }
+        // Still where the volume opened (two paragraphs either way): nothing new. Saved with a fresh
+        // time, the old place of a copy opened offline took a later place read on the Mac back.
+        if var opened = tracker.opened {
+            let moved = opened.counts(chapter: index, position: Double(top))
+            tracker.opened = opened
+            if !moved { return }
+        }
         tracker.lastSaved = Date()
         let fraction = chapter.fraction(atParagraph: top)
-        Task { await media.saveNovelPosition(bookId, chapter: index, offset: fraction) }
+        // The Mac moves the read marker by the paragraph at the top (forward only, far enough).
+        Task { updateMarker(await media.saveNovelPosition(bookId, chapter: index, offset: fraction, paragraph: top)) }
+    }
+
+    // MARK: Read marker
+
+    private func isMarkerParagraph(_ index: Int) -> Bool {
+        guard let marker, let chapterIndex else { return false }
+        return marker.chapter == chapterIndex && marker.paragraph == index
+    }
+
+    private func markerOffset(_ index: Int) -> Int? { isMarkerParagraph(index) ? marker?.paragraphOffset : nil }
+
+    private func placeSpokenLine(_ index: Int, _ line: CGRect?) {
+        if let line { spokenLine = SpokenLine(paragraph: index, rect: line) }
+        else if spokenLine?.paragraph == index { spokenLine = nil }
+    }
+
+    private func placeMarker(_ index: Int, _ line: CGRect?) {
+        if let line { markerLine = MarkerLine(paragraph: index, rect: line) }
+        else if markerLine?.paragraph == index { markerLine = nil }
+    }
+
+    /// The Mac's marker after a save; a pulse when it moved.
+    private func updateMarker(_ value: ReadMarker?) {
+        guard let value else { return }
+        let moved = marker?.chapter != value.chapter || marker?.paragraph != value.paragraph || marker?.paragraphOffset != value.paragraphOffset
+        marker = value
+        markerShown = value.chapter == chapterIndex && tracker.visible.contains(value.paragraph)
+        if moved { markerFlash &+= 1 }
+    }
+
+    private var markerLabel: String { marker.map { markerText($0) } ?? "Read up to here" }
+
+    private func markerText(_ value: ReadMarker) -> String {
+        let kind = value.kind == "manual" ? "set by you" : "automatic"
+        let time = Date(timeIntervalSince1970: value.at).formatted(date: .omitted, time: .shortened)
+        let device = value.here == true ? "" : (value.deviceName ?? "")
+        return "Read up to here · \(kind) · \(time)" + (device.isEmpty ? "" : " · \(device)")
+    }
+
+    /// The label after a tap on the ribbon, for a moment (there is no hover on the phone).
+    private func showMarkerNote() {
+        guard let marker else { return }
+        let text = markerText(marker)
+        withAnimation { markerNote = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            if markerNote == text { withAnimation { markerNote = nil } }
+        }
+    }
+
+    /// "Read up to here" in the selection menu: exactly at the selection's first character.
+    private func markHere(paragraph number: Int, utf16: Int) {
+        guard let index = chapterIndex else { return }
+        interacted()
+        Task {
+            let saved = await media.saveReadMarker(bookId, chapter: index, paragraph: number, utf16: utf16, kind: "manual")
+            // Without the Mac it shows here until the volume opens again.
+            updateMarker(saved ?? ReadMarker(chapter: index, paragraph: number, paragraphOffset: utf16, kind: "manual",
+                                             at: Date().timeIntervalSince1970, here: true))
+            markerFlash &+= 1
+            showMarkerNote()
+        }
+    }
+
+    /// While the linked audiobook plays, the marker follows the word being read (the Mac moves it
+    /// only forward, far enough, to the sentence start); at most every 15 s.
+    private func followMarker(_ spoken: ReaderAudioFollower.Spoken?) {
+        // "Auto-bookmark after 20 s" off on the Mac: only Read up to here moves the marker.
+        guard media.readerLook?.autoBookmarks != false else { return }
+        guard let spoken, follower.playing, Date().timeIntervalSince(markerAudioAt) > 15 else { return }
+        if let marker, marker.chapter > spoken.chapter || (marker.chapter == spoken.chapter && marker.paragraph > spoken.paragraph) { return }
+        markerAudioAt = Date()
+        let utf16 = spoken.token.flatMap { chapter?.paragraphs[safe: spoken.paragraph]?.tokens[safe: $0]?.start } ?? 0
+        Task { updateMarker(await media.saveReadMarker(bookId, chapter: spoken.chapter, paragraph: spoken.paragraph, utf16: utf16, kind: "auto")) }
+    }
+
+    private func jumpToMarker(_ proxy: ScrollViewProxy) {
+        guard let marker else { return }
+        follow = false
+        interacted()
+        markerFlash &+= 1
+        if marker.chapter == chapterIndex {
+            withAnimation { proxy.scrollTo(marker.paragraph, anchor: .center) }
+        } else if detail?.chapters.contains(where: { $0.index == marker.chapter }) != false {
+            // Another chapter (or the volume's chapters not loaded yet): open it at the marker,
+            // never that paragraph number of this chapter.
+            Task { await open(marker.chapter, fraction: 0, paragraph: marker.paragraph) }
+        }
+    }
+}
+
+private struct MarkerLine: Equatable { let paragraph: Int; let rect: CGRect }
+/// The spoken word's line in its paragraph, and the id of the zero-width view on it.
+private struct SpokenLine: Equatable { let paragraph: Int; let rect: CGRect }
+private enum SpokenLineAnchor { static let id = "pudge.reader.spokenLine" }
+
+/// The red ribbon of the read marker in the margin; it pulses when the marker moves.
+struct ReadMarkerRibbon: View {
+    let flash: Int
+    @State private var glow = false
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Color.clear
+            RoundedRectangle(cornerRadius: 2).fill(Color.red).frame(width: 6)
+                .shadow(color: Color.red.opacity(glow ? 0.9 : 0), radius: glow ? 7 : 0)
+                .scaleEffect(glow ? 1.3 : 1)
+        }
+        .contentShape(Rectangle())
+        .onChange(of: flash) { _, _ in
+            withAnimation(.easeOut(duration: 0.2)) { glow = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { withAnimation(.easeOut(duration: 1.1)) { glow = false } }
+        }
     }
 }
 
@@ -874,6 +1234,8 @@ struct IllustrationViewer: View {
 final class VisibleParagraphs {
     var visible = Set<Int>()
     var lastSaved = Date.distantPast
+    /// Where the volume opened (its paragraph), until the reader moves away.
+    var opened: OpenedPlace?
 }
 
 // MARK: Manga reader
@@ -881,108 +1243,301 @@ final class VisibleParagraphs {
 struct MangaReaderScreen: View {
     @ObservedObject var media: MediaModel
     let book: MangaItem
-    @State private var page = 0
-    @State private var showText = true
+    /// The place and what is on screen (MangaReadingPlace, PudgeCore): only a turn moves the
+    /// place and saves it; turning the device or pairing the pages anew only shows the spread
+    /// that holds it.
+    @State private var place = MangaReadingPlace(page: 0, layout: [])
+    /// Text box outlines on the page (kept between volumes); hidden boxes open on a long press.
+    @AppStorage("pudge.mangaShowTextBoxes") private var showText = true
     @State private var lookup: TextLookup?
+    /// The grammar chat of this volume (hidden and shown again with its button).
+    @StateObject private var grammar = GrammarChatModel()
     @State private var chrome = true
+    /// The reader's whole size (bars and safe areas included, so showing the bars changes nothing).
+    @State private var screen = CGSize.zero
+    /// Pages that are one wide picture (a double-page spread): shown alone.
+    @State private var wide: Set<Int> = []
+    /// height / width of the volume's usual page.
+    @State private var pageAspect = MangaSpreads.defaultAspect
+    @State private var aspectKnown = false
+    /// "Shift pairs by one page" for this volume (kept on the Mac, as on the Mac).
+    @State private var shift = false
+    /// "Align scanned pages" for this volume and the pages' transforms (the Mac works them out).
+    @State private var align = true
+    /// "Align scanned pages" just turned on: the alignment is asked once more (see the loop).
+    @State private var alignAskPending = false
+    @State private var alignment: MangaAlignment?
     @Environment(\.dismiss) private var dismiss
 
-    private var order: [Int] { book.rightToLeft ? Array((0..<book.pages).reversed()) : Array(0..<book.pages) }
+    /// Two pages side by side like a printed book when they fit (landscape iPhone/iPad, an unfolded
+    /// display): by the space and the page shape, not the device. Each half then gets one page and
+    /// the gutter is the middle of the reader, where a fold is.
+    private var twoPages: Bool {
+        MangaSpreads.showsTwoPages(width: Double(screen.width), height: Double(screen.height), pageAspect: pageAspect)
+    }
+    /// The pager from left to right: right to left (manga) starts at the right.
+    private var order: [[Int]] { book.rightToLeft ? Array(place.layout.reversed()) : place.layout }
 
     var body: some View {
-        TabView(selection: $page) {
-            ForEach(order, id: \.self) { index in
-                MangaPageView(media: media, book: book.id, page: index, showText: showText, active: index == page,
-                              onRegion: { text in media.app.activity.touched(kind: "manga", item: book.id); lookup = TextLookup(text: text) },
-                              onBackground: { media.app.activity.touched(kind: "manga", item: book.id); withAnimation { chrome.toggle() } })
-                    .tag(index)
+        GeometryReader { geometry in
+            let whole = CGSize(width: geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing,
+                               height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom)
+            let generation = place.generation
+            TabView(selection: Binding(get: { place.shown }, set: { tag in turn(to: tag, generation: generation) })) {
+                ForEach(order, id: \.self) { spread in
+                    MangaPageView(media: media, book: book.id, pages: MangaSpreads.onScreen(spread, rightToLeft: book.rightToLeft),
+                                  showText: showText, active: spread.first == place.shown,
+                                  onRegion: { text in media.app.activity.touched(kind: "manga", item: book.id); lookup = TextLookup(text: text) },
+                                  onBackground: { media.app.activity.touched(kind: "manga", item: book.id); withAnimation { chrome.toggle() } },
+                                  onImage: { index, size in learn(index, size) }, alignment: transforms(spread))
+                        .tag(spread.first ?? 0)
+                }
             }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            // A new layout gets a new pager: the old one never reports a page of the old layout.
+            .id(generation)
+            .onAppear { screen = whole; relayout() }
+            .onChange(of: whole) { _, value in screen = value; relayout() }
         }
-        .tabViewStyle(.page(indexDisplayMode: .never))
         .background(Color.black.ignoresSafeArea())
         .toolbar(chrome ? .visible : .hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
-        .navigationTitle("\(page + 1) / \(book.pages)").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle(MangaSpreads.title(place.shownPages, pageCount: book.pages)).navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .primaryAction) { ReadingDownloadButton(media: media, kind: "manga", id: book.id, title: book.title) }
             ToolbarItem(placement: .primaryAction) { GetOCRButton(media: media, book: book) }
             ToolbarItem(placement: .primaryAction) {
                 Button { showText.toggle() } label: { Image(systemName: showText ? "text.viewfinder" : "viewfinder") }
-                    .accessibilityLabel(showText ? "Hide text boxes" : "Show text boxes")
+                    .accessibilityLabel(showText ? "Hide text box outlines" : "Show text box outlines")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                if twoPages {
+                    Button { toggleShift() } label: { Image(systemName: shift ? "rectangle.split.2x1.fill" : "rectangle.split.2x1") }
+                        .accessibilityLabel("Shift pairs by one page")
+                        .accessibilityValue(shift ? "On" : "Off")
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                if twoPages {
+                    Button { toggleAlign() } label: { Image(systemName: align ? "align.vertical.center.fill" : "align.vertical.center") }
+                        .accessibilityLabel("Align scanned pages")
+                        .accessibilityValue(align ? "On" : "Off")
+                }
             }
         }
-        .sheet(item: $lookup) { item in TextLookupSheet(media: media, lookup: item) }
+        // The hidden grammar chat comes back with this button (closing Look up, so it is on top).
+        .overlay(alignment: .bottomLeading) { GrammarChatButton(chats: grammar) { lookup = nil } }
+        // The grammar chat and Look up open small at the bottom: the page stays in view. Look up
+        // comes after the chat, so a bubble tapped while the chat is open shows on top of it.
+        .bottomPanel(isPresented: $grammar.shown, title: "Explain grammar", compact: 380, keyboard: true) {
+            GrammarChatPanel(chats: grammar, media: media)
+        }
+        .bottomPanel(item: $lookup, title: "Look up") { item in
+            TextLookupSheet(media: media, lookup: item, onExplain: { text in explainBubble(text) })
+        }
         .onAppear {
-            page = min(max(0, media.startPage(book)), max(0, book.pages - 1)); media.app.activity.touched(kind: "manga", item: book.id)
+            grammar.open(book: GrammarChat.book(server: media.app.paired?.serverId, kind: "manga", id: book.id))
+            let start = min(max(0, media.startPage(book)), max(0, book.pages - 1))
+            shift = media.mangaPairShift(book.id)
+            align = media.mangaPageAlign(book.id)
+            place = MangaReadingPlace(page: start, layout: layoutNow())
+            media.app.activity.touched(kind: "manga", item: book.id)
             media.markOpened("manga", book.id)
         }
         .onDisappear {
             observeReading(); media.app.activity.stop(kind: "manga", item: book.id)
+            grammar.stop()
             Task { await media.refreshReading() }
         }
         .task {
-            // Statistics: the page on screen every 5 s (counts while touched in the last 5 min).
+            // Double-page spreads, the page shape and the shift: from the downloaded files or the Mac.
+            guard let known = await media.mangaSpreadPages(book.id) else { return }
+            wide.formUnion(known.wide)
+            if let aspect = known.aspect, aspect.isFinite, aspect > 0 { pageAspect = aspect; aspectKnown = true }
+            if let value = known.shift { shift = value }
+            if let value = known.align { align = value }
+            alignment = known.alignment
+            relayout()
+        }
+        .task {
+            // The Mac works the alignment out in the background: ask again only while it does
+            // (only while aligning: with it off the Mac works nothing out), and once after
+            // "Align scanned pages" was turned on here. Nothing pending: no request at all (it
+            // asked every 30 s for a change made on the Mac; reopening the volume shows that).
+            while true {
+                do { try await Task.sleep(for: .seconds(3)) } catch { break }
+                let working = align && ((alignment?.pending ?? 0) > 0 || alignAskPending)
+                guard twoPages, working else { continue }
+                alignAskPending = false
+                await refreshSpreads()
+            }
+        }
+        .task {
+            // Statistics: the pages on screen every 5 s (counts while touched in the last 5 min).
             // A cancelled sleep ends the loop: no observation after the screen closed.
             while true {
                 do { try await Task.sleep(for: .seconds(5)) } catch { break }
                 observeReading()
             }
         }
-        .onChange(of: page) { _, value in
-            media.app.activity.touched(kind: "manga", item: book.id)
-            Task {
-                try? await Task.sleep(nanoseconds: 800_000_000)
-                if value == page { await media.saveMangaPosition(book.id, page: value) }
+    }
+
+    /// "Explain grammar" of a text box (or a word's sentence in it), with the text of the pages
+    /// on screen as its context (the Mac sends its page's text).
+    /// The chat opens at once ("Explaining…") while the pages' text comes; without the Mac only
+    /// the box itself is sent (the chat then says the Mac is away).
+    private func explainBubble(_ text: String) {
+        lookup = nil
+        let pages = place.shownPages
+        let volume = book.id
+        grammar.explain(GrammarSource(sentence: text), media: media) {
+            var texts: [String] = []
+            for page in pages {
+                texts += (await media.mangaText(volume, page: page))?.regions.map(\.text) ?? []
             }
+            return GrammarContext.joined(texts)
         }
     }
 
+    /// What one turn shows now: the space, the spreads known and the shift.
+    private func layoutNow() -> [[Int]] {
+        MangaSpreads.spreads(pageCount: book.pages, wide: wide, twoPages: twoPages, shift: shift)
+    }
+
+    /// Rotation, a spread found, the pairs shifted: the same place, in the spread that holds it.
+    private func relayout() { place.relayout(layoutNow()) }
+
+    /// The pager settled on a spread: a turn is saved (the first page; a pair's second page is
+    /// read too). Anything else the pager reports (the same spread, an old pager) is not.
+    private func turn(to tag: Int, generation: Int) {
+        guard let save = place.turned(to: tag, generation: generation) else { return }
+        media.app.activity.touched(kind: "manga", item: book.id)
+        Task {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            if place.page == save.page { await media.saveMangaPosition(book.id, page: save.page, readThrough: save.readThrough) }
+        }
+    }
+
+    private func toggleShift() {
+        shift.toggle()
+        relayout()
+        let value = shift
+        Task { await media.setMangaPairShift(book.id, value) }
+    }
+
+    /// "Align scanned pages": shown at once, saved on the Mac (later when it does not answer).
+    private func toggleAlign() {
+        align.toggle()
+        let value = align
+        Task { await media.setMangaPageAlign(book.id, value) }
+        // Turned on: the Mac starts working it out; asked once for its `pending`.
+        alignAskPending = value
+    }
+
+    /// The transforms of a spread's pages left to right on the screen (none: drawn as they are).
+    private func transforms(_ spread: [Int]) -> [MangaPageTransform?] {
+        guard align, twoPages, let found = alignment?.transforms(for: spread, rightToLeft: book.rightToLeft) else { return [] }
+        return book.rightToLeft ? Array(found.reversed()) : found
+    }
+
+    /// The Mac's answer again: the alignment as far as it is worked out, and a shift, alignment
+    /// or wide page changed there, shown at the same place.
+    private func refreshSpreads() async {
+        guard let known = await media.mangaSpreadPages(book.id) else { return }
+        if known.alignment != alignment { alignment = known.alignment }
+        if let value = known.align, value != align { align = value }
+        var changed = false
+        if let value = known.shift, value != shift { shift = value; changed = true }
+        if !Set(known.wide).isSubset(of: wide) { wide.formUnion(known.wide); changed = true }
+        if changed { relayout() }
+    }
+
+    /// The pages on screen: both of a pair (each counts once in Statistics).
     private func observeReading() {
         let activity = media.app.activity
-        activity.observe(kind: "manga", item: book.id, active: activity.isReading(kind: "manga", item: book.id), at: ["page": Double(page)])
+        var at: [String: Double] = ["page": Double(place.shown)]
+        if place.shownPages.count > 1, let last = place.shownPages.last { at["pageEnd"] = Double(last) }
+        activity.observe(kind: "manga", item: book.id, active: activity.isReading(kind: "manga", item: book.id), at: at)
+    }
+
+    /// A page's picture arrived: a wide one is shown alone from now on; the first other one gives
+    /// the page shape when the Mac did not (an older Mac).
+    private func learn(_ index: Int, _ size: CGSize) {
+        let width = Double(size.width), height = Double(size.height)
+        if MangaSpreads.isWide(width: width, height: height) {
+            guard !wide.contains(index) else { return }
+            wide.insert(index)
+        } else if !aspectKnown, width > 0, height > 0 {
+            pageAspect = height / width; aspectKnown = true
+        } else {
+            return
+        }
+        relayout()
     }
 }
 
 struct MangaPageView: View {
     @ObservedObject var media: MediaModel
     let book: Int
-    let page: Int
+    /// The pages shown together, left to right on the screen: one page, or two side by side.
+    let pages: [Int]
     let showText: Bool
     /// The page on screen; a page swiped away goes back to its normal size.
     var active = true
     let onRegion: (String) -> Void
-    /// A tap outside the text boxes (shows or hides the reader's bars).
+    /// A tap on the page, not on a shown text box (shows or hides the reader's bars).
     var onBackground: () -> Void = {}
-    @State private var image: UIImage?
-    @State private var text: MangaPageText?
-    @State private var failed = false
+    /// A page's picture arrived, with its size (wide pages are then shown alone).
+    var onImage: (Int, CGSize) -> Void = { _, _ in }
+    /// How each page is drawn (left to right as `pages`; empty or nil: as it is): straightened
+    /// and aligned with its facing page, its text boxes with it (MangaPageTransform).
+    var alignment: [MangaPageTransform?] = []
+    @State private var images: [Int: UIImage] = [:]
+    @State private var texts: [Int: MangaPageText] = [:]
+    @State private var loaded = false
     var body: some View {
         Group {
-            if let image {
-                // Pinch or double-tap to zoom; while zoomed one finger pans, unzoomed it turns pages.
-                ZoomableContainer(active: active, onTap: { point, size in tapped(at: point, in: size, image: image) }) {
+            if !images.isEmpty {
+                // Pinch or double-tap to zoom (two pages zoom together); while zoomed one finger
+                // pans, unzoomed it turns pages. Text boxes: a tap opens one while their outlines
+                // show, a long press always, on either page.
+                ZoomableContainer(active: active, onTap: { point, size in tapped(at: point, in: size) },
+                                  onLongPress: { point, size in pressed(at: point, in: size) }) {
                     GeometryReader { geometry in
-                        let frame = fit(image.size, in: geometry.size)
+                        let layout = frames(in: geometry.size)
                         ZStack {
-                            Image(uiImage: image).resizable().frame(width: frame.width, height: frame.height)
-                                .position(x: frame.midX, y: frame.midY)
-                            if showText, let regions = text?.regions {
-                                ForEach(Array(regions.enumerated()), id: \.offset) { _, region in
-                                    let box = rect(region, in: frame)
-                                    Rectangle().fill(PudgeTheme.accent.opacity(0.12))
-                                        .overlay(Rectangle().stroke(PudgeTheme.accent.opacity(0.7), lineWidth: 1))
-                                        .frame(width: box.width, height: box.height)
-                                        .position(x: box.midX, y: box.midY)
-                                        .accessibilityElement()
-                                        .accessibilityLabel(region.text)
-                                        .accessibilityAddTraits(.isButton)
-                                        .accessibilityAction { onRegion(region.text) }
+                            ForEach(Array(pages.enumerated()), id: \.offset) { slot, index in
+                                if let image = images[index], slot < layout.count {
+                                    let frame = layout[slot]
+                                    let aligned = pageTransform(slot)
+                                    Image(uiImage: image).resizable().frame(width: frame.width, height: frame.height)
+                                        .modifier(MangaAlignedPage(transform: aligned, size: frame.size))
+                                        .position(x: frame.midX, y: frame.midY)
+                                    // Hidden outlines: the boxes stay (clear) for VoiceOver; a long press opens them.
+                                    if let regions = texts[index]?.regions {
+                                        ForEach(Array(regions.enumerated()), id: \.offset) { _, region in
+                                            let box = rect(region, in: frame)
+                                            // On an aligned page the box turns and moves with it.
+                                            let centre = aligned?.screenPoint(CGPoint(x: box.midX, y: box.midY), in: frame)
+                                                ?? CGPoint(x: box.midX, y: box.midY)
+                                            Rectangle().fill(showText ? PudgeTheme.accent.opacity(0.12) : Color.clear)
+                                                .overlay(Rectangle().stroke(showText ? PudgeTheme.accent.opacity(0.7) : Color.clear, lineWidth: 1))
+                                                .frame(width: box.width, height: box.height)
+                                                .scaleEffect(CGFloat(aligned?.safeScale ?? 1))
+                                                .rotationEffect(.degrees(aligned?.angle ?? 0))
+                                                .position(x: centre.x, y: centre.y)
+                                                .accessibilityElement()
+                                                .accessibilityLabel(region.text)
+                                                .accessibilityAddTraits(.isButton)
+                                                .accessibilityAction { onRegion(region.text) }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            } else if failed {
+            } else if loaded {
                 ContentUnavailableView("Page unavailable", systemImage: "wifi.slash", description: Text("Download the volume to read it without the Mac."))
                     .contentShape(Rectangle()).onTapGesture { onBackground() }
             } else {
@@ -990,24 +1545,64 @@ struct MangaPageView: View {
                     .contentShape(Rectangle()).onTapGesture { onBackground() }
             }
         }
-        .task(id: page) {
-            image = await media.image("manga/\(book)/pages/\(page)")
-            failed = image == nil
-            text = await media.mangaText(book, page: page)
+        .task(id: pages) {
+            // The pictures first (shown as soon as one is here), then their text boxes.
+            for index in pages where images[index] == nil {
+                if let image = await media.image("manga/\(book)/pages/\(index)") {
+                    images[index] = image
+                    onImage(index, image.size)
+                }
+            }
+            loaded = true
+            for index in pages where texts[index] == nil {
+                texts[index] = await media.mangaText(book, page: index)
+            }
         }
     }
 
-    /// The smallest text box under the finger opens; elsewhere the tap toggles the bars.
-    private func tapped(at point: CGPoint, in size: CGSize, image: UIImage) {
-        let frame = fit(image.size, in: size)
-        if showText, let regions = text?.regions {
-            let hits = regions.filter { rect($0, in: frame).insetBy(dx: -4, dy: -4).contains(point) }
-            if let region = hits.min(by: { $0.width * $0.height < $1.width * $1.height }) {
-                onRegion(region.text)
-                return
-            }
+    /// Where each page goes: one page fits the view; two meet in the middle (MangaSpreads.frames).
+    /// A page whose picture did not come takes its half as a blank.
+    private func frames(in size: CGSize) -> [CGRect] {
+        // An aligned pair is drawn at one height (its transforms are made for that).
+        let sameHeight = pages.count == 2 && alignment.contains { $0 != nil }
+        return MangaSpreads.frames(pages.map { images[$0]?.size ?? .zero }, in: size, sameHeight: sameHeight)
+    }
+
+    /// The transform of the page in `slot` (left to right), nil: drawn as it is.
+    private func pageTransform(_ slot: Int) -> MangaPageTransform? {
+        slot < alignment.count ? alignment[slot] : nil
+    }
+
+    /// With the outlines shown, the text box under the finger opens; otherwise (and elsewhere)
+    /// the tap is a tap on the page (bars).
+    private func tapped(at point: CGPoint, in size: CGSize) {
+        if showText, let region = region(at: point, in: size) {
+            onRegion(region.text)
+            return
         }
         onBackground()
+    }
+
+    /// A long press opens the text box under the finger, outlines shown or hidden.
+    private func pressed(at point: CGPoint, in size: CGSize) {
+        guard let region = region(at: point, in: size) else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        onRegion(region.text)
+    }
+
+    /// The smallest text box under the point (a few points of slack), on whichever page it is.
+    private func region(at point: CGPoint, in size: CGSize) -> MangaRegion? {
+        let layout = frames(in: size)
+        var hits: [MangaRegion] = []
+        for (slot, index) in pages.enumerated() where images[index] != nil && slot < layout.count {
+            let frame = layout[slot]
+            // An aligned page: the point on the page as drawn (and nothing past its gutter).
+            let aligned = pageTransform(slot)
+            if let aligned, !aligned.keeps(point, in: frame) { continue }
+            let onPage = aligned?.pagePoint(point, in: frame) ?? point
+            hits += (texts[index]?.regions ?? []).filter { rect($0, in: frame).insetBy(dx: -4, dy: -4).contains(onPage) }
+        }
+        return hits.min(by: { $0.width * $0.height < $1.width * $1.height })
     }
 
     private func rect(_ region: MangaRegion, in frame: CGRect) -> CGRect {
@@ -1016,12 +1611,57 @@ struct MangaPageView: View {
         let centerY = frame.minY + (region.y + region.height / 2) * frame.height
         return CGRect(x: centerX - width / 2, y: centerY - height / 2, width: width, height: height)
     }
+}
 
-    private func fit(_ size: CGSize, in box: CGSize) -> CGRect {
-        guard size.width > 0, size.height > 0 else { return CGRect(origin: .zero, size: box) }
-        let scale = min(box.width / size.width, box.height / size.height)
-        let width = size.width * scale, height = size.height * scale
-        return CGRect(x: (box.width - width) / 2, y: (box.height - height) / 2, width: width, height: height)
+/// A manga page drawn with its alignment (MangaPageTransform): turned and scaled around its
+/// centre and moved, cut off at the gutter line, its backing painted behind it.
+struct MangaAlignedPage: ViewModifier {
+    let transform: MangaPageTransform?
+    let size: CGSize
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let transform {
+            content
+                .scaleEffect(CGFloat(transform.safeScale))
+                .rotationEffect(.degrees(transform.angle))
+                .offset(x: CGFloat(transform.dx) * size.width, y: CGFloat(transform.dy) * size.height)
+                .clipShape(MangaGutterClip(gutter: transform.gutter))
+                .background(alignment: .topLeading) { MangaPageBacking(transform: transform, size: size) }
+        } else {
+            content
+        }
+    }
+}
+
+/// Everything on the page's side of the gutter line (all of it for a page shown alone).
+struct MangaGutterClip: Shape {
+    let gutter: String?
+
+    func path(in rect: CGRect) -> Path {
+        let room = max(rect.width, rect.height)
+        var area = rect.insetBy(dx: -room, dy: -room)
+        if gutter == "right" {
+            area.size.width = rect.maxX - area.minX
+        } else if gutter == "left" {
+            area = CGRect(x: rect.minX, y: area.minY, width: area.maxX - rect.minX, height: area.height)
+        }
+        return Path(area)
+    }
+}
+
+/// The band along the gutter a straightened page may leave open, in the page's own colour there.
+struct MangaPageBacking: View {
+    let transform: MangaPageTransform
+    let size: CGSize
+
+    var body: some View {
+        if let box = transform.backingRect(in: size) {
+            let rgb = transform.fillComponents
+            Rectangle().fill(Color(red: rgb[0], green: rgb[1], blue: rgb[2]))
+                .frame(width: box.width, height: box.height)
+                .offset(x: box.minX, y: box.minY)
+        }
     }
 }
 
@@ -1035,11 +1675,13 @@ struct ZoomableContainer<Content: View>: UIViewRepresentable {
     var active: Bool
     /// A single tap, in the content's unzoomed coordinates, with the content's size.
     var onTap: ((CGPoint, CGSize) -> Void)?
+    /// A long press (0.4 s, the finger still), the same way; never while zooming or panning.
+    var onLongPress: ((CGPoint, CGSize) -> Void)?
     let content: Content
 
     init(maxScale: CGFloat = 5, active: Bool = true, onTap: ((CGPoint, CGSize) -> Void)? = nil,
-         @ViewBuilder content: () -> Content) {
-        self.maxScale = maxScale; self.active = active; self.onTap = onTap; self.content = content()
+         onLongPress: ((CGPoint, CGSize) -> Void)? = nil, @ViewBuilder content: () -> Content) {
+        self.maxScale = maxScale; self.active = active; self.onTap = onTap; self.onLongPress = onLongPress; self.content = content()
     }
 
     func makeCoordinator() -> Coordinator {
@@ -1066,24 +1708,33 @@ struct ZoomableContainer<Content: View>: UIViewRepresentable {
         double.numberOfTapsRequired = 2
         let single = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
         single.require(toFail: double)
+        // A finger that moves first pans (allowableMovement), two fingers pinch: neither is a long press.
+        let long = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.longPressed(_:)))
+        long.minimumPressDuration = 0.4
+        long.allowableMovement = 10
+        long.delegate = context.coordinator
         scroll.addGestureRecognizer(double)
         scroll.addGestureRecognizer(single)
+        scroll.addGestureRecognizer(long)
         context.coordinator.scroll = scroll
         context.coordinator.onTap = onTap
+        context.coordinator.onLongPress = onLongPress
         return scroll
     }
 
     func updateUIView(_ scroll: ZoomScrollView, context: Context) {
         context.coordinator.hosting.rootView = content
         context.coordinator.onTap = onTap
+        context.coordinator.onLongPress = onLongPress
         scroll.maximumZoomScale = maxScale
         if !active && scroll.zoomScale > 1.001 { scroll.setZoomScale(1, animated: false) }
     }
 
-    final class Coordinator: NSObject, UIScrollViewDelegate {
+    final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         let hosting: UIHostingController<Content>
         weak var scroll: ZoomScrollView?
         var onTap: ((CGPoint, CGSize) -> Void)?
+        var onLongPress: ((CGPoint, CGSize) -> Void)?
 
         init(hosting: UIHostingController<Content>) { self.hosting = hosting }
 
@@ -1092,6 +1743,18 @@ struct ZoomableContainer<Content: View>: UIViewRepresentable {
         @objc func tapped(_ recognizer: UITapGestureRecognizer) {
             guard let view = hosting.view else { return }
             onTap?(recognizer.location(in: view), view.bounds.size)
+        }
+
+        @objc func longPressed(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began, let view = hosting.view else { return }
+            onLongPress?(recognizer.location(in: view), view.bounds.size)
+        }
+
+        /// The long press only where one is wanted, and never during a zoom, pan or fling.
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard recognizer is UILongPressGestureRecognizer else { return true }
+            guard onLongPress != nil, let scroll else { return false }
+            return !(scroll.isZooming || scroll.isDragging || scroll.isDecelerating)
         }
 
         @objc func doubleTapped(_ recognizer: UITapGestureRecognizer) {
@@ -1116,5 +1779,45 @@ final class ZoomScrollView: UIScrollView {
         guard let zoomed, abs(zoomScale - 1) < 0.001, zoomed.bounds.size != bounds.size || contentSize != bounds.size else { return }
         zoomed.frame = CGRect(origin: .zero, size: bounds.size)
         contentSize = bounds.size
+    }
+}
+
+
+/// Tells when the reader starts scrolling by hand (`began`) and how far the scroll moved when the
+/// finger lifts (`ended`). iOS 18 reads the scroll view's own phases; iOS 17 (older iPads stop
+/// there) has no scroll phases, so a drag gesture alongside the scroll view stands in.
+private struct ManualScrollWatch: ViewModifier {
+    let began: () -> Void
+    let ended: (CGFloat) -> Void
+    @State private var start: CGFloat?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { old, phase, context in
+                let offset = context.geometry.contentOffset.y
+                if phase == .interacting {
+                    start = offset
+                    began()
+                } else if old == .interacting {
+                    ended(abs(offset - (start ?? offset)))
+                    start = nil
+                }
+            }
+        } else {
+            content.simultaneousGesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { _ in
+                        if start == nil {
+                            start = 0
+                            began()
+                        }
+                    }
+                    .onEnded { value in
+                        ended(abs(value.translation.height))
+                        start = nil
+                    }
+            )
+        }
     }
 }

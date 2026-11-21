@@ -40,7 +40,28 @@ uv export --locked --extra sync --no-dev --no-emit-project --format requirements
 STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"
 rm -rf "$PROJECT_DIR/dist/release"
 mkdir -p "$STAGE" "$STAGE/.github"
-cp -R pudge tests "$STAGE/"
+if [[ "$(git rev-parse --show-toplevel 2>/dev/null || true)" == "$(pwd -P)" ]]; then
+  # A checkout: the release holds the files git tracks (a developer folder's untracked
+  # leftovers stay out) and the two this build generated.
+  python - "$STAGE" <<'PY'
+import os, shutil, subprocess, sys
+from pathlib import Path
+
+stage = Path(sys.argv[1])
+listed = subprocess.run(["git", "ls-files", "-z", "--", "pudge", "tests"], check=True, capture_output=True).stdout
+names = [name for name in listed.decode("utf-8", "surrogateescape").split("\0") if name]
+names += ["pudge/build-info.json", "pudge/assets/jimaku-trial-key"]
+for name in dict.fromkeys(names):
+    source = Path(name)
+    if not os.path.lexists(source) or "__pycache__" in source.parts:
+        continue
+    target = stage / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target, follow_symlinks=False)
+PY
+else
+  cp -R pudge tests "$STAGE/"
+fi
 cp -R .github/workflows .github/release "$STAGE/.github/"
 cp install.sh README.md config.example.toml pyproject.toml build_release.sh Makefile \
   LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md uv.lock "$STAGE/"

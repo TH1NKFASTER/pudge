@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pudge</title>
+<style>html,body{margin:0;height:100%;background:#0b1320}</style>
+</head>
+<body>
+<script>
+// Low RAM mode: the hidden window shows this page instead of the app, so WebKit lets go of
+// the app page's memory. Python loads index.html again when the window is reopened; should
+// that be missed, this page brings it back itself once it becomes visible.
+(function(){
+  let timer=null;
+  function back(){if(document.hidden){clearTimeout(timer);timer=null;return;}if(timer)return;timer=setTimeout(function(){timer=null;if(!document.hidden)location.replace('index.html');},1500);}
+  document.addEventListener('visibilitychange',back);
+  back();
+})();
+</script>
+</body>
+</html>

@@ -48,7 +48,7 @@ def test_downloads_api_only_marks_successful_backend_refresh_as_observed(monkeyp
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for UI runtime tests")
-def test_live_ui_statuses_and_rates_in_three_screens() -> None:
+def test_live_ui_statuses_and_rates_on_home_and_in_the_download_center() -> None:
     script = r"""
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
@@ -89,19 +89,9 @@ sandbox.torrentEta=value=>`${value} sec`;
 sandbox.torrentElapsed=()=>'-';
 sandbox.animeFromId=()=>null;
 sandbox.torrentToggleUiEnabled=()=>!!sandbox.ui.state.settings.torrents_enabled;
-sandbox.ui={lang:'en',page:'downloads',torrentToggleDesired:null,downloadCenterFilter:'all',state:{settings:{torrents_enabled:true},downloads:[{name:'Queued',state:'queuedDL',progress:.2,download_speed:999,upload_speed:888}],subtitle_jobs:[],playlists:[],release_upgrades:[],subtitle_history:[]},torrentTraffic:{enabled:true,stale:true,updated_at:fixed,download_speed:999},downloadCenter:null};
+sandbox.ui={lang:'en',page:'home',torrentToggleDesired:null,downloadCenterFilter:'all',state:{settings:{torrents_enabled:true},downloads:[{name:'Queued',state:'queuedDL',progress:.2,download_speed:999,upload_speed:888}],subtitle_jobs:[],playlists:[],release_upgrades:[],subtitle_history:[]},torrentTraffic:{enabled:true,stale:true,updated_at:fixed,download_speed:999},downloadCenter:null};
 const slice=(start,end)=>html.slice(html.indexOf(start),html.indexOf(end,html.indexOf(start)));
-vm.runInContext(slice('function renderDownloads(){','function torrentBytes('),sandbox);
-sandbox.renderDownloads();
-assert.match(elements.downloadsContent.innerHTML,/Waiting: —/);
-assert.match(elements.downloadsContent.innerHTML,/↓ —/);
-assert.doesNotMatch(elements.downloadsContent.innerHTML,/999 B\/s/);
-assert.match(elements.downloadsContent.innerHTML,/Queued<\/td>/);
 sandbox.ui.torrentTraffic={enabled:true,stale:false,updated_at:fixed,waiting:1,download_speed:42,upload_speed:7};
-sandbox.renderDownloads();
-assert.match(elements.downloadsContent.innerHTML,/Waiting: 1/);
-assert.match(elements.downloadsContent.innerHTML,/↓ 42 B\/s/);
-assert.doesNotMatch(elements.downloadsContent.innerHTML,/999 B\/s/);
 // Same state classifier controls Home's compact label and Download Center's filter.
 sandbox.torrentEta=sec=>`${sec}s`;
 vm.runInContext(home,sandbox);
@@ -122,18 +112,22 @@ assert.doesNotMatch(card,/Downloading: 40%/);
 sandbox.ui.torrentTraffic={enabled:false,stale:true,transition:'unconfirmed',updated_at:null};
 sandbox.ui.state.settings.torrents_enabled=false;
 card=sandbox.downloadAvailableHomeCard(cardData);
-assert.match(card,/Shutdown not confirmed/);
+// A title's card shows its download paused; the client's unconfirmed stop is the Torrents button's.
+assert.doesNotMatch(card,/Shutdown not confirmed/);
 sandbox.ui.state.settings.torrents_enabled=true;
 sandbox.ui.torrentTraffic={enabled:true,stale:false,updated_at:fixed};
 
 sandbox.ui.state.settings.torrents_enabled=false;
 sandbox.ui.torrentTraffic={enabled:false,stale:true,transition:'unconfirmed',updated_at:null};
-assert.match(sandbox.compactDownloadStatus({state:'downloading',progress:.4}),/Shutdown not confirmed/);
+assert.equal(sandbox.compactDownloadStatus({state:'downloading',progress:.4}),'Paused · 40%');
 sandbox.ui.state.settings.torrents_enabled=true;
 sandbox.ui.torrentTraffic={enabled:true,stale:false,updated_at:fixed,download_speed:42};
-vm.runInContext(slice('function torrentPaused(state){','function torrentFilterMatch('),sandbox);
+vm.runInContext(slice('function torrentRowRate(download,upload,fresh){','function torrentFilterMatch('),sandbox);
 vm.runInContext(slice('function torrentFilterMatch(download,filter){','function renderDownloadCenter('),sandbox);
 vm.runInContext(slice('function renderDownloadCenter(result=ui.downloadCenter){','function stopDownloadCenterPoll('),sandbox);
+// The rows of the downloads window (tests/test_feature_download_table.py).
+sandbox.document.addEventListener=()=>{};
+vm.runInContext(fs.readFileSync('pudge/web/torrent_table.js','utf8'),sandbox);
 const row={hash:'x',name:'Episode',state:'stalledDL',progress:.4,download_speed:321,upload_speed:100,total_bytes:1000,downloaded_bytes:400,seeders:0,peers:0};
 assert.equal(sandbox.torrentFilterMatch(row,'active'),false);
 assert.equal(sandbox.torrentFilterMatch(row,'paused'),false);

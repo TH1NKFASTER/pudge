@@ -21,10 +21,43 @@ from .ocr import _vision_recognize
 from .i18n import err
 
 
+# PyObjC resolves Quartz functions lazily on first use, and two threads resolving the same
+# name at once make the second one fail with KeyError (not AttributeError, so a getattr
+# default does not catch it). At start-up the window's first state and a background check
+# did exactly that and the window showed an interface error.
+_QUARTZ_LOOKUP_LOCK = threading.Lock()
+
+
+def _quartz_function(quartz: Any, name: str) -> Any:
+    with _QUARTZ_LOOKUP_LOCK:
+        for _attempt in range(2):
+            try:
+                return getattr(quartz, name, None)
+            except Exception:  # noqa: BLE001 - a lookup race or a missing symbol: try once more, then none
+                continue
+    return None
+
+
 class VisualNovelError(RuntimeError):
     def __init__(self, message: str, *, code: str = "capture_error") -> None:
         super().__init__(message)
         self.code = str(code or "capture_error")
+
+
+_CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+
+
+def _core_graphics_preflight() -> bool | None:
+    """CGPreflightScreenCaptureAccess() through ctypes (no Quartz import); None when unavailable."""
+    try:
+        import ctypes
+
+        function = ctypes.CDLL(_CORE_GRAPHICS).CGPreflightScreenCaptureAccess
+        function.argtypes = []
+        function.restype = ctypes.c_bool
+        return bool(function())
+    except (OSError, AttributeError):
+        return None
 
 
 def _normalized_text(value: str) -> str:
@@ -131,11 +164,17 @@ class VisualNovelService:
 
         if platform.system() != "Darwin":
             return None
+        if "Quartz" not in sys.modules:
+            # Settings ask this on every state build: importing the Quartz bridge for it kept
+            # tens of MB loaded in every window. CoreGraphics itself is loaded by AppKit.
+            answer = _core_graphics_preflight()
+            if answer is not None:
+                return answer
         try:
             import Quartz  # type: ignore
         except ImportError:
             return None
-        preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        preflight = _quartz_function(Quartz, "CGPreflightScreenCaptureAccess")
         if preflight is None:
             return None
         try:

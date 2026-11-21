@@ -54,7 +54,6 @@ def test_each_differing_device_has_its_own_named_candidate_and_one_choice_resolv
     choices = service.phone_position_choices(progress)
     # The iPad's newest candidate (received last) first, then the iPhone's; one per device.
     assert [(c["device_name"], c["position"]) for c in choices] == [("Maksim iPad", 30.0), ("Phone", 10.0)]
-    assert service.phone_position_choice(progress) == choices[0]
     view = service.progress_view(asset)
     assert view["deviceNames"] == {phone: "Phone", pad: "Maksim iPad"}
     service.resolve_progress(asset, progress["revision"], choices[1]["checkpoint_id"])
@@ -190,6 +189,9 @@ def test_a_place_read_earlier_and_sent_late_never_takes_a_newer_one_back(service
     calls = []
     with service.db.connect() as conn:
         conn.execute("INSERT INTO ln_books VALUES(3,'本',1,4,0.5,0,'',2000)")  # read on the Mac at t=2000
+        # The place's own time (light_novels adds this column; updated_at moves on other writes too).
+        conn.execute("ALTER TABLE ln_books ADD COLUMN position_updated_at REAL NOT NULL DEFAULT 0")
+        conn.execute("UPDATE ln_books SET position_updated_at=2000")
     service.api = SimpleNamespace(
         light_novel_position=lambda book, chapter, offset: calls.append((book, chapter, offset)),
         manga_set_position=lambda book, page: calls.append(("manga", book, page)),
@@ -205,7 +207,8 @@ def test_a_place_read_earlier_and_sent_late_never_takes_a_newer_one_back(service
     assert calls == [(3, 6, 0.1), (3, 1, 0.0), (3, 1, 0.2)]
     with service.db.connect() as conn:
         conn.execute(
-            "INSERT INTO manga_books(id,path,title,page_count,position,created_at,updated_at) VALUES(4,'/v.cbz','M',90,40,0,2000)"
+            "INSERT INTO manga_books(id,path,title,page_count,position,position_updated_at,created_at,updated_at) "
+            "VALUES(4,'/v.cbz','M',90,40,2000,0,2000)"
         )
     assert media.manga_position(4, {"page": 10, "read": True, "observedAt": 1000})["kept"] == "newer"
     media.manga_position(4, {"page": 50, "read": True, "observedAt": 1000})

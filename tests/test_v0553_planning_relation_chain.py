@@ -6,7 +6,6 @@ from css_support import css_rules
 
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
-from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
 from test_v0552_planning_relations import DIAGRAM, planning_relations_state
 
@@ -104,95 +103,6 @@ def test_planning_relation_payload_has_two_horizontal_steps(tmp_path: Path) -> N
         [120, 121],
     ]
     assert graph["prequel_levels"][0][0]["watched"] is True
-
-
-def test_anilist_library_caches_nested_relation_metadata(monkeypatch) -> None:
-    client = AniListClient("https://example.invalid", access_token="x")
-    monkeypatch.setattr(client, "viewer", lambda: {"id": 7, "name": "tester"})
-
-    def node(media_id: int, title: str, year: int, *, status: str = "", children=None):
-        return {
-            "id": media_id,
-            "type": "ANIME",
-            "title": {"romaji": title},
-            "episodes": 12,
-            "format": "TV",
-            "seasonYear": year,
-            "status": "FINISHED",
-            "siteUrl": f"https://anilist.co/anime/{media_id}",
-            "coverImage": {"large": f"https://img.example/{media_id}.jpg"},
-            "mediaListEntry": {"status": status, "progress": 12 if status == "COMPLETED" else 0}
-            if status
-            else None,
-            "relations": {"edges": children or []},
-        }
-
-    monkeypatch.setattr(
-        client,
-        "_post",
-        lambda query, variables=None: {
-            "MediaListCollection": {
-                "lists": [
-                    {
-                        "status": "PLANNING",
-                        "entries": [
-                            {
-                                "progress": 0,
-                                "status": "PLANNING",
-                                "media": {
-                                    "id": 100,
-                                    "title": {"romaji": "Current"},
-                                    "synonyms": [],
-                                    "episodes": 12,
-                                    "format": "TV",
-                                    "seasonYear": 2026,
-                                    "status": "NOT_YET_RELEASED",
-                                    "siteUrl": "https://anilist.co/anime/100",
-                                    "coverImage": {},
-                                    "relations": {
-                                        "edges": [
-                                            {
-                                                "relationType": "PREQUEL",
-                                                "node": node(
-                                                    90,
-                                                    "Previous season",
-                                                    2025,
-                                                    status="COMPLETED",
-                                                    children=[
-                                                        {
-                                                            "relationType": "PREQUEL",
-                                                            "node": node(80, "Older season", 2024),
-                                                        }
-                                                    ],
-                                                ),
-                                            },
-                                            {
-                                                "relationType": "SEQUEL",
-                                                "node": node(110, "Next season", 2027),
-                                            },
-                                        ]
-                                    },
-                                },
-                            }
-                        ],
-                    }
-                ]
-            }
-        },
-    )
-    try:
-        items = client.library()
-    finally:
-        client.close()
-
-    current = items[0]
-    assert current.season_year == 2026
-    prequel = current.relations[0]
-    assert prequel["cover_url"].endswith("/90.jpg")
-    assert prequel["episodes"] == 12
-    assert prequel["list_status"] == "COMPLETED"
-    assert prequel["watched"] is True
-    assert prequel["relations"][0]["media_id"] == 80
 
 
 def test_relation_nodes_show_covers_and_watched_state(tmp_path: Path, page) -> None:

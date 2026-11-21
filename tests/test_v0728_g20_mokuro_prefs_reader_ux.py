@@ -9,7 +9,6 @@ from PIL import Image
 
 from pudge.database import Database
 from pudge.manga import MangaService
-from pudge.manga_mokuro import MokuroImportError
 from tests.i18n_support import en, has_text, ru
 from tests.t71g06_support import STUDY, column, reader
 
@@ -62,33 +61,6 @@ def test_manga_state_exposes_persisted_reader_preferences(
     assert state["reader_preferences"]["configured"] is True
     assert state["reader_preferences"]["statusHighlight"] is True
     assert state["ocr_available"] is False
-
-
-def test_mokuro_direct_selection_resolves_only_unambiguous_adjacent_archive(tmp_path: Path) -> None:
-    archive = tmp_path / "book.cbz"
-    make_archive(archive)
-    sidecar = tmp_path / "book.mokuro"
-    sidecar.write_text(json.dumps({"pages": []}), encoding="utf-8")
-    assert MangaService.archive_for_mokuro(sidecar) == archive.resolve()
-
-    second = tmp_path / "book.zip"
-    make_archive(second)
-    with pytest.raises(MokuroImportError, match="more than one archive"):
-        MangaService.archive_for_mokuro(sidecar)
-
-
-def test_mokuro_archive_dot_sidecar_and_known_subdirectory(tmp_path: Path) -> None:
-    archive = tmp_path / "book.cbz"
-    make_archive(archive)
-    explicit = tmp_path / "book.cbz.mokuro"
-    explicit.write_text("{}", encoding="utf-8")
-    assert MangaService.archive_for_mokuro(explicit) == archive.resolve()
-
-    explicit.unlink()
-    nested = tmp_path / "mokuro" / "book.mokuro"
-    nested.parent.mkdir()
-    nested.write_text("{}", encoding="utf-8")
-    assert MangaService.archive_for_mokuro(nested) == archive.resolve()
 
 
 def test_not_ready_episode_status_names_the_episode(page) -> None:
@@ -248,52 +220,3 @@ def _volume(folder: Path, name: str, *, sidecar_pages: tuple[str, ...] | None = 
         ]
         (folder / f"{name}.mokuro").write_text(json.dumps({"pages": pages}), encoding="utf-8")
     return archive
-
-
-def test_opening_manga_files_imports_mokuro_or_starts_ocr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from tests.test_web_app import make_api
-
-    api = make_api(tmp_path / "app")
-    folder = tmp_path / "picked"
-    folder.mkdir()
-    _volume(folder, "chosen-sidecar", sidecar_pages=("01.png", "02.png"))
-    plain = _volume(folder, "plain")
-    nearby = _volume(folder, "nearby", sidecar_pages=("01.png", "02.png"))
-    _volume(folder, "partial", sidecar_pages=("01.png",))
-    (folder / "notes.txt").write_text("x", encoding="utf-8")
-    dialogs: list[dict] = []
-
-    class Window:
-        def create_file_dialog(self, *_args, **kwargs):
-            dialogs.append(kwargs)
-            return [
-                str(folder / "chosen-sidecar.mokuro"),
-                str(plain),
-                str(nearby),
-                str(folder / "partial.mokuro"),
-                str(folder / "notes.txt"),
-            ]
-
-    api.window = Window()
-    started: list[int] = []
-    monkeypatch.setattr(api, "_manga_ocr_backend_available", lambda **_: True)
-    monkeypatch.setattr(api, "start_manga_ocr_book", lambda book_id, *a, **k: started.append(int(book_id)))
-
-    result = api.choose_manga_file()
-
-    assert dialogs[0]["allow_multiple"] is True and "*.cbz;*.zip;*.mokuro" in dialogs[0]["file_types"][0]
-    ids = {Path(book["path"]).stem: int(book["id"]) for book in result["books"]}
-    assert set(ids) == {"chosen-sidecar", "plain", "nearby", "partial"}
-    texts = lambda name: [
-        row["text"] for row in api.manga.text_regions(ids[name], 1, cached_only=True)["regions"]
-    ]  # noqa: E731
-    # A chosen .mokuro opens its volume with that OCR; a sidecar next to a chosen volume is used too.
-    assert texts("chosen-sidecar") == ["chosen-sidecar-02.png"] and texts("nearby") == ["nearby-02.png"]
-    # Only a volume without Mokuro OCR is sent to the OCR engine.
-    assert started == [ids["plain"]]
-    # A chosen sidecar must cover the whole volume; an unknown file is refused.
-    assert any(error.startswith("partial.cbz:") for error in result["errors"])
-    assert texts("partial") == []
-    assert any("notes.txt" in error for error in result["errors"])

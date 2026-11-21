@@ -105,14 +105,14 @@ def test_restore_keeps_the_previous_library_and_can_be_undone(tmp_path: Path) ->
         restore_database_snapshot(snapshot_path=tmp_path / "elsewhere.backup", database_path=live)
 
 
-def test_daily_copy_once_a_day_seven_kept_each_a_complete_database(tmp_path: Path) -> None:
+def test_daily_copy_once_a_day_three_kept_each_a_complete_database(tmp_path: Path) -> None:
     database_path = _live(tmp_path, "today")
     start = time.mktime((2026, 10, 1, 12, 0, 0, 0, 0, -1))
     made = [make_daily_snapshot(database_path, now=start + day * 86400) for day in range(9)]
     assert all(made)
     assert make_daily_snapshot(database_path, now=start + 8 * 86400 + 3600) is None
     copies = list_database_snapshots(database_path)
-    assert len(copies) == 7 and copies[0]["path"] == str(made[-1])
+    assert len(copies) == 3 and copies[0]["path"] == str(made[-1])
     assert {copy["kind"] for copy in copies} == {"daily"}
     newest = Path(copies[0]["path"])
     with closing(sqlite3.connect(newest)) as conn:
@@ -361,6 +361,8 @@ def test_imported_manga_lives_beside_the_library_and_old_imports_move(tmp_path: 
     database_path.parent.mkdir()
     cache = tmp_path / "Caches"
     service = MangaService(Database(database_path), cache_dir=cache)
+    # Part of a folder is packed into a copy (a whole folder is read in place).
+    _png(tmp_path / "drop" / "002.png")
     book = service.import_images([_png(tmp_path / "drop" / "001.png")], title="Dropped")
     stored = Path(book["path"])
     assert stored.parent == (database_path.parent / "manga-imports").resolve() and stored.is_file()

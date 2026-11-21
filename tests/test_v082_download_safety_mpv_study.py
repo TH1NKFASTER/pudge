@@ -181,7 +181,8 @@ def test_aria2_network_and_seeding_options_are_real_launch_options(
     )
     monkeypatch.setattr(client, "_interface_names", lambda: {"lo0", "utun9"})
     options = client._launch_options()
-    assert "--no-conf=true" in options
+    # Only Pudge's own config (it carries the RPC secret) is read, never ~/.aria2/aria2.conf.
+    assert f"--conf-path={tmp_path / 'aria2' / 'aria2-rpc.conf'}" in options
     assert "--seed-ratio=1.5" in options
     assert "--seed-time=90.0" in options
     assert "--max-upload-limit=512K" in options
@@ -278,7 +279,11 @@ def test_mpv_translates_the_visible_subtitle_in_the_player_with_long_context(tmp
     playback_only, args = translate
     assert playback_only == "false"
     assert args[:4] == ["/app/python", "-m", "pudge.cli", "--subtitle-translate"]
-    options = dict(zip(args[4::2], args[5::2]))
+    # Subtitle text goes as "--option=value" (a line may start with "-").
+    joined = [arg for arg in args[4:] if "=" in arg and arg.startswith("--")]
+    rest = [arg for arg in args[4:] if arg not in joined]
+    options = dict(zip(rest[0::2], rest[1::2]))
+    options.update(arg.split("=", 1) for arg in joined)
     assert options["--subtitle-study-text"] == "セリフ18"
     assert options["--subtitle-study-media-id"] == "77"
     # Context: the previous 16 Japanese lines and the English subtitle.

@@ -94,7 +94,7 @@ def test_manual_hotkeys_work_when_auto_update_is_off(tmp_path: Path) -> None:
     [update] = of(log, "subprocess", "--anilist-action update")
     assert update.endswith("--manual")
     [translate] = of(log, "subprocess", "--subtitle-translate")
-    assert "--subtitle-study-text こんにちは" in translate
+    assert "--subtitle-study-text=こんにちは" in translate
 
 
 SUBTITLE_ENV = {"PUDGE_ANILIST_TRACKING_FILE": ""}

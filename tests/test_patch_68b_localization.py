@@ -242,7 +242,12 @@ def test_mpv_scripts_read_the_catalog_file() -> None:
     # (their texts are tested in the Lua tests; this keeps a new script from hard-coding).
     cli = source_policy.source("pudge/cli.py")
     assert "PUDGE_LOCALE_FILE" in cli
-    for name in ("pudge_anilist.lua", "pudge_skip_segments.lua"):
+    for name in (
+        "pudge_anilist.lua",
+        "pudge_skip_segments.lua",
+        "pudge_jiten_restart.lua",
+        "pudge_line_keys.lua",
+    ):
         lua = source_policy.source(f"pudge/mpv_scripts/{name}")
         assert "PUDGE_LOCALE_FILE" in lua and "tr_key(" in lua
 

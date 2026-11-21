@@ -133,7 +133,6 @@ def test_completed_ready_single_episode_chain_is_grouped_in_release_order(tmp_pa
         "play": str(tmp_path / "Part A.mkv"),
         "rows": ["Part A", "Part B", "Part C"],
     }
-    assert ru("label.watchSequence") == "Порядок просмотра"
 
 
 def test_downloaded_planning_title_waiting_for_subtitles_is_visible_on_home(tmp_path: Path) -> None:

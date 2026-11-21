@@ -5,6 +5,7 @@ from pathlib import Path
 from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryEpisode
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -76,9 +77,8 @@ def test_bleach_sized_old_cold_start_result_is_requeued_once(tmp_path: Path) -> 
     assert manager._requeue_large_cold_open_subtitles() == 1
     repaired = manager.db.episode_by_path(video)
     assert repaired is not None
-    assert repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
-    assert manager.db.get_state("subtitle_large_cold_open_generation", "") == "4"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
+    assert manager.db.get_state("subtitle_large_cold_open_generation", "") == "5"
     assert manager._requeue_large_cold_open_subtitles() == 0
 
 
@@ -133,6 +133,5 @@ def test_reverted_v62_large_cold_start_is_requeued(tmp_path: Path) -> None:
     assert manager._requeue_large_cold_open_subtitles() == 1
     repaired = manager.db.episode_by_path(video)
     assert repaired is not None
-    assert repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
-    assert manager.db.get_state("subtitle_large_cold_open_generation", "") == "4"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
+    assert manager.db.get_state("subtitle_large_cold_open_generation", "") == "5"

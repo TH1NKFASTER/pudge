@@ -5,7 +5,14 @@
   let generation = 0;
   let launch = null;
   let busy = false;
+  // Grades already shown as done but not yet confirmed by Jiten. They go one after
+  // another in the background (submitChain), so the next card can be graded at once.
   let saving = false;
+  let pendingSubmits = 0;
+  let retryWaiting = 0;
+  let submitChain = Promise.resolve();
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 60_000;
   let authorizing = false;
   let revealed = false;
   let activeCardKey = '';
@@ -92,6 +99,8 @@
     gateActions = null;
     busy = false;
     saving = false;
+    pendingSubmits = 0;
+    retryWaiting = 0;
     authorizing = false;
     launch = null;
     revealed = false;
@@ -192,6 +201,14 @@
     return Math.max(0, Math.min(required, confirmed + Math.max(0, Number(optimisticReviewed || 0)) - Math.max(0, Number(optimisticUndoCount || 0))));
   }
 
+  // Grading goes on while earlier grades are being saved; only once every required card
+  // is graded (the episode would open) does the gate wait for the saves to land.
+  function savingBlocks() {
+    if (!saving) return false;
+    const view = currentStatus || {};
+    return displayedCompleted(view) >= Math.max(1, Number(view?.required || 1));
+  }
+
   function progressText(status) {
     if (status?.checked && status?.reason === 'no_due_cards') return PudgeI18n.t('gate.cardsChecked');
     const completed = displayedCompleted(status);
@@ -238,8 +255,9 @@
       // Jiten bracket-ruby can annotate Arabic/full-width digits too (e.g.
       // 2[に]時[じ]). Treat a trailing digit run as a ruby base so the raw
       // brackets never leak into the rendered answer. Keep digits and kanji as
-      // separate alternatives so 第2[に] annotates only 2, not 第2.
-      const match = pending.match(/([0-9０-９]+|[\u3400-\u9fff々]+)$/u);
+      // separate alternatives so 第2[に] annotates only 2, not 第2; digits right before
+      // kanji share one reading with them (１０万[じゅうまん] is not 10 + 万[じゅうまん]).
+      const match = pending.match(/([0-9０-９]+[\u3400-\u9fff々]+|[0-9０-９]+|[\u3400-\u9fff々]+)$/u);
       if (!match || !reading) {
         pending += text.slice(i, close + 1);
         i = close;
@@ -426,11 +444,13 @@
     }
     const stateNote = undoing && card
       ? `<span class="pudge-review-gate-saving">${esc(PudgeI18n.t('gate.undoingPreviousReview'))}</span>`
-      : (saving && card
+      : (savingBlocks() && card
         ? `<span class="pudge-review-gate-saving">${esc(PudgeI18n.t('gate.savingPrevious'))}</span>`
+        : (retryWaiting > 0 && card
+        ? `<span class="pudge-review-gate-saving">${esc(PudgeI18n.t('gate.savingLater'))}</span>`
         : (card && !cardAuthorized
           ? `<span class="pudge-review-gate-saving">${esc(authorizing ? (PudgeI18n.t('gate.authorizingCard')) : (PudgeI18n.t('gate.cardAuthorizationPending')))}</span>`
-          : ''));
+          : '')));
     // WebKit can retain the focus/hover compositor of a button that is removed
     // by innerHTML. Blur it before replacing the card to avoid transient ghosts.
     const focusedBeforeRender = document.activeElement;
@@ -450,21 +470,43 @@
       ${previousReviewHtml()}
       ${body}`;
     root.classList.toggle('answer-shown', revealed);
+    alignAnswerUnderWord(root);
     root.dataset.wordId = card ? String(card.wordId ?? '') : '';
     root.dataset.readingIndex = card ? String(card.readingIndex ?? '') : '';
     if (card) window.PudgeJitenWords?.hydrateReadings?.(card, root, ".pudge-review-gate-back", "pudge-review-gate-reading", () => cardQueue[0]);
     if (card) void window.PudgeJitenWords?.prefetch?.(cardQueue);
     root.querySelectorAll('[data-review-gate-grade]').forEach(button => {
-      button.disabled = saving || !cardAuthorized;
+      button.disabled = savingBlocks() || !cardAuthorized;
       if (undoing) button.disabled = true;
     });
     if (cardKey) {
-      const reason = undoing ? 'undoing_previous' : (saving ? 'saving_previous' : (cardAuthorized ? 'ready' : (authorizing ? 'authorizing' : 'not_authorized')));
+      const reason = undoing ? 'undoing_previous' : (savingBlocks() ? 'saving_previous' : (cardAuthorized ? 'ready' : (authorizing ? 'authorizing' : 'not_authorized')));
       const signature = `${cardKey}|${reason}|${revealed ? 1 : 0}`;
       if (signature !== lastGradeStateSignature) {
         lastGradeStateSignature = signature;
         uiLog('grade_state', {card:cardKey, reason, enabled:reason === 'ready', revealed, queue:cardQueue.length});
       }
+    }
+  }
+
+  // The revealed word stays in the front slot (the card's full width) while its pitch and
+  // reading lines are in the answer below, which scrolls: a classic (always shown) scrollbar
+  // narrowed that one and moved their centre left of the word. They take the scrollbar's
+  // width back on the left (--pudge-gate-gutter), measured again whenever the answer resizes.
+  let answerResizeObserver = null;
+  function alignAnswerUnderWord(root) {
+    answerResizeObserver?.disconnect();
+    answerResizeObserver = null;
+    const back = root?.querySelector?.('.pudge-review-gate-back');
+    if (!back) return;
+    const apply = () => {
+      const gutter = Math.max(0, Number(back.offsetWidth || 0) - Number(back.clientWidth || 0));
+      back.style?.setProperty?.('--pudge-gate-gutter', `${gutter}px`);
+    };
+    apply();
+    if (typeof ResizeObserver === 'function') {
+      answerResizeObserver = new ResizeObserver(apply);
+      answerResizeObserver.observe(back);
     }
   }
 
@@ -497,7 +539,8 @@
       }
     };
     void syncWarm();
-    prefetchTimer = setInterval(() => { if (!document.hidden) void prefetch(false); }, PREFETCH_INTERVAL_MS);
+    // Warms cards for the next episode: only while someone looks at the window.
+    prefetchTimer = setInterval(() => { if (!document.hidden && document.hasFocus?.() !== false) void prefetch(false); }, PREFETCH_INTERVAL_MS);
   }
 
   async function finishAndLaunch() {
@@ -505,6 +548,8 @@
     generation += 1;
     busy = false;
     saving = false;
+    pendingSubmits = 0;
+    retryWaiting = 0;
     authorizing = false;
     launch = null;
     revealed = false;
@@ -613,7 +658,7 @@
     const wordId = Number(root?.dataset.wordId || 0);
     const readingIndex = Number(root?.dataset.readingIndex || 0);
     const submittedKey = `${wordId}:${readingIndex}`;
-    const blockedReason = !launch ? 'no_launch' : (!revealed ? 'answer_hidden' : (saving ? 'saving_previous' : (!authorizedCardKeys.has(submittedKey) ? (authorizing ? 'authorizing' : 'not_authorized') : '')));
+    const blockedReason = !launch ? 'no_launch' : (!revealed ? 'answer_hidden' : (undoing ? 'undoing_previous' : (savingBlocks() ? 'saving_previous' : (!authorizedCardKeys.has(submittedKey) ? (authorizing ? 'authorizing' : 'not_authorized') : ''))));
     if (blockedReason) {
       uiLog('grade_blocked', {card:submittedKey, grade:String(grade || ''), reason:blockedReason, busy, authorizing, saving, revealed, queue:cardQueue.length});
       return;
@@ -639,17 +684,26 @@
       grade: String(grade || ''),
       actions: activeGateActions(),
       attemptId,
+      wordId,
+      readingIndex,
+      launch,
+      generation: myGeneration,
       submitPromise: null,
       result: null,
       settled: false,
       undone: false,
+      state: 'queued',
+      wake: null,
     };
+    historyEntry.submitPromise = new Promise(resolve => { historyEntry.resolveSubmit = resolve; });
 
     // Advance visually before network IO. The remaining cards were already
     // prefetched and authorized by review_gate_begin(); the just-submitted card
-    // is still counted only after the Jiten mutation is confirmed.
+    // is counted by Jiten only after its save is confirmed. Saves run one after
+    // another in the background, so the next card can be graded right away.
     cardQueue.shift();
     authorizedCardKeys.delete(submittedKey);
+    pendingSubmits += 1;
     saving = true;
     optimisticReviewed += 1;
     reviewHistory.push(historyEntry);
@@ -657,61 +711,115 @@
     activeCardKey = '';
     render({loading:false}, {replaceCards:false});
 
-    const submitStartedAt = performance?.now?.() ?? Date.now();
     uiLog('review_optimistic', {
       card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:attemptId,
       displayed_completed:displayedCompleted(currentStatus || {}), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed,
+      saves_pending:pendingSubmits,
     });
-    uiLog('review_submit', {card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:attemptId});
+    submitChain = submitChain.then(() => sendReview(historyEntry)).catch(error => console.debug('review gate save', error));
+  }
+
+  function settleSubmit(entry, result) {
+    entry.result = result;
+    entry.settled = true;
+    entry.resolveSubmit?.(result);
+    entry.resolveSubmit = null;
+  }
+
+  // A grade Pudge's Jiten budget held back (outcome "retry": nothing was sent) waits
+  // and goes again; an undo wakes the wait and the grade is dropped unsent.
+  function waitToRetry(entry, seconds) {
+    const ms = Math.max(RETRY_MIN_MS, Math.min(RETRY_MAX_MS, Number(seconds || 0) * 1000 || RETRY_MIN_MS));
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { entry.wake = null; resolve(); }, ms);
+      entry.wake = () => { clearTimeout(timer); entry.wake = null; resolve(); };
+    });
+  }
+
+  async function sendReview(entry) {
+    const myGeneration = entry.generation;
+    const current = () => myGeneration === generation && Boolean(launch);
+    const submittedKey = entry.cardKey;
+    const grade = entry.grade;
+    const target = entry.launch || {};
+    const submitStartedAt = performance?.now?.() ?? Date.now();
     try {
-      historyEntry.submitPromise = new Promise(resolve => { historyEntry.resolveSubmit = resolve; });
-      const result = await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(
-        launch.content?launch.token:launch.path, wordId, readingIndex, String(grade || 'good'), attemptId,
-      );
-      historyEntry.resolveSubmit?.(result);
-      historyEntry.resolveSubmit = null;
-      historyEntry.result = result;
-      historyEntry.settled = true;
-      if (myGeneration !== generation || !launch) return;
-      optimisticReviewed = Math.max(0, optimisticReviewed - 1);
-      currentStatus = {...(currentStatus || {}), ...(result || {})};
-      uiLog('review_result', {card:submittedKey, grade:String(grade || 'good'), outcome:String(result?.outcome || ''), completed:Number(result?.completed || 0), remaining:Number(result?.remaining || 0), granted:Boolean(result?.granted), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - submitStartedAt)});
-      if (result?.outcome === 'unknown') {
-        uiLog('review_optimistic_rollback', {card:submittedKey, reason:'outcome_unknown', displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
-        window.toast?.(result?.message || (PudgeI18n.t('gate.reviewOutcomeIsUnknownIt')));
-      } else {
-        uiLog('review_optimistic_confirm', {card:submittedKey, displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
-        window.dispatchEvent?.(new CustomEvent('pudge-review-completed',{detail:{backend:'jiten',wordId,readingIndex}}));
-      }
-      if ((result?.granted || !result?.blocking) && !historyEntry.undone) {
-        await finishAndLaunch();
+      for (;;) {
+        if (entry.undone) {
+          if (!entry.cancelled) {
+            entry.cancelled = true;
+            settleSubmit(entry, {ok:false, outcome:'cancelled'});
+            if (current()) optimisticReviewed = Math.max(0, optimisticReviewed - 1);
+          }
+          uiLog('review_cancelled', {card:submittedKey, grade});
+          return;
+        }
+        entry.state = 'sending';
+        uiLog('review_submit', {card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:entry.attemptId});
+        let result;
+        try {
+          result = await (target.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(
+            target.content?target.token:target.path, entry.wordId, entry.readingIndex, String(grade || 'good'), entry.attemptId,
+          );
+        } catch (error) {
+          settleSubmit(entry, {ok:false, outcome:'error', message:String(error?.message || error || '')});
+          entry.error = error;
+          if (!entry.undone) {
+            const historyIndex = reviewHistory.lastIndexOf(entry);
+            if (historyIndex >= 0) reviewHistory.splice(historyIndex, 1);
+          }
+          if (!current()) return;
+          optimisticReviewed = Math.max(0, optimisticReviewed - 1);
+          uiLog('review_optimistic_rollback', {card:submittedKey, reason:'exception', displayed_completed:displayedCompleted(currentStatus || {}), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed, error:String(error?.message || error || '')});
+          uiLog('review_error', {card:submittedKey, grade:String(grade || 'good'), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - submitStartedAt), error:String(error?.message || error || '')});
+          window.toast?.(error?.message || String(error));
+          return;
+        }
+        if (String(result?.outcome || '') === 'retry') {
+          // Not sent (Pudge's Jiten budget): the card is still on offer, the same grade goes again.
+          if (entry.undone) continue;
+          entry.state = 'waiting';
+          if (current()) {
+            retryWaiting += 1;
+            render({}, {replaceCards:false});
+          }
+          uiLog('review_retry', {card:submittedKey, grade, duration_ms:Number(result?.retry_after || 0) * 1000, error:String(result?.message || '')});
+          try { await waitToRetry(entry, result?.retry_after); }
+          finally { if (current()) retryWaiting = Math.max(0, retryWaiting - 1); }
+          continue;
+        }
+        entry.state = 'done';
+        settleSubmit(entry, result);
+        if (!current()) return;
+        optimisticReviewed = Math.max(0, optimisticReviewed - 1);
+        currentStatus = {...(currentStatus || {}), ...(result || {})};
+        uiLog('review_result', {card:submittedKey, grade:String(grade || 'good'), outcome:String(result?.outcome || ''), completed:Number(result?.completed || 0), remaining:Number(result?.remaining || 0), granted:Boolean(result?.granted), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - submitStartedAt)});
+        if (result?.outcome === 'unknown') {
+          uiLog('review_optimistic_rollback', {card:submittedKey, reason:'outcome_unknown', displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
+          window.toast?.(result?.message || (PudgeI18n.t('gate.reviewOutcomeIsUnknownIt')));
+        } else {
+          uiLog('review_optimistic_confirm', {card:submittedKey, displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
+          window.dispatchEvent?.(new CustomEvent('pudge-review-completed',{detail:{backend:'jiten',wordId:entry.wordId,readingIndex:entry.readingIndex}}));
+        }
+        if ((result?.granted || !result?.blocking) && !entry.undone && pendingSubmits <= 1) {
+          // The last save of the quota landed: the episode opens.
+          pendingSubmits = Math.max(0, pendingSubmits - 1);
+          saving = pendingSubmits > 0;
+          entry.counted = true;
+          void finishAndLaunch();  // not awaited: later saves never wait for the player
+        }
         return;
       }
-    } catch (error) {
-      historyEntry.resolveSubmit?.({
-        ok:false,
-        outcome:'error',
-        message:String(error?.message || error || ''),
-      });
-      historyEntry.resolveSubmit = null;
-      historyEntry.settled = true;
-      historyEntry.error = error;
-      if (!historyEntry.undone) {
-        const historyIndex = reviewHistory.lastIndexOf(historyEntry);
-        if (historyIndex >= 0) reviewHistory.splice(historyIndex, 1);
-      }
-      if (myGeneration !== generation || !launch) return;
-      optimisticReviewed = Math.max(0, optimisticReviewed - 1);
-      uiLog('review_optimistic_rollback', {card:submittedKey, reason:'exception', displayed_completed:displayedCompleted(currentStatus || {}), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed, error:String(error?.message || error || '')});
-      uiLog('review_error', {card:submittedKey, grade:String(grade || 'good'), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - submitStartedAt), error:String(error?.message || error || '')});
-      window.toast?.(error?.message || String(error));
     } finally {
-      if (myGeneration === generation) {
-        saving = false;
+      if (!entry.counted && myGeneration === generation) {
+        pendingSubmits = Math.max(0, pendingSubmits - 1);
+        saving = pendingSubmits > 0;
+      }
+      if (current()) {
         render({}, {replaceCards:false});
+        if (!saving && cardQueue.length === 0 && !busy) void loadBatch();  // the save queue never waits for it
       }
     }
-    if (myGeneration === generation && launch && cardQueue.length === 0) await loadBatch();
   }
 
   async function undoLastReview() {
@@ -719,6 +827,13 @@
 
     const entry = reviewHistory.pop();
     entry.undone = true;
+    if (entry.state === 'queued' || entry.state === 'waiting') {
+      // Not on its way to Jiten (waiting in the queue or for the budget): dropped here and now.
+      entry.cancelled = true;
+      settleSubmit(entry, {ok:false, outcome:'cancelled'});
+      optimisticReviewed = Math.max(0, optimisticReviewed - 1);
+    }
+    entry.wake?.();
     undoing = true;
     optimisticUndoCount += 1;
 
@@ -732,6 +847,15 @@
     try {
       const submitted = entry.submitPromise ? await entry.submitPromise : entry.result;
       const outcome = String(submitted?.outcome || '');
+      if (outcome === 'cancelled' || outcome === 'retry') {
+        // Never reached Jiten (still queued or held back by the budget): nothing to undo there.
+        optimisticUndoCount = Math.max(0, optimisticUndoCount - 1);
+        authorizedCardKeys.add(entry.cardKey);
+        undoing = false;
+        render({}, {replaceCards:false});
+        uiLog('review_undo_confirm', {card:entry.cardKey, outcome:'not_sent'});
+        return true;
+      }
       const providerHasReview = Boolean(
         submitted?.ok && (outcome === 'confirmed' || outcome === 'already_counted')
       );
@@ -778,6 +902,8 @@
     launch = {...(nextLaunch || {})};
     busy = false;
     saving = false;
+    pendingSubmits = 0;
+    retryWaiting = 0;
     authorizing = false;
     revealed = false;
     activeCardKey = '';
@@ -834,6 +960,7 @@
     startPrefetchLoop,
     isOpen:() => Boolean(overlay?.classList.contains('open')),
     isAnswerShown:() => revealed,
+    alignAnswerUnderWord,
   };
 
   window.addEventListener('pywebviewready', startPrefetchLoop, {once:true});

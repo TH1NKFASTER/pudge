@@ -4,7 +4,10 @@ import json
 import threading
 import time
 from typing import Any
+from .database import STATE_PREFIX_SQL, state_prefix_bounds
 from .i18n import err
+
+KEY_PREFIX = "download_intent:"
 
 
 class UnconfirmedCandidatesError(ValueError):
@@ -89,7 +92,7 @@ class DownloadIntentStore:
     @staticmethod
     def key(media_id: int, episode: int | None, batch: bool) -> str:
         suffix = "batch" if batch else f"episode:{int(episode or 0)}"
-        return f"download_intent:{int(media_id)}:{suffix}"
+        return f"{KEY_PREFIX}{int(media_id)}:{suffix}"
 
     @staticmethod
     def _candidate(item: Any) -> dict[str, Any]:
@@ -167,6 +170,7 @@ class DownloadIntentStore:
         expected_revision: int | None = None,
         owned_candidates: list[dict[str, Any]] | None = None,
         winner_finalized: bool | None = None,
+        stall_fallback: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         key = self.key(media_id, episode, batch)
 
@@ -212,9 +216,39 @@ class DownloadIntentStore:
                     payload.pop("unconfirmed_since", None)
             if winner_finalized is not None:
                 payload["winner_finalized"] = bool(winner_finalized)
+            if stall_fallback is not None:
+                # The chosen release and the other candidates still worth a try,
+                # for when the chosen one never receives data (aria2 race).
+                if stall_fallback.get("candidates"):
+                    payload["stall_fallback"] = {**stall_fallback, "since": payload["updated_at"]}
+                else:
+                    payload.pop("stall_fallback", None)
             return payload
 
         return self._mutate(key, mutate)
+
+    def drop_stall_fallback(self, media_id: int, episode: int | None, batch: bool) -> None:
+        """Forget the recorded fallback candidates (the user chose a release)."""
+
+        def mutate(payload: dict[str, Any]) -> dict[str, Any] | None:
+            if not payload or "stall_fallback" not in payload:
+                return None
+            payload.pop("stall_fallback", None)
+            return payload
+
+        self._mutate(self.key(media_id, episode, batch), mutate)
+
+    def restart_stall_clock(self, media_id: int, episode: int | None, batch: bool, *, now: float) -> None:
+        """Count a chosen release's stall from ``now`` (it was still queued in aria2)."""
+
+        def mutate(payload: dict[str, Any]) -> dict[str, Any] | None:
+            fallback = (payload or {}).get("stall_fallback")
+            if not isinstance(fallback, dict) or float(fallback.get("since") or 0.0) >= float(now):
+                return None
+            payload["stall_fallback"] = {**fallback, "since": float(now)}
+            return payload
+
+        self._mutate(self.key(media_id, episode, batch), mutate)
 
     def get(
         self,
@@ -232,7 +266,9 @@ class DownloadIntentStore:
             with connector() as conn:
                 values = [
                     row["value"]
-                    for row in conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'")
+                    for row in conn.execute(
+                        f"SELECT value FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(KEY_PREFIX)
+                    )
                 ]
         else:
             values = list(self._memory.values())
@@ -241,6 +277,27 @@ class DownloadIntentStore:
         # later attempt for that episode forever.
         return [
             payload for raw in values if (payload := self._decode(raw)) and payload.get("owned_candidates")
+        ]
+
+    def stall_fallbacks(self) -> list[dict[str, Any]]:
+        """Downloading requests whose race recorded other candidates to fall back to."""
+        connector = getattr(self.db, "connect", None)
+        if callable(connector):
+            with connector() as conn:
+                values = [
+                    row["value"]
+                    for row in conn.execute(
+                        f"SELECT value FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(KEY_PREFIX)
+                    )
+                ]
+        else:
+            values = list(self._memory.values())
+        return [
+            payload
+            for raw in values
+            if (payload := self._decode(raw))
+            and str(payload.get("state") or "") == "downloading"
+            and (payload.get("stall_fallback") or {}).get("candidates")
         ]
 
     def unconfirmed(self, media_id: int, episode: int | None, batch: bool) -> bool:
@@ -320,7 +377,9 @@ class DownloadIntentStore:
             return count
         try:
             with connector() as conn:
-                rows = conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'").fetchall()
+                rows = conn.execute(
+                    f"SELECT value FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(KEY_PREFIX)
+                ).fetchall()
         except Exception:
             return 0
         count = 0

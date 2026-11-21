@@ -8,12 +8,10 @@ from types import SimpleNamespace
 from PIL import Image
 
 from pudge import foreground, safe_mode
-from pudge.cli import _subtitle_content_fingerprint
 from pudge.database import Database
 from pudge.manga import MangaService
 from pudge.manga_ocr_artifact import read_artifact
 from pudge.process_utils import pid_alive
-from pudge.subtitles.discovery import _content_fingerprint, content_fingerprint
 from pudge.web_app import WebAppApi
 
 
@@ -33,15 +31,17 @@ def test_single_page_ocr_update_reads_only_changed_archive_page(tmp_path: Path, 
     book_id = int(service.import_file(archive_path)["id"])
     fingerprint, generation, _revision = service._ocr_context(book_id)
 
-    original_read = zipfile.ZipFile.read
+    # Counted on open: the page size comes from the image header (an open, not a read).
+    original_open = zipfile.ZipFile.open
     page_reads: list[str] = []
 
-    def counted_read(self, name, *args, **kwargs):
+    def counted_open(self, name, *args, **kwargs):
+        name = getattr(name, "filename", name)
         if str(name).lower().endswith(".png"):
             page_reads.append(str(name))
-        return original_read(self, name, *args, **kwargs)
+        return original_open(self, name, *args, **kwargs)
 
-    monkeypatch.setattr(zipfile.ZipFile, "read", counted_read)
+    monkeypatch.setattr(zipfile.ZipFile, "open", counted_open)
 
     for page_index in range(3):
         assert service._commit_ocr_page_updates(
@@ -62,6 +62,7 @@ def test_single_page_ocr_update_reads_only_changed_archive_page(tmp_path: Path, 
     # Old post-page rebuild behavior read 1 + 2 + 3 archive images.  Once the
     # first projection exists, each later page update reads only that page.
     assert page_reads == ["001.png", "002.png", "003.png"]
+    service._flush_ocr_artifact(book_id)  # the run ended: the pages kept in memory are written
     artifact = read_artifact(service._ocr_artifact_path(book_id))
     assert artifact is not None
     assert [page["page_index"] for page in artifact["pages"]] == [0, 1, 2]
@@ -85,15 +86,17 @@ def test_incremental_page_refresh_preserves_other_artifact_pages(tmp_path: Path,
             updates=[(page_index, [{"text": f"old-{page_index}"}], "ready", "", False)],
         )
 
-    original_read = zipfile.ZipFile.read
+    # Counted on open: the page size comes from the image header (an open, not a read).
+    original_open = zipfile.ZipFile.open
     page_reads: list[str] = []
 
-    def counted_read(self, name, *args, **kwargs):
+    def counted_open(self, name, *args, **kwargs):
+        name = getattr(name, "filename", name)
         if str(name).lower().endswith(".png"):
             page_reads.append(str(name))
-        return original_read(self, name, *args, **kwargs)
+        return original_open(self, name, *args, **kwargs)
 
-    monkeypatch.setattr(zipfile.ZipFile, "read", counted_read)
+    monkeypatch.setattr(zipfile.ZipFile, "open", counted_open)
     assert service._commit_ocr_page_updates(
         book_id,
         source_fingerprint=fingerprint,
@@ -102,24 +105,10 @@ def test_incremental_page_refresh_preserves_other_artifact_pages(tmp_path: Path,
     )
 
     assert page_reads == ["002.png"]
+    service._flush_ocr_artifact(book_id)  # the run ended: the pages kept in memory are written
     artifact = read_artifact(service._ocr_artifact_path(book_id))
     assert artifact is not None
     assert [page["text"] for page in artifact["pages"]] == ["old-0", "new-1"]
-
-
-def test_subtitle_content_fingerprint_has_one_shared_implementation(tmp_path: Path) -> None:
-    subtitle = tmp_path / "sample.srt"
-    subtitle.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\n<font>テスト</font>\n",
-        encoding="utf-8",
-    )
-    candidate = SimpleNamespace(path=subtitle)
-    cache_dir = tmp_path / "cache"
-
-    shared = content_fingerprint(candidate, cache_dir, ffmpeg_path="ffmpeg")
-    assert shared
-    assert _content_fingerprint(candidate, cache_dir, ffmpeg_path="ffmpeg") == shared
-    assert _subtitle_content_fingerprint(candidate, cache_dir, ffmpeg_path="ffmpeg") == shared
 
 
 def test_pid_alive_private_names_are_thin_compatibility_aliases() -> None:

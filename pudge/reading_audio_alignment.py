@@ -120,24 +120,6 @@ def _dense_anchor_clock(
     return clock
 
 
-def _linear_offset_at_time(
-    anchors: list[dict[str, Any]],
-    position: float,
-) -> float:
-    if not anchors:
-        return 0.0
-    position = float(position)
-    for left, right in pairwise(anchors):
-        left_time = float(left["time"])
-        right_time = float(right["time"])
-        if position <= right_time:
-            ratio = (position - left_time) / max(0.02, right_time - left_time)
-            return float(left["offset"]) + max(0.0, min(1.0, ratio)) * (
-                float(right["offset"]) - float(left["offset"])
-            )
-    return float(anchors[-1]["offset"])
-
-
 def _inject_punctuation_pause_anchors(
     anchors: list[dict[str, Any]],
     boundaries: Iterable[dict[str, Any]],
@@ -3050,6 +3032,28 @@ def _raw_anchors_with_leading_hold(chapter: dict[str, Any]) -> list[dict[str, fl
     ]
 
 
+# Exact n-gram anchors per 100 normalized characters below which the audio is not
+# a reading of the text (see align_light_novel_to_transcript).
+MIN_ANCHORS_PER_100_CHARACTERS = 0.75
+_CHAPTER_DENSITY_MIN_LENGTH = 2000
+
+
+def _matched_span_density(anchors: list[tuple[int, int]], anchor_size: int) -> float:
+    """Anchors per 100 characters over the text they cover (the central 96%).
+
+    A few stray chance anchors before or after the read part (another volume of an
+    omnibus) do not stretch the span; chance anchors of unrelated audio are spread
+    over the whole book, so their density stays at chance level.
+    """
+    if not anchors:
+        return 0.0
+    offsets = sorted(int(novel_index) for novel_index, _transcript_index in anchors)
+    trim = int(len(offsets) * 0.02)
+    kept = offsets[trim : len(offsets) - trim] or offsets
+    span = kept[-1] - kept[0] + max(1, int(anchor_size))
+    return len(kept) * 100.0 / max(1, span)
+
+
 def align_light_novel_to_transcript(
     chapters: list[dict[str, Any]],
     segments: list[dict[str, Any]],
@@ -3059,7 +3063,14 @@ def align_light_novel_to_transcript(
     speech_regions: list[dict[str, Any]] | None = None,
     chapter_start_segments: dict[int, list[dict[str, Any]]] | None = None,
     chapter_start_reading_hints: dict[int, list[dict[str, Any]]] | None = None,
+    minimum_anchor_density: float = 0.0,
 ) -> dict[str, Any]:
+    """Align a book's chapters to the speech-to-text of its audio.
+
+    ``minimum_anchor_density`` (exact anchors per 100 characters; the audiobook
+    pairing passes MIN_ANCHORS_PER_100_CHARACTERS) refuses audio that is not a
+    reading of the text, and leaves out long chapters it does not read.
+    """
     transcript, transcript_times = _transcript_clock(segments)
     chapter_ranges: list[dict[str, Any]] = []
     novel_parts: list[str] = []
@@ -3090,6 +3101,15 @@ def align_light_novel_to_transcript(
     anchor_size, anchors, alignment_method, fuzzy_similarity = _global_anchor_chain(novel, transcript)
     if len(anchors) < 8:
         raise ValueError(err("audiobook.notEnoughAnchors"))
+    anchor_density = _matched_span_density(anchors, anchor_size)
+    # Chance n-gram matches between a book and another book's audio (a wrong volume
+    # link) gave a "ready" alignment with high confidence and a timeline that jumped
+    # to wrong places: about 0.4 anchors per 100 characters, where the right audio
+    # gives tens (several even with half of the speech misrecognized). Measured over
+    # the text the audio reads, not the whole book: one volume's audio against an
+    # omnibus, or an audiobook of part of a book, is dense there.
+    if alignment_method == "exact-ngram" and anchor_density < float(minimum_anchor_density):
+        raise ValueError(err("audiobook.audioDoesNotMatchText"))
 
     aligned: list[dict[str, Any]] = []
     for chapter in chapter_ranges:
@@ -3102,6 +3122,14 @@ def align_light_novel_to_transcript(
             continue
         span = local[-1][0] - local[0][0] + anchor_size
         if len(local) < 4 and span < chapter["length"] * 0.20:
+            continue
+        if (
+            alignment_method == "exact-ngram"
+            and int(chapter["length"]) >= _CHAPTER_DENSITY_MIN_LENGTH
+            and len(local) * 100.0 / int(chapter["length"]) < float(minimum_anchor_density)
+        ):
+            # A chapter the audio does not read (an audiobook of part of the book):
+            # its few chance matches must not place it on the timeline.
             continue
         clock = _dense_anchor_clock(
             local,
@@ -3418,6 +3446,7 @@ def align_light_novel_to_transcript(
         "novel_characters": len(novel),
         "anchor_count": sum(len(row.get("anchors") or []) for row in aligned),
         "matched_anchor_count": len(anchors),
+        "anchor_density": round(anchor_density, 3),
         "punctuation_pause_count": sum(int(row.get("punctuation_pause_count") or 0) for row in aligned),
         "anchor_size": anchor_size,
         "alignment_method": alignment_method,
@@ -3445,9 +3474,10 @@ def _enforce_min_char_duration(
 ) -> tuple[list[dict[str, Any]], int]:
     """Give every spoken character a minimum share of audio time.
 
-    Sparse STT anchors produce a slow linear bridge followed by a burst
-    (おばあちゃん: 7 chars/1.6 s then ゃ,ん at 40 ms each) or an onset hold
-    followed by a sprint (言ってやりました: 260 ms on 言, then 3 chars in 80 ms).
+    Sparse STT anchors produce a slow linear bridge followed by a burst (a word
+    ending in ゃん: 7 chars/1.6 s then ゃ,ん at 40 ms each) or an onset hold
+    followed by a sprint (a polite past verb: 260 ms on its kanji, then 3 chars in
+    80 ms).
     Borrow time from the *earlier* speech-active neighbour so the burst gets at
     least ``min_char`` per character.  Pause holds (VAD silence) are barriers and
     are never shortened; the fast segment's right anchor never moves.
@@ -3522,9 +3552,9 @@ def _relocate_misplaced_pause_holds(
 ) -> tuple[list[dict[str, Any]], int]:
     """Move a punctuation hold to the real sentence pause when STT put it early.
 
-    Coarse STT can stamp a sentence start (桐生 after 。) inside the previous
+    Coarse STT can stamp a sentence start (a name after 。) inside the previous
     clause, so pause injection binds 。 to a short intra-word VAD dip.  The
-    clause before the hold then sprints (返してあげました: 8 chars in 180 ms),
+    clause before the hold then sprints (an 8-char verb phrase in 180 ms),
     the next sentence starts ~2.5 s early, and the real 1.5 s pause freezes the
     highlight mid-sentence.  When the segment feeding a hold is physically too
     fast and the segment after it contains a clearly longer silence that leaves

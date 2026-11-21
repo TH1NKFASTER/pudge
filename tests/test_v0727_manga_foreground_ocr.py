@@ -59,17 +59,19 @@ def test_visible_page_with_a_cold_cache_is_read_now_and_shown(page) -> None:
 
 def test_only_the_current_page_gets_foreground_ocr(page) -> None:
     # Two pages side by side, both missing from the cache: the second (not current) one
-    # waits for the volume run.
+    # waits for the volume run. (The cover is alone in two-page mode: the pair is pages 2-3.)
     result = page.run(
         READER + "await openReader(); return __text('#mangaV2PageLabel');",
         before=reader_before({})
-        + pages({0: {"cached": MISS, "ocr": READ}, 1: {"cached": MISS, "ocr": READ}}),
+        + pages({1: {"cached": MISS, "ocr": READ}, 2: {"cached": MISS, "ocr": READ}})
+        + "const listed = __api.manga_state; __api.manga_state = async () => { const state = await listed();"
+        + " state.books[0].position = 1; return state; };",
         state=READER_SETTINGS,
         localStorage={"pudge.manga.reader.v2": json.dumps({"mode": "double"})},
     )
-    assert result.value.startswith("1–2")
-    assert reads(result, 0) == ["cached", "ocr"]
-    assert reads(result, 1) == ["cached"]
+    assert result.value.startswith("2–3")
+    assert reads(result, 1) == ["cached", "ocr"]
+    assert reads(result, 2) == ["cached"]
 
 
 def test_foreground_ocr_is_tried_at_most_once_a_minute_and_only_when_it_can_help(page) -> None:

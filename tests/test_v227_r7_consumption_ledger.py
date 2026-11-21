@@ -90,7 +90,8 @@ def test_event_retry_is_idempotent_and_conflicting_retry_is_rejected(tmp_path: P
     assert first.duplicate is False
     assert second.duplicate is True
     assert second.device_seq == first.device_seq
-    assert ledger.ledger_counts()["events"] == 1
+    with ledger.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM consumption_events").fetchone()[0] == 1
 
     with pytest.raises(ConsumptionConflictError):
         ledger.append_interval(**{**args, "payload": {"page": 2}})

@@ -8,7 +8,7 @@ import pytest
 from pudge.audiobooks import AudiobookService
 from pudge.database import Database
 from pudge.reading_audio_alignment import light_novel_position_for_audio
-from pudge.web_app import WebAppApi, _plain_anilist_description
+from pudge.web_app import _plain_anilist_description
 from tests.i18n_support import en, has_text
 
 
@@ -104,33 +104,6 @@ def test_live_audiobook_seek_and_slowdown_use_existing_mpv(
     assert ["set_property", "speed", 1.0] in commands
     assert service.book(book_id)["position"] == 54.0
     assert service.book(book_id)["speed"] == 1.0
-
-
-def test_planning_episode_uses_full_ranked_search_after_local_precheck() -> None:
-    calls: list[dict[str, object]] = []
-    anime = SimpleNamespace(
-        media_status="RELEASING",
-        released_episodes=4,
-        episodes=12,
-        next_airing_episode=5,
-    )
-    manager = SimpleNamespace(
-        db=SimpleNamespace(get_anime=lambda _media_id: anime),
-        search_and_add_best=lambda media_id, **kwargs: calls.append({"media_id": media_id, **kwargs}) or None,
-    )
-    api = object.__new__(WebAppApi)
-    api.manager = manager
-    api._local_episode_for_relative = lambda *_args: None
-
-    result = api.add_best_planning_episode(99, 3)
-
-    assert result == {
-        "ok": False,
-        "episode": 3,
-        "local": False,
-        "release": None,
-    }
-    assert calls == [{"media_id": 99, "episode": 3, "batch": False, "automatic": False}]
 
 
 def test_planning_description_is_plain_text() -> None:

@@ -164,6 +164,8 @@ def test_a_phone_that_pauses_reading_still_gets_the_whole_episode(service, monke
 
     size = 24 * 1024 * 1024
     resource, sha, path = _resource(service, size)
+    # A short idle timeout (5 s in the app), so the pause below outlasts it quickly.
+    monkeypatch.setattr("pudge.iphone_http._IDLE_TIMEOUT", 1.0)
     server, thread, pin = start_iphone_server(service, host="127.0.0.1", port=0)
     try:
         invite = service.invite(f"https://127.0.0.1:{server.server_port}", pin)
@@ -195,8 +197,8 @@ def test_a_phone_that_pauses_reading_still_gets_the_whole_episode(service, monke
         assert head.startswith(b"HTTP/1.1 200")
         digest = hashlib.sha256(body)
         count = len(body)
-        # The phone stops reading for longer than the old 5-second socket timeout.
-        time.sleep(6.5)
+        # The phone stops reading for longer than the idle socket timeout.
+        time.sleep(1.5)
         # Meanwhile the Mac makes room: the copy being downloaded stays.
         monkeypatch.setattr("pudge.iphone_media._VIDEO_BUDGET_BYTES", 1)
         os.utime(path, (1, 1))

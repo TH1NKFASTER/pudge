@@ -877,7 +877,7 @@ def test_extreme_embedded_map_is_replaced_by_reliable_japanese_speech(tmp_path: 
 
 
 def test_timing_activity_detects_cold_open_improvement(tmp_path: Path):
-    from pudge.syncing import compare_timing_activity, _embedded_reference_is_better
+    from pudge.syncing import compare_timing_activity
 
     reference = tmp_path / "reference.srt"
     baseline = tmp_path / "baseline.srt"
@@ -900,23 +900,8 @@ def test_timing_activity_detects_cold_open_improvement(tmp_path: Path):
 
     baseline_metrics = compare_timing_activity(baseline, reference)
     aligned_metrics = compare_timing_activity(aligned, reference)
-    accepted, reason = _embedded_reference_is_better(baseline_metrics, aligned_metrics)
 
     assert aligned_metrics["start"] > baseline_metrics["start"]
-    assert accepted is True
-    assert reason in {"start_improved", "weighted_improved", "strong_reference_alignment"}
-
-
-def test_embedded_reference_rejects_middle_degradation():
-    from pudge.syncing import _embedded_reference_is_better
-
-    accepted, reason = _embedded_reference_is_better(
-        {"available": True, "start": 0.2, "middle": 0.95, "weighted": 0.7, "full": 0.8},
-        {"available": True, "start": 0.9, "middle": 0.7, "weighted": 0.75, "full": 0.8},
-    )
-
-    assert accepted is False
-    assert reason == "middle_degraded"
 
 
 def test_llm_accepted_alass_failure_is_reported_without_local_noise(tmp_path: Path, monkeypatch):
@@ -1162,7 +1147,7 @@ def test_subtitle_shift_summary_detects_constant_offset(tmp_path: Path):
 
 def test_constant_offset_estimator_handles_different_cue_splitting(tmp_path: Path):
     from pudge.subtitle_formats import write_srt
-    from pudge.syncing import estimate_constant_subtitle_offset
+    from pudge.syncing import estimate_constant_subtitle_offsets
 
     source = tmp_path / "japanese.srt"
     reference = tmp_path / "english.srt"
@@ -1186,7 +1171,7 @@ def test_constant_offset_estimator_handles_different_cue_splitting(tmp_path: Pat
     write_srt(source_cues, source)
     write_srt(sorted(reference_cues, key=lambda cue: cue[0]), reference)
 
-    result = estimate_constant_subtitle_offset(source, reference)
+    result = estimate_constant_subtitle_offsets(source, reference, maximum_results=1)[0]
 
     assert result["available"] is True
     assert result["usable_for_semantic_sampling"] is True
@@ -1258,7 +1243,7 @@ def test_constant_offset_estimator_rejects_dense_boundary_false_peak(tmp_path: P
     import random
 
     from pudge.subtitle_formats import write_srt
-    from pudge.syncing import estimate_constant_subtitle_offset
+    from pudge.syncing import estimate_constant_subtitle_offsets
 
     source = tmp_path / "japanese.srt"
     reference = tmp_path / "english.srt"
@@ -1280,7 +1265,7 @@ def test_constant_offset_estimator_rejects_dense_boundary_false_peak(tmp_path: P
     write_srt(source_cues, source)
     write_srt(reference_cues, reference)
 
-    result = estimate_constant_subtitle_offset(source, reference)
+    result = estimate_constant_subtitle_offsets(source, reference, maximum_results=1)[0]
 
     assert result["usable_for_semantic_sampling"] is True
     assert abs(float(result["offset_seconds"]) - 28.0) <= 0.3

@@ -307,12 +307,14 @@ def test_content_addressed_covers_are_served_immutable(tmp_path: Path) -> None:
     covers.mkdir()
     (covers / "ln-0123456789abcdef01234567.jpg").write_bytes(b"jpg")
     (covers / "plain.jpg").write_bytes(b"jpg")
-    handler = _asset_handler_for_api(types.SimpleNamespace(), tmp_path)
+    api = types.SimpleNamespace()
+    handler = _asset_handler_for_api(api, tmp_path)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        base = f"http://127.0.0.1:{server.server_address[1]}"
+        # Pages and covers are served under the window's per-launch key.
+        base = f"http://127.0.0.1:{server.server_address[1]}/k/{api._http_page_key}"
         with urllib.request.urlopen(f"{base}/covers/ln-0123456789abcdef01234567.jpg") as response:
             assert response.headers["Cache-Control"] == "private, max-age=31536000, immutable"
         with urllib.request.urlopen(f"{base}/covers/plain.jpg") as response:

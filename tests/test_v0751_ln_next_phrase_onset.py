@@ -10,8 +10,8 @@ from pudge.reading_audio_alignment import (
 
 
 def test_next_phrase_word_does_not_light_during_punctuation_pause() -> None:
-    previous = "向かっていく。"
-    following = "その雲の流れる先へ向かうことを思い出していた"
+    previous = "坂を下りていく。"
+    following = "その川の向こうに住む祖母のことを考えていた"
     boundary = len(normalize_reading_text(previous))
     alignment = align_light_novel_to_transcript(
         [

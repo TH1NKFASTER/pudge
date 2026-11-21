@@ -44,7 +44,7 @@ def test_watch_order_rows_use_immediate_tooltip_and_hide_order_mode(tmp_path: Pa
             await __fire('.ready-sequence-row[data-entry-index="1"] .ready-sequence-row-title', 'mouseover', {relatedTarget: document.body}, 'MouseEvent');
             const tip = {shown: $('titleTooltip').classList.contains('show'), text: $('titleTooltip').textContent};
             return {tip, native: [...list.querySelectorAll('[title]')].length, list: list.innerText,
-                    orderLabels: ['label.watchSequence', 'label.releaseOrder', 'label.anilistOrder'].map(key => t(key))};
+                    orderLabels: ['Watch order', 'Release order', 'AniList relation order', 'Порядок просмотра', 'Порядок выхода', 'Связи AniList']};
             """,
             lang=lang,
             state=monogatari_state(tmp_path / lang),

@@ -5,7 +5,8 @@ def _rows(points):
     return [{"time": t, "offset": o} for t, o in points]
 
 
-# Real book 178 ch3 (fixes4 trace): …と返してあげました。桐生くんにも言い返す
+# Real book 178 ch3 (fixes4 trace, offsets and times only): a quote's 」, an 8-char verb
+# phrase, 。, then the next sentence starting with a name
 REAL = _rows(
     [
         (3740.16, 16063.999),

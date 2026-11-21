@@ -172,6 +172,10 @@ def test_cleanup_repairs_missing_hash_before_deleting_koukaku(tmp_path: Path, mo
                 else {"hash": torrent_hash, "progress": 1.0}
             )
 
+        def files(self, _torrent_hash: str) -> list[dict]:
+            # The client answers the file list (the real clients always do): no other file.
+            return []
+
         def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
             self.deleted.append((torrent_hash, delete_files))
 

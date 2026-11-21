@@ -1,0 +1,20 @@
+/* Downloaded on a paired iPhone/iPad (device_copies.js): a small glyph, details on hover. */
+.device-copies{display:inline-flex;align-items:center;gap:2px;flex:0 0 auto;color:#d6e2f3;line-height:1;cursor:help;vertical-align:middle}
+.device-copies[hidden]{display:none!important}
+.device-copies svg{display:block;width:auto;height:12px}
+.device-copies.stale{opacity:.5}
+/* In a title line, beside the light novel's audiobook badge. */
+.device-copies-info,.device-copies-row{margin-left:5px}
+/* Anime cards: the top-left corner of the cover (the card's menu is top-right). */
+.device-copies-corner{position:absolute;top:6px;left:6px;z-index:4;padding:4px 5px;gap:3px;border:1px solid rgba(255,255,255,.22);border-radius:7px;background:rgba(8,15,26,.82);color:#fff;box-shadow:0 1px 6px rgba(0,0,0,.3)}
+.device-copies-corner svg{height:11px}
+.device-copies-corner.stale{opacity:.65}
+/* Inside a cover (Planning's list cards: the cover sits after the colour stripe). */
+.cover-shell>.device-copies-corner{top:4px;left:4px}
+/* Planning's episode buttons ("Separate episodes"). */
+.planning-episode-grid button .device-copies-row{margin-left:4px}
+.audiobook-title-row>.device-copies{margin-left:0}
+/* Audiobook series: right after the series title (its grid puts the volume count below both). */
+.audiobook-series-card-head>div{grid-template-columns:minmax(0,max-content) auto;justify-content:start;column-gap:6px}
+.audiobook-series-card-head>div>.device-copies{grid-row:1;grid-column:2;margin-left:0;color:#d6e2f3;font-size:inherit}
+.audiobook-series-card-head>div>:not(strong):not(.device-copies){grid-column:1/-1}

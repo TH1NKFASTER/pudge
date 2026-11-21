@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import ipaddress
+import secrets
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from pathlib import Path
 from typing import Any
@@ -23,6 +27,14 @@ from .i18n import err
 
 # APIs that advertise the phone server over Bonjour (dns-sd processes + a 30 s re-check).
 _IPHONE_BONJOUR_OWNERS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def _network_of(address: str) -> str:
+    """The /24 (IPv4) a LAN address belongs to: one Bonjour name per network, not per lease."""
+    try:
+        return str(ipaddress.ip_network(f"{address}/24", strict=False))
+    except ValueError:
+        return str(address or "")
 
 
 def stop_iphone_bonjour_everywhere() -> None:
@@ -44,10 +56,6 @@ class IPhoneApiMixin:
         from . import iphone_network
 
         return iphone_network.lan_hosts() or ["127.0.0.1"]
-
-    @classmethod
-    def _lan_host(cls) -> str:
-        return cls._lan_hosts()[0]
 
     def _remove_web_companion_leftovers(self) -> None:
         """The browser companion was removed: drop its video cache once (HLS segments, registry rows)."""
@@ -104,6 +112,17 @@ class IPhoneApiMixin:
         service.api = self
         self.audiobooks.mobile_progress = service
         self._iphone_service = service
+        if self.manager.db.get_state("iphone.listening_backfill.v1") != "1":
+
+            def backfill() -> None:
+                try:
+                    count = service.backfill_listening_runs()
+                    self.manager.db.set_state("iphone.listening_backfill.v1", "1")
+                    self.logger.info("EVENT iphone.listening_backfill runs=%s", count)
+                except Exception as exc:  # noqa: BLE001 - statistics repair is best effort
+                    self.logger.warning("FAIL iphone.listening_backfill error=%r", str(exc)[:300])
+
+            threading.Thread(target=backfill, name="pudge-iphone-listen-backfill", daemon=True).start()
         self._iphone_server = server
         self._iphone_thread = thread
         self._iphone_pin = pin
@@ -127,46 +146,104 @@ class IPhoneApiMixin:
             threading.Thread(target=watch, name="pudge-iphone-bonjour", daemon=True).start()
 
     def _advertise_iphone(self) -> None:
-        """Bonjour for paired phones on private LAN interfaces only (one dns-sd per interface)."""
+        """Bonjour for paired phones on private LAN interfaces only (dns-sd per interface).
+
+        Nothing is advertised while no iPhone/iPad is paired (pairing uses the QR's addresses),
+        and the name is new for each network: it was the permanent server ID, which let anyone
+        on a café or hotel Wi-Fi recognise the same Mac wherever it went. Paired phones find
+        the Mac by trying the Pudge services they see (only it passes their certificate pin).
+        While a paired device still runs an older build (it accepts only the server ID as the
+        name), that legacy advertisement stays too, until every device was seen on a newer one.
+        """
         server = getattr(self, "_iphone_server", None)
         service = getattr(self, "_iphone_service", None)
         if server is None or service is None or sys.platform != "darwin" or not shutil.which("dns-sd"):
             return
         from . import iphone_network
 
-        wanted = {name for name, _address in iphone_network.lan_interfaces() if name}
+        try:
+            needs = dict(service.bonjour_needs())
+        except Exception:  # noqa: BLE001 - an unreadable library advertises nothing
+            needs = {}
+        private, legacy = bool(needs.get("private")), bool(needs.get("legacy"))
+        interfaces = iphone_network.lan_interfaces() if private or legacy else []
+        wanted = {name: address for name, address in interfaces if name}
         lock = getattr(self, "_iphone_bonjour_lock", None) or threading.Lock()
         with lock:
             stop = getattr(self, "_iphone_bonjour_stop", None)
             if stop is not None and stop.is_set():
                 return  # access was turned off meanwhile
-            self._advertise_on(service, server, wanted)
+            self._advertise_on(service, server, wanted, private=private, legacy=legacy)
 
-    def _advertise_on(self, service: Any, server: Any, wanted: set[str]) -> None:
+    @staticmethod
+    def _bonjour_name(service: Any, network: str) -> str:
+        """The advertised name on one network: the same there (no churn every 30 s), unrelated
+        between networks and to the server ID; a new one after each launch of Pudge."""
+        salt = getattr(IPhoneApiMixin, "_bonjour_salt", None)
+        if salt is None:
+            salt = IPhoneApiMixin._bonjour_salt = secrets.token_bytes(16)
+        value = hmac.new(salt, (str(service.server_id) + ":" + network).encode(), hashlib.sha256)
+        return "Pudge " + value.hexdigest()[:12]
+
+    def _advertise_on(
+        self,
+        service: Any,
+        server: Any,
+        wanted: dict[str, str] | set[str],
+        *,
+        private: bool = True,
+        legacy: bool = False,
+    ) -> None:
+        if not isinstance(wanted, dict):
+            wanted = {name: "" for name in wanted}
+        # The private advertisement: one per interface, network (its address) and day (a new
+        # network or a new day, a new name). The legacy one ("<interface>#legacy"): the server
+        # ID as the name and in TXT, as older phone builds look for.
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        desired: dict[str, tuple[str, str, list[str]]] = {}
+        for name, address in wanted.items():
+            if private:
+                key = name + "@" + _network_of(address) + "@" + day
+                desired[name] = (name, key, [self._bonjour_name(service, key), "v=2"])
+            if legacy:
+                desired[name + "#legacy"] = (
+                    name,
+                    name + "#legacy",
+                    [str(service.server_id), "serverId=" + str(service.server_id)],
+                )
         current = dict(getattr(self, "_iphone_bonjour", None) or {})
-        for name, process in list(current.items()):
-            if name not in wanted or process.poll() is not None:
+        networks = dict(getattr(self, "_iphone_bonjour_networks", None) or {})
+        for entry, process in list(current.items()):
+            if entry not in desired or process.poll() is not None or networks.get(entry) != desired[entry][1]:
                 if process.poll() is None:
                     process.terminate()
-                del current[name]
-        for name in sorted(wanted - set(current)):
-            current[name] = subprocess.Popen(
+                del current[entry]
+                networks.pop(entry, None)
+        for entry in sorted(set(desired) - set(current)):
+            interface, key, (instance, txt) = desired[entry][0], desired[entry][1], desired[entry][2]
+            current[entry] = subprocess.Popen(
                 [
                     "dns-sd",
                     "-i",
-                    name,
+                    interface,
                     "-R",
-                    service.server_id,
+                    instance,
                     "_pudge-audio._tcp",
                     "local",
                     str(server.server_port),
-                    "serverId=" + service.server_id,
+                    txt,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self.logger.info("EVENT iphone.bonjour interface=%s", name)
+            networks[entry] = key
+            self.logger.info(
+                "EVENT iphone.bonjour interface=%s kind=%s",
+                interface,
+                "legacy" if entry.endswith("#legacy") else "private",
+            )
         self._iphone_bonjour = current
+        self._iphone_bonjour_networks = networks
 
     def _stop_iphone_bonjour(self) -> None:
         """End the Bonjour re-check and the dns-sd processes."""
@@ -178,6 +255,7 @@ class IPhoneApiMixin:
                 if process.poll() is None:
                     process.terminate()
             self._iphone_bonjour = {}
+            self._iphone_bonjour_networks = {}
 
     def _stop_iphone_server(self, *, strict: bool = True) -> None:
         """Stop the phone server. Open connections are cut first (the phone resumes a download
@@ -245,6 +323,17 @@ class IPhoneApiMixin:
             "expiresAt": invitation["expiresAt"] if invitation else None,
         }
 
+    def iphone_device_copies(self) -> dict[str, Any]:
+        """Which paired iPhones/iPads have which library items downloaded (their own last
+        reports; also while phone access is off: the copies stay on the devices)."""
+        from .iphone_inventory import summary
+
+        try:
+            return summary(self.manager.db)
+        except Exception as exc:  # noqa: BLE001 - the icons are optional, the library is not
+            self.logger.warning("SKIP step=iphone.device_copies error=%r", str(exc)[:200])
+            return {"devices": [], "anime": {}, "ln": {}, "manga": {}, "audiobooks": {}}
+
     def iphone_start_pairing(self) -> dict[str, Any]:
         from .iphone_service import encoded
         from ._qr import QrCode
@@ -284,16 +373,28 @@ class IPhoneApiMixin:
         return {"ok": True}
 
     def iphone_revoke_device(self, device_id: str) -> dict[str, Any]:
-        self._ensure_iphone_server()
+        if getattr(self, "_iphone_service", None) is None:
+            self._ensure_iphone_server()
+        # With access turned off the service stays attached (Settings still lists the devices):
+        # revoking there started the HTTPS server and its Bonjour advertisement again.
         self._iphone_service.revoke(str(device_id))
         self.logger.info("EVENT iphone.revoked device=%s", str(device_id)[:8])
+        self._readvertise_iphone()
         return self.iphone_status()
+
+    def _readvertise_iphone(self) -> None:
+        """Paired devices changed: Bonjour starts with the first one and ends with the last."""
+        try:
+            self._advertise_iphone()
+        except Exception as exc:  # noqa: BLE001 - discovery is optional
+            self.logger.warning("SKIP step=iphone.bonjour error=%r", str(exc)[:200])
 
     def iphone_approve_pairing(self, device_id: str) -> dict[str, Any]:
         """Allow: the iPhone/iPad showing the same code receives its access."""
         service = getattr(self, "_iphone_service", None)
         if service is not None and service.approve_pairing(str(device_id)):
             self.logger.info("EVENT iphone.pairing_allowed device=%s", str(device_id)[:8])
+            self._readvertise_iphone()
         return self.iphone_status()
 
     def iphone_deny_pairing(self, device_id: str) -> dict[str, Any]:

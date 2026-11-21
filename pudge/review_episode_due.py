@@ -200,12 +200,24 @@ def _hiragana(text: str) -> str:
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in text)
 
 
+_RUBY_PART = re.compile(r"[\u3400-\u9fff々〆ヵヶ0-9０-９]+\[([^\[\]]*)\]")
+
+
+def _ruby_kana(reading: str) -> str:
+    """The kana of a bracket-ruby reading (促[うなが]す -> うながす); plain kana as it is."""
+    return _RUBY_PART.sub(lambda match: match.group(1), reading).replace(" ", "")
+
+
 def _bracket_ruby(spelling: str, reading: str) -> str:
     """Jiten bracket ruby (選[えら]ぶ, 取[と]り扱[あつか]う) of a spelling and its kana reading.
 
     Each kanji run gets its part of the reading; when spelling and reading cannot be
-    aligned, the plain spelling (kanji without furigana) is returned.
+    aligned, the plain spelling (kanji without furigana) is returned. Jiten can send the
+    reading already as bracket ruby (促[うなが]す): it is the ruby as it is, never wrapped
+    a second time (that showed 促[うなが above 促 ]す).
     """
+    if "[" in reading:
+        return reading
     if not spelling or not reading or not _KANJI_RUN.search(spelling):
         return spelling or reading
     parts = [part for part in _KANJI_RUN.split(spelling) if part]
@@ -385,7 +397,8 @@ def _build_cue_due_review_cards(
         item = vocab_by_pair.get(pair, {})
         ctx = context[pair]
         spelling = str(item.get("spelling") or "").strip()
-        reading = str(item.get("reading") or "").strip()
+        ruby_reading = str(item.get("reading") or "").strip()
+        reading = _ruby_kana(ruby_reading)
         word_text = spelling or reading or f"#{word_id}"
         card: dict[str, Any] = {
             "wordId": word_id,
@@ -397,7 +410,7 @@ def _build_cue_due_review_cards(
                 [
                     {
                         "text": reading,
-                        "rubyText": _bracket_ruby(spelling, reading) if spelling else reading,
+                        "rubyText": _bracket_ruby(spelling, ruby_reading) if spelling else reading,
                         "readingIndex": reading_index,
                         "formType": 0,
                     }

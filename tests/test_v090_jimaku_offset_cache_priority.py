@@ -98,7 +98,7 @@ def test_slime_uses_full_relation_graph_offset(
         )
 
     class FakeDatabase:
-        def __init__(self, _path):
+        def __init__(self, _path, **_kwargs):
             pass
 
         def relation_graph_for_media(self, _media_id):

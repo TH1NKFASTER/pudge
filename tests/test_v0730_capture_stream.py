@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
+import time
 import weakref
 from types import SimpleNamespace
 
@@ -167,16 +168,15 @@ def start_source(bridge, *, error=None):
 
     worker = threading.Thread(target=start)
     worker.start()
-    for _ in range(100):
-        if bridge.queued:
-            break
+    deadline = time.monotonic() + 30  # 100 x 1 ms was too short for a busy Mac
+    while not bridge.queued and time.monotonic() < deadline:
         worker.join(0.001)
     bridge.queued.pop(0)()
     stream = bridge.streams[-1]
     assert stream.chosen is chosen
     assert bridge.config.interval == (1, 2) and bridge.config.depth == 3
     stream.started(error)
-    worker.join(1)
+    worker.join(30)
     assert not worker.is_alive()
     return source, stream, result
 
@@ -331,7 +331,7 @@ def test_cancel_waiting_for_first_frame_wakes_and_stops_source(stream_bridge, tm
     worker = threading.Thread(target=wait)
     worker.start()
     cancelled.set()
-    worker.join(0.2)
+    worker.join(30)
     assert not worker.is_alive() and caught == ["cancelled"]
     source.close()
     stream_bridge.queued.pop(0)()
@@ -350,13 +350,12 @@ def test_late_start_callback_after_timeout_cannot_restore_stream(stream_bridge):
 
     worker = threading.Thread(target=start)
     worker.start()
-    for _ in range(100):
-        if stream_bridge.queued:
-            break
+    deadline = time.monotonic() + 30  # 100 x 1 ms was too short for a busy Mac
+    while not stream_bridge.queued and time.monotonic() < deadline:
         worker.join(0.001)
     stream_bridge.queued.pop(0)()
     stream = stream_bridge.streams[-1]
-    worker.join(0.2)
+    worker.join(30)
     assert not worker.is_alive() and result == ["capture_timeout"]
     stream_bridge.queued.pop(0)()
     stream.started(None)

@@ -70,7 +70,7 @@ def test_vn_retries_empty_ocr_on_unchanged_frame(monkeypatch, tmp_path: Path) ->
     previous_level = vn_logger.level
     vn_logger.setLevel(logging.INFO)
     thread.start()
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 30  # ends at the first transcript line
     state = service.state()
     while time.monotonic() < deadline and not state["transcript"]:
         time.sleep(0.03)

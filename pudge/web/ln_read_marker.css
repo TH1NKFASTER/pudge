@@ -1,0 +1,26 @@
+/* Light novel reader: the "read up to here" marker (ln_read_marker.js). Everything is drawn
+   over the text (absolutely positioned in the reader), so the text never moves. */
+.ln-reader{position:relative}
+.ln-read-marker{position:absolute;left:0;top:0;width:0;height:0;z-index:3;pointer-events:none;writing-mode:horizontal-tb;--ln-read-marker:#ef4444}
+.ln-read-marker[hidden]{display:none}
+.ln-read-marker>span{position:absolute;display:block}
+.ln-read-marker-caret{background:var(--ln-read-marker);border-radius:1px;box-shadow:0 0 0 .5px rgba(0,0,0,.35)}
+/* A small ribbon in the margin by the line: pointing at the line (right), or down at the column. */
+.ln-read-marker-ribbon{pointer-events:auto;cursor:default;background:var(--ln-read-marker);clip-path:polygon(0 0,68% 0,100% 50%,68% 100%,0 100%);transform-origin:center}
+.ln-read-marker.vertical .ln-read-marker-ribbon{clip-path:polygon(0 0,100% 0,100% 64%,50% 100%,0 64%)}
+.ln-read-marker-glow{border-radius:5px;background:rgba(239,68,68,.28);opacity:0}
+.ln-read-marker.flash .ln-read-marker-glow{animation:ln-read-marker-glow 1.6s ease-out}
+.ln-read-marker.flash .ln-read-marker-ribbon{animation:ln-read-marker-pop 1.6s ease-out}
+@keyframes ln-read-marker-glow{0%{opacity:0}15%{opacity:1}100%{opacity:0}}
+@keyframes ln-read-marker-pop{0%,100%{transform:scale(1)}18%{transform:scale(1.35)}}
+@media (prefers-reduced-motion: reduce){
+  .ln-read-marker.flash .ln-read-marker-glow{animation:ln-read-marker-glow 1.6s steps(1,end)}
+  .ln-read-marker.flash .ln-read-marker-ribbon{animation:none}
+}
+.ln-read-marker-tip{position:fixed;z-index:9060;max-width:min(420px,calc(100vw - 16px));padding:6px 10px;border:1px solid #455f7d;border-radius:8px;background:#0c1725;color:var(--text,#dce7f6);font:12.5px/1.35 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap}
+.ln-read-marker-tip[hidden]{display:none}
+/* Back to the marker when it is off screen (like the phone reader's arrow back to the audio). */
+.ln-read-marker-jump{position:absolute;z-index:9045;right:22px;bottom:calc(22px + var(--pa-dock-bottom,0px));display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid rgba(239,68,68,.55);border-radius:999px;background:rgba(12,23,37,.92);color:#fecaca;font:600 13px/1.2 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.45);cursor:pointer}
+.ln-read-marker-jump[hidden]{display:none}
+.ln-read-marker-jump:hover{border-color:#ef4444;color:#fff}
+.ln-read-marker-jump-arrow{color:#ef4444;font-size:15px}

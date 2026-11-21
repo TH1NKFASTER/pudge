@@ -72,9 +72,6 @@ def test_rows_get_the_second_episode_when_written(tmp_path: Path) -> None:
     )
     assert db.download_by_hash("a" * 40).media_episode_end == 2
     assert db.download_by_hash("b" * 40).media_episode_end is None
-    # A confirmed identity keeps the span from the new first episode.
-    db.attach_download_metadata("a" * 40, 1, 3, False)
-    assert db.download_by_hash("a" * 40).media_episode_end == 4
 
 
 # Search

@@ -197,21 +197,21 @@ def test_interrupted_transcription_resumes_from_its_own_valid_chunks(tmp_path: P
     assert _transcribe(service, first, crash_on={3}) == [1, 2, 3, 3]
     assert service.transcription_status(first)["status"] == "error"
     assert not service._transcript_path(first).exists()
-    # The next run recognizes only what is missing.
-    assert _transcribe(service, first) == [3]
+    # A damaged checkpoint is recognized again instead of being trusted.
+    checkpoints = service._transcription_checkpoint_dir(service._transcript_path(first))
+    damaged = sorted(checkpoints.glob("*1.json"))
+    assert damaged
+    damaged[0].write_text("{not json", encoding="utf-8")
+    # The next run recognizes only what is missing (and the damaged chunk).
+    assert _transcribe(service, first) == [1, 3]
     assert service.transcription_status(first)["status"] == "ready"
     payload = json.loads(service._transcript_path(first).read_text(encoding="utf-8"))
     assert [row["start"] for row in payload["segments"]] == [1.0, 301.0, 601.0]
+    # The finished transcript replaces its chunk checkpoints (they only duplicated it).
+    assert not checkpoints.exists()
     # Another book (other audio, other fingerprint) never reuses these chunks.
     assert service._transcript_path(second) != service._transcript_path(first)
     assert _transcribe(service, second) == [1, 2, 3]
-
-    # A damaged checkpoint is recognized again instead of being trusted.
-    service._transcript_path(first).unlink()
-    damaged = sorted(service._transcription_checkpoint_dir(service._transcript_path(first)).glob("*1.json"))
-    assert damaged
-    damaged[0].write_text("{not json", encoding="utf-8")
-    assert _transcribe(service, first) == [1]
 
 
 def test_failed_final_write_leaves_no_truncated_transcript(tmp_path: Path, monkeypatch) -> None:
@@ -222,19 +222,15 @@ def test_failed_final_write_leaves_no_truncated_transcript(tmp_path: Path, monke
     )
     monkeypatch.setattr(service, "_resolved_ffmpeg", lambda: "/usr/bin/false")
     output = service._transcript_path(book_id)
-    original = Path.write_text
+    # The disk fills up while the transcript is written: half of it reaches the disk.
+    from write_failure_support import disk_full_while_writing
 
-    def interrupted(self, data, *args, **kwargs):
-        if self.parent == output.parent and self.name.startswith(output.stem):
-            original(self, data[: len(data) // 2], *args, **kwargs)
-            raise OSError("disk full")
-        return original(self, data, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "write_text", interrupted)
-    _transcribe(service, book_id)
-    monkeypatch.setattr(Path, "write_text", original)
+    with disk_full_while_writing(output) as doomed:
+        _transcribe(service, book_id)
+    assert doomed
     assert service.transcription_status(book_id)["status"] == "error"
     assert not output.exists()
+    assert not list(output.parent.glob(f".{output.name}.*"))
 
 
 # --- countdowns and settings -----------------------------------------------------------------

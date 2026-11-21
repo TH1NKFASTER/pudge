@@ -5,7 +5,6 @@ from pathlib import Path
 
 import httpx
 
-from pudge import i18n
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
 from pudge.providers.anilist import AniListClient
@@ -53,66 +52,6 @@ def test_post_retries_transient_500_once() -> None:
     finally:
         client.close()
     assert calls == 2
-
-
-def test_library_falls_back_after_extended_query_500() -> None:
-    full_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal full_calls
-        payload = json.loads(request.content)
-        query = payload["query"]
-        if "Viewer" in query:
-            return httpx.Response(200, json={"data": {"Viewer": {"id": 7, "name": "x"}}})
-        if "fragment RelationLeaf" in query:
-            full_calls += 1
-            return httpx.Response(500, text="query bug")
-        return httpx.Response(
-            200,
-            json={
-                "data": {
-                    "MediaListCollection": {
-                        "lists": [
-                            {
-                                "status": "CURRENT",
-                                "entries": [
-                                    {
-                                        "status": "CURRENT",
-                                        "progress": 3,
-                                        "score": 8,
-                                        "media": {
-                                            "id": 100,
-                                            "title": {"romaji": "Fallback Anime"},
-                                            "synonyms": [],
-                                            "episodes": 12,
-                                            "format": "TV",
-                                            "seasonYear": 2026,
-                                            "status": "FINISHED",
-                                            "siteUrl": "",
-                                            "coverImage": {},
-                                            "studios": {"nodes": []},
-                                            "nextAiringEpisode": None,
-                                        },
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                }
-            },
-        )
-
-    client = _client(handler)
-    try:
-        items = client.library()
-    finally:
-        client.close()
-
-    assert full_calls == 2
-    assert items[0].title == "Fallback Anime"
-    assert client.last_library_used_fallback is True
-    assert "used a simplified query" in client.last_library_warning
-    assert "упрощённый" in i18n.message(client.last_library_warning, "ru")
 
 
 def test_status_mutation_500_is_verified_by_readback() -> None:

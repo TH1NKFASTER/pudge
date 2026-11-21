@@ -33,7 +33,7 @@
   }
 
   // Shared tile shell: identical slot structure for series and franchise.
-  function tileHtml({kind, key, attrs, title, current, total, finishedAll, badge, stats}) {
+  function tileHtml({kind, key, attrs, title, current, total, finishedAll, badge, stats, ids = ''}) {
     const percent = percentOf(current);
     const volume = Number(current?.volume || 1);
     const position = finishedAll
@@ -46,9 +46,11 @@
       ? '<span class="ln-group-continue is-empty" aria-hidden="true"></span>'
       : `<button type="button" class="ln-group-continue" data-ln-action="read" data-id="${Number(current.id)}" title="${esc(contLabel)}" aria-label="${esc(contLabel)}">${PudgeI18n.t('ui.continue')}</button>`;
     const label = `${title}. ${badge}. ${position}`;
+    // Volumes downloaded on a paired iPhone/iPad (device_copies.js), beside the title.
+    const copies = g.PudgeDeviceCopies?.slot?.('ln', String(ids || '').split(','), 'info') || '';
     return `<article class="ln-card ln-entry ln-group-tile" ${attrs} data-ln-group-open="${kind}" data-ln-group-key="${esc(key)}" tabindex="0" role="button" aria-haspopup="dialog" aria-label="${esc(label)}">`
       + `<div class="ln-group-cover-col">${coverHtml(current)}${cont}</div>`
-      + `<div class="ln-card-body"><h3><span class="ln-card-title">${esc(title)}</span></h3>`
+      + `<div class="ln-card-body"><h3><span class="ln-card-title">${esc(title)}</span>${copies}</h3>`
       + `<div class="ln-card-meta"><span>${esc(position)}</span><span class="ln-group-badge">${esc(badge)}</span></div>`
       + `<div class="ln-card-progress"><span style="width:${finishedAll ? 100 : percent}%"></span></div>`
       + (stats ? `<div class="ln-group-stats">${stats}</div>` : '')
@@ -103,6 +105,7 @@
       finishedAll,
       badge: PudgeI18n.tn('ln.seriesBadge', books.length),
       stats: seriesStats(first),
+      ids,
     });
   }
 
@@ -130,6 +133,7 @@
       finishedAll: books.length > 0 && books.every(book => Boolean(book.finished)),
       badge: PudgeI18n.tn('ln.franchiseBadge', series.length),
       stats: seriesStats(books.find(book => book.anilist_id || book.jiten_deck_id) || books[0]),
+      ids,
     });
   }
 

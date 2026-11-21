@@ -31,10 +31,11 @@ def test_native_launcher_embeds_the_managed_venv_python() -> None:
     # The tools Homebrew provides and the config are passed to Pudge.
     for name, value in (
         ("PUDGE_CONFIG", sim.config),
-        ("PUDGE_7ZIP", sim.prefix / "sevenzip/bin/7zz"),
         ("PUDGE_ARIA2C", sim.prefix / "aria2/bin/aria2c"),
     ):
         assert f'setenv("{name}", "{value}", 1);' in main
+    # No 7-Zip path any more: archives are unpacked by macOS's /usr/bin/bsdtar.
+    assert "PUDGE_7ZIP" not in main
 
 
 def test_native_launcher_sends_notifications_without_starting_python() -> None:

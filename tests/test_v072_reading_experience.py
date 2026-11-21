@@ -214,7 +214,7 @@ def test_manga_menus_score_the_series_and_run_ocr_per_volume(page) -> None:
             const out = {volume: await rightClick('[data-manga-book="3"]')};
             out.series = await rightClick('[data-manga-series-key]');
             out.scoreLabel = __text('[data-manga-context-action="score-series"]');
-            await __click('[data-manga-context-action="score-series"]'); await __tick(1500);
+            await __click('[data-manga-context-action="score-series"]'); await __tick(2500);  // FINALE2: first spin 2 s
             out.modal = {open: __visible('#modalBackdrop'), title: __text('#modalTitle')};
             await __click('#modalBackdrop [data-action="score-anime"]'); await __tick(50);
             out.saved = {open: __visible('#modalBackdrop'), toasts: __toasts()};
@@ -505,11 +505,11 @@ def test_prepare_alignment_reaches_the_audiobook_service(tmp_path: Path, monkeyp
 
 def test_stt_worker_returns_word_timestamps_when_asked(tmp_path: Path, monkeypatch) -> None:
     calls: list[dict] = []
-    fake = types.ModuleType("mlx_whisper")
+    fake = types.ModuleType("pudge.whisper_mlx")
     fake.transcribe = lambda audio, **options: (
         calls.append(options) or {"text": "ねこ", "segments": [{"words": [{"word": "ねこ"}]}]}
     )
-    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    monkeypatch.setitem(sys.modules, "pudge.whisper_mlx", fake)
     audio = tmp_path / "a.m4a"
     audio.write_bytes(b"audio")
     assert stt_worker.main(["--words", str(audio), str(tmp_path / "words.json"), "model"]) == 0

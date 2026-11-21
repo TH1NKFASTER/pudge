@@ -58,9 +58,11 @@ def test_subsplease_parser_reads_magnet_and_marks_official_feed():
 
 
 def test_subsplease_uses_official_magnet_feed_for_selected_resolution():
-    assert SubsPleaseClient.feed_url("1080p") == "https://subsplease.org/rss/?r=1080"
-    assert SubsPleaseClient.feed_url("720p") == "https://subsplease.org/rss/?r=720"
-    assert SubsPleaseClient.feed_url("480p") == "https://subsplease.org/rss/?r=sd"
+    # The weekly feed's address comes from Settings → Sources (stored without "/").
+    client = SubsPleaseClient(base_url="https://weekly.invalid/rss")
+    assert client.feed_url("1080p") == "https://weekly.invalid/rss/?r=1080"
+    assert client.feed_url("720p") == "https://weekly.invalid/rss/?r=720"
+    assert client.feed_url("480p") == "https://weekly.invalid/rss/?r=sd"
 
 
 def test_subsplease_ranking_keeps_matching_episode_and_drops_unrelated_titles():
@@ -154,7 +156,7 @@ def test_settings_have_no_subsplease_fallback_switch_and_keep_it_on(page, tmp_pa
 # Settings shows no SubsPlease switch any more: RSS is always used (fallback and first choice).
 SETTINGS_WITHOUT_SUBSPLEASE = r"""
 const out = {nyaa: Boolean($('s_nyaa_enabled')), controls: ['s_subsplease_rss', 's_subsplease_preferred'].filter(id => $(id)),
-             texts: [t('settings.useSubsPleaseRss'), t('settings.preferSubsPleaseRss')].filter(text => $('settingsContent').textContent.includes(text))};
+             texts: ['Use the weekly releases feed', 'Check the weekly releases feed before the release search'].filter(text => $('settingsContent').textContent.includes(text))};
 await __click('#saveSettings'); await __tick(20);
 return out;
 """

@@ -3,14 +3,9 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-from desktop_isolation import patch_webapp_popen
 
 from pudge.providers.anilist import AniListClient
 from pudge.relation_graphs import compact_relations_from_graph
-from pudge.web_app import WebAppApi
 from tests.i18n_support import en, ru
 
 # Root 1 with a sequel and entries that are only loosely related to it.
@@ -134,95 +129,6 @@ def test_planned_anime_subtitle_states_are_descriptive(page) -> None:
         out = result.value
         assert out["imageText"] in out["image"] and out["noneText"] not in out["image"]
         assert out["noneText"] in out["none"]
-
-
-# library.js renders the rows of the old anime Library page. No page calls libraryCard()
-# any more (dead code, see the audit report); the rows are checked directly.
-LIBRARY_ROWS = """
-const rows = %s;
-const box = document.createElement('div');
-box.innerHTML = rows.map(libraryEpisodeRow).join('');
-document.body.appendChild(box);
-const out = rows.map((row, index) => {
-  const node = box.children[index];
-  return {state: node.querySelector('.library-state').innerText,
-          subtitle: node.querySelector('.library-subtitle').innerText,
-          revealable: node.querySelector('.library-subtitle').matches('button[data-action="reveal-subtitle"]')};
-});
-for (const button of box.querySelectorAll('[data-action="reveal-subtitle"]')) { button.click(); await __flush(); }
-return {rows: out, texts: {
-  local: t('library.state.local'), image: t('library.state.waiting_text_subtitles'), none: t('subtitle.none'),
-  embedded: t('subtitle.embedded'), imageSource: t('subtitle.image'), external: t('subtitle.external')}};
-"""
-
-
-def test_library_rows_describe_subtitles_and_reveal_their_source(page) -> None:
-    rows = [
-        {
-            "episode": 1,
-            "state": "local",
-            "subtitle_source": "none",
-            "video_path": "/v/01.mkv",
-            "filename": "01.mkv",
-        },
-        {
-            "episode": 2,
-            "state": "waiting_text_subtitles",
-            "subtitle_source": "image",
-            "video_path": "/v/02.mkv",
-            "filename": "02.mkv",
-        },
-        {
-            "episode": 3,
-            "state": "ready",
-            "subtitle_source": "external",
-            "subtitle_path": "/s/03.ass",
-            "video_path": "/v/03.mkv",
-            "filename": "03.mkv",
-        },
-        {
-            "episode": 4,
-            "state": "some_new_state",
-            "subtitle_source": "embedded",
-            "video_path": "/v/04.mkv",
-            "filename": "04.mkv",
-        },
-    ]
-    for lang in ("en", "ru"):
-        result = page.run(LIBRARY_ROWS % json.dumps(rows), lang=lang)
-        out, texts = result.value["rows"], result.value["texts"]
-        assert [row["state"] for row in out[:2]] == [texts["local"], texts["image"]]
-        assert out[3]["state"] == texts["none"]  # an unknown state is not shown raw
-        assert [row["subtitle"] for row in out] == [
-            texts["none"],
-            texts["imageSource"],
-            texts["external"],
-            texts["embedded"],
-        ]
-        assert [row["revealable"] for row in out] == [False, True, True, False]
-        # Image subtitles inside the video reveal the video; external ones their file.
-        assert result.calls_of("reveal_subtitle_file") == [["/v/02.mkv"], ["/s/03.ass"]]
-
-
-def test_reveal_subtitle_accepts_pgs_and_embedded_video(tmp_path: Path, monkeypatch) -> None:
-    api = WebAppApi(tmp_path / "config.toml")
-    calls: list[list[str]] = []
-    patch_webapp_popen(
-        monkeypatch,
-        lambda command, *args, **kwargs: calls.append(command),
-    )
-
-    pgs = tmp_path / "episode.sup"
-    pgs.write_bytes(b"PG")
-    video = tmp_path / "episode.mkv"
-    video.write_bytes(b"video")
-
-    assert api.reveal_subtitle_file(str(pgs))["ok"] is True
-    assert api.reveal_subtitle_file(str(video))["ok"] is True
-    assert calls == [
-        ["open", "-R", str(pgs.resolve())],
-        ["open", "-R", str(video.resolve())],
-    ]
 
 
 def test_general_settings_group_and_ready_notification_label(page) -> None:

@@ -246,6 +246,7 @@ def test_macos_identity_is_set_before_nsapplication_registration(monkeypatch) ->
     monkeypatch.setitem(sys.modules, "AppKit", appkit)
     monkeypatch.setitem(sys.modules, "Foundation", foundation)
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("PUDGE_NO_DOCK_CHANGES", raising=False)  # the stand-in Cocoa is the Dock here
     monkeypatch.setenv("PUDGE_APP_ICON", "/app/icon.icns")
 
     app_entry._set_macos_app_icon()
@@ -372,11 +373,18 @@ def test_watched_media_folders_route_ln_manga_and_audiobooks_and_are_idempotent(
         api.light_novels, "import_file", lambda path, **_kwargs: calls.append(("ln", Path(path))) or {}
     )
     monkeypatch.setattr(api.manga, "import_file", lambda path: calls.append(("manga", Path(path))) or {})
+    audio_options: list[dict] = []
     monkeypatch.setattr(
-        api.audiobooks, "import_file", lambda path: calls.append(("audio-file", Path(path))) or {}
+        api.audiobooks,
+        "import_file",
+        lambda path, **kwargs: audio_options.append(kwargs) or calls.append(("audio-file", Path(path))) or {},
     )
     monkeypatch.setattr(
-        api.audiobooks, "import_folder", lambda path: calls.append(("audio-folder", Path(path))) or {}
+        api.audiobooks,
+        "import_folder",
+        lambda path, **kwargs: (
+            audio_options.append(kwargs) or calls.append(("audio-folder", Path(path))) or {}
+        ),
     )
 
     first = api.scan_watched_media_folders()
@@ -388,6 +396,8 @@ def test_watched_media_folders_route_ln_manga_and_audiobooks_and_are_idempotent(
     assert second["light_novels"] == second["manga"] == second["audiobooks"] == 0
     assert ("audio-folder", audio.resolve()) in calls
     assert ("audio-file", (watched / "single.m4b").resolve()) in calls
+    # A folder scan queues no speech-to-text: it starts once a book is linked or opened.
+    assert audio_options == [{"prepare_transcription": False}] * 2
 
 
 def test_refresh_scans_watched_and_video_sources_before_heavy_refresh(tmp_path: Path, monkeypatch) -> None:

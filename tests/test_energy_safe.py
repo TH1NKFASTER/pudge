@@ -163,9 +163,13 @@ def test_minute_polls_stop_while_the_window_is_hidden(page) -> None:
     out = result.value
     for name, at_start in out["start"].items():
         assert at_start == 1, name  # one check when the window opens
-        assert out["visible"][name] == 3, name  # then one a minute
+        # Then one a minute; AniList additions every 5 minutes (Python caches them that long,
+        # MEM7 window polls), and a coming back asks for the ones that came due.
+        minutes = 1 if name == "poll_anilist_related_media_notifications" else 3
+        assert out["visible"][name] == minutes, (name, out)
         assert out["hidden"][name] == out["visible"][name], name  # nothing while hidden
-        assert out["after"][name] == out["shown"][name] + 1, name  # minute checks resume
+        if name != "poll_anilist_related_media_notifications":
+            assert out["after"][name] == out["shown"][name] + 1, name  # minute checks resume
     # Coming back resynchronizes the review cards at once.
     assert out["shown"]["review_gate_prefetch"] == out["hidden"]["review_gate_prefetch"] + 1
 

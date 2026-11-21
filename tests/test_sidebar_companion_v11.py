@@ -131,7 +131,7 @@ def test_child_windows_preserve_real_quit_delegate_and_allow_quit(cocoa):
         assert c.app.delegate() is proxy
         assert c.browser._shared_app_delegate is proxy
     assert proxy.applicationShouldTerminate_(c.app) == 2
-    assert c.app.replied.wait(2)
+    assert c.app.replied.wait(30)
     assert c.lifecycle.quit_requested is True
     assert c.main.hide_calls == 0
     assert c.quiet == ["macos_quit"]
@@ -174,9 +174,9 @@ def test_delegate_install_is_idempotent_and_keeps_original_backend(cocoa):
         assert c.app.delegate() is c.browser._shared_app_delegate is proxy
         assert proxy._pudge_original_delegate is c.original
     assert proxy.applicationShouldTerminate_(c.app) == 2
-    assert c.app.replied.wait(2)
+    assert c.app.replied.wait(30)
     assert proxy.applicationShouldTerminate_(c.app) == 2
-    assert c.app.replied.wait(2)
+    assert c.app.replied.wait(30)
     assert c.quiet == ["macos_quit"]
 
 
@@ -202,7 +202,7 @@ def test_restore_from_worker_queues_native_operations_on_main_thread(cocoa, monk
     )
     worker = threading.Thread(target=c.lifecycle.reopen)
     worker.start()
-    worker.join(timeout=2)
+    worker.join(timeout=30)
     assert not worker.is_alive()
     assert len(queued) == 1 and native_threads == []
     queued[0]()

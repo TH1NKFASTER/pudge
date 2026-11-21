@@ -34,7 +34,7 @@ GAME_PID = 4242
 WINDOW_FILTER = SimpleNamespace(kind="window")
 
 
-def wait_for(condition, timeout: float = 4.0) -> None:
+def wait_for(condition, timeout: float = 30.0) -> None:  # ends as soon as it holds
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if condition():

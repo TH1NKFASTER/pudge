@@ -257,10 +257,11 @@ def test_one_left_click_on_a_continue_card_resumes_once(page) -> None:
     assert result.value == {"ctrl": 0, "once": 1}
     [[path, resume, *_rest]] = result.calls_of("play")
     assert (path, resume) == ("/lib/Show - 03.mkv", True)
-    # While the player starts or runs, the card offers its menu instead of a second start.
+    # While the player starts or runs, a click brings that player to the front (or says it is
+    # starting): the hand cursor like on any card, not the menu cursor (user: "make it a hand").
     rules = css_rules("index.html")
-    assert rules.get(".airing-card.play-starting", "cursor") == "context-menu"
-    assert rules.get(".airing-card.play-running", "cursor") == "context-menu"
+    assert rules.get(".airing-card.play-starting", "cursor") == "pointer"
+    assert rules.get(".airing-card.play-running", "cursor") == "pointer"
 
 
 def test_continue_watching_payload_carries_the_anime_link_and_status(tmp_path: Path) -> None:

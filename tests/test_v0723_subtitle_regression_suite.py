@@ -447,8 +447,8 @@ def test_srt_roundtrip_preserves_japanese_and_multiline(tmp_path: Path) -> None:
 
 
 def test_plain_text_strips_ass_and_html_but_keeps_japanese() -> None:
-    value = r"{\an8}<i>今日は</i>\N<ずっと嫌いだった>"
-    assert plain_subtitle_text(value) == "今日は\nずっと嫌いだった"
+    value = r"{\an8}<i>今日は</i>\N<いつも朝が苦手だった>"
+    assert plain_subtitle_text(value) == "今日は\nいつも朝が苦手だった"
 
 
 @pytest.mark.parametrize(
@@ -464,7 +464,7 @@ def test_plain_text_removes_furigana(raw: str, expected: str) -> None:
 
 
 def test_plain_text_removes_leading_speaker_label() -> None:
-    assert plain_subtitle_text("（南）赤石さん") == "赤石さん"
+    assert plain_subtitle_text("（ミオ）青木さん") == "青木さん"
 
 
 def test_plain_text_keeps_standalone_stage_direction() -> None:

@@ -103,6 +103,15 @@ def test_completed_ready_never_skips_broken_nearest_unwatched_episode(tmp_path: 
         media_status="FINISHED",
     )
     manager.db.upsert_anime(anime)
+    # Episode 1 is on disk, its subtitles broken and being prepared again.
+    broken = (manager.config.library.root_dir / "Akiba - 01.mkv").resolve()
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_bytes(b"video")
+    manager.db.upsert_episode(
+        LibraryEpisode(
+            media_id=151379, title=anime.title, episode=1, video_path=broken, state="waiting_subtitles"
+        )
+    )
     api = _api(manager)
 
     downloaded = [

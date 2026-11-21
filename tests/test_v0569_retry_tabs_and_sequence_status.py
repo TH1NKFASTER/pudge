@@ -99,7 +99,8 @@ def test_resolver_upgrade_retries_delayed_jobs_immediately_with_agent_enabled(
     assert calls == []
     assert stats["subs"] == 0
     job = next(row for row in manager.db.subtitle_jobs() if str(row["video_path"]) == str(video))
-    assert int(job["priority"]) >= 200
+    # A launch is a normal pass, not a Refresh: due at once, without the manual-refresh priority.
+    assert int(job["priority"]) == 0
     assert manager.db.get_state("subtitle_resolver_generation", "") == "9"
     row = manager.db.subtitle_jobs()[0]
     assert float(row["next_check"]) <= __import__("time").time() + 2

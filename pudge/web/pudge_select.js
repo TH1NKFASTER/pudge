@@ -26,6 +26,8 @@
     state.menu.classList.remove('open');
     state.button.setAttribute('aria-expanded', 'false');
     if (openSelect === select) openSelect = null;
+    // Its select left the page while the menu was open: the menu goes now that it is closed.
+    if (select.isConnected === false) state.menu.remove();
   }
 
   function position(select) {
@@ -109,6 +111,7 @@
     }
     if (openSelect && openSelect !== select) close(openSelect, 'other-opened');
     trace('open', select);
+    if (state.menu.isConnected === false) document.body.appendChild(state.menu);
     buildMenu(select);
     state.shell.classList.add('open');
     state.menu.classList.add('open');
@@ -204,11 +207,6 @@
     });
   }
 
-  function stateFocus(select) {
-    const state = enhanced.get(select);
-    state?.button?.focus({preventScroll: true});
-  }
-
   function scan(root = document) {
     if (root instanceof HTMLSelectElement) enhance(root);
     root.querySelectorAll?.('select').forEach(enhance);
@@ -236,10 +234,56 @@
   window.addEventListener('resize', () => openSelect && position(openSelect));
   window.addEventListener('scroll', () => openSelect && position(openSelect), true);
 
+  // Each select's menu hangs on <body>, outside the select's own subtree. When the select left
+  // the page (Settings drawn again after Save, a dialog's body replaced) its menu stayed there
+  // for good, and through its click handler so did the select with the whole removed subtree
+  // around it: one copy of the Settings page per Save. The menu now goes with its select (an
+  // open one once it closes) and comes back if the select does (a card moved, a page shown again).
+  function releaseMenus(node) {
+    const selects = node instanceof HTMLSelectElement ? [node] : [...(node.querySelectorAll?.('select') || [])];
+    for (const select of selects) {
+      const state = enhanced.get(select);
+      if (!state) continue;
+      if (select.isConnected !== false) {
+        if (state.menu.isConnected === false) document.body.appendChild(state.menu);
+        continue;
+      }
+      // An open menu stays until it is closed (Escape closes one surface at a time); close() removes it.
+      if (openSelect === select) continue;
+      state.menu.remove();
+    }
+  }
+
+  // What makes a select "the same one" after its card was drawn again: its id, else its name
+  // and data-* attributes (an audiobook's speed: data-audio-speed + data-id).
+  function selectKey(select) {
+    if (select.id) return `#${select.id}`;
+    return [...(select.attributes || [])]
+      .filter(attr => attr.name === 'name' || (attr.name.startsWith('data-') && attr.name !== 'data-pudge-select-enhanced' && attr.name !== 'data-disabled-reason'))
+      .map(attr => `${attr.name}=${attr.value}`).sort().join('&');
+  }
+  // The open menu's select was replaced by a redraw (clearing a card selection redraws the
+  // audiobook cards): the menu moves to the new select and stays open. It used to stay open
+  // on the removed select, where a choice changed nothing.
+  function adoptReplacement() {
+    const old = openSelect;
+    if (!old || old.isConnected !== false) return;
+    const key = selectKey(old);
+    if (!key) return;
+    const next = [...document.querySelectorAll('select')].find(item => item !== old && item.isConnected !== false && selectKey(item) === key);
+    if (!next) return;
+    close(old, 'replaced');
+    enhance(next);
+    if (enhanced.has(next)) open(next);
+  }
+
   const observer = new MutationObserver(records => {
     for (const record of records) {
+      (record.removedNodes || []).forEach(node => {
+        if (node.nodeType === Node.ELEMENT_NODE) releaseMenus(node);
+      });
       record.addedNodes.forEach(node => {
-        if (node.nodeType === Node.ELEMENT_NODE) scan(node);
+        if (node.nodeType === Node.ELEMENT_NODE) { scan(node); releaseMenus(node); }
       });
       const target = record.target;
       if (target instanceof HTMLSelectElement) sync(target);
@@ -248,6 +292,7 @@
         if (select) sync(select);
       }
     }
+    adoptReplacement();
   });
 
   const installValueHook = name => {

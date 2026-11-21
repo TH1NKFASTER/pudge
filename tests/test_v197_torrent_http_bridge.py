@@ -59,7 +59,10 @@ def test_asset_server_torrent_post_bypasses_pywebview_and_reaches_backend(tmp_pa
         assert calls == [True]
         assert any(message == "EVENT torrent.http_toggle desired=%s" for message, _ in logger.lines)
 
-        with urllib.request.urlopen(f"http://{host}:{port}/api/torrents/status", timeout=2) as response:
+        status_request = urllib.request.Request(
+            f"http://{host}:{port}/api/torrents/status", headers={"X-Pudge-Token": api._http_session_token}
+        )
+        with urllib.request.urlopen(status_request, timeout=2) as response:
             status = json.loads(response.read().decode("utf-8"))
         assert status["enabled"] is True
     finally:
@@ -178,7 +181,17 @@ def test_asset_server_http_api_is_same_origin_and_no_store(tmp_path: Path) -> No
     port = server.server_address[1]
     token = api._http_session_token
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/torrents/status", timeout=2) as response:
+        # GETs need the session token too (or the page key): any local process could read them.
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/torrents/status", timeout=2)
+        except urllib.error.HTTPError as error:
+            assert error.code == 403
+        else:
+            raise AssertionError("a status GET without the session token was answered")
+        status_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/torrents/status", headers={"X-Pudge-Token": token}
+        )
+        with urllib.request.urlopen(status_request, timeout=2) as response:
             assert response.headers.get("Cache-Control") == "no-store"
             assert json.loads(response.read()) == {"enabled": False, "stale": False}
         # Only the app's own page, with its session token and JSON, can switch torrents.

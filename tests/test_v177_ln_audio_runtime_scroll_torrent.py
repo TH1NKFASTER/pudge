@@ -155,15 +155,18 @@ def test_switching_torrents_on_shows_in_the_next_state_at_once(tmp_path: Path) -
     )
 
     def card_download(state: dict) -> dict:
-        [card] = state["home"]["download_available"]
+        [card] = state["home"]["waiting"]
         return {
             "enabled": state["settings"]["torrents_enabled"],
             "shown": card["download"]["effective_state"],
         }
 
-    assert card_download(api.get_state_fast()) == {"enabled": False, "shown": "paused"}
-    api.set_torrents_enabled(True)
-    assert card_download(api.get_state_fast()) == {"enabled": True, "shown": "downloading"}
+    try:
+        assert card_download(api.get_state_fast()) == {"enabled": False, "shown": "paused"}
+        api.set_torrents_enabled(True)
+        assert card_download(api.get_state_fast()) == {"enabled": True, "shown": "downloading"}
+    finally:
+        api.close()  # stops what switching on started in the background
 
 
 def test_torrents_off_pauses_running_tasks_but_not_finished_aria2_ones(tmp_path: Path) -> None:

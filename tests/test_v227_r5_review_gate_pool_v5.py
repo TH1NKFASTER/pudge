@@ -120,7 +120,7 @@ def test_prefetch_target_is_reviews_per_episode_times_unique_ready_anime(tmp_pat
     assert started["started"] is True
     thread = api._review_gate_prefetch_thread
     assert thread is not None
-    thread.join(timeout=3)
+    thread.join(timeout=30)
     assert not thread.is_alive()
 
     # Cold startup first publishes one episode quota, then fills the x*y pool.
@@ -315,7 +315,7 @@ def test_cold_click_fetches_only_current_episode_quota_then_warms_full_pool(tmp_
 
     thread = api._review_gate_prefetch_thread
     if thread is not None:
-        thread.join(timeout=3)
+        thread.join(timeout=30)
         assert not thread.is_alive()
     # The full 20-card account pool is filled only in the background.
     assert any(required == 15 for required, _trusted in service.calls[1:])

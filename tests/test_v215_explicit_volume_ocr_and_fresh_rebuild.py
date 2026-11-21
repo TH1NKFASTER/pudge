@@ -60,22 +60,23 @@ def test_debug_fresh_rebuilds_the_subtitle_from_scratch(tmp_path: Path, monkeypa
     manager, video, commands = subtitle_library(tmp_path, monkeypatch)
     force_key = manager._subtitle_force_rebuild_state_key(video)
     fingerprint_key = manager._subtitle_candidate_fingerprint_state_key(video)
-    # What anyone reading the database sees at the moment the old selection disappears
+    # What anyone reading the database sees at the moment the job is queued
     # (a subtitle worker running at the same time must already see the rebuild request).
     seen: list[tuple[str, str]] = []
-    clear = manager.db.clear_subtitle_selection
+    queue = manager.db.queue_subtitle_job
 
-    def watched_clear(path, **kwargs):
+    def watched_queue(*args, **kwargs):
         seen.append((manager.db.get_state(force_key, ""), manager.db.get_state(fingerprint_key, "")))
-        return clear(path, **kwargs)
+        return queue(*args, **kwargs)
 
-    monkeypatch.setattr(manager.db, "clear_subtitle_selection", watched_clear)
+    monkeypatch.setattr(manager.db, "queue_subtitle_job", watched_queue)
 
     manager.force_fresh_subtitle_selection(video)
 
     assert seen == [("1", "")]
+    # The old subtitles stay playable until the rebuild has new ones (FX Senshi Kurumi-chan E03).
     episode = manager.db.episode_by_path(video)
-    assert episode.subtitle_path is None and episode.state != "ready"
+    assert episode.state == "ready" and episode.subtitle_path.name == "old.srt"
 
     assert manager.process_subtitle_jobs(limit=1) == 1
     # The old subtitle in the history is not brought back; a full search and resync runs.

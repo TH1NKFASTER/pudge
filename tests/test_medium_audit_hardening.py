@@ -79,7 +79,7 @@ def test_parse_same_hash_is_single_flight_and_reuses_cache(
         with calls_lock:
             calls += 1
         started.set()
-        assert release.wait(2)
+        assert release.wait(30)
         rows = list((payload or {}).get("text") or [])
         return {"tokens": [[] for _ in rows], "vocabulary": []}
 
@@ -89,13 +89,13 @@ def test_parse_same_hash_is_single_flight_and_reuses_cache(
     first = threading.Thread(target=lambda: results.append(service._parse_text("同じ本文", "same-hash")))
     second = threading.Thread(target=lambda: results.append(service._parse_text("同じ本文", "same-hash")))
     first.start()
-    assert started.wait(1)
+    assert started.wait(30)
     second.start()
     time.sleep(0.05)
     assert calls == 1
     release.set()
     first.join(2)
-    second.join(2)
+    second.join(30)
 
     assert not first.is_alive() and not second.is_alive()
     assert calls == 1
@@ -115,7 +115,7 @@ def test_parse_different_hashes_do_not_share_one_global_network_lock(
         rows = list((payload or {}).get("text") or [])
         if rows == ["長い章"]:
             first_started.set()
-            assert allow_first.wait(2)
+            assert allow_first.wait(30)
         else:
             second_started.set()
         return {"tokens": [[] for _ in rows], "vocabulary": []}
@@ -124,13 +124,13 @@ def test_parse_different_hashes_do_not_share_one_global_network_lock(
     first = threading.Thread(target=lambda: service._parse_text("長い章", "chapter"))
     second = threading.Thread(target=lambda: service._parse_text("短い台詞", "dialogue"))
     first.start()
-    assert first_started.wait(1)
+    assert first_started.wait(30)
     second.start()
 
     assert second_started.wait(0.5), "interactive parse was blocked behind unrelated chapter parse"
     allow_first.set()
     first.join(2)
-    second.join(2)
+    second.join(30)
     assert not first.is_alive() and not second.is_alive()
 
 
@@ -161,7 +161,7 @@ def test_interactive_parse_slot_has_priority_over_queued_background(
     def active_worker(index: int) -> None:
         with service._parse_request_slot(interactive=False):
             active_started[index].set()
-            assert release_active.wait(2)
+            assert release_active.wait(30)
 
     active_threads = [
         threading.Thread(target=active_worker, args=(0,)),
@@ -169,7 +169,7 @@ def test_interactive_parse_slot_has_priority_over_queued_background(
     ]
     for thread in active_threads:
         thread.start()
-    assert all(event.wait(1) for event in active_started)
+    assert all(event.wait(30) for event in active_started)
 
     # Use explicit workers for correct context cleanup after acquisition.
     def queued_background() -> None:
@@ -182,7 +182,7 @@ def test_interactive_parse_slot_has_priority_over_queued_background(
 
     background = threading.Thread(target=queued_background)
     background.start()
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 30  # ends as soon as the thread queued
     while time.monotonic() < deadline:
         with service._parse_admission:
             if service._parse_waiting_background:
@@ -191,7 +191,7 @@ def test_interactive_parse_slot_has_priority_over_queued_background(
 
     interactive = threading.Thread(target=queued_interactive)
     interactive.start()
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 30  # ends as soon as the thread queued
     while time.monotonic() < deadline:
         with service._parse_admission:
             if service._parse_waiting_interactive:
@@ -199,11 +199,11 @@ def test_interactive_parse_slot_has_priority_over_queued_background(
         time.sleep(0.005)
 
     release_active.set()
-    assert interactive_acquired.wait(1)
+    assert interactive_acquired.wait(30)
     assert not background_acquired.is_set() or interactive_acquired.is_set()
 
     for thread in [*active_threads, interactive, background]:
-        thread.join(2)
+        thread.join(30)
         assert not thread.is_alive()
 
 

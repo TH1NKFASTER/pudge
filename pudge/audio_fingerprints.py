@@ -18,6 +18,7 @@ content hash.  Silent frames are flagged and never count as a match.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,21 +118,48 @@ def decode_region(
     stream_index: int | None = None,
     timeout: float = 180.0,
     cancel_check: Any | None = None,
+    nice: int | None = None,
+    leading_silence: float = 0.0,
+    from_file_start: bool = False,
+    fill_gaps: bool = False,
 ) -> Any:
-    """Decode one region of the audio track to mono float PCM via FFmpeg."""
+    """Decode one region of the audio track to mono float PCM via FFmpeg.
+
+    ``nice``: run FFmpeg at that lower CPU priority (background work). ``cancel_check`` is
+    polled every 50 ms; a True kills FFmpeg at once.
+
+    The region is on the playback timeline (``audio_timeline``). ``from_file_start``
+    (audio that starts before the video): a region from 0 is read without ``-ss``, which
+    would land on the first video keyframe and lose the audio before it.
+    ``leading_silence`` (a track that starts that long after the file start): the track is
+    decoded from the file start with that silence in front, then cut. ``fill_gaps`` (a
+    timestamp gap inside the track, in or before the region): decoded the same way, the
+    gaps filled. Without any of them the command is the one it always was.
+    """
     import numpy as np
 
+    from .audio_timeline import delay_filter
+
+    start = max(0.0, float(start_seconds))
+    duration = max(0.1, float(duration_seconds))
+    if leading_silence > 0 or fill_gaps:
+        window = [
+            "-i",
+            str(video),
+            "-af",
+            f"{delay_filter(leading_silence)},asetpts=N/SR/TB,"
+            f"atrim=start={start:.3f}:duration={duration:.3f}",
+        ]
+    elif from_file_start and start <= 0.0005:
+        window = ["-t", f"{duration:.3f}", "-i", str(video)]
+    else:
+        window = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(video)]
     command = [
         str(ffmpeg),
         "-nostdin",
         "-v",
         "error",
-        "-ss",
-        f"{max(0.0, float(start_seconds)):.3f}",
-        "-t",
-        f"{max(0.1, float(duration_seconds)):.3f}",
-        "-i",
-        str(video),
+        *window,
         "-map",
         f"0:{int(stream_index)}" if stream_index is not None else "0:a:0",
         "-vn",
@@ -145,6 +173,10 @@ def decode_region(
         "s16le",
         "pipe:1",
     ]
+    nice_tool = shutil.which("nice") if nice is not None else None
+    if nice_tool:
+        # nice execs FFmpeg in its own process: killing the PID still kills FFmpeg.
+        command = [nice_tool, "-n", str(int(nice)), *command]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
@@ -230,6 +262,7 @@ class MatchRun:
     b_start: float
     b_end: float
     bit_error_rate: float
+    voiced: float = 1.0  # share of the run's frames that are not silent in either file
 
     @property
     def duration(self) -> float:
@@ -294,6 +327,7 @@ def matching_runs(
         if (end - start) * HOP_SECONDS < min_seconds:
             continue
         rate = float(np.mean(ber[start:end][valid[start:end]])) if valid[start:end].any() else 1.0
+        voiced = float(np.mean(valid[start:end]))
         ia, ib = first_a + start, first_a + end - 1
         result.append(
             MatchRun(
@@ -302,9 +336,72 @@ def matching_runs(
                 b_start=b.time_of(ia + offset) - HOP_SECONDS / 2,
                 b_end=b.time_of(ib + offset) + HOP_SECONDS / 2,
                 bit_error_rate=round(rate, 4),
+                voiced=round(voiced, 4),
             )
         )
     return result
+
+
+# Pieces of one stretch at the same alignment, broken by a few seconds that differ (a sound
+# effect or a line over the OP), are one stretch: Assassination Classroom E07's OP matched every
+# other episode at 0:38-1:13 and 1:16-2:05, and only the second piece was offered as the OP.
+JOIN_PIECE_SECONDS = 10.0
+JOIN_GAP_SECONDS = 6.0
+
+
+def _join_broken_runs(runs: list[MatchRun], *, max_gap: float = JOIN_GAP_SECONDS) -> list[MatchRun]:
+    joined: list[MatchRun] = []
+    for run in sorted(runs, key=lambda item: item.a_start):
+        if joined and 0.0 <= run.a_start - joined[-1].a_end <= max_gap:
+            last = joined[-1]
+            weight = last.duration + run.duration
+            joined[-1] = MatchRun(
+                a_start=last.a_start,
+                a_end=run.a_end,
+                b_start=last.b_start,
+                b_end=run.b_end,
+                bit_error_rate=round(
+                    (last.bit_error_rate * last.duration + run.bit_error_rate * run.duration) / weight, 4
+                ),
+            )
+        else:
+            joined.append(run)
+    return joined
+
+
+# A shared stretch is extended at both ends by short pieces at the same alignment that match
+# clearly (stricter than the main threshold, mostly non-silent), a few seconds away: Sora yori mo
+# Tooi Basho E01's ED matched the other episodes for its first ~3 s, then a line of dialogue over
+# the ED's intro differed for ~6 s, and only the rest of the ED (from ~9 s late) was offered.
+EXTEND_PIECE_SECONDS = 2.0
+EXTEND_MAX_BIT_ERROR = 0.25
+EXTEND_GAP_SECONDS = 9.0
+EXTEND_MIN_VOICED = 0.8
+
+
+def _extend_run(run: MatchRun, pieces: list[MatchRun], *, max_seconds: float) -> MatchRun:
+    """``run`` grown by the qualifying short ``pieces`` (same alignment) chained at either end."""
+    usable = [
+        piece
+        for piece in pieces
+        if piece.duration >= EXTEND_PIECE_SECONDS
+        and piece.bit_error_rate <= EXTEND_MAX_BIT_ERROR
+        and piece.voiced >= EXTEND_MIN_VOICED
+    ]
+    start, end, b_start, b_end = run.a_start, run.a_end, run.b_start, run.b_end
+    for piece in sorted(usable, key=lambda item: -item.a_end):  # leading pieces, nearest first
+        if piece.a_end <= start and start - piece.a_end <= EXTEND_GAP_SECONDS:
+            if end - piece.a_start > max_seconds:
+                break
+            start, b_start = piece.a_start, piece.b_start
+    for piece in sorted(usable, key=lambda item: item.a_start):  # trailing pieces, nearest first
+        if piece.a_start >= end and piece.a_start - end <= EXTEND_GAP_SECONDS:
+            if piece.a_end - start > max_seconds:
+                break
+            end, b_end = piece.a_end, piece.b_end
+    if start == run.a_start and end == run.a_end:
+        return run
+    return MatchRun(start, end, b_start, b_end, run.bit_error_rate, run.voiced)
 
 
 def best_shared_run(
@@ -318,9 +415,18 @@ def best_shared_run(
     """Longest shared stretch of a plausible OP/ED length (None when there is none)."""
     best: MatchRun | None = None
     for offset in candidate_offsets(a, b):
-        for run in matching_runs(a, b, offset, max_bit_error=max_bit_error, min_seconds=min_seconds):
+        pieces = matching_runs(
+            a, b, offset, max_bit_error=max_bit_error, min_seconds=min(min_seconds, JOIN_PIECE_SECONDS)
+        )
+        short: list[MatchRun] | None = None
+        for run in _join_broken_runs(pieces):
             if not (min_seconds <= run.duration <= max_seconds):
                 continue
+            if short is None:
+                short = matching_runs(
+                    a, b, offset, max_bit_error=EXTEND_MAX_BIT_ERROR, min_seconds=EXTEND_PIECE_SECONDS
+                )
+            run = _extend_run(run, short, max_seconds=max_seconds)
             if (
                 best is None
                 or run.duration > best.duration
@@ -358,6 +464,8 @@ def save_fingerprint(path: Path, fp: AudioFingerprint, *, meta: dict[str, Any]) 
 
 def load_fingerprint(path: Path) -> tuple[AudioFingerprint, dict[str, Any]] | None:
     import json
+    import zipfile
+    import zlib
 
     import numpy as np
 
@@ -376,5 +484,16 @@ def load_fingerprint(path: Path) -> tuple[AudioFingerprint, dict[str, Any]] | No
                 ),
                 meta,
             )
-    except (OSError, ValueError, KeyError, TypeError):
+    # A truncated or damaged cache file (an interrupted write, a full disk): computed again.
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        AttributeError,
+        EOFError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ):
         return None

@@ -386,7 +386,8 @@ def test_one_fetch_fills_one_slot_and_stale_answers_are_dropped(page) -> None:
         ),
         before=reviews(THIRD),
     )
-    assert stale.value == {"word": "古い", "next": None}
+    # The card on show (新) stays: another card was graded; FIRST never comes back.
+    assert stale.value == {"word": "新", "next": None}
 
 
 def test_undo_pressed_while_saving_runs_after_the_save(page) -> None:

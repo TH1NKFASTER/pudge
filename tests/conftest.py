@@ -14,16 +14,42 @@ from __future__ import annotations
 import atexit
 import os
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
 
-_CREATED_RUNTIME = Path(tempfile.mkdtemp(prefix="pudge-pytest-runtime."))
+
+def _remove_stale_runtimes() -> None:
+    """Runtimes of earlier runs that were killed (atexit never ran) - only when their run is gone."""
+    for stale in Path(tempfile.gettempdir()).glob("pudge-pytest-runtime.*"):
+        owner = stale / "owner.pid"
+        try:
+            pid = int(owner.read_text().strip())
+        except (OSError, ValueError):
+            continue  # no owner file: an older run or a foreign folder; leave it alone
+        try:
+            os.kill(pid, 0)
+            continue  # that run is still going
+        except ProcessLookupError:
+            shutil.rmtree(stale, ignore_errors=True)
+        except PermissionError:
+            continue
+
+
+_remove_stale_runtimes()
+# ".noindex": Spotlight never indexes it, so the fake pudge.app bundles some tests build (same
+# bundle id, version 9.8.x) never reach Spotlight or Launch Services, where they would outrank the
+# real app, also when a killed run leaves the folder behind.
+_CREATED_RUNTIME = Path(tempfile.mkdtemp(prefix="pudge-pytest-runtime.", suffix=".noindex"))
+(_CREATED_RUNTIME / "owner.pid").write_text(str(os.getpid()))
 _TEST_HOME = _CREATED_RUNTIME / "home"
 _TEST_TMP = _CREATED_RUNTIME / "tmp"
 _GUI_STUBS = _CREATED_RUNTIME / "gui-stubs"
 for directory in (_TEST_HOME, _TEST_TMP, _GUI_STUBS):
     directory.mkdir()
+# Private like macOS's per-user TMPDIR, so mpv sockets are created here and not in /tmp.
+_TEST_TMP.chmod(0o700)
 # dns-sd: a test that turns iPhone access on must never advertise the Mac on the real network.
 for name in ("open", "xdg-open", "osascript", "dns-sd"):
     stub = _GUI_STUBS / name
@@ -62,6 +88,11 @@ os.environ.setdefault("PUDGE_ANIME_MAPPINGS", "0")
 os.environ.setdefault("PUDGE_SEADEX", "0")
 # ... nor run FFmpeg OP/ED analysis from a manager maintenance pass.
 os.environ.setdefault("PUDGE_INTRO_DETECTION", "0")
+# ... nor start worker processes (pudge/low_ram.py) from managers built on a real config file:
+# tests of the workers themselves clear this (monkeypatch.delenv(low_ram.WORKERS_DISABLE_ENV)).
+os.environ.setdefault("PUDGE_WORKERS", "0")
+# ... nor change its Dock presence (nor the window processes it starts): no Python icons in the Dock.
+os.environ["PUDGE_NO_DOCK_CHANGES"] = "1"
 
 if not os.environ.get("PUDGE_HOME", "").strip():
     os.environ["PUDGE_HOME"] = str(_CREATED_RUNTIME / "pudge-home")
@@ -75,6 +106,17 @@ if not os.environ.get("PUDGE_HOME", "").strip():
 def _cleanup_pytest_runtime() -> None:
     if _CREATED_RUNTIME is not None:
         shutil.rmtree(_CREATED_RUNTIME, ignore_errors=True)
+
+
+def _terminate_with_cleanup(signum, _frame) -> None:  # noqa: ANN001
+    # SIGTERM skips atexit: remove the runtime folder, then die of the same signal as before.
+    _cleanup_pytest_runtime()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+if signal.getsignal(signal.SIGTERM) == signal.SIG_DFL:
+    signal.signal(signal.SIGTERM, _terminate_with_cleanup)
 
 
 import pytest as _pytest
@@ -110,8 +152,12 @@ def _reset_nyaa_mirror_backoff():
         yield
         return
     _nyaa._MIRROR_BACKOFF.clear()
+    _nyaa._HOST_BREAKERS.clear()
+    _nyaa._HOST_RETRY_AFTER.clear()
     yield
     _nyaa._MIRROR_BACKOFF.clear()
+    _nyaa._HOST_BREAKERS.clear()
+    _nyaa._HOST_RETRY_AFTER.clear()
 
 
 @_pytest.fixture(autouse=True)
@@ -126,6 +172,67 @@ def _reset_qbittorrent_discovery_cache():
     cache.clear()
     yield
     cache.clear()
+
+
+def _clear_anilist_process_state() -> None:
+    try:
+        from pudge.providers import anilist as _anilist
+    except Exception:
+        return
+    for name, value in (
+        ("_PROCESS_COOLDOWN_UNTIL", 0.0),
+        ("_PROCESS_COOLDOWN_STATUS", 0),
+        ("_PROCESS_COOLDOWN_MESSAGE", ""),
+        ("_PROCESS_FORBIDDEN_STREAK", 0),
+        ("_FORBIDDEN_SEEN", False),
+        ("_BULK_LAST_REQUEST_AT", 0.0),
+    ):
+        if hasattr(_anilist, name):
+            setattr(_anilist, name, value)
+    getattr(_anilist, "_VIEWER_IDS", {}).clear()
+    if hasattr(_anilist.AniListClient, "_nested_graph_query"):
+        _anilist.AniListClient._nested_graph_query = True
+
+
+@_pytest.fixture(autouse=True)
+def _reset_jiten_client():
+    """The Jiten request budget, Retry-After and outage pause are process-wide; isolate tests."""
+    try:
+        from pudge import jiten_client as _jiten_client
+    except Exception:
+        yield
+        return
+    _jiten_client.CLIENT.configure(None)
+    _jiten_client.CLIENT.reset()
+    yield
+    _jiten_client.CLIENT.configure(None)
+    _jiten_client.CLIENT.reset()
+
+
+@_pytest.fixture(autouse=True)
+def _reset_anilist_process_state():
+    """AniList 403/429 cool-downs and the viewer-id cache are process-wide; isolate tests."""
+    _clear_anilist_process_state()
+    yield
+    _clear_anilist_process_state()
+
+
+@_pytest.fixture(autouse=True)
+def _no_host_aria2_listener_probe(monkeypatch):
+    """Tests talk to fake aria2 RPC servers, not to whatever listens on the host's port 6801.
+
+    The lsof listener check of the sidecar answers "cannot tell" (as without lsof), so
+    only the token test decides; tests of the listener check patch it themselves.
+    """
+    try:
+        from pudge.providers import aria2 as _aria2
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(_aria2.Aria2Client, "_rpc_listener_pids", lambda self: None)
+    _aria2._TRUSTED_RPC_LISTENERS.clear()
+    yield
+    _aria2._TRUSTED_RPC_LISTENERS.clear()
 
 
 @_pytest.fixture(autouse=True)
@@ -266,7 +373,28 @@ def _pudge_logs_reach_caplog():
     for name, logger in list(_logging.Logger.manager.loggerDict.items()):
         if name.startswith("pudge") and isinstance(logger, _logging.Logger):
             logger.disabled = False
+    before = {
+        name: list(logger.handlers)
+        for name, logger in [
+            ("pudge", _logging.getLogger("pudge")),
+            *_logging.Logger.manager.loggerDict.items(),
+        ]
+        if name.startswith("pudge") and isinstance(logger, _logging.Logger)
+    }
     yield
+    # Handlers a test added to the app loggers end with it. pytest's caplog handler is one
+    # object for the whole session: a test that added it to the "pudge" logger made every
+    # later test see each app record twice in caplog (test_upgrade_score_context -> "logged
+    # once" assertions failed depending on the order). configure_logging(tmp_path / ...) left a
+    # second file handler that wrote every later test's lines to that test's file.
+    for name, logger in list(_logging.Logger.manager.loggerDict.items()):
+        if not (name.startswith("pudge") and isinstance(logger, _logging.Logger)):
+            continue
+        kept = before.get(name, [])
+        for handler in [handler for handler in logger.handlers if handler not in kept]:
+            logger.removeHandler(handler)
+            if not isinstance(handler, _logging.StreamHandler) or isinstance(handler, _logging.FileHandler):
+                handler.close()
 
 
 @_pytest.fixture(autouse=True)
@@ -285,6 +413,26 @@ def _stop_statistics_word_jobs():
 
 
 @_pytest.fixture(autouse=True)
+def _stop_periodic_loops_of_unclosed_apis(monkeypatch):
+    """The playback-time recorder, background OCR and daily snapshot of a WebAppApi a
+    test did not close stop with that test (tests/background_isolation.py)."""
+    from background_isolation import stop_periodic_loops_started_inside
+
+    with stop_periodic_loops_started_inside(monkeypatch):
+        yield
+
+
+@_pytest.fixture(autouse=True)
+def _drain_jiten_word_fetches(monkeypatch):
+    """Background dictionary fetches of a test's Jiten word cache end with that test
+    (tests/background_isolation.py)."""
+    from background_isolation import drain_jiten_word_fetches_started_inside
+
+    with drain_jiten_word_fetches_started_inside(monkeypatch):
+        yield
+
+
+@_pytest.fixture(autouse=True)
 def _roomy_download_disk(monkeypatch):
     """Automatic downloads keep a free-space reserve on the real download volume.
 
@@ -298,4 +446,71 @@ def _roomy_download_disk(monkeypatch):
         yield
         return
     monkeypatch.setattr(_disk_space, "volume_usage", lambda _path: (4 * 1024**4, 2 * 1024**4))
+    yield
+
+
+@_pytest.fixture(autouse=True)
+def _restore_environ():
+    """Each test starts with the environment the previous one started with.
+
+    Code under test sets variables in-process (``PUDGE_LAUNCH_BACKGROUND``, the notification
+    helper flag), and ``monkeypatch.delenv(..., raising=False)`` of a variable that was not set
+    records nothing to undo: what the code set then leaked into every later test. (monkeypatch's
+    own undo, before or after this, tolerates a variable that is already gone.)
+    """
+    # The raw mapping: a copy of it costs ~1 µs, dict(os.environ) ~150 µs (x 7700 tests).
+    raw = getattr(os.environ, "_data", None)
+    decode = (getattr(os.environ, "decodekey", None), getattr(os.environ, "decodevalue", None))
+    if not isinstance(raw, dict) or None in decode:
+        before = dict(os.environ)
+        yield
+        changed = os.environ != before
+    else:
+        raw_before = raw.copy()
+        yield
+        changed = raw != raw_before
+        if changed:
+            before = {decode[0](key): decode[1](value) for key, value in raw_before.items()}
+    if changed:
+        for name in [name for name in os.environ if name not in before]:
+            del os.environ[name]
+        for name, value in before.items():
+            if os.environ.get(name) != value:
+                os.environ[name] = value
+
+
+@_pytest.fixture(autouse=True)
+def _restore_umask():
+    """Each test starts with the umask the run started with (a test that changes it,
+    or code under test, must not decide the file modes of later tests)."""
+    previous = os.umask(0o022)
+    os.umask(previous)
+    yield
+    os.umask(previous)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_process_scan: the audiobook start-up process-table scans run for real (see "
+        "_no_process_table_scan_at_audiobook_start)",
+    )
+
+
+@_pytest.fixture(autouse=True)
+def _no_process_table_scan_at_audiobook_start(request, monkeypatch):
+    """Every AudiobookService start scans the whole process table twice (``ps -axo``) for
+    orphaned mpv players and pre-v131 STT workers of the user's own runs. Every WebAppApi a
+    test builds has one: 2,500 ``ps`` launches per run, ~40 ms each on a Mac with many
+    processes. Tests of the scans themselves are marked ``real_process_scan``."""
+    if request.node.get_closest_marker("real_process_scan") is not None:
+        yield
+        return
+    try:
+        from pudge import audiobooks as _audiobooks
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(_audiobooks, "terminate_legacy_audiobook_stt_workers", lambda **_kwargs: [])
+    monkeypatch.setattr(_audiobooks, "terminate_orphaned_audiobook_players", lambda *_args, **_kwargs: [])
     yield

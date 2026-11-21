@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import copy
 import hashlib
 import io
@@ -16,19 +17,31 @@ import threading
 import time
 import unicodedata
 import zipfile
+import zlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import httpx
 from PIL import Image
 
+from .archive_limits import (
+    BOOK_ARCHIVE_LIMIT,
+    IMAGE_MEMBER_LIMIT,
+    ArchiveBudget,
+    ArchiveTooLargeError,
+    read_member,
+)
 from .branding import DATA_DIR
+from .fsutil import temporary_sibling
 from .cover_assets import CoverRef
 from .i18n import err
-from .database import Database
+from .database import STATE_PREFIX_SQL, Database, state_prefix_bounds
+from .junk_files import junk_member, junk_part, junk_path
 from . import library_overrides
 from .library_overrides import kanji_volume_digits
 from .manga_mokuro import MokuroImportError, convert_mokuro, mokuro_page_regions
+from .manga_spreads import spread_table
+from .manga_text_cleanup import clean_region_dots
 from .manga_mokuro_session import (
     MokuroSession,
     MokuroSessionError,
@@ -41,23 +54,56 @@ from .manga_lexicon import (
     fix_region as fix_lexicon_region,
 )
 from .manga_ocr_artifact import (
+    artifact_file,
     artifact_page,
     build_artifact,
     normalize_page,
     read_artifact,
+    remove_artifact,
     write_artifact,
 )
 from .process_priority import background_environment
 from .runtime import worker_environment
 from .work_scheduler import WorkPriority
 
+# A page over Pillow's pixel limit raises DecompressionBombError (not an OSError);
+# one such page used to break the whole manga library. The warning is listed for
+# setups that turn warnings into errors.
+_PAGE_IMAGE_ERRORS = (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning)
+# "012-013.jpg": one picture over two pages (the Mac reader shows it alone).
+_SPREAD_NAME = re.compile(r"(?:^|[^0-9])(\d{1,4})\s*[-–—]\s*(\d{1,4})(?:[^0-9]|$)")
+
 _LOGGER = logging.getLogger(__name__)
+# Two requests at once never make two alignment stores (two workers) for one service.
+_ALIGN_STORE_LOCK = threading.Lock()
+
+# Compression methods zipfile can read; Deflate64 (9) and others raise NotImplementedError.
+_READABLE_ZIP_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA}
+
+
+def read_page_member(archive: Any, name: str, *, budget: ArchiveBudget | None = None) -> bytes:
+    """One page's bytes; a password-protected or unreadably compressed page is a ValueError.
+
+    zipfile raises RuntimeError ("password required") or NotImplementedError for
+    them, which no reader path caught: one such CBZ broke the whole Manga tab.
+    """
+    try:
+        return read_member(archive, name, budget=budget, limit=IMAGE_MEMBER_LIMIT)
+    except RuntimeError as exc:
+        raise ValueError(err("manga.archiveEncrypted")) from exc
+    except NotImplementedError as exc:
+        raise ValueError(err("manga.archiveUnsupportedCompression")) from exc
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 _REGION_CACHE_KEY = "pudge-manga-regions-v96p27-orphan-vertical-ink"
 # A volume's OCR artifact is "<source fingerprint><suffix>" (current OCR generation).
 _OCR_ARTIFACT_SUFFIX = "-regions-v96p27.json"
+# A volume's artifact updated page by page is kept in memory and written at most this often
+# (and when the run ends, or before anything loads it): rewriting the whole gzip file per page
+# made a volume quadratic. The database holds every page; an artifact older than it (after a
+# crash) is rebuilt from the database on the next load, as before.
+_OCR_ARTIFACT_WRITE_SECONDS = 20.0
 _READER_PREFS_KEY = "manga_reader_preferences:v1"
 # Hand-made OCR edits of earlier versions (corrected text, reading order, moved,
 # hidden, added, merged and split regions). The reader shows OCR as recognized
@@ -152,8 +198,74 @@ def _manga_series_title(value: str) -> str:
 
 def _manga_series_key(value: str) -> str:
     text = _manga_series_title(value)
-    text = re.sub(r"[\s\[\](){}._・･:：!！?？'\"“”‘’—–-]+", "", text)
+    # 〜 (wave dash) and ～/~ (tilde) are one mark in titles (light_novels._series_key).
+    text = re.sub(r"[\s\[\](){}._・･:：!！?？'\"“”‘’—–\-~〜∼〰]+", "", text)
     return text.casefold()
+
+
+_ARCHIVE_SUFFIXES = {".cbz", ".zip"}
+# Page lists of archives (MangaService._pages): (path, junk listed) -> (size, mtime, inode), names.
+_PAGE_LIST_CACHE: "collections.OrderedDict[tuple[str, bool], tuple[tuple[int, int, int], tuple[str, ...]]]" = collections.OrderedDict()
+_PAGE_LIST_CACHE_SIZE = 64
+_PAGE_LIST_LOCK = threading.Lock()
+# Packed copies of dropped image folders: "<title>-<20 hex digest>.cbz".
+_PACKED_COPY_NAME = re.compile(r"-([0-9a-f]{20})\.cbz$")
+# Earlier versions packed every dropped image folder into a CBZ copy; a one-time
+# startup step points those volumes back at their original folders.
+_FOLDER_RELINK_STATE_KEY = "manga_imports_relinked:v1"
+_FOLDER_RELINK_PENDING_PREFIX = "manga_imports_relink_pending:v1:"
+
+
+def _folder_source(path: Path) -> bool:
+    """A volume read in place from an image folder (also while that folder is missing)."""
+    try:
+        if path.is_dir():
+            return True
+        if path.exists():
+            return False
+    except OSError:
+        pass
+    return path.suffix.casefold() not in _ARCHIVE_SUFFIXES
+
+
+class _FolderPages:
+    """An image folder read through the part of ZipFile's API the reader uses.
+
+    A page name is a file name directly in the folder; it never leads outside it.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    def __enter__(self) -> "_FolderPages":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def _file(self, member: str | zipfile.ZipInfo) -> Path:
+        name = member.filename if isinstance(member, zipfile.ZipInfo) else str(member)
+        if not name or name in {".", ".."} or Path(name).name != name:
+            raise KeyError(name)
+        path = self.root / name
+        if not path.is_file():
+            raise KeyError(name)
+        return path
+
+    def getinfo(self, member: str | zipfile.ZipInfo) -> zipfile.ZipInfo:
+        path = self._file(member)
+        info = zipfile.ZipInfo(path.name)
+        info.file_size = path.stat().st_size
+        return info
+
+    def open(self, member: str | zipfile.ZipInfo, mode: str = "r") -> Any:
+        return self._file(member).open("rb")
+
+    def read(self, member: str | zipfile.ZipInfo) -> bytes:
+        return self._file(member).read_bytes()
 
 
 class MangaOcrDeferred(RuntimeError):
@@ -275,7 +387,9 @@ class MangaService:
         with self.db.connect() as conn:
             for prefix in _LEGACY_MANUAL_OCR_PREFIXES:
                 removed += int(
-                    conn.execute("DELETE FROM state WHERE substr(key,1,?)=?", (len(prefix), prefix)).rowcount
+                    conn.execute(
+                        f"DELETE FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(prefix)
+                    ).rowcount
                     or 0
                 )
             self._set_state_in_conn(conn, _MANUAL_OCR_REMOVED_STATE_KEY, str(int(time.time())))
@@ -347,7 +461,7 @@ class MangaService:
                     revision = self._state_int_from_conn(conn, self._ocr_revision_state_key(book_id)) + 1
                     self._set_state_in_conn(conn, self._ocr_revision_state_key(book_id), str(revision))
                 if artifact is not None:
-                    artifact.unlink(missing_ok=True)
+                    remove_artifact(artifact)
             stats["volumes"] += 1
             stats["pages"] += len(pages)
         root = self.cache_dir / "manga-ocr"
@@ -381,14 +495,29 @@ class MangaService:
 
     def shelf_metadata(self, book_id: int, title: str, path: str) -> dict[str, Any]:
         """Series title, series key and volume, hand-made corrections included."""
-        series_title = _manga_series_title(title or Path(path).stem) or title or Path(path).stem
+        # A folder's whole name: "Series Vol.01" has no file extension to drop.
+        stem = Path(path).name if _folder_source(Path(path)) else Path(path).stem
+        series_title = _manga_series_title(title or stem) or title or stem
         item = {
             "id": int(book_id),
             "series_title": series_title,
             "series_key": _manga_series_key(series_title) or f"book:{int(book_id)}",
-            "volume": _manga_volume(f"{title} {Path(path).stem}") or 1,
+            "volume": _manga_volume(f"{title} {stem}") or 1,
         }
         return library_overrides.apply(item, self._metadata_overrides().get(int(book_id)), _manga_series_key)
+
+    def shelf_keys(self) -> dict[int, str]:
+        """Series key of every volume (no page scan); a Finder drop compares its volumes with these."""
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id,title,path FROM manga_books").fetchall()
+        return {
+            int(row["id"]): str(
+                self.shelf_metadata(int(row["id"]), str(row["title"] or ""), str(row["path"] or ""))[
+                    "series_key"
+                ]
+            )
+            for row in rows
+        }
 
     def set_metadata_override(self, book_id: int, *, volume: int | None, series_title: str) -> dict[str, Any]:
         """Store a hand-made volume/series correction; it wins over the file name."""
@@ -442,48 +571,101 @@ class MangaService:
         return {"configured": True, **sanitized}
 
     @staticmethod
-    def archive_for_mokuro(sidecar: Path) -> Path:
-        """Resolve one adjacent archive for a user-selected .mokuro sidecar.
+    def _folder_pages(folder: Path, *, include_junk: bool = False) -> list[str]:
+        """Image files directly in a folder, in reading order (a folder volume's pages).
 
-        The mapping is deliberately narrow: exact sibling stem, explicit
-        ``archive.cbz.mokuro``/``archive.zip.mokuro`` packaging, or the known
-        sibling ``mokuro/`` directory. Never guess by title across a folder.
+        Hidden and AppleDouble ``._x.jpg`` files (exFAT/SMB) are not pages;
+        ``include_junk`` lists them as earlier versions did (to move saved
+        positions of volumes imported then).
         """
-        path = Path(sidecar).expanduser().resolve()
-        if path.suffix.casefold() != ".mokuro" or not path.is_file():
-            raise MokuroImportError(err("manga.selectMokuroFile"))
-        candidates: list[Path] = []
-        without_mokuro = path.with_suffix("")
-        if without_mokuro.suffix.casefold() in {".cbz", ".zip"} and without_mokuro.is_file():
-            candidates.append(without_mokuro.resolve())
-        else:
-            for suffix in (".cbz", ".zip"):
-                candidate = path.with_suffix(suffix)
-                if candidate.is_file():
-                    candidates.append(candidate.resolve())
-            if path.parent.name.casefold() == "mokuro":
-                for suffix in (".cbz", ".zip"):
-                    candidate = path.parent.parent / f"{path.stem}{suffix}"
-                    if candidate.is_file():
-                        candidates.append(candidate.resolve())
-        unique = list(dict.fromkeys(candidates))
-        if not unique:
-            raise MokuroImportError(err("manga.mokuroNoArchive"))
-        if len(unique) != 1:
-            raise MokuroImportError(err("manga.mokuroManyArchives"))
-        return unique[0]
+        names = [
+            item.name
+            for item in Path(folder).iterdir()
+            if item.suffix.casefold() in _IMAGE_EXTENSIONS
+            and (include_junk or not junk_part(item.name))
+            and item.is_file()
+        ]
+        return sorted(names, key=lambda name: (_natural_key(name), name))
 
     @staticmethod
-    def _pages(path: Path) -> list[str]:
-        if path.suffix.casefold() not in {".cbz", ".zip"} or not path.is_file():
+    def _open_book(path: Path) -> Any:
+        """A volume's pages: its CBZ/ZIP archive, or its image folder read in place."""
+        return _FolderPages(path) if Path(path).is_dir() else zipfile.ZipFile(path)
+
+    @staticmethod
+    def _source_fingerprint(path: Path, pages: list[str], *, as_path: Path | None = None) -> str:
+        """OCR identity of a volume's files; ``as_path`` computes it for another location.
+
+        A folder's is its path plus every page's name, size and mtime, so an edited
+        folder is read again like a changed archive.
+        """
+        named = str(as_path if as_path is not None else path)
+        if Path(path).is_dir():
+            entries = []
+            for name in sorted(pages):
+                stat = (Path(path) / name).stat()
+                entries.append(f"{name}:{stat.st_size}:{stat.st_mtime_ns}")
+            text = f"manga-folder-v1:{named}:{'|'.join(entries)}"
+        else:
+            stat = Path(path).stat()
+            text = f"manga-v2:{named}:{stat.st_size}:{stat.st_mtime_ns}:{'|'.join(pages)}"
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def folder_volume(path: str | Path) -> bool:
+        """The volume reads an image folder in place (not a CBZ/ZIP archive)."""
+        return _folder_source(Path(str(path or "")))
+
+    def source_missing(self, path: str | Path) -> bool:
+        """The volume's archive or image folder is no longer where Pudge reads it."""
+        source = Path(str(path or ""))
+        try:
+            return not (source.is_dir() if _folder_source(source) else source.is_file())
+        except OSError:
+            return True
+
+    @staticmethod
+    def _pages(path: Path, *, include_junk: bool = False) -> list[str]:
+        """A volume's page names in reading order.
+
+        ``__MACOSX/`` members (Finder's "Compress") and hidden ``._x.jpg`` files are
+        not pages: they sorted first, had no cover and stopped OCR before any real
+        page. ``include_junk`` lists them as earlier versions did.
+        """
+        if path.is_dir():
+            return MangaService._folder_pages(path, include_junk=include_junk)
+        if not path.exists():
+            raise ValueError(err("manga.sourceMissing", name=path.name))
+        if path.suffix.casefold() not in _ARCHIVE_SUFFIXES or not path.is_file():
             raise ValueError(err("manga.onlyCbzZip"))
+        # Every page turn, page asset, OCR lookup and spread table listed the archive again
+        # (its central directory read, every name filtered and sorted): kept while the file
+        # keeps its size, date and inode. A file changed in the last two seconds is listed
+        # again each time (a coarse clock can give two writes the same date).
+        stat = path.stat()
+        key = (str(path), bool(include_junk))
+        signature = (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ino))
+        with _PAGE_LIST_LOCK:
+            cached = _PAGE_LIST_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                _PAGE_LIST_CACHE.move_to_end(key)
+                return list(cached[1])
         with zipfile.ZipFile(path) as archive:
             pages = [
                 name
                 for name in archive.namelist()
-                if not name.endswith("/") and Path(name).suffix.casefold() in _IMAGE_EXTENSIONS
+                if not name.endswith("/")
+                and Path(name).suffix.casefold() in _IMAGE_EXTENSIONS
+                and (include_junk or not junk_member(name))
             ]
-        return sorted(pages, key=_natural_key)
+        pages = sorted(pages, key=_natural_key)
+        if time.time_ns() - signature[1] > 2_000_000_000:
+            with _PAGE_LIST_LOCK:
+                _PAGE_LIST_CACHE[key] = (signature, tuple(pages))
+                _PAGE_LIST_CACHE.move_to_end(key)
+                while len(_PAGE_LIST_CACHE) > _PAGE_LIST_CACHE_SIZE:
+                    _PAGE_LIST_CACHE.popitem(last=False)
+        return pages
 
     @staticmethod
     def series_title(value: str) -> str:
@@ -600,11 +782,11 @@ class MangaService:
         path = path.expanduser().resolve()
         pages = self._pages(path)
         if not pages:
-            raise ValueError(err("manga.archiveNoPages"))
-        stat = path.stat()
-        fingerprint = hashlib.sha1(
-            f"manga-v2:{path}:{stat.st_size}:{stat.st_mtime_ns}:{'|'.join(pages)}".encode("utf-8")
-        ).hexdigest()[:24]
+            raise ValueError(err("manga.volumeNoImages" if path.is_dir() else "manga.archiveNoPages"))
+        if not path.is_dir():
+            self._check_pages_readable(path, pages)
+        fingerprint = self._source_fingerprint(path, pages)
+        title = path.name if path.is_dir() else path.stem
         now = time.time()
         stale_artifact_prefix = ""
         with self.db.connect() as conn:
@@ -612,41 +794,191 @@ class MangaService:
                 "SELECT id,source_fingerprint FROM manga_books WHERE path=?", (str(path),)
             ).fetchone()
             previous_fingerprint = str(previous["source_fingerprint"] or "") if previous is not None else ""
+            # An archive imported again with fewer pages: the place and the read pages stay
+            # inside it (they used to keep the old, larger numbers).
             conn.execute(
                 """
                 INSERT INTO manga_books(path,title,page_count,position,reading_direction,source_fingerprint,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET title=excluded.title,page_count=excluded.page_count,
-                    source_fingerprint=excluded.source_fingerprint,updated_at=excluded.updated_at
+                    source_fingerprint=excluded.source_fingerprint,updated_at=excluded.updated_at,
+                    position=MIN(manga_books.position,MAX(excluded.page_count-1,0)),
+                    read_pages=MIN(manga_books.read_pages,excluded.page_count)
                 """,
-                (str(path), path.stem, len(pages), 0, "rtl", fingerprint, now, now),
+                (str(path), title, len(pages), 0, "rtl", fingerprint, now, now),
             )
             row = conn.execute("SELECT * FROM manga_books WHERE path=?", (str(path),)).fetchone()
             if previous is not None and previous_fingerprint != fingerprint:
-                book_id = int(previous["id"])
-                conn.execute("DELETE FROM manga_ocr_cache WHERE book_id=?", (book_id,))
-                conn.execute(
-                    "DELETE FROM state WHERE key LIKE ?",
-                    (f"manga_ocr_page_status:v18:{book_id}:%",),
-                )
-                self._bump_ocr_generation_in_conn(conn, book_id)
-                if previous_fingerprint:
-                    stale_artifact_prefix = f"{previous_fingerprint}-regions-"
-        if stale_artifact_prefix:
-            # The replaced file's OCR artifact, of the current or any older generation.
-            try:
-                stale_artifacts = [
-                    item
-                    for item in (self.cache_dir / "manga-ocr" / "artifacts").iterdir()
-                    if item.name.startswith(stale_artifact_prefix) and item.name.endswith(".json")
-                ]
-            except OSError:
-                stale_artifacts = []
-            for item in stale_artifacts:
-                item.unlink(missing_ok=True)
+                self._forget_ocr_in_conn(conn, int(previous["id"]))
+                stale_artifact_prefix = previous_fingerprint
+        self._delete_ocr_artifacts(stale_artifact_prefix)
         assert row is not None
         self._inherit_series_anilist(int(row["id"]))
         return self._payload(self._book(int(row["id"])))
+
+    @staticmethod
+    def _check_pages_readable(path: Path, pages: list[str]) -> None:
+        """Refuse a CBZ whose pages are password-protected or use a compression zipfile cannot read."""
+        try:
+            with zipfile.ZipFile(path) as archive:
+                infos = [archive.getinfo(name) for name in pages]
+        except (KeyError, zipfile.BadZipFile) as exc:
+            raise ValueError(err("manga.archiveNoPages")) from exc
+        if any(info.flag_bits & 0x1 for info in infos):
+            raise ValueError(err("manga.archiveEncrypted"))
+        if any(info.compress_type not in _READABLE_ZIP_METHODS for info in infos):
+            raise ValueError(err("manga.archiveUnsupportedCompression"))
+
+    def _forget_ocr_in_conn(self, conn: Any, book_id: int) -> None:
+        """The volume's pages changed: its OCR belongs to the old pages."""
+        conn.execute("DELETE FROM manga_ocr_cache WHERE book_id=?", (int(book_id),))
+        conn.execute(
+            f"DELETE FROM state WHERE {STATE_PREFIX_SQL}",
+            state_prefix_bounds(f"manga_ocr_page_status:v18:{int(book_id)}:"),
+        )
+        self._bump_ocr_generation_in_conn(conn, int(book_id))
+
+    def _delete_ocr_artifacts(self, fingerprint: str) -> None:
+        """OCR artifacts of a replaced source, of the current or any older generation."""
+        if not fingerprint:
+            return
+        prefix = f"{fingerprint}-regions-"
+        try:
+            stale_artifacts = [
+                item
+                for item in (self.cache_dir / "manga-ocr" / "artifacts").iterdir()
+                if item.name.startswith(prefix) and item.name.endswith((".json", ".json.gz"))
+            ]
+        except OSError:
+            stale_artifacts = []
+        for item in stale_artifacts:
+            item.unlink(missing_ok=True)
+
+    @staticmethod
+    def _progress_without_junk(legacy_pages: list[str], position: int, read_pages: int) -> tuple[int, int]:
+        """Saved position/read pages of a listing with junk pages, in the listing without them.
+
+        Earlier versions counted ``__MACOSX/._x.jpg`` and ``._x.jpg`` files as pages
+        (sorted first in most archives): page 12 then was real page 12 minus those.
+        A position on a junk page moves to the next real page.
+        """
+        real_before = [0]
+        for name in legacy_pages:
+            real_before.append(real_before[-1] + (0 if junk_member(name) else 1))
+        total = real_before[-1]
+        index = max(0, min(int(position), len(legacy_pages)))
+        done = max(0, min(int(read_pages), len(legacy_pages)))
+        return max(0, min(real_before[index], total - 1)), real_before[done]
+
+    def _refresh_folder_source(self, row: Any) -> Any:
+        """A volume whose pages were added, removed or edited is read again.
+
+        Pages are listed from the folder on every read, so its page numbers move
+        with such a change and the old OCR would land on the wrong pages. A CBZ or
+        folder imported while junk files (``__MACOSX/``, ``._x.jpg``) still counted
+        as pages is converted once: its page count, saved position and read pages
+        lose those entries and its OCR (of the old page numbers) is read again.
+        """
+        path = Path(str(row["path"] or ""))
+        try:
+            if not path.is_dir():
+                return self._refresh_archive_pages(row)
+            checked = self.__dict__.setdefault("_folder_checked", {})
+            # Adding, removing or renaming a page changes the folder's date: only
+            # then (and once per launch) are its pages compared again.
+            marker = (str(path), path.stat().st_mtime_ns, str(row["source_fingerprint"] or ""))
+            if checked.get(int(row["id"])) == marker:
+                return row
+            pages = self._pages(path)
+            fingerprint = self._source_fingerprint(path, pages) if pages else ""
+        except (OSError, ValueError):
+            return row
+        previous = str(row["source_fingerprint"] or "")
+        if not pages or fingerprint == previous:
+            if pages:
+                checked[int(row["id"])] = marker
+            return row
+        try:
+            legacy = self._pages(path, include_junk=True)
+            junk_only = self._junk_layout(row, path, pages, legacy)
+        except (OSError, ValueError):
+            legacy, junk_only = [], False
+        if junk_only:
+            return self._drop_junk_pages(row, pages, fingerprint, legacy)
+        book_id = int(row["id"])
+        with self._ocr_publish_lock(book_id):
+            with self.db.connect() as conn:
+                count = len(pages)
+                conn.execute(
+                    "UPDATE manga_books SET page_count=?,source_fingerprint=?,position=MIN(position,?),"
+                    "read_pages=MIN(read_pages,?) WHERE id=?",
+                    (count, fingerprint, count - 1, count, book_id),
+                )
+                self._forget_ocr_in_conn(conn, book_id)
+            self._delete_ocr_artifacts(previous)
+        _LOGGER.info("EVENT manga.folder_changed book_id=%s pages=%s path=%s", book_id, len(pages), path)
+        return self._book(book_id)
+
+    def _refresh_archive_pages(self, row: Any) -> Any:
+        """A CBZ imported while its ``__MACOSX/`` entries counted as pages (checked once per launch)."""
+        path = Path(str(row["path"] or ""))
+        checked = self.__dict__.setdefault("_archive_checked", {})
+        try:
+            if not path.is_file() or path.suffix.casefold() not in _ARCHIVE_SUFFIXES:
+                return row
+            stat = path.stat()
+            marker = (str(path), stat.st_size, stat.st_mtime_ns, str(row["source_fingerprint"] or ""))
+            if checked.get(int(row["id"])) == marker:
+                return row
+            checked[int(row["id"])] = marker
+            legacy = self._pages(path, include_junk=True)
+            pages = [name for name in legacy if not junk_member(name)]
+            if not pages or not self._junk_layout(row, path, pages, legacy):
+                return row
+            fingerprint = self._source_fingerprint(path, pages)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return row
+        updated = self._drop_junk_pages(row, pages, fingerprint, legacy)
+        stat = path.stat()
+        checked[int(row["id"])] = (str(path), stat.st_size, stat.st_mtime_ns, fingerprint)
+        return updated
+
+    def _junk_layout(self, row: Any, path: Path, pages: list[str], legacy: list[str]) -> bool:
+        """The saved progress counts junk pages: the stored fingerprint is that listing's, or
+        the stored page count is (the file's date changed since, so the fingerprint did too)."""
+        if legacy == pages:
+            return False
+        if self._source_fingerprint(path, legacy) == str(row["source_fingerprint"] or ""):
+            return True
+        return int(row["page_count"] or 0) == len(legacy) > len(pages)
+
+    def _drop_junk_pages(self, row: Any, pages: list[str], fingerprint: str, legacy: list[str]) -> Any:
+        book_id = int(row["id"])
+        previous = str(row["source_fingerprint"] or "")
+        position, read_pages = self._progress_without_junk(
+            legacy, int(row["position"] or 0), int(row["read_pages"] or 0)
+        )
+        with self._ocr_publish_lock(book_id):
+            with self.db.connect() as conn:
+                conn.execute(
+                    "UPDATE manga_books SET page_count=?,source_fingerprint=?,position=?,read_pages=? "
+                    "WHERE id=? AND source_fingerprint=?",
+                    (len(pages), fingerprint, position, read_pages, book_id, previous),
+                )
+                # OCR results are stored by page number: they belong to the old numbering.
+                self._forget_ocr_in_conn(conn, book_id)
+                self._set_state_in_conn(
+                    conn, f"manga_junk_pages_removed:v1:{book_id}", str(len(legacy) - len(pages))
+                )
+            self._delete_ocr_artifacts(previous)
+        _LOGGER.info(
+            "EVENT manga.junk_pages_removed book_id=%s removed=%s pages=%s position=%s",
+            book_id,
+            len(legacy) - len(pages),
+            len(pages),
+            position,
+        )
+        return self._book(book_id)
 
     @staticmethod
     def discover_image_files(root: Path, *, limit: int = 50000) -> list[Path]:
@@ -658,6 +990,9 @@ class MangaService:
         try:
             for item in source.rglob("*"):
                 if not item.is_file() or item.suffix.casefold() not in _IMAGE_EXTENSIONS:
+                    continue
+                # An unpacked Finder zip's __MACOSX/._x.jpg, an exFAT ._x.jpg, a hidden folder.
+                if junk_path(item, source):
                     continue
                 found.append(item.resolve())
                 if len(found) >= max(1, int(limit)):
@@ -742,7 +1077,9 @@ class MangaService:
             {
                 Path(path).expanduser().resolve()
                 for path in paths
-                if Path(path).expanduser().is_file() and Path(path).suffix.casefold() in _IMAGE_EXTENSIONS
+                if Path(path).expanduser().is_file()
+                and Path(path).suffix.casefold() in _IMAGE_EXTENSIONS
+                and not junk_part(Path(path).name)
             },
             key=lambda path: _natural_key(str(path)),
         )
@@ -774,20 +1111,66 @@ class MangaService:
 
     def import_images(self, paths: list[Path], *, title: str | None = None) -> dict[str, Any]:
         images = [Path(path).expanduser().resolve() for path in paths]
-        images = [path for path in images if path.is_file() and path.suffix.casefold() in _IMAGE_EXTENSIONS]
+        images = [
+            path
+            for path in images
+            if path.is_file() and path.suffix.casefold() in _IMAGE_EXTENSIONS and not junk_part(path.name)
+        ]
         if not images:
             raise ValueError(err("manga.noDroppedImages"))
         images = sorted(set(images), key=lambda path: _natural_key(str(path)))
+        digest = self._images_digest(images)
+        logical_title = _strip_manga_release_metadata(str(title or images[0].parent.name)) or str(
+            title or images[0].parent.name
+        )
+        folder = self._whole_folder(images)
+        if folder is not None:
+            # Every image of one folder: the volume reads that folder in place.
+            # Earlier versions packed a copy of it (a user had 2.6 GB of them);
+            # such a copy's volume becomes this folder, keeping its OCR.
+            copy_row = self._packed_copy_row(digest)
+            if copy_row is not None:
+                self._convert_copy(int(copy_row["id"]), Path(str(copy_row["path"])), folder)
+            book = self.import_file(folder)
+        else:
+            book = self.import_file(self._pack_images(images, logical_title, digest))
+        book_id = int(book["id"])
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE manga_books SET title=?,updated_at=? WHERE id=?",
+                (logical_title, time.time(), book_id),
+            )
+        self._inherit_series_anilist(book_id)
+        return self._payload(self._book(book_id))
+
+    @staticmethod
+    def _images_digest(images: list[Path]) -> str:
+        """Name digest of a packed copy: each image's path, size and mtime, in page order."""
         signature_rows: list[str] = []
         for path in images:
             stat = path.stat()
             signature_rows.append(f"{path}:{stat.st_size}:{stat.st_mtime_ns}")
-        digest = hashlib.sha1("|".join(signature_rows).encode("utf-8")).hexdigest()[:20]
+        return hashlib.sha1("|".join(signature_rows).encode("utf-8")).hexdigest()[:20]
+
+    def _whole_folder(self, images: list[Path]) -> Path | None:
+        """The folder whose images are exactly ``images``: all of them, directly in it."""
+        folder = images[0].parent
+        if any(image.parent != folder for image in images):
+            return None
+        if any(root == folder or root in folder.parents for root in self._generated_roots()):
+            return None
+        try:
+            names = self._folder_pages(folder)
+        except OSError:
+            return None
+        if len(names) != len(images) or {folder / name for name in names} != set(images):
+            return None
+        return folder
+
+    def _pack_images(self, images: list[Path], logical_title: str, digest: str) -> Path:
+        """Pack some images of a folder into a CBZ copy (a part of a folder is no folder volume)."""
         target_dir = self.imports_dir
         target_dir.mkdir(parents=True, exist_ok=True)
-        logical_title = _strip_manga_release_metadata(str(title or images[0].parent.name)) or str(
-            title or images[0].parent.name
-        )
         safe_title = (
             re.sub(r"[^\w .()\[\]-]+", "_", logical_title, flags=re.UNICODE).strip() or "Dropped manga"
         )
@@ -816,30 +1199,288 @@ class MangaService:
                         (str(target.resolve()), logical_title, time.time(), int(legacy_row["id"])),
                     )
         if not target.is_file():
-            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for index, image in enumerate(images, 1):
-                    source_stem = (
-                        re.sub(
-                            r"[^\w.\-]+",
-                            "_",
-                            image.stem,
-                            flags=re.UNICODE,
-                        ).strip("._")[:120]
-                        or f"page-{index:04d}"
-                    )
-                    archive.write(
-                        image,
-                        arcname=f"{index:04d}__{source_stem}{image.suffix.casefold()}",
-                    )
-        book = self.import_file(target)
-        book_id = int(book["id"])
+            # Stored, not deflated: the pages are JPEG/PNG/WebP already, deflate
+            # only cost CPU. Written aside first so a crash never leaves a broken copy.
+            partial = target.with_name(f".{target.name}.partial")
+            try:
+                with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for index, image in enumerate(images, 1):
+                        source_stem = (
+                            re.sub(
+                                r"[^\w.\-]+",
+                                "_",
+                                image.stem,
+                                flags=re.UNICODE,
+                            ).strip("._")[:120]
+                            or f"page-{index:04d}"
+                        )
+                        archive.write(
+                            image,
+                            arcname=f"{index:04d}__{source_stem}{image.suffix.casefold()}",
+                        )
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
+        return target
+
+    def _generated_roots(self) -> set[Path]:
+        return {self.imports_dir.resolve(), (self.cache_dir / "manga-imports").resolve()}
+
+    def _packed_copy(self, path: str | Path) -> bool:
+        """A CBZ Pudge packed from dropped images: the only kind of source it ever deletes."""
+        try:
+            source = Path(str(path)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return False
+        return source.suffix.casefold() == ".cbz" and any(
+            root in source.parents for root in self._generated_roots()
+        )
+
+    def _packed_copy_row(self, digest: str) -> Any | None:
         with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE manga_books SET title=?,updated_at=? WHERE id=?",
-                (logical_title, time.time(), book_id),
-            )
-        self._inherit_series_anilist(book_id)
+            rows = conn.execute(
+                "SELECT id,path,page_count FROM manga_books WHERE path LIKE ? ORDER BY id",
+                (f"%-{digest}.cbz",),
+            ).fetchall()
+        return next((row for row in rows if self._packed_copy(row["path"])), None)
+
+    def _copy_matches_folder(self, copy: Path, page_count: int, folder: Path) -> bool:
+        """The copy holds the folder's images as its pages, in the same order."""
+        try:
+            names = self._folder_pages(folder)
+            sizes = [(folder / name).stat().st_size for name in names]
+            if not copy.is_file():
+                # The copy itself is gone: its name digest already proves the files.
+                return bool(names) and int(page_count) == len(names)
+            with zipfile.ZipFile(copy) as archive:
+                members = self._pages(copy)
+                packed = [archive.getinfo(name).file_size for name in members]
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            return False
+        return bool(names) and packed == sizes
+
+    def _convert_copy(self, book_id: int, copy: Path, folder: Path) -> bool:
+        """A packed copy's volume reads its original folder again (same id, progress, OCR).
+
+        The copy is deleted afterwards. The folder's pages are the copy's pages in
+        the same order, so OCR (stored by page number) stays on the right pages.
+        """
+        book_id = int(book_id)
+        copy = Path(copy)
+        with self.db.connect() as conn:
+            taken = conn.execute(
+                "SELECT 1 FROM manga_books WHERE path=? AND id<>?", (str(folder), book_id)
+            ).fetchone()
+        page_count = int(self._book(book_id)["page_count"] or 0)
+        if taken is not None or not self._copy_matches_folder(copy, page_count, folder):
+            return False
+        self._switch_source(book_id, folder, keep_ocr=True, delete_after=copy)
+        self._finish_copy_deletion(book_id)
+        _LOGGER.info("EVENT manga.copy_relinked book_id=%s copy=%s folder=%s", book_id, copy.name, folder)
+        return True
+
+    def _switch_source(
+        self, book_id: int, source: Path, *, keep_ocr: bool, delete_after: Path | None = None
+    ) -> None:
+        """Read a volume from another archive or folder; its id and progress stay.
+
+        With ``keep_ocr`` the pages are the same pages: OCR and page statuses move
+        to the new source. Otherwise the volume is read again, like a changed file.
+        """
+        book_id = int(book_id)
+        source = Path(source).expanduser().resolve()
+        pages = self._pages(source)
+        if not pages:
+            raise ValueError(err("manga.volumeNoImages"))
+        fingerprint = self._source_fingerprint(source, pages)
+        count = len(pages)
+        legacy = self._pages(source, include_junk=True)
+        with self._ocr_publish_lock(book_id):
+            with self.db.connect() as conn:
+                row = conn.execute(
+                    "SELECT source_fingerprint,page_count,position,read_pages FROM manga_books WHERE id=?",
+                    (book_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(err("manga.unknownBook", bookId=book_id))
+                previous = str(row["source_fingerprint"] or "")
+                if legacy != pages and int(row["page_count"] or 0) == len(legacy) > count:
+                    # Imported while junk pages (__MACOSX/, ._x.jpg) counted: the saved place
+                    # and the OCR use those page numbers.
+                    position, read_pages = self._progress_without_junk(
+                        legacy, int(row["position"] or 0), int(row["read_pages"] or 0)
+                    )
+                    keep_ocr = False
+                    self._set_state_in_conn(
+                        conn, f"manga_junk_pages_removed:v1:{book_id}", str(len(legacy) - count)
+                    )
+                else:
+                    position = min(int(row["position"] or 0), count - 1)
+                    read_pages = min(int(row["read_pages"] or 0), count)
+                # updated_at stays: the library keeps its order.
+                conn.execute(
+                    "UPDATE manga_books SET path=?,page_count=?,source_fingerprint=?,position=?,read_pages=? "
+                    "WHERE id=?",
+                    (str(source), count, fingerprint, position, read_pages, book_id),
+                )
+                if keep_ocr:
+                    # A page status names the source it was read from; it moves along.
+                    statuses = conn.execute(
+                        f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}",
+                        state_prefix_bounds(f"manga_ocr_page_status:v18:{book_id}:"),
+                    ).fetchall()
+                    for item in statuses:
+                        try:
+                            payload = json.loads(str(item["value"] or "{}"))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if (
+                            isinstance(payload, dict)
+                            and str(payload.get("source_fingerprint") or "") == previous
+                        ):
+                            payload["source_fingerprint"] = fingerprint
+                            self._set_state_in_conn(
+                                conn,
+                                str(item["key"]),
+                                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                            )
+                    # The artifact is built again from the cache rows, for the new source.
+                    revision = self._state_int_from_conn(conn, self._ocr_revision_state_key(book_id)) + 1
+                    self._set_state_in_conn(conn, self._ocr_revision_state_key(book_id), str(revision))
+                else:
+                    self._forget_ocr_in_conn(conn, book_id)
+                if delete_after is not None:
+                    self._set_state_in_conn(
+                        conn, f"{_FOLDER_RELINK_PENDING_PREFIX}{book_id}", str(delete_after)
+                    )
+            if previous != fingerprint:
+                self._delete_ocr_artifacts(previous)
+
+    def _finish_copy_deletion(self, book_id: int | None = None) -> int:
+        """Delete packed copies whose volume now reads its folder (also after a crash)."""
+        prefix = _FOLDER_RELINK_PENDING_PREFIX
+        with self.db.connect() as conn:
+            if book_id is None:
+                rows = conn.execute(
+                    f"SELECT key,value FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds(prefix)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT key,value FROM state WHERE key=?", (f"{prefix}{int(book_id)}",)
+                ).fetchall()
+        freed = 0
+        for item in rows:
+            copy = Path(str(item["value"] or ""))
+            with self.db.connect() as conn:
+                used = conn.execute("SELECT 1 FROM manga_books WHERE path=?", (str(copy),)).fetchone()
+            if used is None and self._packed_copy(copy):
+                try:
+                    size = copy.stat().st_size if copy.is_file() else 0
+                    copy.unlink(missing_ok=True)
+                    freed += size
+                except OSError as exc:
+                    _LOGGER.warning("FAIL step=manga.copy_delete path=%s error=%r", copy, str(exc))
+                    continue
+            with self.db.connect() as conn:
+                conn.execute("DELETE FROM state WHERE key=?", (str(item["key"]),))
+        return freed
+
+    def relink_book(self, book_id: int, source: Path) -> dict[str, Any]:
+        """Find…: read a volume whose archive or folder moved from its new place.
+
+        Id, reading progress and AniList link stay. OCR stays when the files are the
+        same (names, sizes and dates); otherwise the volume is read again.
+        """
+        book_id = int(book_id)
+        row = self._book(book_id)
+        source = Path(source).expanduser().resolve()
+        pages = self._pages(source)
+        if not pages:
+            raise ValueError(err("manga.volumeNoImages"))
+        with self.db.connect() as conn:
+            taken = conn.execute(
+                "SELECT 1 FROM manga_books WHERE path=? AND id<>?", (str(source), book_id)
+            ).fetchone()
+        if taken is not None:
+            raise ValueError(err("manga.alreadyInLibrary", name=source.name))
+        same = self._source_fingerprint(source, pages, as_path=Path(str(row["path"]))) == str(
+            row["source_fingerprint"] or ""
+        )
+        self._switch_source(book_id, source, keep_ocr=same)
+        _LOGGER.info("EVENT manga.relinked book_id=%s ocr_kept=%s path=%s", book_id, same, source)
         return self._payload(self._book(book_id))
+
+    def imported_copies_relinked(self) -> bool:
+        return bool(self.db.get_state(_FOLDER_RELINK_STATE_KEY, ""))
+
+    def relink_imported_copies(
+        self, roots: Iterable[Path | str], *, cancelled: Callable[[], bool] | None = None
+    ) -> dict[str, int]:
+        """One-time step: volumes packed from dropped folders read their folders again.
+
+        The folders the user imported or dropped manga from are walked like the
+        import walked them. A packed copy whose name digest matches one of their
+        image groups (same paths, sizes and dates: the same pages in the same order)
+        and whose group is a whole folder switches to that folder; the copy is then
+        deleted. Copies without such a folder stay. A stopped run resumes next start.
+        """
+        stats = {"copies": 0, "relinked": 0, "kept": 0, "roots": 0, "failed": 0, "freed_mb": 0}
+        freed = self._finish_copy_deletion()
+        if self.db.get_state(_FOLDER_RELINK_STATE_KEY, ""):
+            return {**stats, "already_done": 1}
+        copies: dict[str, int] = {}
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id,path FROM manga_books ORDER BY id").fetchall()
+        for row in rows:
+            match = _PACKED_COPY_NAME.search(Path(str(row["path"] or "")).name)
+            if match and self._packed_copy(row["path"]):
+                copies.setdefault(match.group(1), int(row["id"]))
+        stats["copies"] = len(copies)
+        generated = self._generated_roots()
+        seen: set[Path] = set()
+        # ``roots`` may be lazy: import history is only read when copies exist.
+        for raw in roots if copies else ():
+            if not copies:
+                break
+            if cancelled is not None and cancelled():
+                return {**stats, "cancelled": 1}
+            try:
+                root = Path(raw).expanduser().resolve()
+                if root in seen or not root.is_dir():
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            seen.add(root)
+            if any(item == root or item in root.parents for item in generated):
+                continue
+            stats["roots"] += 1
+            groups: dict[Path, list[Path]] = {}
+            for image in self.discover_image_files(root, limit=50000):
+                groups.setdefault(self._image_group_root(image), []).append(image)
+            for images in groups.values():
+                images = sorted(set(images), key=lambda path: _natural_key(str(path)))
+                try:
+                    digest = self._images_digest(images)
+                except OSError:
+                    continue
+                book_id = copies.get(digest)
+                folder = self._whole_folder(images) if book_id is not None else None
+                if book_id is None or folder is None:
+                    continue
+                try:
+                    copy = Path(str(self._book(book_id)["path"]))
+                    size = copy.stat().st_size if copy.is_file() else 0
+                    if self._convert_copy(book_id, copy, folder):
+                        copies.pop(digest, None)
+                        stats["relinked"] += 1
+                        freed += size
+                except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+                    stats["failed"] += 1
+                    _LOGGER.warning("FAIL step=manga.copy_relink book_id=%s error=%r", book_id, str(exc))
+        stats["kept"] = len(copies)
+        stats["freed_mb"] = int(freed // (1024 * 1024))
+        self.db.set_state(_FOLDER_RELINK_STATE_KEY, str(int(time.time())))
+        return stats
 
     def remove_books(self, book_ids: list[int]) -> int:
         ids = sorted({int(value) for value in book_ids if int(value) > 0})
@@ -863,15 +1504,23 @@ class MangaService:
             # a re-imported book that reuses this id with the same file.
             for book_id in existing_ids:
                 self._bump_ocr_generation_in_conn(conn, book_id)
-        generated_roots = {self.imports_dir.resolve(), (self.cache_dir / "manga-imports").resolve()}
+                conn.execute("DELETE FROM state WHERE key=?", (f"manga_junk_pages_removed:v1:{book_id}",))
+                conn.execute("DELETE FROM state WHERE key=?", (self._pair_shift_key(book_id),))
+                conn.execute("DELETE FROM state WHERE key=?", (self._page_align_key(book_id),))
         for row in rows:
+            # Only a CBZ Pudge packed itself is deleted; an archive or an image
+            # folder of the user's (a folder volume) stays on disk.
             try:
                 source = Path(str(row["path"])).expanduser().resolve()
-                if any(root in source.parents for root in generated_roots):
+                if self._packed_copy(source) and source.is_file():
                     source.unlink(missing_ok=True)
             except OSError:
                 pass
-            artifact_paths[int(row["id"])].unlink(missing_ok=True)
+            remove_artifact(artifact_paths[int(row["id"])])
+            try:
+                self._alignment_store().forget(Path(str(row["path"])))
+            except OSError:
+                pass
         return len(existing_ids)
 
     def remove_series(self, book_id: int) -> int:
@@ -893,6 +1542,9 @@ class MangaService:
         if not pages:
             raise ValueError(err("manga.noPages"))
         page_name = str(pages[0])
+        if path.is_dir():
+            # A folder's own size and date do not change when a page is replaced.
+            stat = (path / page_name).stat()
         revision = hashlib.sha1(
             f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{page_name}".encode("utf-8")
         ).hexdigest()[:20]
@@ -905,12 +1557,23 @@ class MangaService:
             cover_dir.mkdir(parents=True, exist_ok=True)
             target = cover_dir / f"{revision}.jpg"
             if not target.is_file() or target.stat().st_size <= 0:
-                with zipfile.ZipFile(path) as archive:
-                    image = Image.open(io.BytesIO(archive.read(page_name))).convert("RGB")
+                with self._open_book(path) as archive:
+                    raw = read_page_member(archive, page_name)
+                with Image.open(io.BytesIO(raw)) as source_image:
+                    # JPEG pages decode at 1/2..1/8 scale: ~4x faster, ~16x less pixel memory.
+                    source_image.draft("RGB", (320, 480))
+                    image = source_image.convert("RGB")
                 image.thumbnail((320, 480))
-                image.save(target, format="JPEG", quality=82, optimize=True)
+                # Written aside, then renamed: a cover cut off half-way (a quit, two library
+                # reads at once) was a non-empty file and stayed the volume's cover.
+                temporary = temporary_sibling(target, ".tmp.jpg")
+                try:
+                    image.save(temporary, format="JPEG", quality=82, optimize=True)
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
             return target
-        except (OSError, ValueError, zipfile.BadZipFile):
+        except (*_PAGE_IMAGE_ERRORS, KeyError, zipfile.BadZipFile, RuntimeError, NotImplementedError):
             return None
 
     def _local_cover_data_uri(self, row: Any) -> str:
@@ -976,8 +1639,8 @@ class MangaService:
         preview_dir.mkdir(parents=True, exist_ok=True)
         target = preview_dir / f"v1-{revision}-original{suffix}"
         if not target.is_file() or target.stat().st_size <= 0:
-            with zipfile.ZipFile(path) as archive:
-                raw = archive.read(page_name)
+            with self._open_book(path) as archive:
+                raw = read_page_member(archive, page_name)
             temporary: Path | None = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -986,8 +1649,9 @@ class MangaService:
                     suffix=".tmp",
                     delete=False,
                 ) as handle:
-                    handle.write(raw)
+                    # Named before writing: a failed write used to leave the .tmp behind.
                     temporary = Path(handle.name)
+                    handle.write(raw)
                 temporary.replace(target)
             finally:
                 if temporary is not None and temporary.exists():
@@ -1014,12 +1678,17 @@ class MangaService:
             target.parent.mkdir(parents=True, exist_ok=True)
             response = httpx.get(str(url), timeout=15, follow_redirects=True)
             response.raise_for_status()
-            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            with Image.open(io.BytesIO(response.content)) as source_image:
+                source_image.draft("RGB", (480, 720))
+                image = source_image.convert("RGB")
             image.thumbnail((480, 720))
-            temporary = target.with_suffix(".tmp.jpg")
-            image.save(temporary, format="JPEG", quality=86, optimize=True)
-            temporary.replace(target)
-        except (OSError, ValueError, httpx.HTTPError):
+            temporary = temporary_sibling(target, ".tmp.jpg")
+            try:
+                image.save(temporary, format="JPEG", quality=86, optimize=True)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except (*_PAGE_IMAGE_ERRORS, httpx.HTTPError):
             pass
         finally:
             with self._cover_cache_lock:
@@ -1083,6 +1752,9 @@ class MangaService:
             "local_cover_url": selected_cover if self.asset_base else "",
             "remote_cover_url": remote_cover,
             "cover_source": "anilist_cache" if cached_remote else "first_page",
+            # The archive or image folder moved or was deleted: the library offers Find….
+            "missing": self.source_missing(path),
+            "folder": _folder_source(Path(path)),
             "updated_at": float(row["updated_at"] or 0),
         }
 
@@ -1165,18 +1837,24 @@ class MangaService:
         row = self._book(int(book_id))
         total = max(0, int(row["page_count"] or 0))
         status_prefix = f"manga_ocr_page_status:v18:{int(book_id)}:"
+        # Polled every few seconds per volume while OCR runs (FE-3): a key range uses the
+        # state table's primary key (LIKE scanned the whole table), and the OCR text is
+        # read only for legacy pages that have no page status.
+        status_end = status_prefix[:-1] + chr(ord(status_prefix[-1]) + 1)
         with self.db.connect() as conn:
             current_fingerprint = str(row["source_fingerprint"] or "")
             current_generation = self._state_int_from_conn(conn, self._ocr_generation_state_key(int(book_id)))
-            cache_rows = conn.execute(
-                "SELECT page_index,text FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
-                (int(book_id), _REGION_CACHE_KEY),
-            ).fetchall()
+            cached_indices = {
+                int(item["page_index"])
+                for item in conn.execute(
+                    "SELECT page_index FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                    (int(book_id), _REGION_CACHE_KEY),
+                ).fetchall()
+            }
             status_rows = conn.execute(
-                "SELECT key,value FROM state WHERE key LIKE ?",
-                (f"{status_prefix}%",),
+                "SELECT key,value FROM state WHERE key>=? AND key<?",
+                (status_prefix, status_end),
             ).fetchall()
-        cache_by_page = {int(item["page_index"]): item for item in cache_rows}
         status_by_page: dict[int, dict[str, Any]] = {}
         for item in status_rows:
             try:
@@ -1198,6 +1876,22 @@ class MangaService:
                 elif current_generation > 0:
                     continue
                 status_by_page[page_index] = dict(payload)
+        legacy = sorted(
+            index
+            for index in cached_indices
+            if 0 <= index < total and not str(status_by_page.get(index, {}).get("status") or "")
+        )
+        cache_by_page: dict[int, Any] = {index: None for index in cached_indices}
+        if legacy:
+            with self.db.connect() as conn:
+                for start in range(0, len(legacy), 400):
+                    chunk = legacy[start : start + 400]
+                    for item in conn.execute(
+                        "SELECT page_index,text FROM manga_ocr_cache WHERE book_id=? AND region_key=? "
+                        f"AND page_index IN ({','.join('?' * len(chunk))})",
+                        (int(book_id), _REGION_CACHE_KEY, *chunk),
+                    ).fetchall():
+                        cache_by_page[int(item["page_index"])] = item
 
         ready_pages = 0
         empty_pages = 0
@@ -1205,6 +1899,7 @@ class MangaService:
         failed_pages = 0
         unknown_pages = 0
         for page_index in range(total):
+            cached = page_index in cache_by_page
             item = cache_by_page.get(page_index)
             page_state = status_by_page.get(page_index, {})
             status = str(page_state.get("status") or "")
@@ -1214,7 +1909,7 @@ class MangaService:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     legacy_regions = []
                 status = "ready" if isinstance(legacy_regions, list) and legacy_regions else "unknown"
-            if status in {"ready", "empty_verified"} and item is None:
+            if status in {"ready", "empty_verified"} and not cached:
                 status = "unknown"
             if not status:
                 continue
@@ -1278,7 +1973,7 @@ class MangaService:
             rows = conn.execute("SELECT * FROM manga_books ORDER BY updated_at DESC,id DESC").fetchall()
         books: list[dict[str, Any]] = []
         for row in rows:
-            payload = self._payload(row)
+            payload = self._payload(self._refresh_folder_source(row))
             status = self.ocr_cache_status(int(payload["id"]))
             payload["ocr_cached_pages"] = int(status["cached_pages"])
             payload["ocr_complete"] = bool(status["complete"])
@@ -1289,6 +1984,16 @@ class MangaService:
             "reader_preferences": self.reader_preferences(),
         }
 
+    def search_catalog(self) -> list[dict[str, Any]]:
+        """Every volume's card (title, series, volume, cover) for the global search (Cmd+F).
+
+        ``state`` also reads each volume's OCR pages and page statuses (three queries a
+        volume, most of its time) and may rewrite rows: the search, run again a moment
+        after each typed letter, waited for all of that every time."""
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT * FROM manga_books ORDER BY updated_at DESC,id DESC").fetchall()
+        return [self._payload(row) for row in rows]
+
     def _book(self, book_id: int) -> Any:
         with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM manga_books WHERE id=?", (int(book_id),)).fetchone()
@@ -1298,39 +2003,158 @@ class MangaService:
 
     @staticmethod
     def _page_revision(path: Path, page_name: str) -> str:
-        stat = path.stat()
+        stat = (path / page_name).stat() if path.is_dir() else path.stat()
         return hashlib.sha1(
             f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:page:{page_name}".encode("utf-8")
         ).hexdigest()[:20]
+
+    @staticmethod
+    def _spread_by_name(page_name: str) -> bool:
+        """A double-page spread by its name ("012-013.jpg")."""
+        match = _SPREAD_NAME.search(Path(page_name).stem)
+        return bool(match and int(match.group(2)) == int(match.group(1)) + 1)
+
+    @staticmethod
+    def _spread_by_size(width: int, height: int) -> bool:
+        """A double-page spread by its shape (clearly wider than tall)."""
+        return bool(width > 0 and height > 0 and width >= height * 1.15)
+
+    @staticmethod
+    def _image_size(archive: Any, page_name: str, data: bytes | None = None) -> tuple[int, int] | None:
+        """A page's pixel size from its image header (None: unreadable)."""
+        try:
+            source = io.BytesIO(data) if data is not None else archive.open(page_name)
+            with source, Image.open(source) as source_image:
+                width, height = source_image.size
+            return int(width), int(height)
+        except (
+            *_PAGE_IMAGE_ERRORS,
+            KeyError,
+            RuntimeError,
+            NotImplementedError,
+            EOFError,
+            zipfile.BadZipFile,
+            zlib.error,
+        ):
+            # One damaged entry: only that page is unknown.
+            return None
+
+    @staticmethod
+    def _pair_shift_key(book_id: int) -> str:
+        return f"manga_pair_shift:v1:{int(book_id)}"
+
+    def pair_shift(self, book_id: int) -> bool:
+        """ "Shift pairs by one page" for this volume (scans that are one page off)."""
+        return self.db.get_state(self._pair_shift_key(book_id), "") == "1"
+
+    def set_pair_shift(self, book_id: int, shift: bool) -> dict[str, Any]:
+        """Turn "Shift pairs by one page" on or off; the volume's spreads as they are now."""
+        self._book(int(book_id))
+        if shift:
+            self.db.set_state(self._pair_shift_key(book_id), "1")
+        else:
+            self.db.delete_state(self._pair_shift_key(book_id))
+        return self.spread_pages(int(book_id))
+
+    @staticmethod
+    def _page_align_key(book_id: int) -> str:
+        return f"manga_page_align:v1:{int(book_id)}"
+
+    def page_align(self, book_id: int) -> bool:
+        """ "Align scanned pages" for this volume (on unless turned off)."""
+        return self.db.get_state(self._page_align_key(book_id), "") != "0"
+
+    def set_page_align(self, book_id: int, align: bool) -> dict[str, Any]:
+        """Turn "Align scanned pages" on or off; the volume's spreads as they are now."""
+        self._book(int(book_id))
+        if align:
+            self.db.delete_state(self._page_align_key(book_id))
+        else:
+            self.db.set_state(self._page_align_key(book_id), "0")
+        return self.spread_pages(int(book_id))
+
+    def _alignment_store(self) -> Any:
+        """The volumes' page alignment (one store, so one worker, per service)."""
+        store = self.__dict__.get("_align_store")
+        if store is None:
+            with _ALIGN_STORE_LOCK:
+                store = self.__dict__.get("_align_store")
+                if store is None:
+                    from .manga_align_store import AlignmentStore
+
+                    store = AlignmentStore(self.cache_dir, self._open_book, read_page_member)
+                    self.__dict__["_align_store"] = store
+        return store
+
+    def spread_pages(self, book_id: int) -> dict[str, Any]:
+        """What two pages side by side show (the Mac's two-page mode and the iPhone/iPad
+        landscape view): `spreads` (pudge/manga_spreads.py), the `wide` pages they keep alone
+        (double-page spreads, by name or shape), the volume's `shift` setting and the usual
+        page's height / width (`aspect`); "Align scanned pages" (`align`) and the transforms
+        that straighten and align the pages (`alignment`, pudge/manga_align.py; None when this
+        Mac cannot work them out), worked out in the background, both readers apply the same.
+
+        Only image headers are read here; that part is kept until the volume's files change."""
+        row = self._book(int(book_id))
+        path = Path(str(row["path"]))
+        pages = self._pages(path)
+        fingerprint = self._source_fingerprint(path, pages)
+        cache: dict[int, tuple[str, dict[str, Any]]] = self.__dict__.setdefault("_spread_cache", {})
+        cached = cache.get(int(book_id))
+        if cached is not None and cached[0] == fingerprint:
+            shape = cached[1]
+        else:
+            wide: list[int] = []
+            ratios: list[float] = []
+            with self._open_book(path) as archive:
+                for index, name in enumerate(pages):
+                    size = self._image_size(archive, name)
+                    if self._spread_by_name(name) or (size is not None and self._spread_by_size(*size)):
+                        wide.append(index)
+                    elif size is not None and size[0] > 0 and size[1] > 0:
+                        ratios.append(size[1] / size[0])
+            ratios.sort()
+            aspect = round(ratios[len(ratios) // 2], 4) if ratios else None
+            shape = {"wide": wide, "aspect": aspect, "page_count": len(pages)}
+            cache[int(book_id)] = (fingerprint, shape)
+        shift = self.pair_shift(int(book_id))
+        align = self.page_align(int(book_id))
+        alignment = None
+        try:
+            alignment = self._alignment_store().served(
+                path, pages, list(shape["wide"]), start=int(row["position"] or 0), work=align
+            )
+        except Exception as exc:  # noqa: BLE001 - the pairs never depend on the alignment
+            _LOGGER.debug("manga alignment unavailable: %s", exc)
+        return {
+            "wide": list(shape["wide"]),
+            "aspect": shape["aspect"],
+            "shift": shift,
+            "spreads": spread_table(int(shape["page_count"]), shape["wide"], shift=shift),
+            "align": align,
+            "alignment": alignment,
+        }
 
     def page(self, book_id: int, page_index: int) -> dict[str, Any]:
         row = self._book(book_id)
         path = Path(str(row["path"]))
         pages = self._pages(path)
+        if not pages:
+            # A folder emptied since the import: a readable error, not "list index out of range".
+            raise ValueError(err("manga.volumeNoImages" if path.is_dir() else "manga.archiveNoPages"))
         index = max(0, min(int(page_index), len(pages) - 1))
         # pudge-v0.7.23-manga-spread-detection-v1
         page_name = pages[index]
         as_url = bool(self.asset_base)
         data = b""
-        spread = False
-        range_match = re.search(
-            r"(?:^|[^0-9])(\d{1,4})\s*[-–—]\s*(\d{1,4})(?:[^0-9]|$)",
-            Path(page_name).stem,
-        )
-        if range_match:
-            spread = int(range_match.group(2)) == int(range_match.group(1)) + 1
-        with zipfile.ZipFile(path) as archive:
+        spread = self._spread_by_name(page_name)
+        with self._open_book(path) as archive:
             if not as_url:
-                data = archive.read(page_name)
+                data = read_page_member(archive, page_name)
             if not spread:
-                try:
-                    # Only the image header is read when the page goes by URL.
-                    source = io.BytesIO(data) if not as_url else archive.open(page_name)
-                    with source, Image.open(source) as source_image:
-                        width, height = source_image.size
-                    spread = bool(width > 0 and height > 0 and width >= height * 1.15)
-                except (OSError, ValueError, KeyError):
-                    spread = False
+                # Only the image header is read when the page goes by URL.
+                size = self._image_size(archive, page_name, data if not as_url else None)
+                spread = size is not None and self._spread_by_size(*size)
         media_type = mimetypes.guess_type(page_name)[0] or "image/jpeg"
         # Page fetch/preload is intentionally read-only for progress.
         payload: dict[str, Any] = {
@@ -1357,24 +2181,47 @@ class MangaService:
         page_name = pages[int(page_index)]
         if self._page_revision(path, page_name) != str(expected_revision):
             raise KeyError("stale manga page revision")
-        with zipfile.ZipFile(path) as archive:
-            data = archive.read(page_name)
+        with self._open_book(path) as archive:
+            data = read_page_member(archive, page_name)
         return data, mimetypes.guess_type(page_name)[0] or "image/jpeg"
 
     def set_position(self, book_id: int, page_index: int) -> None:
         with self.db.connect() as conn:
+            now = time.time()
+            # Never past the last page (a phone's older package may count more pages).
             conn.execute(
-                "UPDATE manga_books SET position=?,updated_at=? WHERE id=?",
-                (max(0, int(page_index)), time.time(), int(book_id)),
+                "UPDATE manga_books SET position=CASE WHEN page_count>0 THEN MIN(?,page_count-1) ELSE ? END,"
+                "position_updated_at=?,updated_at=? WHERE id=?",
+                (max(0, int(page_index)), max(0, int(page_index)), now, now, int(book_id)),
             )
+
+    def page_from_junk_listing(self, book_id: int, page_index: int) -> int:
+        """A page number an older listing counted, with junk pages, in today's pages.
+
+        An iPhone package made before ``__MACOSX/`` and ``._x.jpg`` stopped being pages
+        has them first: its page N+p is page p now. Only numbers past today's last page
+        are known to come from such a package; others are taken as they are.
+        """
+        index = max(0, int(page_index))
+        row = self._book(int(book_id))
+        count = int(row["page_count"] or 0)
+        if index < count or not self.db.get_state(f"manga_junk_pages_removed:v1:{int(book_id)}", ""):
+            return index
+        try:
+            legacy = self._pages(Path(str(row["path"] or "")), include_junk=True)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return max(0, count - 1)
+        position, _read = self._progress_without_junk(legacy, index, index)
+        return min(position, max(0, count - 1))
 
     def reset_progress(self, book_id: int) -> dict[str, Any]:
         """Reset reading progress only; preserve AniList/library metadata."""
         self._book(int(book_id))
         with self.db.connect() as conn:
+            now = time.time()
             conn.execute(
-                "UPDATE manga_books SET position=0,read_pages=0,updated_at=? WHERE id=?",
-                (time.time(), int(book_id)),
+                "UPDATE manga_books SET position=0,read_pages=0,position_updated_at=?,updated_at=? WHERE id=?",
+                (now, now, int(book_id)),
             )
         return self._payload(self._book(int(book_id)))
 
@@ -1541,7 +2388,11 @@ class MangaService:
 
         book_id = int(book_id)
         artifact_path = self._ocr_artifact_path(book_id)
-        previous = read_artifact(artifact_path)
+        unwritten = self._unwritten_ocr_artifacts().get(book_id)
+        if unwritten is not None and unwritten["path"] == artifact_path:
+            previous = unwritten["artifact"]
+        else:
+            previous = read_artifact(artifact_path)
         if previous is None or previous.get("migrated_from_schema"):
             return False
         source = previous.get("source") if isinstance(previous.get("source"), dict) else {}
@@ -1563,11 +2414,12 @@ class MangaService:
         if not 0 <= int(page_index) < len(page_names):
             return False
         try:
-            with zipfile.ZipFile(archive_path) as archive:
-                with Image.open(io.BytesIO(archive.read(page_names[int(page_index)]))) as source_image:
-                    width, height = source_image.size
-        except (OSError, ValueError, KeyError):
-            width, height = 0, 0
+            with self._open_book(archive_path) as archive:
+                # The image header only: the page is not decoded or read whole.
+                size = self._image_size(archive, page_names[int(page_index)])
+        except (*_PAGE_IMAGE_ERRORS, KeyError, zipfile.BadZipFile):
+            size = None
+        width, height = size or (0, 0)
 
         pages_by_index = {
             int(page.get("page_index") or 0): dict(page)
@@ -1616,13 +2468,67 @@ class MangaService:
             or current_revision != int(revision)
         ):
             return False
-        write_artifact(artifact_path, artifact)
+        now = time.monotonic()
+        # The interval starts with the first page kept in memory.
+        written_at = (
+            unwritten["written_at"] if unwritten is not None and unwritten["path"] == artifact_path else now
+        )
+        if now - written_at >= _OCR_ARTIFACT_WRITE_SECONDS:
+            write_artifact(artifact_path, artifact)
+            written_at, dirty = now, False
+        else:
+            dirty = True
+        self._unwritten_ocr_artifacts()[book_id] = {
+            "path": artifact_path,
+            "artifact": artifact,
+            "fingerprint": str(source_fingerprint),
+            "written_at": written_at,
+            "dirty": dirty,
+        }
+        self._flush_other_ocr_artifacts(book_id)
         return True
+
+    def _unwritten_ocr_artifacts(self) -> dict[int, dict[str, Any]]:
+        return self.__dict__.setdefault("_ocr_artifacts_in_memory", {})
+
+    def _flush_ocr_artifact(self, book_id: int, *, blocking: bool = True) -> None:
+        """Write the artifact _update_ocr_artifact_page kept in memory (if it is still the
+        current one) and forget it."""
+        book_id = int(book_id)
+        if book_id not in self._unwritten_ocr_artifacts():
+            return
+        lock = self._ocr_publish_lock(book_id)
+        if not lock.acquire(blocking=blocking):
+            return  # its own run writes it
+        try:
+            kept = self._unwritten_ocr_artifacts().pop(book_id, None)
+            if kept is None or not kept["dirty"]:
+                return
+            artifact = kept["artifact"]
+            try:
+                current = self._ocr_context(book_id)
+                path = self._ocr_artifact_path(book_id)
+            except KeyError:
+                return  # the volume is gone
+            if path == kept["path"] and current == (
+                kept["fingerprint"],
+                int(artifact.get("generation") or 0),
+                int(artifact.get("revision") or 0),
+            ):
+                write_artifact(path, artifact)
+        finally:
+            lock.release()
+
+    def _flush_other_ocr_artifacts(self, book_id: int) -> None:
+        """At most one volume's artifact stays in memory (several MB each)."""
+        for other in [key for key in self._unwritten_ocr_artifacts() if key != int(book_id)]:
+            self._flush_ocr_artifact(other, blocking=False)
 
     def _ocr_artifact_path(self, book_id: int) -> Path:
         row = self._book(int(book_id))
         fingerprint = str(row["source_fingerprint"] or f"book-{int(book_id)}")
-        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}{_OCR_ARTIFACT_SUFFIX}"
+        # Written gzip-compressed; an older uncompressed .json is still read (read_artifact).
+        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}{_OCR_ARTIFACT_SUFFIX}.gz"
 
     def _read_artifact_cached(self, path: Path) -> dict[str, Any] | None:
         """The last parsed artifact, reused while its file is unchanged (read-only use).
@@ -1630,11 +2536,12 @@ class MangaService:
         A volume's artifact is several MB of JSON; parsing it on every page turn
         cost ~130 ms and a 45 MB peak.
         """
+        source = artifact_file(path)
         try:
-            stat = path.stat()
+            stat = source.stat()
         except OSError:
             return None
-        key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        key = (str(source), int(stat.st_mtime_ns), int(stat.st_size))
         cached = self.__dict__.get("_artifact_read_cache")
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1644,6 +2551,7 @@ class MangaService:
 
     def _load_ocr_artifact(self, book_id: int, *, read_only: bool = False) -> dict[str, Any] | None:
         book_id = int(book_id)
+        self._flush_ocr_artifact(book_id)
         path = self._ocr_artifact_path(book_id)
         artifact = self._read_artifact_cached(path) if read_only else read_artifact(path)
         if artifact is None:
@@ -1683,6 +2591,7 @@ class MangaService:
     ) -> dict[str, Any]:
         book_id = int(book_id)
         with self._ocr_publish_lock(book_id):
+            self._flush_ocr_artifact(book_id)
             last_artifact: dict[str, Any] | None = None
             for _attempt in range(2):
                 row = self._book(book_id)
@@ -1702,7 +2611,7 @@ class MangaService:
                     ).fetchall()
                 by_index = {int(item["page_index"]): str(item["text"] or "[]") for item in cache_rows}
                 pages: list[dict[str, Any]] = []
-                with zipfile.ZipFile(archive_path) as archive:
+                with self._open_book(archive_path) as archive:
                     for page_index, encoded in sorted(by_index.items()):
                         try:
                             regions = json.loads(encoded)
@@ -1710,11 +2619,8 @@ class MangaService:
                             regions = []
                         if not isinstance(regions, list) or not 0 <= page_index < len(page_names):
                             continue
-                        try:
-                            with Image.open(io.BytesIO(archive.read(page_names[page_index]))) as source_image:
-                                width, height = source_image.size
-                        except (OSError, ValueError, KeyError):
-                            width, height = 0, 0
+                        # The image header only (it read and kept every page whole).
+                        width, height = self._image_size(archive, page_names[page_index]) or (0, 0)
                         pages.append(
                             normalize_page(
                                 page_index,
@@ -1781,11 +2687,11 @@ class MangaService:
                     (book_id, _REGION_CACHE_KEY),
                 )
                 conn.execute(
-                    "DELETE FROM state WHERE key LIKE ?",
-                    (f"manga_ocr_page_status:v18:{book_id}:%",),
+                    f"DELETE FROM state WHERE {STATE_PREFIX_SQL}",
+                    state_prefix_bounds(f"manga_ocr_page_status:v18:{book_id}:"),
                 )
                 self._bump_ocr_generation_in_conn(conn, book_id)
-            artifact_path.unlink(missing_ok=True)
+            remove_artifact(artifact_path)
 
     @staticmethod
     def _ocr_page_status_state_key(book_id: int, page_index: int) -> str:
@@ -1938,15 +2844,39 @@ class MangaService:
             return fixes
 
     def _apply_series_fixes(self, book_id: int, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Regions as they are served (reader, iPhone, look-up parse): series fixes, then
+        dot runs as ellipses. The stored OCR stays as it was read."""
         if not regions:
             return regions
         try:
             fixes = self._series_ocr_fixes(int(book_id))
         except Exception:  # noqa: BLE001 - fixes are an optional improvement
-            return regions
-        if not fixes:
-            return regions
-        return [fix_lexicon_region(region, fixes) for region in regions]
+            fixes = {}
+        if fixes:
+            regions = [fix_lexicon_region(region, fixes) for region in regions]
+        served = [clean_region_dots(region) for region in regions]
+        self._alias_cleaned_parses(served)
+        return served
+
+    def _alias_cleaned_parses(self, regions: list[dict[str, Any]]) -> None:
+        """A box served with ellipses gets the cached look-up parse of its text as recognized
+        (`parse_alias`, set by the app), once per text, so its words need no new request."""
+        alias = getattr(self, "parse_alias", None)
+        if not callable(alias):
+            return
+        done: set[tuple[str, str]] = self.__dict__.setdefault("_parse_aliased", set())
+        for region in regions:
+            raw = region.get("raw_text") if isinstance(region, dict) else None
+            text = str(region.get("text") or "") if isinstance(region, dict) else ""
+            if not isinstance(raw, str) or raw == text or "…" not in text or (text, raw) in done:
+                continue
+            if len(done) > 20000:
+                done.clear()
+            done.add((text, raw))
+            try:
+                alias(text, raw)
+            except Exception:  # noqa: BLE001 - the text is then parsed when it is looked up
+                continue
 
     def _cached_ocr_payload(
         self,
@@ -2142,6 +3072,18 @@ class MangaService:
                 "reason": "mokuro_not_installed",
                 "retryable": False,
             }
+        if not pages:
+            # The volume's folder was emptied: nothing to read (it raised IndexError).
+            return {
+                "book_id": int(book_id),
+                "page_index": index,
+                "regions": [],
+                "available": True,
+                "cached": False,
+                "status": "failed",
+                "reason": "volume_has_no_pages",
+                "retryable": True,
+            }
         return self._mokuro_text_regions(
             int(book_id),
             index,
@@ -2211,9 +3153,24 @@ class MangaService:
         self, archive: Path, name: str, *, python: Path | None = None, background: bool = False
     ) -> dict[str, Any]:
         """Mokuro page OCR of one archive page as a .mokuro page dict (no lease)."""
+        # The worker runs next to ~2 GB of models: a page that unpacks to more than
+        # a page may is refused before it is asked to read it.
+        try:
+            with self._open_book(Path(archive)) as book:
+                size = int(book.getinfo(str(name)).file_size)
+        except (KeyError, OSError, zipfile.BadZipFile) as exc:
+            raise MangaOcrWorkerError("mokuro_page_missing") from exc
+        if size > IMAGE_MEMBER_LIMIT:
+            raise MangaOcrWorkerError("mokuro_page_too_large")
+        # A folder volume's page is read by Mokuro straight from its file.
+        request = (
+            {"op": "ocr", "path": str(Path(archive) / str(name))}
+            if Path(archive).is_dir()
+            else {"op": "ocr", "archive": str(archive), "name": str(name)}
+        )
         with self._ocr_lock:
             reply = self._mokuro_request(
-                {"op": "ocr", "archive": str(archive), "name": str(name)},
+                request,
                 timeout=120,
                 python=python,
                 background=background,
@@ -2250,42 +3207,6 @@ class MangaService:
             raise MokuroImportError(err("manga.mokuroPageNoSize"))
         return mokuro_page_regions(page, width, height, str(name).replace("\\", "/"))
 
-    def _nearby_mokuro_path(self, book_id: int) -> Path | None:
-        """Discover only unambiguous, same-volume sidecars next to the source.
-
-        Never search a whole library, follow symlinks, or accept paths supplied
-        by the browser. Ambiguous names require the existing manual picker.
-        """
-        archive = Path(str(self._book(int(book_id))["path"]))
-        choices = (
-            archive.with_suffix(".mokuro"),
-            archive.with_name(archive.name + ".mokuro"),
-            archive.parent / "mokuro" / (archive.stem + ".mokuro"),
-        )
-        found: list[Path] = []
-        for candidate in dict.fromkeys(choices):
-            if candidate.is_symlink() or candidate.parent.is_symlink() or not candidate.is_file():
-                continue
-            try:
-                if 0 < candidate.stat().st_size <= 100 * 1024 * 1024:
-                    found.append(candidate)
-            except OSError:
-                continue
-        return found[0] if len(found) == 1 else None
-
-    def nearby_mokuro(self, book_id: int) -> dict[str, Any]:
-        """A lightweight hint for the reader, without reading or importing OCR."""
-        path = self._nearby_mokuro_path(int(book_id))
-        return {"available": path is not None, "filename": path.name if path else ""}
-
-    def import_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
-        """Require a complete page match before importing an auto-found sidecar."""
-        book_id = int(book_id)
-        path = self._nearby_mokuro_path(book_id)
-        if path is None:
-            raise MokuroImportError(err("manga.mokuroNoSidecar"))
-        return self.import_mokuro(book_id, path, require_full_coverage=True)
-
     def import_mokuro(
         self,
         book_id: int,
@@ -2313,10 +3234,18 @@ class MangaService:
         names = self._pages(archive_path)
         # A mismatched sidecar is rejected before any cache or artifact writes.
         sizes: dict[int, tuple[int, int]] = {}
-        with zipfile.ZipFile(archive_path) as archive:
+        with self._open_book(archive_path) as archive:
+            budget = ArchiveBudget(BOOK_ARCHIVE_LIMIT)
             for index, name in enumerate(names):
-                with Image.open(io.BytesIO(archive.read(name))) as image:
-                    sizes[index] = image.size
+                try:
+                    raw = read_page_member(archive, name, budget=budget)
+                    with Image.open(io.BytesIO(raw)) as image:
+                        sizes[index] = image.size
+                except ArchiveTooLargeError:
+                    raise
+                except (*_PAGE_IMAGE_ERRORS, KeyError, EOFError, zipfile.BadZipFile, zlib.error) as exc:
+                    # A damaged page image: the import's own error, not an internal failure.
+                    raise MokuroImportError(err("manga.mokuroPageUnreadable", name=name)) from exc
         pages = convert_mokuro(payload, names, image_sizes=sizes)
         if require_full_coverage and len(pages) != len(names):
             raise MokuroImportError(err("manga.mokuroIncomplete"))
@@ -2436,6 +3365,27 @@ class MangaService:
         A volume the user started shares the reader's worker; background library
         OCR uses a separate worker at low CPU priority.
         """
+        try:
+            return self._ocr_book_mokuro_pages(
+                int(book_id),
+                mokuro_python=mokuro_python,
+                progress=progress,
+                cancelled=cancelled,
+                background=background,
+            )
+        finally:
+            # Finished, cancelled or failed: the pages read so far are in the artifact file.
+            self._flush_ocr_artifact(int(book_id))
+
+    def _ocr_book_mokuro_pages(
+        self,
+        book_id: int,
+        *,
+        mokuro_python: Path,
+        progress: Callable[..., None] | None,
+        cancelled: Callable[[], bool] | None,
+        background: bool,
+    ) -> dict[str, Any]:
         python = Path(mokuro_python).expanduser()
         if not python.is_file():
             raise RuntimeError(err("manga.mokuroNotInstalled"))

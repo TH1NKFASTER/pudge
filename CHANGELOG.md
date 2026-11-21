@@ -2,6 +2,94 @@
 
 ## Unreleased
 
+## v0.8.1 — Watch from the Mac on iPhone and iPad, subtitle timing to 0.01 s, anime audiobooks, a lighter Pudge, and six review rounds
+
+Range: [v0.8.0 → v0.8.1](https://github.com/TH1NKFASTER/pudge/compare/v0.8.0...v0.8.1).
+
+These notes are derived from the complete source diff against v0.8.0. The database schema stays at v13. The iPhone / iPad app is built from `ios/` in Xcode and now runs on iOS / iPadOS 17 and later; the Mac release works without it.
+
+### Before you update
+- Pudge no longer comes with built-in torrent search or release feed addresses. Add your release search site, its mirrors and the weekly release feed in Settings → Sources; until then searches say "Add a release source in Settings → Sources." instead of failing. Backups include the release sources.
+- mpv is optional: the installer no longer installs it (about 1 GB with Homebrew's dependencies). The setup guide, the first episode or audiobook you play and `pudge --doctor` offer to install it; an mpv you installed with Homebrew later is found.
+- Google Translate for selected text is a setting now: off for new installs, kept on for existing ones.
+- Python packages are much smaller: speech recognition runs on Whisper without torch, packages older versions needed are removed, and pip/uv download caches are no longer kept (about 1 GB less on disk).
+
+### iPhone and iPad
+- **Watch** plays any episode straight from the Mac over the local network, with a playhead cache; a download can be played while it comes, and the position bar shows what is already on the device. Downloads offer qualities, resume after the Mac restarts and keep one copy per episode.
+- Handoff between the iPad (or iPhone) and the Mac: the position follows live while playing, pausing, seeking or going to the background, and a watched episode counts once across devices.
+- The player: Skip OP/ED, a compact timing wheel and separate subtitle timing / size panels, line skip, gestures in one zone only, controls that hide after 5 seconds, closing at the episode end, and a player that stays open while the Mac restarts. Subtitle words are selectable like native text (handles, loupe, double / triple tap).
+- The anime list follows the Mac while the app is in front (every 15 s while the Mac prepares something, else 90 s), split like the Mac into New episodes ready, Completed & ready, Caught up and Waiting on the Mac. A card's Play opens the nearest episode, here or on the Mac. After the final episode a score wheel appears, as on the Mac.
+- Grammar chat: Explain grammar in the light-novel reader, the word card and manga text boxes, with answers drawn from Markdown (code with Copy, lists, headings, links).
+- Light novels: the Mac's "read up to here" marker, and reading along with the audiobook opens full screen from the player and keeps the spoken line in the middle, one line at a time.
+- Manga: two-page spreads in landscape, paired the same way as on the Mac; "Hide text box outlines" is remembered.
+- Audiobooks: Finished shows on cards and offers to mark the linked light novel read; books the Mac prepares on request show their cover and join their series.
+- Statistics open at once (the Mac keeps them built); long offline listening counts correctly.
+- A downloaded episode watched on the Mac or another device is deleted after the usual delay, like one watched here (it stayed for good); opening it here again keeps it while you watch.
+- Library grids keep the app width after rotation; Settings → Storage accounts for every file and clears leftovers; graded words recolour at once.
+- Safer pairing: a pairing link opened from outside the app asks first and shows the Mac, its address and any certificate change. A device on the Wi-Fi that is not paired can no longer tie up the Mac's iPhone server, and the Mac's Bonjour name no longer shows its ID.
+- Sync: newer reading places from the phone are no longer dropped as "older", watched marks and places survive deleting a download, switching Macs and temporary Mac errors, and a phone restored from a backup keeps syncing.
+
+### Subtitles
+- Subtitle timing is exact to 0.01 s instead of the 0.25–1 s grid the timeline used, on a benchmark of real episodes and on 70+ synthetic episodes with a known true clock.
+- TV captures and cut broadcasts: pre-roll minutes, ad breaks, cut openings and endings, cold opens before the opening and small cuts between two clocks now each get their own clock, checked against the video's speech and the Japanese transcript. A map on several clocks a few seconds apart is checked against the speech clock and replaced only when it is clearly better.
+- The second Jimaku file is synced too and kept when it matches better; the preferred source (WEB, then BD, TV; SRT first) is synced instead of a second choice. Machine-translated Japanese subtitles are a last resort.
+- An untagged subtitle track of the video is used as the timing reference; a Japanese audio track that starts after the video, Shift-JIS / CP932 / UTF-16 / EUC-JP / ISO-2022-JP files, SRTs with missing blank lines and videos with several audio tracks are all handled.
+- A fresh rebuild keeps the current subtitles until it has new ones, and rebuild fixes also reach episodes prepared by older versions. "Use subtitle file as is" plays a chosen file without re-timing it, and mpv lists the original files as extra tracks.
+- When no timing can be trusted but the subtitles are this exact episode, they are shown marked as not aligned instead of not at all. Three failed speech checks in a row, not one, make an episode "Action required".
+
+### Playback and mpv
+- Line keys: replay the line, previous / next line and auto-pause at the end of each line (only replay is bound by default, Ctrl+R; the others in Settings → Shortcuts).
+- A subtitle delay set with z/x is remembered for that video, and a delay you set on two or more episodes of the same release starts the next one.
+- Opening / ending skip works for weekly shows watched one at a time and for an episode played right after its download; an opening with a few different seconds is still found whole, and one title can no longer stall detection for the others.
+- Clicking the card of an episode already open in mpv brings mpv to the front. JitenMPV is started again when its program crashes.
+- "Play next" starts at the next unwatched episode; Ctrl+A in mpv is never counted twice.
+
+### Review gate and Jiten
+- Grades before an episode save in the background, one after another, so the next card can be graded at once. A grade held back by Pudge's Jiten budget is sent again instead of being lost, and ⌘Z goes back to the right card.
+- Every Jiten request goes through one shared budget (150 requests and 180k characters a minute across Pudge's processes). The sidebar card no longer changes, or refetches, while the gate grades other cards.
+- Words written without kanji get no second line of kana, furigana covers digits that belong to a word (１０万), and Jiten's bracket readings are no longer wrapped twice. The pitch line stays centred under the word.
+
+### Anime
+- **Make audiobook…** turns downloaded episodes, or the whole anime, into an audiobook (the Japanese audio, without the opening and ending) whose prepared subtitles become its read-along text. The Mac audiobook player has a Text panel for it and for a linked light novel.
+- **Episode words…** shows the known share and the most frequent new words of one episode or all of them, with "Add checked words to the deck"; Statistics adds "Met often, not in deck".
+- Library folders: a folder of anime dropped on the window is added from anywhere; finished titles you are not watching show under Completed & ready; S2 / Season N / S00 files go to their own entries; renaming or moving a video keeps its place, watched mark and subtitles; NCOP / NCED / PV and bonus files stay extras.
+- Extra files of a batch (an OVA, a special, a movie, NCOP / NCED) go to Action required with Keep and Delete; Keep gives an OVA or movie its own title.
+- While AniList is down or refuses requests, watched episodes, Watching / Planning / Drop / Delete / Keep and scores work locally and are sent later. A file Pudge could not match offers "Identify…".
+- Home builds faster on large libraries; a downloading movie or one-episode title shows with its progress; "Weekly load" counts the episodes your personal schedules unlock in the next 7 days.
+
+### Downloads and torrents
+- Planning downloads a season all together or not at all, stops when a pack does not fit, searches premieres missed while Pudge was closed, offers season packs of a full drop, and gives movies and one-episode titles Auto-download. "Later" only closes the offers; "Not interested" dismisses one for good. Cinema recordings are skipped unless you allow them.
+- Release search: far fewer queries per episode, a per-host pause, unmarked season packs, named second seasons, TV + Specials packs, titles that end in a number and decimal titles (2.5-jigen no Ririsa) are found; SeaDex works again.
+- Season packs: once seeding ends, the torrent is removed (files kept) and watched episodes are deleted one by one. Torrent On resumes what Pudge paused, and rewatch downloads stay until they are watched.
+- The downloads window is a sortable table; percentages no longer step back and the ETA no longer disappears.
+- aria2: Pudge trusts only its own aria2 on its port, a race tries more packs and drops candidates that never send data, a batch that finished just before aria2 stopped reaches the library, and leftovers of removed candidates are cleaned up. A stopped aria2 no longer blocks new episodes.
+- qBittorrent: reading a torrent's file list never deletes a torrent you have, logins and keys go only to the address in Settings, and downloading a light-novel volume never touches an existing torrent.
+- Upgrades: no "upgrade" to the same WEB stream; an old copy without Japanese subtitles is replaced at once.
+
+### Light novels, manga and audiobooks
+- Dropping several books adds every one with a per-file summary and a highlight; a series that got new volumes shows "+N new". The light-novel screen also takes a dropped audiobook.
+- Hover furigana works for readings like 幸[さいわ]い, kanji next to each other share one reading, and a word no longer breaks across lines. Paragraphs Jiten left unparsed are asked again, at most once a week.
+- The reading assistant can dock to an edge of the light-novel reader.
+- EPUB import is faster and safer: huge or malicious files are refused, prologues before the first chapter link are kept, Sigil-made tables of contents work, and legacy-encoded EPUB / TXT files are read. Same-title imports ask Keep both / Replace.
+- Manga: folders are read in place (no copy into Pudge's data folder), moved volumes can be found again, two-page mode pairs pages like a printed book and straightens scans, and OCR results take a sixth of the space.
+- Audiobooks: multi-disc folders become one book and collections one book per title; audio that reads another book is refused; speech recognition gives way to playback; a transcript survives deleting and adding the same files again. Volumes whose titles differ only by an imprint or 〜 / ～ are one series, on the Mac and on the phone.
+
+### Statistics and personal schedules
+- A "Reading speed" card (characters per minute by day or week); Custom periods work.
+- Personal schedules count episodes watched elsewhere and use the same watched rule as AniList.
+
+### A lighter Pudge
+- The window runs in its own process, which ends 5 minutes after the window is closed (30 seconds in the experimental Low RAM mode, which also keeps pages lighter); the AniList refresh, Statistics and opening / ending detection run in short-lived worker processes. The log has an hourly memory line.
+- A background launch (an installer's relaunch) never takes the screen; "Update now" reopens with its window and keeps Torrents On.
+- The library database is compacted, local copies are smaller and kept for a shorter time, and every cache has a limit.
+
+### Reliability, privacy and security
+- Six review rounds went over the whole code: user files are never deleted by mistake, an unplugged library disk no longer stops a start or a cleanup pass, one odd file no longer ends a pass, and many crashes, races and slow paths are fixed.
+- Pudge's data, settings, caches and logs are readable by your macOS account only; the window's local server answers only Pudge's own windows; saved keys and passwords are no longer sent to the window; proxy passwords and prefixed secrets are scrubbed from logs and debug exports.
+- Updates: a failed or interrupted update puts back both Pudge and its Python packages and reopens Pudge; the Dock no longer restarts on every update.
+- A damaged library database or config.toml no longer stops Pudge from opening; it offers a restore or names the line to fix.
+- The Jimaku trial that comes with Pudge lasts 7 days.
+
 ## v0.8.0 — Pudge for iPhone, English and Russian interface, statistics for every medium, and safer downloads and cleanup
 
 Range: [0.7.30 → v0.8.0](https://github.com/TH1NKFASTER/pudge/compare/0.7.30...v0.8.0).
@@ -130,6 +218,7 @@ These notes are derived from the complete source diff against 0.7.30. The databa
 - CI and release checks install with `uv sync --locked`; lint runs on Linux with ruff and mypy at the pinned versions; `make install-dev` syncs uv.lock.
 - Irodori TTS records the exact commit it installed and its last good commit; Update Irodori asks GitHub first, checks the updated server and goes back to the last good commit if it does not start.
 - Releases are published as before 0.7.30: a `Pudge vX.Y.Z` commit, a `vX.Y.Z` tag and the `pudge-macos-vX.Y.Z.zip` archive with its `.sha256`. `make release` turns the local commits since the last release into that one commit, so GitHub gets one commit per release.
+- Updating a development install from Settings is no longer blocked by the changes Xcode makes to the iPhone project (`ios/`).
 - CI runs on machines without FFmpeg: tests that need it are skipped there, and the macOS smoke step runs the current SRT fallback tests.
 - The release test batches give each test file a short temporary folder, so Unix-socket tests fit macOS's path limit and no test name ends up in a parent folder.
 - Quit cleanup leaves multiprocessing's resource tracker alone (no warning or KeyError at the end of a test run); tests no longer leave background workers or the iPhone Bonjour advertisement running.

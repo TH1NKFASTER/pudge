@@ -92,7 +92,7 @@ def test_review_gate_prefetch_warms_cards_before_open(tmp_path: Path) -> None:
     assert scheduled["started"] is True
     thread = api._review_gate_prefetch_thread
     assert thread is not None
-    thread.join(timeout=2)
+    thread.join(timeout=30)
     assert not thread.is_alive()
     assert service.required_values == [8]
 
@@ -231,10 +231,11 @@ def test_next_card_shows_at_once_while_the_previous_review_is_saved(page) -> Non
     out = result.value
     texts = out["texts"]
     assert out["first"]["word"] == "一" and out["first"]["status"] == texts["of"][0]
-    # The next card is drawn before Jiten answers; the count already includes the review.
+    # The next card is drawn before Jiten answers and can be graded at once (the save goes
+    # on in the background); the count already includes the review.
     assert out["saving"]["word"] == "2時"
-    assert out["saving"]["status"] == texts["of"][1] + texts["saving"]
-    assert out["saving"]["grades"] == [True] * 4 and out["saving"]["busy"] is False
+    assert out["saving"]["status"] == texts["of"][1]
+    assert out["saving"]["grades"] == [False] * 4 and out["saving"]["busy"] is False
     assert out["sent"] == [["/v/Show - 01.mkv", 10, 0, "good"]] and out["attempt"]
     # A lost answer takes the optimistic count back and says so.
     assert out["unknown"]["status"] == texts["of"][0] and out["unknown"]["grades"] == [False] * 4

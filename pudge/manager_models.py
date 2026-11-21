@@ -29,6 +29,15 @@ class LibraryAnime:
     next_airing_episode: int | None = None
     next_airing_at: int | None = None
     relations: list[dict[str, Any]] = field(default_factory=list)
+    # When the title was added to the AniList list (MediaList.createdAt, unix
+    # seconds); 0 = unknown (rows built from other sources do not carry it).
+    list_added_at: float = 0.0
+    # Release search only, never stored: the place of a named sequel in its
+    # chain of seasons ("Rakugo Shinjuu: Sukeroku Futatabi-hen" is season 2)
+    # and the titles of the seasons before it, from the cached relation graph.
+    # Releases call it "<first season title> S2"; 0 / empty = unknown.
+    chain_season: int = 0
+    chain_titles: list[str] = field(default_factory=list)
 
     @property
     def next_episode(self) -> int:

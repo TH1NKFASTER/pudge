@@ -12,6 +12,7 @@ from pudge.subtitle_formats import clean_srt_for_playback
 from css_support import css_rules
 from source_policy import source
 from tests.i18n_support import en, has_text, ru
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def _srt(text: str = "日本語") -> str:
@@ -112,8 +113,9 @@ def test_alignment_generation_uses_history_when_old_sync_source_was_pruned(
 
     bleach = manager.db.episode_by_path(video)
     direct = manager.db.episode_by_path(clean_video)
-    assert bleach is not None and bleach.subtitle_path is None
-    assert bleach.state == "waiting_subtitles"
+    assert bleach is not None
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
+    assert_not_prepared_again(manager, clean_video)
     assert direct is not None and direct.subtitle_path == clean_playback.resolve()
     assert direct.state == "ready"
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
@@ -211,7 +213,7 @@ def test_light_novels_have_no_nyaa_volume_search_and_settings_keep_auto_download
             // AniList: credentials only, no separate link to AniList's authentication guide.
             const anilist = $('s_anilist_enabled').closest('.setting-block');
             out.anilist = {guideLinks: [...anilist.querySelectorAll('a, button, [data-url]')].filter(n =>
-                              /docs\.anilist\.co/.test(n.getAttribute('href') || n.dataset.url || '') || n.innerText === PudgeI18n.t('action.anilistDocs')).length};
+                              /docs\.anilist\.co/.test(n.getAttribute('href') || n.dataset.url || '') || ['Authentication guide', 'Инструкция по авторизации'].includes(n.innerText)).length};
             const semantic = $('s_subtitle_semantic_checks');
             out.semantic = {type: semantic.type, label: semantic.closest('label').innerText, expected: PudgeI18n.t('ui.allowLlmSubtitleVerificationExpensive')};
             await __input('#s_ln_auto_download', true);
@@ -246,5 +248,3 @@ def test_light_novels_have_no_nyaa_volume_search_and_settings_keep_auto_download
         assert values["ln_auto_download_nyaa"] is True
     assert en("ui.allowLlmSubtitleVerificationExpensive") == "Allow LLM subtitle verification (expensive)"
     assert ru("ui.allowLlmSubtitleVerificationExpensive") == "Разрешить LLM-проверку субтитров (дорого)"
-    assert "Light Novel translation" in en("settings.llmOptional")
-    assert "перевода в читалке ранобэ" in ru("settings.llmOptional")

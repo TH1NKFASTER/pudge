@@ -71,12 +71,9 @@ def test_background_window_checks_downloads_and_subtitles_less_often(page) -> No
     behind = page.run(f"await __tick(200000); {POLLS}", api=IDLE, before=HIDDEN)
     assert front.value == [1000, 16000]
     assert behind.value == [1000, 121000]
-    assert front.calls_of("poll_downloads_and_subtitles")[0] == [
-        "1",
-        False,
-        True,
-    ]  # (version, downloads, visible)
-    assert behind.calls_of("poll_downloads_and_subtitles")[0] == ["1", False, False]
+    # (version, downloads, visible, state token: '' while the page holds no poll snapshot)
+    assert front.calls_of("poll_downloads_and_subtitles")[0] == ["1", False, True, ""]
+    assert behind.calls_of("poll_downloads_and_subtitles")[0] == ["1", False, False, ""]
 
     # Subtitles waiting for a check in an hour (the backend's hint): once a minute in front,
     # every 2 min behind; hiding the window reschedules the pending check.

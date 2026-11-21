@@ -5,6 +5,7 @@ from pudge.syncing import (
     _exact_jimaku_timing_consensus,
     _rank_embedded_reference_candidates,
 )
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def _item(path: Path, *, activity: float, score: float, structure_reason: str = "ok"):
@@ -121,8 +122,7 @@ def test_generation_eleven_requeues_only_generated_playback_outputs(tmp_path: Pa
         )
 
     assert manager._requeue_legacy_generated_subtitles() == 1
-    playback = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv")
-    alass = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
-    assert playback is not None and playback.subtitle_path is None
-    assert alass is not None and alass.subtitle_path is not None
+    # The old playback copy is kept while it is prepared again; the ALASS output is not touched.
+    assert_rebuilding_with_subtitles_kept(manager, cfg.library.root_dir / "Anime - 05.mkv")
+    assert_not_prepared_again(manager, cfg.library.root_dir / "Anime - 06.mkv")
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"

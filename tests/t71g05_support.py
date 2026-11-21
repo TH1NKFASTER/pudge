@@ -20,6 +20,8 @@ from typing import Any
 
 from PIL import Image
 
+from pudge.manga_spreads import spread_table
+
 READER_SETTINGS = {"settings": {"review_gate_manga_enabled": False}}
 
 
@@ -36,6 +38,7 @@ window.OCR = %s;
 __api.manga_state = async () => ({books: [{id: 3, title: 'Vol 1', series_title: 'Manga', page_count: 4, position: 0, ocr_complete: true}], ocr_available: true});
 __api.manga_page = async (id, index) => ({book_id: id, page_index: index, page_count: 4, name: `p${index}.png`, spread: false, data_uri: 'data:image/png;base64,AAAA'});
 __api.manga_ocr_book_status = async () => ({running: false, state: 'ready', complete: true, total_pages: 4, completed: 4, cached_pages: 4});
+__api.manga_spreads = async () => ({spreads: %s, shift: false, wide: []});
 __api.manga_text_regions = async (id, index) => ({book_id: id, page_index: index, available: true, cached: true, regions: OCR.regions[index] || []});
 __api.study_parse_text = async text => {
   const surfaces = OCR.words[text] || [text];
@@ -51,7 +54,7 @@ __api.study_parse_text = async text => {
   return {paragraphs: [text], tokens: [tokens], vocabulary};
 };
 %s
-""" % (data, extra)
+""" % (data, json.dumps(spread_table(4)), extra)
 
 
 # The page image is 200x300 px on screen at (0, 0) (natural size the same) as soon as

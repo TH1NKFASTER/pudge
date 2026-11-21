@@ -17,7 +17,7 @@ def _image_placeholder() -> str:
 
 def test_inline_image_placeholder_is_zero_width_for_audiobook_offsets() -> None:
     image = _image_placeholder()
-    prose = "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
+    prose = "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。"
     raw = image + "\n" + prose
 
     assert len(normalize_reading_text(image)) > 380
@@ -27,7 +27,7 @@ def test_inline_image_placeholder_is_zero_width_for_audiobook_offsets() -> None:
 
 def test_cached_jiten_hints_do_not_count_leading_image_placeholder() -> None:
     image = _image_placeholder()
-    prose = "小高い丘が延々と続く。"
+    prose = "白い砂浜が延々と続く。"
     parsed = {
         "paragraphs": [image, prose],
         "tokens": [
@@ -40,7 +40,7 @@ def test_cached_jiten_hints_do_not_count_leading_image_placeholder() -> None:
             ],
         ],
         "vocabulary": [
-            {"wordId": 1, "readingIndex": 1, "reading": "小[こ]高[だか]い丘[おか]"},
+            {"wordId": 1, "readingIndex": 1, "reading": "白[しろ]い砂[すな]浜[はま]"},
             {"wordId": 2, "readingIndex": 1, "reading": "が"},
             {"wordId": 3, "readingIndex": 1, "reading": "延[えん]々[えん]と"},
             {"wordId": 4, "readingIndex": 1, "reading": "続[つづ]く"},
@@ -49,7 +49,7 @@ def test_cached_jiten_hints_do_not_count_leading_image_placeholder() -> None:
 
     hints = _reading_hints_from_cached_parse(parsed, source_limit=32)
     assert hints[:4] == [
-        {"offset_start": 0, "offset_end": 4, "surface": "小高い丘", "reading": "こだかいおか"},
+        {"offset_start": 0, "offset_end": 4, "surface": "白い砂浜", "reading": "しろいすなはま"},
         {"offset_start": 4, "offset_end": 5, "surface": "が", "reading": "が"},
         {"offset_start": 5, "offset_end": 8, "surface": "延々と", "reading": "えんえんと"},
         {"offset_start": 8, "offset_end": 10, "surface": "続く", "reading": "つづく"},
@@ -59,8 +59,8 @@ def test_cached_jiten_hints_do_not_count_leading_image_placeholder() -> None:
 def test_alignment_normalized_length_matches_reader_when_chapter_starts_with_image() -> None:
     image = _image_placeholder()
     prose = (
-        "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
-        "道は丘と丘の間を縫って作られている。旅人は静かに歩き続けた。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り、人も舟も少ない。"
+        "細い道は浜に沿って北へと伸びている。旅人は静かに歩き続けた。"
     )
     spoken = normalize_reading_text(prose)
     alignment = align_light_novel_to_transcript(

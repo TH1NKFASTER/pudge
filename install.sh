@@ -22,8 +22,15 @@ OLD_SETTINGS_APP="$APP_DIR/$APP_NAME Settings.app"
 CONFIG_PATH="$HOME/.config/$APP_SLUG/config.toml"
 LOG_DIR="$HOME/Library/Logs"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-AGENT_PLIST="$LAUNCH_AGENTS/$APP_AGENT_LABEL.plist"
+# The agent works only while Pudge is open: launchd loads ~/Library/LaunchAgents at
+# every login (the agent then ran all day after a reboot), so its plist lives in the
+# data folder and the window bootstraps it by path. Older installs put it there.
+AGENT_PLIST="$DATA_DIR/launchd/$APP_AGENT_LABEL.plist"
+LEGACY_AGENT_PLIST="$LAUNCH_AGENTS/$APP_AGENT_LABEL.plist"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+# uv's cache for this install only (removed when the installer exits): uv used to keep
+# gigabytes in ~/.cache/uv after every install.
+UV_INSTALL_CACHE="$HOME/Library/Caches/$APP_SLUG/uv-install-cache"
 
 UPDATE_MODE=0
 if [[ "${1:-}" == "--update" ]]; then
@@ -60,7 +67,11 @@ fi
 # resolve the same way whether install.sh is launched from Terminal or Pudge.
 export PATH="${BREW_BIN:h}:$PATH"
 
-for formula in mpv ffmpeg alass sevenzip aria2 python@3.12 python-tk@3.12; do
+# No sevenzip: macOS's own /usr/bin/bsdtar unpacks Jimaku and Light Novel .7z/.rar archives.
+# No python-tk@3.12: nothing in Pudge uses tkinter any more.
+# No mpv: Homebrew's mpv pulls about 1 GB of dependencies and only anime and audiobook
+# playback need it, so the first-run guide offers it instead. An installed mpv is kept.
+for formula in ffmpeg alass aria2 python@3.12; do
   if ! brew list --versions "$formula" >/dev/null 2>&1; then
     echo "Installing $formula..."
     brew install "$formula"
@@ -85,20 +96,15 @@ python3.12 "$PROJECT_DIR/pudge/legacy_install.py" paths \
   --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
   --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}"
 
-MPV_BIN="$(brew --prefix mpv)/bin/mpv"
+# `brew --prefix mpv` names the folder even when mpv is not installed: keep the path
+# only when the binary is there (empty: the config keeps its mpv value).
+MPV_BIN="$(brew --prefix mpv 2>/dev/null || true)/bin/mpv"
+[[ -x "$MPV_BIN" ]] || MPV_BIN=""
 FFMPEG_BIN="$(brew --prefix ffmpeg)/bin/ffmpeg"
 FFPROBE_BIN="$(brew --prefix ffmpeg)/bin/ffprobe"
 ALASS_BIN="$(brew --prefix alass)/bin/alass-cli"
 if [[ ! -x "$ALASS_BIN" ]]; then
   ALASS_BIN="$(brew --prefix alass)/bin/alass"
-fi
-SEVENZIP_BIN="$(brew --prefix sevenzip)/bin/7zz"
-if [[ ! -x "$SEVENZIP_BIN" ]]; then
-  SEVENZIP_BIN="$(brew --prefix sevenzip)/bin/7z"
-fi
-if [[ ! -x "$SEVENZIP_BIN" ]]; then
-  echo "Installer error: sevenzip was installed but 7zz/7z was not found." >&2
-  exit 1
 fi
 ARIA2_BIN="$(brew --prefix aria2)/bin/aria2c"
 if [[ ! -x "$ARIA2_BIN" ]]; then
@@ -106,7 +112,21 @@ if [[ ! -x "$ARIA2_BIN" ]]; then
   exit 1
 fi
 
-mkdir -p "$DATA_DIR" "$BIN_DIR" "$APP_DIR" "$LOG_DIR" "$LAUNCH_AGENTS"
+mkdir -p "$DATA_DIR" "$BIN_DIR" "$APP_DIR" "$LOG_DIR" "$LAUNCH_AGENTS" "${AGENT_PLIST:h}"
+# The library database and Pudge's state live here: this user's only (other
+# accounts on the Mac can look inside home folders).
+chmod 700 "$DATA_DIR"
+
+# A full install sets the working runtime environment aside until the new one is
+# ready (see below). One killed before it finished (power loss, SIGKILL) left a
+# half-built venv: the environment it set aside is the last working one.
+VENV_PREVIOUS="$DATA_DIR/venv-before-install"
+rm -rf "$VENV_PREVIOUS.discard"
+if [[ -d "$VENV_PREVIOUS" ]]; then
+  echo "Restoring the runtime environment an interrupted install set aside..."
+  rm -rf "$VENV_DIR"
+  /bin/mv "$VENV_PREVIOUS" "$VENV_DIR"
+fi
 
 FAST_UPDATE=0
 if (( UPDATE_MODE )) && [[ -x "$VENV_DIR/bin/python" ]]; then
@@ -174,8 +194,84 @@ if pid > 0:
         raise SystemExit("A Pudge session is still active. Quit its window with Cmd+Q before installing.")
 PUDGE_SESSION_GUARD
 
+# Rewrite only old *default* branded paths/category values. Custom user paths
+# are left intact. This runs after the physical folder migration above and,
+# for an existing config, before the runtime is touched: the rewrite refuses a
+# config it cannot parse, and that used to fail an update after its Python
+# dependencies had already been upgraded in the live venv.
+LEGACY_CONFIG_ARGS=(
+  --app-name "$APP_NAME" --app-slug "$APP_SLUG"
+  --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}"
+  --config "$CONFIG_PATH"
+)
+LEGACY_CONFIG_DONE=0
+if [[ -f "$CONFIG_PATH" ]]; then
+  python3.12 "$PROJECT_DIR/pudge/legacy_install.py" config "${LEGACY_CONFIG_ARGS[@]}"
+  LEGACY_CONFIG_DONE=1
+fi
+
 UPDATE_PACKAGE_BACKUP="$DATA_DIR/update-package-backup"
+# Every installed distribution except Pudge as name==version lines: an update
+# upgrades them in the live venv, and a rollback used to restore only Pudge.
+PIN_DEPENDENCIES_PY='
+import sys
+from importlib.metadata import distributions
+pins = set()
+for dist in distributions():
+    name = dist.metadata["Name"]
+    if name and name.casefold() != "pudge":
+        pins.add(name + "==" + dist.version)
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write("".join(pin + "\n" for pin in sorted(pins, key=str.casefold)))
+'
+# Packages an older Pudge needed stayed in the venv for good (an install only installs and
+# upgrades): after a locked install, everything its requirements do not list goes, except
+# pip, setuptools, wheel and Pudge itself. Names compare PEP 503-normalized.
+UNLISTED_PACKAGES_PY='
+import re, sys
+from importlib.metadata import distributions
+
+
+def canonical(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+listed = {"pip", "setuptools", "wheel", "pudge"}
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", line.strip())
+        if match:
+            listed.add(canonical(match.group(0)))
+unlisted = set()
+for dist in distributions():
+    name = dist.metadata["Name"]
+    if name and canonical(name) not in listed:
+        unlisted.add(name)
+print("\n".join(sorted(unlisted, key=str.casefold)))
+'
+prune_unlisted_packages() {
+  local -a unlisted
+  if ! unlisted=("${(@f)$("$VENV_DIR/bin/python" -I -c "$UNLISTED_PACKAGES_PY" "$1")}"); then
+    echo "Installer warning: could not list the installed Python packages." >&2
+    return 0
+  fi
+  unlisted=("${(@)unlisted:#}")
+  (( ${#unlisted[@]} )) || return 0
+  if ! "$VENV_DIR/bin/python" -m pip uninstall --quiet --yes "${unlisted[@]}"; then
+    echo "Installer warning: packages no longer needed could not be removed." >&2
+    return 0
+  fi
+  if (( ${#unlisted[@]} == 1 )); then
+    echo "Removed 1 package no longer needed."
+  else
+    echo "Removed ${#unlisted[@]} packages no longer needed."
+  fi
+}
 UPDATE_SITE_PACKAGES=""
+VENV_SET_ASIDE=0
+# The new package is installed here first and renamed into place (see below).
+PACKAGE_STAGE="$DATA_DIR/update-package-stage"
+PACKAGE_PREVIOUS="$DATA_DIR/update-package-previous"
 WHEEL_BUILD_DIR=""
 SOURCE_BUILD_BACKUP=""
 SOURCE_BUILD_ISOLATED=0
@@ -192,7 +288,10 @@ restore_source_build() {
 }
 cleanup_install() {
   local exit_code=$?
-  if (( exit_code != 0 && FAST_UPDATE )) && [[ -n "$UPDATE_SITE_PACKAGES" && -d "$UPDATE_PACKAGE_BACKUP" ]]; then
+  # Only a finished backup (its "complete" marker) is a rollback source. Without it
+  # the update stopped while copying (Ctrl+C, a full disk) and the live package was
+  # not touched yet: putting the partial copy back is what broke it.
+  if (( exit_code != 0 && FAST_UPDATE )) && [[ -n "$UPDATE_SITE_PACKAGES" && -f "$UPDATE_PACKAGE_BACKUP/complete" ]]; then
     echo "Update failed; restoring the previous Pudge package..."
     rm -rf "$UPDATE_SITE_PACKAGES/pudge" "$UPDATE_SITE_PACKAGES"/pudge-*.dist-info(N)
     if [[ -d "$UPDATE_PACKAGE_BACKUP/pudge" ]]; then
@@ -201,7 +300,26 @@ cleanup_install() {
     for info in "$UPDATE_PACKAGE_BACKUP"/pudge-*.dist-info(N); do
       /usr/bin/ditto "$info" "$UPDATE_SITE_PACKAGES/${info:t}"
     done
+    if [[ -f "$UPDATE_PACKAGE_BACKUP/requirements.txt" ]] \
+       && "$VENV_DIR/bin/python" -I -c "$PIN_DEPENDENCIES_PY" "$UPDATE_PACKAGE_BACKUP/requirements-after.txt" \
+       && ! cmp -s "$UPDATE_PACKAGE_BACKUP/requirements.txt" "$UPDATE_PACKAGE_BACKUP/requirements-after.txt"; then
+      echo "Update failed; restoring the previous Python dependencies..."
+      if ! "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --no-deps -r "$UPDATE_PACKAGE_BACKUP/requirements.txt"; then
+        echo "Installer warning: the previous Python dependencies could not be restored; run install.sh again." >&2
+      fi
+    fi
   fi
+  if (( VENV_SET_ASIDE )); then
+    if (( exit_code != 0 )); then
+      echo "Install failed; restoring the previous runtime environment..."
+      rm -rf "$VENV_DIR"
+      /bin/mv "$VENV_PREVIOUS" "$VENV_DIR" || true
+    else
+      # Renamed first: a removal cut short never looks like an environment to restore.
+      /bin/mv "$VENV_PREVIOUS" "$VENV_PREVIOUS.discard" && rm -rf "$VENV_PREVIOUS.discard"
+    fi
+  fi
+  rm -rf "$PACKAGE_STAGE" "$PACKAGE_PREVIOUS"
   if (( exit_code != 0 )) && [[ -n "${APP_SWAP_BACKUP:-}" && -d "$APP_SWAP_BACKUP" ]]; then
     echo "Install failed; restoring the previous app bundle..."
     rm -rf "$APP_PATH"
@@ -212,10 +330,16 @@ cleanup_install() {
   restore_source_build
   [[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"
   [[ -n "${LOCKED_REQUIREMENTS:-}" ]] && rm -f "$LOCKED_REQUIREMENTS"
+  rm -rf "$UV_INSTALL_CACHE"
   rm -rf "$UPDATE_PACKAGE_BACKUP"
   return "$exit_code"
 }
 trap cleanup_install EXIT
+# A plain kill or a closed Terminal ended zsh without running the EXIT trap,
+# so nothing was rolled back; leave through it instead.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if (( FAST_UPDATE )); then
   UPDATE_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITE'
@@ -223,18 +347,44 @@ import sysconfig
 print(sysconfig.get_paths()["purelib"])
 PYSITE
 )"
-  rm -rf "$UPDATE_PACKAGE_BACKUP"
-  mkdir -p "$UPDATE_PACKAGE_BACKUP"
-  if [[ -d "$UPDATE_SITE_PACKAGES/pudge" ]]; then
-    /usr/bin/ditto "$UPDATE_SITE_PACKAGES/pudge" "$UPDATE_PACKAGE_BACKUP/pudge"
+  if [[ -z "$UPDATE_SITE_PACKAGES" ]]; then
+    echo "Installer error: the runtime's site-packages folder was not found." >&2
+    exit 1
   fi
-  for info in "$UPDATE_SITE_PACKAGES"/pudge-*.dist-info(N); do
-    /usr/bin/ditto "$info" "$UPDATE_PACKAGE_BACKUP/${info:t}"
-  done
+  if [[ -f "$UPDATE_PACKAGE_BACKUP/complete" ]]; then
+    # A finished backup is still here: the last update was killed (power loss,
+    # SIGKILL) before its rollback ran, possibly between removing the package
+    # and installing the new one. That backup is the last working state, so it
+    # stays the rollback source instead of a copy of what was left behind.
+    echo "Resuming after an interrupted update; keeping its backup of the previous Pudge package."
+  else
+    rm -rf "$UPDATE_PACKAGE_BACKUP"
+    mkdir -p "$UPDATE_PACKAGE_BACKUP"
+    if [[ -d "$UPDATE_SITE_PACKAGES/pudge" ]]; then
+      /usr/bin/ditto "$UPDATE_SITE_PACKAGES/pudge" "$UPDATE_PACKAGE_BACKUP/pudge"
+    fi
+    for info in "$UPDATE_SITE_PACKAGES"/pudge-*.dist-info(N); do
+      /usr/bin/ditto "$info" "$UPDATE_PACKAGE_BACKUP/${info:t}"
+    done
+    "$VENV_DIR/bin/python" -I -c "$PIN_DEPENDENCIES_PY" "$UPDATE_PACKAGE_BACKUP/requirements.txt"
+    : > "$UPDATE_PACKAGE_BACKUP/complete"
+  fi
 else
-  rm -rf "$VENV_DIR"
+  # A full install builds a new runtime environment. A working one used to be
+  # deleted first, so a failed download left Pudge without one: it is set aside
+  # and put back if this install fails, and removed once it succeeded.
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    for plist in "$AGENT_PLIST" "$LEGACY_AGENT_PLIST"; do
+      [[ -f "$plist" ]] && launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    done
+    rm -rf "$VENV_PREVIOUS"
+    /bin/mv "$VENV_DIR" "$VENV_PREVIOUS"
+    VENV_SET_ASIDE=1
+  else
+    rm -rf "$VENV_DIR"
+  fi
   python3.12 -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/python" -m pip install --upgrade pip
+  "$VENV_DIR/bin/python" -m pip install --no-cache-dir --upgrade pip
 fi
 BUILD_CURRENT_TREE=0
 if [[ -e "$PROJECT_DIR/.git" ]]; then
@@ -260,7 +410,7 @@ if (( BUILD_CURRENT_TREE )); then
   fi
   SOURCE_BUILD_ISOLATED=1
 
-  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "setuptools>=75" wheel
+  "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade "setuptools>=75" wheel
   # A source checkout carries no (or a stale) build-info.json: fingerprint the
   # tree being installed so Settings shows this build instead of "(modified)".
   if [[ -f "$PROJECT_DIR/.github/release/write_build_info.py" ]]; then
@@ -291,9 +441,10 @@ WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 # before installing the exact wheel. A same-version pip reinstall can otherwise
 # leave stale package files behind in a long-lived update venv.
 # pip and uv stay quiet (no per-package lines or hash lists); errors and warnings still show.
-echo "Installing locked Python dependencies (the first install downloads a few GB)..."
+echo "Installing locked Python dependencies (the first install downloads about 100 MB)..."
 if [[ -f "$PROJECT_DIR/release-requirements.txt" && ! -d "$PROJECT_DIR/.git" ]]; then
-  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
+  "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
+  prune_unlisted_packages "$PROJECT_DIR/release-requirements.txt"
 elif [[ -f "$PROJECT_DIR/uv.lock" ]]; then
   # A development checkout or a patched tree: the same locked, hash-checked versions a
   # release installs, exported from uv.lock (as build_release.sh does), never resolved anew.
@@ -306,30 +457,68 @@ elif [[ -f "$PROJECT_DIR/uv.lock" ]]; then
   UV_BIN="$(command -v uv 2>/dev/null || true)"
   [[ -n "$UV_BIN" ]] || UV_BIN="$(brew --prefix uv)/bin/uv"
   LOCKED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/${APP_SLUG}-requirements.XXXXXX")"
-  "$UV_BIN" export --project "$PROJECT_DIR" --python "$VENV_DIR/bin/python" --locked --extra sync \
+  rm -rf "$UV_INSTALL_CACHE"
+  UV_CACHE_DIR="$UV_INSTALL_CACHE" "$UV_BIN" export --project "$PROJECT_DIR" --python "$VENV_DIR/bin/python" --locked --extra sync \
     --no-dev --no-emit-project --format requirements.txt --output-file "$LOCKED_REQUIREMENTS" \
     --quiet >/dev/null
-  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade --require-hashes -r "$LOCKED_REQUIREMENTS"
+  rm -rf "$UV_INSTALL_CACHE"
+  "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade --require-hashes -r "$LOCKED_REQUIREMENTS"
+  prune_unlisted_packages "$LOCKED_REQUIREMENTS"
   rm -f "$LOCKED_REQUIREMENTS"
   LOCKED_REQUIREMENTS=""
 else
-  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "${WHEEL_PATH}[sync]"
+  "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade "${WHEEL_PATH}[sync]"
 fi
 INSTALL_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITEINSTALL'
 import sysconfig
 print(sysconfig.get_paths()["purelib"])
 PYSITEINSTALL
 )"
+if [[ -z "$INSTALL_SITE_PACKAGES" ]]; then
+  echo "Installer error: the runtime's site-packages folder was not found." >&2
+  exit 1
+fi
 # launchd may start the scheduled agent at any moment. During an in-place
 # update there is a short interval where the old package directory is removed;
 # unload the agent before that destructive step so it can never observe a
 # half-installed runtime. The GUI bootstraps the freshly written plist again
 # after it reopens.
-if (( FAST_UPDATE )) && [[ -f "$AGENT_PLIST" ]]; then
-  launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
+if (( FAST_UPDATE )); then
+  for plist in "$AGENT_PLIST" "$LEGACY_AGENT_PLIST"; do
+    [[ -f "$plist" ]] && launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+  done
 fi
-rm -rf "$INSTALL_SITE_PACKAGES/pudge" "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N)
-"$VENV_DIR/bin/python" -m pip install --no-cache-dir --no-deps "$WHEEL_PATH"
+# The new package is installed into a staging root first (pip --root: the same
+# paths under PACKAGE_STAGE) and then renamed into place. Removing the old package
+# and running pip in place left no package at all when power was lost or the
+# installer was killed in between. A fresh directory also leaves no stale files.
+rm -rf "$PACKAGE_STAGE" "$PACKAGE_PREVIOUS"
+"$VENV_DIR/bin/python" -m pip install --no-cache-dir --no-deps --ignore-installed \
+  --no-warn-script-location --root "$PACKAGE_STAGE" "$WHEEL_PATH"
+STAGED_SITE="$PACKAGE_STAGE$INSTALL_SITE_PACKAGES"
+if [[ ! -d "$STAGED_SITE/pudge" ]]; then
+  # pip spelled the site-packages path differently (a symlinked folder): use where it put it.
+  STAGED_INFOS=("$PACKAGE_STAGE"/**/pudge-*.dist-info(N/))
+  (( ${#STAGED_INFOS[@]} == 1 )) && STAGED_SITE="${STAGED_INFOS[1]:h}"
+fi
+STAGED_INFOS=("$STAGED_SITE"/pudge-*.dist-info(N))
+if [[ ! -d "$STAGED_SITE/pudge" ]] || (( ${#STAGED_INFOS[@]} != 1 )); then
+  echo "Installer error: the new Pudge package was not found in $PACKAGE_STAGE." >&2
+  exit 1
+fi
+mkdir -p "$PACKAGE_PREVIOUS"
+if [[ -d "$INSTALL_SITE_PACKAGES/pudge" ]]; then
+  /bin/mv "$INSTALL_SITE_PACKAGES/pudge" "$PACKAGE_PREVIOUS/pudge"
+fi
+/bin/mv "$STAGED_SITE/pudge" "$INSTALL_SITE_PACKAGES/pudge"
+for info in "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N); do
+  /bin/mv "$info" "$PACKAGE_PREVIOUS/${info:t}"
+done
+/bin/mv "${STAGED_INFOS[1]}" "$INSTALL_SITE_PACKAGES/${STAGED_INFOS[1]:t}"
+for script in "$PACKAGE_STAGE$VENV_DIR/bin"/*(N); do
+  /bin/mv -f "$script" "$VENV_DIR/bin/${script:t}"
+done
+rm -rf "$PACKAGE_STAGE" "$PACKAGE_PREVIOUS"
 
 # Verify the installed package byte-for-byte against the wheel before the app
 # bundle is touched. This catches stale runtime files even when package version
@@ -402,23 +591,36 @@ done
 if [[ ! -f "$CONFIG_PATH" ]]; then
   "$BIN_DIR/$APP_CLI" --init-config
 fi
-
-# Rewrite only old *default* branded paths/category values. Custom user paths
-# are left intact. This runs after the physical folder migration above.
-python3.12 "$PROJECT_DIR/pudge/legacy_install.py" config \
-  --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
-  --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}" \
-  --config "$CONFIG_PATH"
+# A config created just now (first install) gets the same rewrite.
+if (( ! LEGACY_CONFIG_DONE )); then
+  python3.12 "$PROJECT_DIR/pudge/legacy_install.py" config "${LEGACY_CONFIG_ARGS[@]}"
+fi
 
 MPV_BIN="$MPV_BIN" FFMPEG_BIN="$FFMPEG_BIN" FFPROBE_BIN="$FFPROBE_BIN" ALASS_BIN="$ALASS_BIN" ARIA2_BIN="$ARIA2_BIN" CONFIG_PATH="$CONFIG_PATH" \
   "$VENV_DIR/bin/python" - <<'PYCONFIG'
 import os
+import sys
 from pathlib import Path
+from pudge import config as pudge_config
 from pudge.config import load_config, write_config
 
 path = Path(os.environ["CONFIG_PATH"])
 config = load_config(path)
-config.tools.mpv = os.environ["MPV_BIN"]
+broken = getattr(pudge_config, "CONFIG_LOAD_ERROR", None)
+if broken:
+    # Pudge refuses to write over a config.toml it cannot read (it would replace the
+    # user's settings with the defaults in memory): leave it, and say what to fix.
+    print(
+        f"Installer warning: {path} has a syntax error at line {broken.get('line') or '?'}"
+        f" ({broken.get('message') or 'invalid TOML'}); fix it, then reopen Pudge."
+        " The tool paths in it were not updated.",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
+# Without an installed mpv the config keeps what it has: an mpv set up another way still
+# works, and a missing path never replaces it.
+if os.environ.get("MPV_BIN"):
+    config.tools.mpv = os.environ["MPV_BIN"]
 config.tools.ffmpeg = os.environ["FFMPEG_BIN"]
 config.tools.ffprobe = os.environ["FFPROBE_BIN"]
 config.tools.alass = os.environ["ALASS_BIN"]
@@ -468,7 +670,6 @@ LAUNCHER_SOURCE="$BUILD_DIR/pudge-launcher.m"
 LAUNCHER_SOURCE="$LAUNCHER_SOURCE" \
 VENV_PYTHON="$VENV_DIR/bin/python" \
 CONFIG_PATH="$CONFIG_PATH" \
-SEVENZIP_BIN="$SEVENZIP_BIN" \
 ARIA2_BIN="$ARIA2_BIN" \
 APP_NAME="$APP_NAME" \
 python3.12 - <<'PYNATIVELAUNCHER'
@@ -480,7 +681,6 @@ source = Path(os.environ["LAUNCHER_SOURCE"])
 app_name = json.dumps(os.environ["APP_NAME"])
 venv_python = json.dumps(os.environ["VENV_PYTHON"])
 config_path = json.dumps(os.environ["CONFIG_PATH"])
-sevenzip_bin = json.dumps(os.environ["SEVENZIP_BIN"])
 aria2_bin = json.dumps(os.environ["ARIA2_BIN"])
 
 template = r"""#import <Foundation/Foundation.h>
@@ -592,7 +792,6 @@ int main(int argc, char *argv[]) {
     const char *python = __VENV_PYTHON__;
     setenv("PUDGE_PYTHON", python, 1);
     setenv("PUDGE_CONFIG", __CONFIG_PATH__, 1);
-    setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);
     setenv("PUDGE_ARIA2C", __ARIA2_BIN__, 1);
 
     // Only temporary Objective-C objects used before Python starts belong to
@@ -641,7 +840,6 @@ template = (
     .replace("__APP_NAME__", app_name)
     .replace("__VENV_PYTHON__", venv_python)
     .replace("__CONFIG_PATH__", config_path)
-    .replace("__SEVENZIP_BIN__", sevenzip_bin)
     .replace("__ARIA2_BIN__", aria2_bin)
 )
 source.write_text(template, encoding="utf-8")
@@ -777,6 +975,11 @@ codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1 || true
 fi
 printf '%s\n' "$NATIVE_SHELL_REV" > "$NATIVE_SHELL_REV_FILE"
 
+# Installs before the agent's plist moved: unload it and remove it from LaunchAgents.
+if [[ -f "$LEGACY_AGENT_PLIST" ]]; then
+  launchctl bootout "gui/$(id -u)" "$LEGACY_AGENT_PLIST" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_AGENT_PLIST"
+fi
 cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -799,7 +1002,6 @@ cat > "$AGENT_PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$BIN_DIR</string>
-    <key>PUDGE_7ZIP</key><string>$SEVENZIP_BIN</string>
     <key>PUDGE_ARIA2C</key><string>$ARIA2_BIN</string>
     <key>PUDGE_NOTIFICATION_HELPER</key><string>$APP_PATH/Contents/MacOS/$APP_NAME</string>
   </dict>
@@ -849,7 +1051,6 @@ PYINSTALLSOURCE
 "$VENV_DIR/bin/python" "$PROJECT_DIR/pudge/mac_app_aliases.py" \
   "$APP_PATH" "$APP_BUNDLE_ID" "${LEGACY_NAMES[@]}" || \
   echo "Installed successfully; old Dock aliases could not be refreshed." >&2
-killall Dock >/dev/null 2>&1 || true
 
 if [[ ! -d "/Applications/qbittorrent.app" && ! -d "/Applications/qBittorrent.app" ]] && ! brew list --cask qbittorrent >/dev/null 2>&1; then
   echo

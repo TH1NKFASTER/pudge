@@ -39,23 +39,17 @@ def test_quit_cleanup_never_kills_the_launched_update_installer():
                 process.wait(timeout=5)
 
 
-def test_update_preflight_cancels_jiten_prefetch_and_names_real_blockers():
+def test_update_preflight_names_real_blockers():
     api = WebAppApi.__new__(WebAppApi)
-    cancel = threading.Event()
-    prefetch = threading.Thread(target=lambda: cancel.wait(10), name="jiten-prefetch")
-    prefetch.start()
     stop = threading.Event()
     startup = threading.Thread(target=lambda: stop.wait(10), name="pudge-startup-maintenance")
     startup.start()
-    api._jiten_state_prefetch_cancel_event = cancel
-    api._jiten_state_prefetch_thread = prefetch
     api._startup_maintenance_thread = startup
     api._irodori_tts_lock = threading.Lock()
     api._irodori_tts_threads = {}
     try:
         with pytest.raises(RuntimeError, match=r"pudge-startup-maintenance"):
             api._prepare_update_shutdown()
-        assert cancel.is_set() and not prefetch.is_alive()
     finally:
         stop.set()
         startup.join(timeout=5)

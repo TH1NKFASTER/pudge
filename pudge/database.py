@@ -3,16 +3,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import threading
 import time
+import weakref
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .database_storage import vacuum_into
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from .filename import release_name_display_title
 from .release_parser import double_episode_span
 from .episode_state import transition_episode_state, stronger_episode_state
 from .personal_schedule import (
@@ -25,9 +29,22 @@ from .personal_schedule import (
     reanchored_start_local_datetime,
 )
 from .i18n import err
+from .private_files import secure_database_files
 
 
 _LOGGER = logging.getLogger(__name__)
+# Bumped whenever this process saves or forgets a release numbering rule: caches of episode
+# offsets derived from the rules (the window's _episode_numbering_offset) compare it.
+_NUMBERING_RULES_VERSION = [0]
+
+
+def numbering_rules_version() -> int:
+    return _NUMBERING_RULES_VERSION[0]
+
+
+def _numbering_rules_changed() -> None:
+    _NUMBERING_RULES_VERSION[0] += 1
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS anime (
@@ -52,6 +69,7 @@ CREATE TABLE IF NOT EXISTS anime (
     next_airing_episode INTEGER,
     next_airing_at INTEGER,
     relations_json TEXT NOT NULL DEFAULT '[]',
+    list_added_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL
 );
 
@@ -177,6 +195,10 @@ CREATE TABLE IF NOT EXISTS release_history (
     selected_at REAL NOT NULL,
     FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
 );
+
+-- prune_history() looks up the latest release of each row's episode: without this index that
+-- correlated subquery read the whole table once per row (10k rows: ~13 s under the write lock).
+CREATE INDEX IF NOT EXISTS idx_release_history_media ON release_history(media_id);
 
 
 CREATE TABLE IF NOT EXISTS upgrade_jobs (
@@ -397,6 +419,7 @@ CREATE TABLE IF NOT EXISTS manga_books (
     user_score REAL,
     mean_score REAL,
     source_fingerprint TEXT NOT NULL DEFAULT '',
+    position_updated_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -706,6 +729,35 @@ ON vn_capture_lines(captured_at_utc);
 
 LATEST_SCHEMA_VERSION = 13
 
+# Indexes added to tables of every schema version (cache_registry only exists after the
+# migrations): created after _migrate on every initialization, so existing libraries get
+# them too. The FK columns pointing at anime are searched on every anime delete/cascade.
+_ADDITIVE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_cache_registry_path ON cache_registry(path);
+CREATE INDEX IF NOT EXISTS idx_downloads_media ON downloads(media_id);
+CREATE INDEX IF NOT EXISTS idx_upgrade_jobs_media ON upgrade_jobs(media_id);
+CREATE INDEX IF NOT EXISTS idx_playlists_media ON playlists(media_id);
+CREATE INDEX IF NOT EXISTS idx_personal_release_schedules_anime ON personal_release_schedules(anime_id);
+"""
+
+
+# Rows of the ``state`` table whose key starts with a prefix: ``key>=? AND key<?`` searches the
+# primary-key index. ``key LIKE 'p%'`` and ``substr(key,1,n)='p'`` read the whole table (tens of
+# thousands of rows with manga OCR and per-episode markers) and LIKE also treats "_" as a wildcard.
+STATE_PREFIX_SQL = "key>=? AND key<?"
+
+
+# prune_history entries that delete ``state`` rows rather than a table of their own.
+_STATE_PRUNE_ROWS = frozenset({"playback_markers", "double_episode_seen", "aria2_stall_markers"})
+
+
+def state_prefix_bounds(prefix: str) -> tuple[str, str]:
+    """``(low, high)`` for STATE_PREFIX_SQL: every key that starts with ``prefix``, nothing else."""
+    prefix = str(prefix)
+    if not prefix:
+        raise ValueError("empty state key prefix")
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
 
 def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
     """Execute a SQLite script without ``executescript``'s implicit COMMIT.
@@ -729,6 +781,40 @@ def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
     if statement.strip():
         raise sqlite3.OperationalError("incomplete SQL migration statement")
 
+
+# Needs-action jobs that wait for the person's answer (Keep or Delete an extra file of a
+# download, "preparation keeps failing"): Refresh and launch never turn them back into
+# pending. Settings-related codes are retried, settings may have changed. A new file in
+# the subtitle inbox retries a failing job too, only the extra files stay.
+EXTRA_FILE_ACTION_CODES = ("review_extra_file", "extra_file_kept")
+
+
+def preferred_copy(rows: Iterable[Any], folder_counts: dict[str, int]) -> Any:
+    """The copy to play among several library files of the same episode.
+
+    A file that is on disk wins, then one next to more of the title's episodes (the batch the
+    neighbouring episodes come from over an older single download), then the oldest row (the
+    order the library query returned before). The Mac (``ready_episode``) and the phone list
+    (``iphone_media``) use the same rule.
+    """
+
+    def key(row: Any) -> tuple[int, int, int]:
+        path = Path(str(row["video_path"]))
+        try:
+            present = path.is_file()
+        except OSError:
+            present = False
+        return (int(present), folder_counts.get(str(path.parent), 0), -int(row["id"] or 0))
+
+    return max(rows, key=key)
+
+
+def season_zero_set_aside_key(video: Path | str) -> str:
+    """State key of a season-0 file the library scan set aside (see extra_files)."""
+    return "season_zero_set_aside:" + hashlib.sha1(str(Path(video).resolve()).encode("utf-8")).hexdigest()
+
+
+REFRESH_KEEPS_ACTION_CODES = (*EXTRA_FILE_ACTION_CODES, "subtitle_retry_exhausted")
 
 # Continue Watching lists an episode from this position on, until this close to its end.
 RESUME_MIN_POSITION = 30.0
@@ -765,8 +851,16 @@ _EPISODE_UI_COLUMNS = (
 # full Home rebuild; every other column (including ones added by later
 # migrations) still invalidates it.
 _UI_STATE_UPDATE_TRIGGERS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
-    ("anime_ui_state_update", "anime", ("updated_at",), ""),
-    ("downloads_ui_state_update", "downloads", ("updated_at",), ""),
+    ("anime_ui_state_update", "anime", ("updated_at", "list_added_at"), ""),
+    # Progress and the client stats in raw_json change on every client poll; live progress
+    # reaches the page through the traffic poll (WEBFLOW-7). Finishing still counts, and
+    # upsert_download bumps for any other raw_json change.
+    (
+        "downloads_ui_state_update",
+        "downloads",
+        ("updated_at", "progress", "raw_json"),
+        "((OLD.progress >= 1) IS NOT (NEW.progress >= 1))",
+    ),
     (
         "subtitle_jobs_ui_state_update",
         "subtitle_jobs",
@@ -777,6 +871,51 @@ _UI_STATE_UPDATE_TRIGGERS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         "(OLD.state IS NOT 'processing' OR NEW.state IS NOT 'processing'))",
     ),
 )
+
+
+# Client statistics stored in downloads.raw_json that change on every poll (qBittorrent's
+# torrent info, aria2's normalized status): a change of only these is no UI change.
+_VOLATILE_DOWNLOAD_RAW_KEYS = frozenset(
+    {
+        # qBittorrent
+        "amount_left",
+        "availability",
+        "completed",
+        "dlspeed",
+        "downloaded",
+        "downloaded_session",
+        "eta",
+        "last_activity",
+        "num_complete",
+        "num_incomplete",
+        "num_leechs",
+        "num_seeds",
+        "popularity",
+        "progress",
+        "ratio",
+        "reannounce",
+        "seeding_time",
+        "seen_complete",
+        "time_active",
+        "uploaded",
+        "uploaded_session",
+        "upspeed",
+        # aria2 (providers/aria2.py)
+        "download_speed",
+        "num_connections",
+        "num_seeders",
+        "upload_speed",
+        "verification_progress",
+        "verified",
+    }
+)
+
+
+def _download_ui_raw(raw: object) -> dict[str, object]:
+    """raw_json without the per-poll client statistics."""
+    if not isinstance(raw, dict):
+        return {}
+    return {key: value for key, value in raw.items() if key not in _VOLATILE_DOWNLOAD_RAW_KEYS}
 
 
 def _ui_state_update_trigger_sql(conn: sqlite3.Connection) -> dict[str, str]:
@@ -800,6 +939,101 @@ def _ui_state_update_trigger_sql(conn: sqlite3.Connection) -> dict[str, str]:
     return specs
 
 
+# Which schema code last initialized the file (DB-6): helpers open the library with
+# initialize=False and skip the schema script only while this matches. The schema
+# version alone did not say it: tables and _ensure_column checks are added without
+# a version bump, so the app version is part of the digest.
+SCHEMA_DIGEST_KEY = "schema_digest"
+_SCHEMA_DIGEST: str | None = None
+
+
+def _schema_digest() -> str:
+    global _SCHEMA_DIGEST
+    if _SCHEMA_DIGEST is None:
+        from . import __version__
+
+        source = repr(
+            (
+                SCHEMA,
+                _ADDITIVE_INDEXES,
+                _UI_STATE_BUMP_SQL,
+                _EPISODE_UI_COLUMNS,
+                _UI_STATE_UPDATE_TRIGGERS,
+                sorted(Database._CURRENT_INDEXES.items()),
+            )
+        )
+        _SCHEMA_DIGEST = (
+            f"{LATEST_SCHEMA_VERSION}:{__version__}:{hashlib.sha256(source.encode()).hexdigest()[:16]}"
+        )
+    return _SCHEMA_DIGEST
+
+
+class _TrackedConnection(sqlite3.Connection):
+    """A connection that knows which of its cursors are still alive.
+
+    A cursor kept past its call can hold an unfinished SELECT, and with it the old
+    read snapshot: a parked connection would then read stale rows on its next call.
+    Such a connection is closed as before instead of parked.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursors: weakref.WeakSet[sqlite3.Cursor] = weakref.WeakSet()
+
+    def _track(self, cursor: sqlite3.Cursor) -> sqlite3.Cursor:
+        self.cursors.add(cursor)
+        return cursor
+
+    def cursor(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._track(super().cursor(*args, **kwargs))
+
+    def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._track(super().execute(*args, **kwargs))
+
+    def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._track(super().executemany(*args, **kwargs))
+
+    def executescript(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._track(super().executescript(*args, **kwargs))
+
+
+class _IdleConnection:
+    """A thread's parked SQLite connection (Database(thread_connections=True))."""
+
+    __slots__ = ("conn", "identity", "pid", "owner")
+
+    def __init__(self, conn: sqlite3.Connection, identity: tuple[int, int] | None, owner: object) -> None:
+        self.conn: sqlite3.Connection | None = conn
+        self.identity = identity
+        self.pid = os.getpid()
+        self.owner = owner
+
+
+# Parked connections of the whole process, oldest first: at most _PARKED_LIMIT stay open (two
+# file handles each; a macOS app starts with 256). A thread that finished or a Database no
+# longer used leaves its connection here until it is the oldest. Taken out under the lock,
+# so a connection is closed by eviction or retire() only while nobody uses it.
+_PARKED_LIMIT = 12
+_PARKED_LOCK = threading.Lock()
+_PARKED: dict[int, _IdleConnection] = {}
+
+
+def _close_quietly(conn: sqlite3.Connection | None) -> None:
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - closing an idle handle
+            pass
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
 def reused_connection(db: object) -> AbstractContextManager[object]:
     """``db.reuse_connection()`` for a real Database, a no-op for test doubles."""
     return db.reuse_connection() if isinstance(db, Database) else nullcontext()
@@ -814,20 +1048,72 @@ def _json_object(value: object) -> dict[str, object]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+# Episode state written when a subtitle selection is dropped for a new preparation:
+# Watched and Dropped episodes stay what they are (a rebuild must not show them again
+# as new on Home).
+_WAITING_UNLESS_WATCHED_SQL = (
+    "CASE WHEN state IN ('watched','dropped') THEN state ELSE 'waiting_subtitles' END"
+)
+# ... and when a job is deferred, postponed or waits for the user: a Ready episode that
+# keeps its selection (an upgrade check or a rebuild keeping its subtitles) stays Ready.
+_WAITING_UNLESS_SETTLED_SQL = (
+    "CASE WHEN state IN ('watched','dropped') THEN state "
+    "WHEN state='ready' AND (subtitle_path IS NOT NULL OR embedded_subtitle_id IS NOT NULL) THEN state "
+    "ELSE 'waiting_subtitles' END"
+)
+_SELECTED_HISTORY_STATUSES_SQL = "('selected','upgraded','manual','legacy')"
+
+
 class Database:
-    def __init__(self, path: Path, *, initialize: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        initialize: bool = True,
+        integrity_check: bool = True,
+        thread_connections: bool = False,
+    ) -> None:
+        """Open the library.
+
+        ``initialize=False`` (helpers, the agent, CLI commands): when this app's
+        schema code already initialized the file, only open it — no write lock,
+        no schema script, no full-file ``quick_check``. An older or unknown schema
+        is still initialized/migrated. ``integrity_check`` runs ``quick_check``
+        after a full initialization (the window decides when it is due, DB-6);
+        a migration always checks.
+
+        ``thread_connections`` (the window's own library): a finished call parks
+        its connection for the next call on the same thread instead of closing
+        it, saving the open and schema parse (milliseconds per call). retire()
+        closes the parked connections; a replaced file is never reused. Off
+        for helper processes, which must not keep the file open between calls.
+        """
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection_scope_local = threading.local()
         self._connection_condition = threading.Condition()
         self._active_connections = 0
         self._retired = False
+        self._thread_connections = bool(thread_connections)
+        self._park_owner = object()  # this Database's entries in _PARKED
+        self.integrity_checked = False
         existing_database = self.path.is_file() and self.path.stat().st_size > 0
+        if existing_database:
+            # Older versions created it 0644 in a 0755 folder: other accounts could read it.
+            secure_database_files(self.path)
         if not initialize and existing_database:
             with self.connect() as conn:
                 row = conn.execute("PRAGMA user_version").fetchone()
                 if row and int(row[0]) == LATEST_SCHEMA_VERSION:
-                    return  # The owning app initializes/checks the current schema.
+                    try:
+                        digest = conn.execute(
+                            "SELECT value FROM state WHERE key=?", (SCHEMA_DIGEST_KEY,)
+                        ).fetchone()
+                    except sqlite3.OperationalError:
+                        digest = None  # no state table yet: initialize below
+                    if digest and str(digest[0]) == _schema_digest():
+                        return  # The owning app initializes/checks the current schema.
+            integrity_check = False  # helpers never pay for the full-file check
         with self.connect() as conn:
             # WAL mode is persistent for the database file. Reissuing this PRAGMA
             # on every short-lived connection forces SQLite to touch/parse schema
@@ -835,24 +1121,48 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
             version_row = conn.execute("PRAGMA user_version").fetchone()
             previous_version = int(version_row[0] if version_row else 0)
-            if existing_database and previous_version < LATEST_SCHEMA_VERSION:
-                self._backup_before_migration(conn, previous_version)
-            migrating = previous_version < LATEST_SCHEMA_VERSION
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                _execute_sql_script(conn, SCHEMA)
-                self._migrate(conn)
-                self._install_ui_state_update_triggers(conn)
-                if migrating:
-                    self._quick_check(conn)
-            except BaseException:
-                conn.rollback()
-                raise
-        if not migrating:
+            outdated = existing_database and previous_version < LATEST_SCHEMA_VERSION
+            # After an update the window, the agent and mpv helpers can open the old
+            # schema together: one process at a time backs up and migrates, and the
+            # others find the schema current once they get the lock.
+            with self._migration_lock() if outdated else nullcontext():
+                if outdated:
+                    version_row = conn.execute("PRAGMA user_version").fetchone()
+                    previous_version = int(version_row[0] if version_row else 0)
+                    if previous_version < LATEST_SCHEMA_VERSION:
+                        self._backup_before_migration(conn, previous_version)
+                migrating = previous_version < LATEST_SCHEMA_VERSION
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _execute_sql_script(conn, SCHEMA)
+                    self._migrate(conn)
+                    self._create_additive_indexes(conn)
+                    self._install_ui_state_update_triggers(conn)
+                    self._recreate_drifted_indexes(conn)
+                    if migrating:
+                        self._quick_check(conn)
+                        self.integrity_checked = True
+                    conn.execute(
+                        "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (SCHEMA_DIGEST_KEY, _schema_digest(), time.time()),
+                    )
+                    conn.commit()  # before the lock is released
+                except BaseException:
+                    conn.rollback()
+                    raise
+        if not migrating and integrity_check:
             # The full scan runs outside the write transaction, so the agent and
             # mpv heartbeat are not blocked for its duration on every launch.
-            with self.connect() as conn:
-                self._quick_check(conn)
+            self.check_integrity()
+        if not existing_database:
+            secure_database_files(self.path)
+
+    def check_integrity(self) -> None:
+        """``PRAGMA quick_check`` of the whole file; raises sqlite3.DatabaseError on damage."""
+        with self.connect() as conn:
+            self._quick_check(conn)
+        self.integrity_checked = True
 
     @staticmethod
     def _install_ui_state_update_triggers(conn: sqlite3.Connection) -> None:
@@ -875,15 +1185,77 @@ class Database:
                 f"database integrity check failed: {integrity[0] if integrity else 'no result'}"
             )
 
+    @contextmanager
+    def _migration_lock(self) -> Iterator[None]:
+        """An exclusive flock on ``<db>.migrate.lock`` for one schema migration."""
+        import fcntl
+
+        lock_path = self.path.with_name(f"{self.path.name}.migrate.lock")
+        try:
+            handle = open(lock_path, "a+b")
+        except OSError:
+            yield  # a read-only folder: migrate as before
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+    # Indexes whose definition changed after databases had been created with the old
+    # one: CREATE INDEX IF NOT EXISTS keeps the old definition for good.
+    _CURRENT_INDEXES = {
+        "idx_audiobook_bookmarks_book": (
+            "CREATE INDEX idx_audiobook_bookmarks_book ON audiobook_bookmarks(book_id,sort_order,position)"
+        ),
+    }
+
+    @staticmethod
+    def _create_additive_indexes(conn: sqlite3.Connection) -> None:
+        """_ADDITIVE_INDEXES on the tables this file has (an old or partly built
+        library may lack cache_registry)."""
+        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for statement in _ADDITIVE_INDEXES.strip().splitlines():
+            table = statement.split(" ON ", 1)[1].split("(", 1)[0].strip()
+            if table in tables:
+                conn.execute(statement)
+
+    @classmethod
+    def _recreate_drifted_indexes(cls, conn: sqlite3.Connection) -> None:
+        def normalized(sql: str) -> str:
+            return "".join(sql.split()).casefold().replace("ifnotexists", "")
+
+        stored = {
+            str(row[0]): str(row[1] or "")
+            for row in conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='index' AND name IN ({})".format(
+                    ",".join("?" * len(cls._CURRENT_INDEXES))
+                ),
+                tuple(cls._CURRENT_INDEXES),
+            ).fetchall()
+        }
+        for name, sql in cls._CURRENT_INDEXES.items():
+            if name in stored and normalized(stored[name]) != normalized(sql):
+                conn.execute(f"DROP INDEX {name}")
+                conn.execute(sql)
+
     def _backup_before_migration(self, conn: sqlite3.Connection, version: int) -> Path:
         """Create a consistent last-known-good copy before changing the schema."""
 
         backup_path = self.path.with_name(f"{self.path.name}.pre-v{LATEST_SCHEMA_VERSION}.backup")
-        destination = sqlite3.connect(backup_path)
+        # VACUUM INTO: the backup API copied the free pages too (~1 GB copies). The
+        # temp name is this process's and thread's own: a shared one made processes
+        # migrating together delete each other's copy (a 0-byte backup).
+        temporary = backup_path.with_name(f".{backup_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            conn.backup(destination)
+            vacuum_into(conn, temporary)
+            os.chmod(temporary, 0o600)  # a full copy of the library: this user's only
+            temporary.replace(backup_path)
         finally:
-            destination.close()
+            temporary.unlink(missing_ok=True)
         return backup_path
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
@@ -957,8 +1329,15 @@ class Database:
             "TEXT NOT NULL DEFAULT ''",
         )
         self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
+        # When the reading place last moved: updated_at also changes on AniList refreshes and
+        # scores, so a newer page from the phone was dropped as older. Existing books: 0 (the
+        # phone's page counts until the place moves again).
+        self._ensure_column(conn, "manga_books", "position_updated_at", "REAL NOT NULL DEFAULT 0")
         self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
         self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")
+        # When the title was added to the AniList list (MediaList.createdAt): Planning
+        # discovery uses it for movies it saw only after their premiere. 0 = unknown.
+        self._ensure_column(conn, "anime", "list_added_at", "REAL NOT NULL DEFAULT 0")
         # Hot predicates of the job/torrent queries (idempotent, instant once present).
         conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_torrent_hash ON episodes(torrent_hash)")
         conn.execute(
@@ -1359,7 +1738,11 @@ class Database:
         return local
 
     def _open_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
+        if getattr(self, "_thread_connections", False):
+            # A parked connection may be closed by retire() or its holder on another thread.
+            conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False, factory=_TrackedConnection)
+        else:
+            conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -1370,27 +1753,85 @@ class Database:
 
     @contextmanager
     def _managed_connection(self) -> Iterator[sqlite3.Connection]:
+        parked = None
         with self._connection_condition:
             if self._retired:
                 raise RuntimeError("Database is retired")
             self._active_connections += 1
+            if getattr(self, "_thread_connections", False):
+                local = self._scope_local()
+                parked = getattr(local, "idle", None)
+                local.idle = None
         conn = None
+        identity = None
+        reusable = False
         try:
-            conn = self._open_connection()
+            if parked is not None:
+                with _PARKED_LOCK:
+                    _PARKED.pop(id(parked), None)
+                    conn, parked.conn = parked.conn, None  # None: evicted or closed by retire()
+                if conn is not None and (
+                    parked.pid != os.getpid() or parked.identity != _file_identity(self.path)
+                ):
+                    _close_quietly(conn)  # the library file was replaced (or a forked child)
+                    conn = None
+                identity = parked.identity
+            if conn is None:
+                conn = self._open_connection()
+                identity = _file_identity(self.path)  # the file this connection opened
             try:
                 yield conn
                 conn.commit()
             except BaseException:
                 conn.rollback()
+                reusable = not conn.in_transaction
                 raise
+            reusable = not conn.in_transaction
         finally:
             try:
-                if conn is not None:
+                if conn is not None and not (reusable and self._park(conn, identity)):
                     conn.close()
             finally:
                 with self._connection_condition:
                     self._active_connections -= 1
                     self._connection_condition.notify_all()
+
+    def _park(self, conn: sqlite3.Connection, identity: tuple[int, int] | None) -> bool:
+        """Keep a clean connection for this thread's next call (thread_connections)."""
+        if not getattr(self, "_thread_connections", False) or len(getattr(conn, "cursors", ())):
+            return False
+        evicted: list[sqlite3.Connection | None] = []
+        with self._connection_condition:
+            local = self._scope_local()
+            if self._retired or identity is None or getattr(local, "idle", None) is not None:
+                return False
+            holder = _IdleConnection(conn, identity, self._park_owner)
+            with _PARKED_LOCK:
+                _PARKED[id(holder)] = holder
+                while len(_PARKED) > _PARKED_LIMIT:
+                    oldest = _PARKED.pop(next(iter(_PARKED)))
+                    evicted.append(oldest.conn)
+                    oldest.conn = None
+            local.idle = holder
+        for old in evicted:
+            _close_quietly(old)
+        return True
+
+    def close_idle_connections(self) -> None:
+        """Close this Database's parked connections (none is in use while parked)."""
+        closing: list[sqlite3.Connection | None] = []
+        with _PARKED_LOCK:
+            for key, holder in list(_PARKED.items()):
+                if holder.owner is self._park_owner:
+                    del _PARKED[key]
+                    closing.append(holder.conn)
+                    holder.conn = None
+        for conn in closing:
+            _close_quietly(conn)
+
+    def _parked_count(self) -> int:
+        with _PARKED_LOCK:
+            return sum(1 for holder in _PARKED.values() if holder.owner is self._park_owner)
 
     def retire(self, *, timeout: float = 5.0) -> None:
         """Reject new handles and drain admitted transactions before restore."""
@@ -1402,6 +1843,8 @@ class Database:
                 if remaining <= 0:
                     raise TimeoutError(err("backup.dbBusy"))
                 self._connection_condition.wait(remaining)
+        # Restore removes WAL/SHM and replaces the file: no handle may stay open.
+        self.close_idle_connections()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1415,10 +1858,42 @@ class Database:
                 with self._reused_call(local, shared) as conn:
                     yield conn
                 return
-            yield shared
+            with self._scoped_call(local, shared) as conn:
+                yield conn
             return
         with self._managed_connection() as conn:
             yield conn
+
+    @contextmanager
+    def _scoped_call(
+        self, local: threading.local, conn: sqlite3.Connection, *, nested_scope: bool = False
+    ) -> Iterator[sqlite3.Connection]:
+        """One repository call (or a nested scope) inside connection_scope().
+
+        A write used to stay uncommitted until the whole scope ended, so a Home
+        snapshot held the SQLite write lock for its full duration and blocked
+        mpv progress saves, subtitle workers and the agent. Now the outermost
+        call commits (or rolls back) its own writes like a fresh connection,
+        unless a transaction is already open (the scope owner ran BEGIN
+        IMMEDIATE): then everything stays one atomic transaction until the
+        scope that opened it ends. A nested scope does not count as a call, so
+        the calls inside it still commit one by one.
+        """
+        depth = int(getattr(local, "scope_depth", 0) or 0)
+        owns = not depth and not conn.in_transaction
+        if not nested_scope:
+            local.scope_depth = depth + 1
+        try:
+            try:
+                yield conn
+            except BaseException:
+                if owns and conn.in_transaction:
+                    conn.rollback()
+                raise
+            if owns and conn.in_transaction:
+                conn.commit()
+        finally:
+            local.scope_depth = depth
 
     @contextmanager
     def _reused_call(self, local: threading.local, conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
@@ -1484,14 +1959,15 @@ class Database:
                 with self._reused_call(local, shared) as conn:
                     yield conn
                 return
-            yield shared
+            with self._scoped_call(local, shared, nested_scope=True) as conn:
+                yield conn
             return
         with self._managed_connection() as conn:
-            local.connection = conn
+            local.connection, local.scope_depth = conn, 0
             try:
                 yield conn
             finally:
-                local.connection = None
+                local.connection, local.scope_depth = None, 0
 
     def set_state(self, key: str, value: str) -> None:
         with self.connect() as conn:
@@ -1741,6 +2217,23 @@ class Database:
             """,
         )
 
+    def bump_ui_state_version(self) -> str:
+        """``ui_state_version + 1`` in one statement; returns the new value.
+
+        A read, +1 and set_state raced the triggers that increment it in SQL: bumps
+        were lost and the version could move back to one a page already held, which
+        then saw "unchanged" and kept stale data (DB-8).
+        """
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES('ui_state_version','1',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=CAST(state.value AS INTEGER)+1,"
+                "updated_at=excluded.updated_at",
+                (time.time(),),
+            )
+            row = conn.execute("SELECT value FROM state WHERE key='ui_state_version'").fetchone()
+        return str(row["value"]) if row else ""
+
     def get_state(self, key: str, default: str = "") -> str:
         with self.connect() as conn:
             row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
@@ -1758,6 +2251,19 @@ class Database:
     def delete_state(self, key: str) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM state WHERE key=?", (key,))
+
+    def delete_states(self, keys: Iterable[str]) -> int:
+        """Delete several state rows in one transaction; returns how many existed."""
+        unique = list(dict.fromkeys(str(key) for key in keys if key))
+        removed = 0
+        with self.connect() as conn:
+            for start in range(0, len(unique), 400):
+                chunk = unique[start : start + 400]
+                cursor = conn.execute(
+                    f"DELETE FROM state WHERE key IN ({','.join('?' * len(chunk))})", tuple(chunk)
+                )
+                removed += max(0, int(cursor.rowcount or 0))
+        return removed
 
     def set_state_if_subtitle_job_owned(
         self,
@@ -1831,8 +2337,19 @@ class Database:
                 (cutoff,),
             ),
             "playback_markers": (
-                "DELETE FROM state WHERE substr(key,1,17)='playback_save:v1:' AND updated_at<?",
-                (cutoff,),
+                f"DELETE FROM state WHERE {STATE_PREFIX_SQL} AND updated_at<?",
+                (*state_prefix_bounds("playback_save:v1:"), cutoff),
+            ),
+            # When a two-episode release was first seen: it matters for ten minutes
+            # (AnimeManager.DOUBLE_EPISODE_WAIT_SECONDS), one row per release stayed forever.
+            "double_episode_seen": (
+                f"DELETE FROM state WHERE {STATE_PREFIX_SQL} AND updated_at<?",
+                (*state_prefix_bounds("double_episode_seen:"), cutoff),
+            ),
+            # aria2 stall markers that older versions emptied instead of deleting.
+            "aria2_stall_markers": (
+                f"DELETE FROM state WHERE {STATE_PREFIX_SQL} AND value=''",
+                state_prefix_bounds("aria2_stall:"),
             ),
         }
         with self.connect() as conn:
@@ -1840,7 +2357,7 @@ class Database:
                 str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
             for name, (sql, args) in statements.items():
-                table = "state" if name == "playback_markers" else name
+                table = "state" if name in _STATE_PRUNE_ROWS else name
                 if table not in tables:
                     continue
                 try:
@@ -1880,10 +2397,12 @@ class Database:
                     time.time(),
                 ),
             )
+        _numbering_rules_changed()
 
     def forget_release_numbering_rules(self, media_id: int) -> int:
         with self.connect() as conn:
             cursor = conn.execute("DELETE FROM release_numbering_rules WHERE media_id=?", (int(media_id),))
+        _numbering_rules_changed()
         return int(cursor.rowcount or 0)
 
     def relation_graph_for_media(self, media_id: int) -> dict[str, object] | None:
@@ -2094,8 +2613,8 @@ class Database:
                 """
                 INSERT INTO anime(
                     media_id,title,titles_json,synonyms_json,cover_url,site_url,status,
-                    progress,episodes,format,season_year,start_date,studio,media_status,end_date,mean_score,user_score,duration,next_airing_episode,next_airing_at,relations_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    progress,episodes,format,season_year,start_date,studio,media_status,end_date,mean_score,user_score,duration,next_airing_episode,next_airing_at,relations_json,list_added_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(media_id) DO UPDATE SET
                     title=excluded.title,titles_json=excluded.titles_json,
                     synonyms_json=excluded.synonyms_json,cover_url=excluded.cover_url,
@@ -2103,7 +2622,10 @@ class Database:
                     progress=excluded.progress,episodes=excluded.episodes,format=excluded.format,
                     season_year=excluded.season_year,start_date=excluded.start_date,studio=excluded.studio,media_status=excluded.media_status,end_date=excluded.end_date,mean_score=excluded.mean_score,
                     user_score=excluded.user_score,duration=excluded.duration,next_airing_episode=excluded.next_airing_episode,
-                    next_airing_at=excluded.next_airing_at,relations_json=excluded.relations_json,updated_at=excluded.updated_at
+                    next_airing_at=excluded.next_airing_at,relations_json=excluded.relations_json,
+                    list_added_at=CASE WHEN excluded.list_added_at>0 THEN excluded.list_added_at
+                        ELSE anime.list_added_at END,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     anime.media_id,
@@ -2127,9 +2649,14 @@ class Database:
                     anime.next_airing_episode,
                     anime.next_airing_at,
                     json.dumps(anime.relations, ensure_ascii=False),
+                    # Rows built from relation graphs, imports or local files lack
+                    # the AniList add time; the CASE above keeps a stored one.
+                    max(0.0, float(anime.list_added_at or 0)),
                     time.time(),
                 ),
             )
+            if anime.status:
+                self.note_anilist_progress(anime.media_id, int(anime.progress or 0), conn=conn)
 
     def anime_list(self, statuses: tuple[str, ...] | None = None) -> list[LibraryAnime]:
         sql = "SELECT * FROM anime"
@@ -2180,6 +2707,8 @@ class Database:
             relations=list(json.loads(row["relations_json"] or "[]"))
             if "relations_json" in row.keys()
             else [],
+            # The scheduled agent opens the database without migrating it.
+            list_added_at=float(row["list_added_at"] or 0) if "list_added_at" in row.keys() else 0.0,
         )
 
     @staticmethod
@@ -2199,9 +2728,11 @@ class Database:
         if media_id is None:
             return
         now = time.time()
+        # Callers pass what they have: a torrent, release or file name. The row is
+        # only a placeholder until AniList fills it, and a file name is no title.
         conn.execute(
             "INSERT OR IGNORE INTO anime(media_id,title,updated_at) VALUES(?,?,?)",
-            (int(media_id), str(title or f"AniList {int(media_id)}"), now),
+            (int(media_id), release_name_display_title(str(title or ""), int(media_id)), now),
         )
 
     @staticmethod
@@ -2331,6 +2862,15 @@ class Database:
             rows = conn.execute(sql, params).fetchall()
         return [self._episode_from_row(row) for row in rows]
 
+    def episode_rows(self, media_id: int, episode: int) -> list[LibraryEpisode]:
+        """Every row of one title's episode (several files may hold it)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? ORDER BY video_path",
+                (int(media_id), int(episode)),
+            ).fetchall()
+        return [self._episode_from_row(row) for row in rows]
+
     def episode_by_path(self, video_path: Path) -> LibraryEpisode | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM episodes WHERE video_path=?", (str(video_path),)).fetchone()
@@ -2347,8 +2887,26 @@ class Database:
             )
             params.append(episode)
             # An exact single-episode file wins over a double that also covers it.
-            sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode)=? THEN 0 ELSE 1 END, COALESCE(media_episode,episode) LIMIT 1"
+            sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode)=? THEN 0 ELSE 1 END, COALESCE(media_episode,episode), id"
             params.append(episode)
+            with self.connect() as conn:
+                rows = conn.execute(sql, tuple(params)).fetchall()
+                if not rows:
+                    return None
+                number = (
+                    rows[0]["media_episode"] if rows[0]["media_episode"] is not None else rows[0]["episode"]
+                )
+                tied = [
+                    row
+                    for row in rows
+                    if (row["media_episode"] if row["media_episode"] is not None else row["episode"])
+                    == number
+                ]
+                if len(tied) > 1:
+                    # Two files of the same episode (an older single and a later batch):
+                    # the copy the phone list offers too (preferred_copy).
+                    tied = [preferred_copy(tied, self._folder_counts(conn, media_id))]
+            return self._episode_from_row(tied[0])
         else:
             sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode) IS NULL THEN 1 ELSE 0 END, COALESCE(media_episode,episode) LIMIT 1"
         with self.connect() as conn:
@@ -2356,71 +2914,60 @@ class Database:
         return self._episode_from_row(row) if row else None
 
     @staticmethod
+    def _folder_counts(conn: sqlite3.Connection, media_id: int) -> dict[str, int]:
+        """Rows of one title per folder (a batch keeps its episodes together)."""
+        counts: dict[str, int] = {}
+        for row in conn.execute("SELECT video_path FROM episodes WHERE media_id=?", (int(media_id),)):
+            folder = str(Path(str(row["video_path"])).parent)
+            counts[folder] = counts.get(folder, 0) + 1
+        return counts
+
+    def folder_counts(self, media_id: int) -> dict[str, int]:
+        with self.connect() as conn:
+            return self._folder_counts(conn, media_id)
+
+    @staticmethod
     def _episode_from_row(row: sqlite3.Row) -> LibraryEpisode:
+        # One keys() per row: it builds a fresh list on every call, and asking it once per
+        # optional column made converting a full episodes() listing (dozens of passes call it)
+        # noticeably slower. Columns added by later migrations may be missing from old rows.
+        get = dict(zip(row.keys(), row)).get
+        episode = get("episode")
+        episode = int(episode) if episode is not None else None
+        media_episode = get("media_episode")
+        media_episode = int(media_episode) if media_episode is not None else episode
+        release_episode = get("release_episode")
+        release_episode = int(release_episode) if release_episode is not None else episode
+        media_id = get("media_id")
+        subtitle_path = get("subtitle_path")
+        embedded_subtitle_id = get("embedded_subtitle_id")
+        watched_at = get("watched_at")
+        delete_after = get("delete_after")
+        position = get("playback_position")
+        duration = get("playback_duration")
+        updated = get("playback_updated_at")
+        episode_end = get("media_episode_end")
+        boundary = get("part_boundary")
         return LibraryEpisode(
-            media_id=int(row["media_id"]) if row["media_id"] is not None else None,
+            media_id=int(media_id) if media_id is not None else None,
             title=str(row["title"]),
-            episode=(
-                int(row["media_episode"])
-                if "media_episode" in row.keys() and row["media_episode"] is not None
-                else int(row["episode"])
-                if row["episode"] is not None
-                else None
-            ),
-            media_episode=(
-                int(row["media_episode"])
-                if "media_episode" in row.keys() and row["media_episode"] is not None
-                else int(row["episode"])
-                if row["episode"] is not None
-                else None
-            ),
-            release_episode=(
-                int(row["release_episode"])
-                if "release_episode" in row.keys() and row["release_episode"] is not None
-                else int(row["episode"])
-                if row["episode"] is not None
-                else None
-            ),
+            episode=media_episode,
+            media_episode=media_episode,
+            release_episode=release_episode,
             video_path=Path(str(row["video_path"])),
-            subtitle_path=Path(str(row["subtitle_path"])) if row["subtitle_path"] else None,
-            embedded_subtitle_id=(
-                int(row["embedded_subtitle_id"]) if row["embedded_subtitle_id"] is not None else None
-            ),
-            subtitle_origin=(str(row["subtitle_origin"] or "") if "subtitle_origin" in row.keys() else ""),
+            subtitle_path=Path(str(subtitle_path)) if subtitle_path else None,
+            embedded_subtitle_id=int(embedded_subtitle_id) if embedded_subtitle_id is not None else None,
+            subtitle_origin=str(get("subtitle_origin") or ""),
             state=str(row["state"]),
-            torrent_hash=str(row["torrent_hash"] or ""),
-            watched_at=float(row["watched_at"]) if row["watched_at"] else None,
-            delete_after=float(row["delete_after"]) if row["delete_after"] else None,
-            playback_position=(
-                float(row["playback_position"])
-                if "playback_position" in row.keys() and row["playback_position"] is not None
-                else None
-            ),
-            playback_duration=(
-                float(row["playback_duration"])
-                if "playback_duration" in row.keys() and row["playback_duration"] is not None
-                else None
-            ),
-            playback_updated_at=(
-                float(row["playback_updated_at"])
-                if "playback_updated_at" in row.keys() and row["playback_updated_at"] is not None
-                else None
-            ),
-            playback_active_seconds=(
-                float(row["playback_active_seconds"] or 0.0)
-                if "playback_active_seconds" in row.keys()
-                else 0.0
-            ),
-            media_episode_end=(
-                int(row["media_episode_end"])
-                if "media_episode_end" in row.keys() and row["media_episode_end"] is not None
-                else None
-            ),
-            part_boundary=(
-                float(row["part_boundary"])
-                if "part_boundary" in row.keys() and row["part_boundary"] is not None
-                else None
-            ),
+            torrent_hash=str(get("torrent_hash") or ""),
+            watched_at=float(watched_at) if watched_at else None,
+            delete_after=float(delete_after) if delete_after else None,
+            playback_position=float(position) if position is not None else None,
+            playback_duration=float(duration) if duration is not None else None,
+            playback_updated_at=float(updated) if updated is not None else None,
+            playback_active_seconds=float(get("playback_active_seconds") or 0.0),
+            media_episode_end=int(episode_end) if episode_end is not None else None,
+            part_boundary=float(boundary) if boundary is not None else None,
         )
 
     def record_playback(
@@ -2482,6 +3029,7 @@ class Database:
                 "UPDATE anime SET progress=0,status=CASE WHEN status IN ('COMPLETED','REPEATING') THEN 'CURRENT' ELSE status END,updated_at=? WHERE media_id=?",
                 (now, int(media_id)),
             )
+            self.note_anilist_progress(int(media_id), 0, now=now, conn=conn)
             cursor = conn.execute(
                 """
                 UPDATE episodes
@@ -2505,14 +3053,6 @@ class Database:
                 (now, int(media_id)),
             )
         return max(0, int(cursor.rowcount or 0))
-
-    def clear_playback(self, video_path: Path) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE episodes SET playback_position=NULL,playback_duration=NULL,"
-                "playback_updated_at=NULL,updated_at=? WHERE video_path=?",
-                (time.time(), str(video_path)),
-            )
 
     def resumable_episodes(
         self,
@@ -2565,6 +3105,68 @@ class Database:
                 (value, str(video_path)),
             )
         return bool(cursor.rowcount)
+
+    def episodes_watched_since(self, since: float) -> dict[int, int]:
+        """media id -> the highest episode marked watched here at or after ``since``.
+
+        An AniList list fetched before such a watch cannot contain it yet: a
+        library sync that started earlier must not take that progress back.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT media_id,MAX(COALESCE(media_episode_end,media_episode,episode)) AS number "
+                "FROM episodes WHERE media_id IS NOT NULL AND watched_at IS NOT NULL AND watched_at>=? "
+                "GROUP BY media_id",
+                (float(since),),
+            ).fetchall()
+        return {int(row["media_id"]): int(row["number"]) for row in rows if row["number"]}
+
+    _PROGRESS_MARKS_KEY = "anilist_progress_marks_v1:{media_id}"
+
+    def note_anilist_progress(
+        self,
+        media_id: int,
+        progress: int,
+        *,
+        now: float | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[list[float]]:
+        """Remember when the list progress first reached each value (``[[progress, at], ...]``).
+
+        Cleanup marks a local episode watched from AniList progress only when the progress
+        reached it after the file was downloaded: a title re-downloaded for a rewatch is
+        already counted, and its new files stay until they are watched. A lowered progress
+        (a rewatch reset) forgets the marks above it. The first sight of a title is its
+        first mark (files from before were downloaded before it).
+        """
+        key = self._PROGRESS_MARKS_KEY.format(media_id=int(media_id))
+        progress = max(0, int(progress or 0))
+        stamp = time.time() if now is None else float(now)
+        with nullcontext(conn) if conn is not None else self.connect() as active:
+            row = active.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+            try:
+                stored = json.loads(str(row["value"])) if row is not None else []
+            except (TypeError, ValueError):
+                stored = []
+            marks = [
+                [int(item[0]), float(item[1])]
+                for item in stored
+                if isinstance(item, list) and len(item) == 2 and int(item[0]) <= progress
+            ]
+            if not marks or marks[-1][0] < progress:
+                marks.append([progress, stamp])
+            if marks != stored:
+                active.execute(
+                    "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (key, json.dumps(marks), stamp),
+                )
+        return marks
+
+    @staticmethod
+    def anilist_progress_reached_at(marks: list[list[float]], episode: int) -> float | None:
+        """When the list progress first covered ``episode`` (None: it does not)."""
+        return next((float(at) for value, at in marks if int(value) >= int(episode)), None)
 
     def raise_anime_progress(self, media_id: int, progress: int) -> None:
         with self.connect() as conn:
@@ -2925,7 +3527,7 @@ class Database:
                     continue
                 conn.execute(
                     "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
-                    "state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                    f"state={_WAITING_UNLESS_WATCHED_SQL},updated_at=? WHERE video_path=?",
                     (now, video_path),
                 )
                 if missing_ready_external:
@@ -2971,7 +3573,15 @@ class Database:
         media_id: int | None,
         episode: int | None,
         error: str,
+        *,
+        keep_selection: bool = False,
+        priority: int = 0,
     ) -> None:
+        """Prepare the subtitles again from scratch (new job generation, forced rebuild).
+
+        ``keep_selection`` leaves the current subtitles playable: the caller has stored
+        an upgrade request that replaces them with the result or puts them back.
+        """
         now = time.time()
         resolved_video = Path(video_path).expanduser().resolve()
         digest = hashlib.sha1(str(resolved_video).encode("utf-8")).hexdigest()
@@ -2990,26 +3600,28 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 (force_rebuild_key, "1", now),
             )
-            conn.execute(
-                "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
-                "state='waiting_subtitles',updated_at=? "
-                "WHERE video_path=?",
-                (now, str(resolved_video)),
-            )
+            if not keep_selection:
+                conn.execute(
+                    "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
+                    f"state={_WAITING_UNLESS_WATCHED_SQL},updated_at=? "
+                    "WHERE video_path=?",
+                    (now, str(resolved_video)),
+                )
             conn.execute(
                 """
                 INSERT INTO subtitle_jobs(
-                    video_path,media_id,episode,state,attempts,next_check,last_error,updated_at
-                ) VALUES(?,?,?,'pending',0,?,?,?)
+                    video_path,media_id,episode,state,attempts,priority,next_check,last_error,updated_at
+                ) VALUES(?,?,?,'pending',0,?,?,?,?)
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                     episode=COALESCE(excluded.episode,subtitle_jobs.episode),
                     state='pending',stage='queued',attempts=0,next_check=excluded.next_check,
+                    priority=MAX(subtitle_jobs.priority,excluded.priority),
                     lease_until=0,heartbeat_at=0,progress_json='{}',action_code='',
                     generation=subtitle_jobs.generation+1,owner_token='',
                     last_error=excluded.last_error,updated_at=excluded.updated_at
                 """,
-                (str(resolved_video), media_id, episode, now, error[-1000:], now),
+                (str(resolved_video), media_id, episode, max(0, int(priority)), now, error[-1000:], now),
             )
 
     def queue_subtitle_job(
@@ -3049,6 +3661,18 @@ class Database:
                     now,
                 ),
             )
+
+    def note_subtitle_job_error(self, video_path: Path, error: str) -> bool:
+        """Show why a job's preparation stopped (its card and diagnostics); state unchanged.
+
+        last_error is a UI column: the update bumps ui_state_version through the trigger.
+        """
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE subtitle_jobs SET last_error=?,updated_at=? WHERE video_path=?",
+                (str(error), time.time(), str(video_path)),
+            )
+            return bool(cursor.rowcount)
 
     def delete_subtitle_job(
         self,
@@ -3099,45 +3723,61 @@ class Database:
         *,
         priority: int = 20,
         recover_processing: bool = True,
+        keep_action_codes: Iterable[str] = REFRESH_KEEPS_ACTION_CODES,
     ) -> int:
         """Immediately retry every existing or reconstructable subtitle job.
 
         A blocking/manual maintenance pass may recover rows left in ``processing``
-        by a killed process.  An *interactive* Refresh must not do that while
-        another maintenance process owns the lock: those rows can be actively
-        executing already.  In that case we only raise their priority and leave
-        the processing lease intact, avoiding duplicate preparation while still
-        making the UI track the requested check.
+        by a killed process: only rows whose lease has run out, a live lease belongs
+        to a worker (the agent, another window) that is preparing it right now.
+        An *interactive* Refresh recovers none.  Live rows only get the priority,
+        avoiding duplicate preparation while still making the UI track the
+        requested check.  Jobs waiting for the person's answer
+        (``keep_action_codes``) stay as they are.
         """
         now = time.time()
         priority = max(0, min(1000, int(priority)))
         affected_paths: set[str] = set()
+        keep_codes = tuple(str(code) for code in keep_action_codes) or ("",)
+        kept_codes = ",".join("?" for _ in keep_codes)
+        upsert_guard = (
+            "subtitle_jobs.state<>'processing' AND NOT (subtitle_jobs.state='needs_action' "
+            f"AND subtitle_jobs.action_code IN ({kept_codes}))"
+        )
         with self.connect() as conn:
+            kept = {
+                str(row["video_path"])
+                for row in conn.execute(
+                    "SELECT video_path FROM subtitle_jobs "
+                    f"WHERE state='needs_action' AND action_code IN ({kept_codes})",
+                    keep_codes,
+                ).fetchall()
+            }
             existing = conn.execute(
                 "SELECT video_path FROM subtitle_jobs WHERE state IN ('pending','processing','needs_action')"
             ).fetchall()
             for row in existing:
-                affected_paths.add(str(row["video_path"]))
+                if str(row["video_path"]) not in kept:
+                    affected_paths.add(str(row["video_path"]))
             conn.execute(
                 "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
-                "priority=MAX(priority,?),last_error=?,updated_at=? "
+                "priority=MAX(priority,?),last_error=?,progress_json='{}',updated_at=? "
                 "WHERE state='pending'",
                 (now, priority, err("jobs.manualRefresh"), now),
             )
             if recover_processing:
                 conn.execute(
                     "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
-                    "priority=MAX(priority,?),last_error=?,updated_at=? "
-                    "WHERE state='processing'",
-                    (now, priority, err("jobs.manualRefresh"), now),
+                    "priority=MAX(priority,?),last_error=?,progress_json='{}',updated_at=? "
+                    "WHERE state='processing' AND lease_until<?",
+                    (now, priority, err("jobs.manualRefresh"), now, now),
                 )
-            else:
-                conn.execute(
-                    "UPDATE subtitle_jobs SET priority=MAX(priority,?),"
-                    "last_error=?,updated_at=? "
-                    "WHERE state='processing'",
-                    (priority, err("jobs.manualRefreshChecking"), now),
-                )
+            conn.execute(
+                "UPDATE subtitle_jobs SET priority=MAX(priority,?),"
+                "last_error=?,updated_at=? "
+                "WHERE state='processing'",
+                (priority, err("jobs.manualRefreshChecking"), now),
+            )
 
             rows = conn.execute(
                 """
@@ -3152,9 +3792,13 @@ class Database:
             ).fetchall()
             for row in rows:
                 video_path = str(row["video_path"])
+                if video_path in kept:
+                    continue
                 affected_paths.add(video_path)
+                # A processing row was handled above: recovered when its lease ran out,
+                # otherwise its worker keeps it.
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO subtitle_jobs(
                         video_path,media_id,episode,state,attempts,priority,next_check,last_error,updated_at
                     ) VALUES(?,?,?,'pending',0,?,?,?,?)
@@ -3162,8 +3806,9 @@ class Database:
                         media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                         episode=COALESCE(excluded.episode,subtitle_jobs.episode),
                         state='pending',stage='queued',action_code='',next_check=excluded.next_check,
-                        priority=MAX(subtitle_jobs.priority,excluded.priority),
+                        priority=MAX(subtitle_jobs.priority,excluded.priority),progress_json='{{}}',
                         last_error=excluded.last_error,updated_at=excluded.updated_at
+                    WHERE {upsert_guard}
                     """,
                     (
                         video_path,
@@ -3173,6 +3818,7 @@ class Database:
                         now,
                         err("jobs.manualRefresh"),
                         now,
+                        *keep_codes,
                     ),
                 )
         return len(affected_paths)
@@ -3324,7 +3970,7 @@ class Database:
                 (stage, now + delay_seconds, error[-1000:], now, str(video_path)),
             )
             conn.execute(
-                "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                f"UPDATE episodes SET state={_WAITING_UNLESS_SETTLED_SQL},updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
             return True
@@ -3365,7 +4011,7 @@ class Database:
                 (now + delay_seconds, error[-1000:], now, str(video_path)),
             )
             conn.execute(
-                "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                f"UPDATE episodes SET state={_WAITING_UNLESS_SETTLED_SQL},updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
             return True
@@ -3456,7 +4102,7 @@ class Database:
                 (error[-1000:], str(action_code), now, str(video_path)),
             )
             conn.execute(
-                "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                f"UPDATE episodes SET state={_WAITING_UNLESS_SETTLED_SQL},updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
             return True
@@ -3470,6 +4116,61 @@ class Database:
                 (max(0, int(min_priority)),),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
+
+    def reschedule_subtitle_job(
+        self,
+        video_path: Path,
+        error: str,
+        delay_seconds: float,
+        *,
+        count_attempt: bool = False,
+        keep_priority: bool | None = None,
+        action_code: str = "",
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
+        """Return a claimed job to pending (or needs_action) and leave its episode alone.
+
+        For runs without a verdict on the subtitles (paused, timed out, a network
+        error) and for jobs that were never started: the episode keeps its state and
+        its playable fallback (OCR, raw unsynced, the bitmap source). Only a real
+        attempt counts; a job nobody tried keeps its priority.
+        """
+        if keep_priority is None:
+            keep_priority = not count_attempt
+        now = time.time()
+        with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
+            if action_code:
+                conn.execute(
+                    """
+                    UPDATE subtitle_jobs
+                    SET state='needs_action',stage='needs_action',attempts=attempts+?,priority=0,
+                        lease_until=0,next_check=0,last_error=?,action_code=?,progress_json='{}',updated_at=?
+                    WHERE video_path=?
+                    """,
+                    (1 if count_attempt else 0, error[-1000:], str(action_code), now, str(video_path)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE subtitle_jobs
+                    SET state='pending',stage='retry_scheduled',attempts=attempts+?,
+                        priority=CASE WHEN ? THEN priority ELSE 0 END,
+                        lease_until=0,next_check=?,last_error=?,progress_json='{}',updated_at=?
+                    WHERE video_path=?
+                    """,
+                    (
+                        1 if count_attempt else 0,
+                        1 if keep_priority else 0,
+                        now + max(0.0, float(delay_seconds)),
+                        error[-1000:],
+                        now,
+                        str(video_path),
+                    ),
+                )
+            return True
 
     def subtitle_jobs(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -3745,8 +4446,8 @@ class Database:
         if current != plan:
             raise ValueError(err("db.repairSourceChanged"))
         backup = self.path.with_name(f"{self.path.name}.identity-repair-{time.time_ns()}.backup")
-        with self.connect() as source, sqlite3.connect(backup) as destination:
-            source.backup(destination)
+        with self.connect() as source:
+            vacuum_into(source, backup)
         now = time.time()
         with self.connection_scope() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -3777,10 +4478,12 @@ class Database:
                 f"UPDATE episodes SET episode=?,media_episode=?,release_episode=?,{span_end},delete_after=NULL,updated_at=? WHERE video_path=?",
                 (local, local, release, local, local, now, video),
             )
+            conn.execute("DELETE FROM state WHERE key=?", (season_zero_set_aside_key(video),))
             conn.execute(
                 f"UPDATE downloads SET episode=?,media_episode=?,release_episode=?,{span_end},raw_json=?,updated_at=? WHERE torrent_hash=?",
                 (local, local, release, local, local, json.dumps(raw), now, hash_),
             )
+            conn.execute(_UI_STATE_BUMP_SQL)  # the downloads trigger leaves raw_json out
             conn.execute(
                 "UPDATE release_history SET episode=?,media_episode=?,release_episode=? WHERE lower(info_hash)=lower(?)",
                 (local, local, release, hash_),
@@ -3880,8 +4583,12 @@ class Database:
         return {"identity": anchor, "backup": str(backup)}
 
     def upsert_download(self, item: DownloadItem) -> None:
+        raw_json = json.dumps(item.raw, ensure_ascii=False)
         with self.connect() as conn:
             self._ensure_anime_parent(conn, item.media_id, item.name)
+            previous = conn.execute(
+                "SELECT raw_json FROM downloads WHERE torrent_hash=?", (item.torrent_hash,)
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO downloads(
@@ -3915,7 +4622,7 @@ class Database:
                     1 if item.is_batch else 0,
                     item.added_on,
                     item.completed_on,
-                    json.dumps(item.raw, ensure_ascii=False),
+                    raw_json,
                     time.time(),
                     self._span_end(
                         str(item.name or ""), item.media_episode, item.media_episode_end, batch=item.is_batch
@@ -3924,6 +4631,12 @@ class Database:
                     1 if (item.raw or {}).get("single_video_file") and not item.is_batch else 0,
                 ),
             )
+            # The trigger leaves raw_json out (its client stats change on every poll):
+            # anything else in it (an error, the backend, tags, sizes) still refreshes Home.
+            if previous is not None and _download_ui_raw(
+                _json_object(previous["raw_json"])
+            ) != _download_ui_raw(_json_object(raw_json)):
+                conn.execute(_UI_STATE_BUMP_SQL)
 
     def downloads(self) -> list[DownloadItem]:
         with self.connect() as conn:
@@ -3973,16 +4686,31 @@ class Database:
             )
         return result
 
-    def prune_downloads(self, active_hashes: set[str]) -> None:
+    def prune_downloads(self, active_hashes: set[str], *, written_before: float | None = None) -> None:
+        """Delete download rows not in ``active_hashes``.
+
+        ``written_before``: only rows last written before then (when the client
+        listing started); a row an add wrote meanwhile, in this process or the
+        agent, is not in that listing yet.
+        """
+        age = "" if written_before is None else " AND updated_at<?"
+        age_params: tuple[object, ...] = () if written_before is None else (float(written_before),)
         with self.connect() as conn:
             if not active_hashes:
-                conn.execute("DELETE FROM downloads")
+                conn.execute("DELETE FROM downloads WHERE 1=1" + age, age_params)
                 return
             placeholders = ",".join("?" for _ in active_hashes)
             conn.execute(
-                f"DELETE FROM downloads WHERE torrent_hash NOT IN ({placeholders})",
-                tuple(active_hashes),
+                f"DELETE FROM downloads WHERE torrent_hash NOT IN ({placeholders})" + age,
+                (*tuple(active_hashes), *age_params),
             )
+
+    def download_hashes_written_since(self, since: float) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT torrent_hash FROM downloads WHERE updated_at>=?", (float(since),)
+            ).fetchall()
+        return {str(row["torrent_hash"] or "").strip().casefold() for row in rows if row["torrent_hash"]}
 
     def delete_torrent_records(self, torrent_hash: str) -> None:
         with self.connect() as conn:
@@ -3993,34 +4721,10 @@ class Database:
             conn.execute("DELETE FROM episodes WHERE torrent_hash=?", (torrent_hash,))
             conn.execute("DELETE FROM downloads WHERE torrent_hash=?", (torrent_hash,))
 
-    def attach_download_metadata(
-        self,
-        torrent_hash: str,
-        media_id: int,
-        episode: int | None,
-        is_batch: bool,
-        *,
-        release_episode: int | None = None,
-    ) -> None:
+    def delete_download_record(self, torrent_hash: str) -> None:
+        """Forget the download row only; its episode rows (and their hash) stay."""
         with self.connect() as conn:
-            self._ensure_anime_parent(conn, media_id)
-            conn.execute(
-                "UPDATE downloads SET media_id=?,episode=?,media_episode=?,"
-                "media_episode_end=CASE WHEN media_episode_end IS NOT NULL AND ? IS NOT NULL AND ?=0 THEN ?+1 ELSE NULL END,"
-                "release_episode=COALESCE(?,release_episode),is_batch=?,updated_at=? WHERE torrent_hash=?",
-                (
-                    media_id,
-                    episode,
-                    episode,
-                    episode,
-                    int(is_batch),
-                    episode,
-                    release_episode,
-                    int(is_batch),
-                    time.time(),
-                    torrent_hash,
-                ),
-            )
+            conn.execute("DELETE FROM downloads WHERE torrent_hash=?", (torrent_hash,))
 
     def set_episode_torrent_hash(self, video_path: Path, torrent_hash: str) -> int:
         value = str(torrent_hash or "").strip().casefold()
@@ -4406,6 +5110,20 @@ class Database:
             )
         return result
 
+    def selected_subtitle_fingerprint(self, video_path: Path) -> str:
+        """The content fingerprint recorded with this path's latest subtitle selection ("" if none)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT video_fingerprint FROM subtitle_history
+                WHERE video_path=? AND status IN ('selected','upgraded','manual','legacy')
+                  AND video_fingerprint!=''
+                ORDER BY created_at DESC,id DESC LIMIT 1
+                """,
+                (str(video_path),),
+            ).fetchone()
+        return str(row["video_fingerprint"] or "") if row is not None else ""
+
     def latest_selected_subtitle(self, video_path: Path) -> dict[str, object] | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -4432,6 +5150,65 @@ class Database:
             "details": details if isinstance(details, dict) else {},
             "created_at": float(row["created_at"] or 0),
         }
+
+    def subtitle_history_max_id(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(id),0) AS n FROM subtitle_history").fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
+    def latest_selected_subtitle_rows(
+        self, *, after_id: int = 0, chunk_size: int = 200
+    ) -> Iterator[tuple[LibraryEpisode, dict[str, object]]]:
+        """Episodes with a prepared subtitle, each with its latest selected history row.
+
+        The same rows as ``latest_selected_subtitle`` per episode, in one query; each
+        ``details_json`` is read and decoded once, a chunk at a time. With ``after_id``
+        only episodes whose latest selection is newer than that history row.
+        """
+        after_id = max(0, int(after_id))
+        sql = (
+            "SELECT e.*,h.id AS h_id,h.source AS h_source,h.candidate_name AS h_candidate_name,"
+            "h.candidate_path AS h_candidate_path,h.score AS h_score,h.status AS h_status,"
+            "h.created_at AS h_created_at "
+            "FROM episodes e JOIN subtitle_history h ON h.id=("
+            "SELECT id FROM subtitle_history WHERE video_path=e.video_path "
+            f"AND status IN {_SELECTED_HISTORY_STATUSES_SQL} ORDER BY created_at DESC,id DESC LIMIT 1) "
+            "WHERE e.subtitle_path IS NOT NULL AND h.id>?"
+        )
+        params: tuple[object, ...] = (after_id,)
+        if after_id:
+            sql += " AND e.video_path IN (SELECT video_path FROM subtitle_history WHERE id>?)"
+            params += (after_id,)
+        sql += " ORDER BY e.title COLLATE NOCASE, COALESCE(e.media_episode,e.episode), e.video_path"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        size = max(1, int(chunk_size))
+        for start in range(0, len(rows), size):
+            part = rows[start : start + size]
+            ids = [int(row["h_id"]) for row in part]
+            with self.connect() as conn:
+                details_by_id = {
+                    int(found["id"]): found["details_json"]
+                    for found in conn.execute(
+                        f"SELECT id,details_json FROM subtitle_history WHERE id IN ({','.join('?' * len(ids))})",
+                        ids,
+                    )
+                }
+            for row in part:
+                history_id = int(row["h_id"])
+                yield (
+                    self._episode_from_row(row),
+                    {
+                        "id": history_id,
+                        "source": str(row["h_source"] or ""),
+                        "candidate_name": str(row["h_candidate_name"] or ""),
+                        "candidate_path": str(row["h_candidate_path"] or ""),
+                        "score": float(row["h_score"]) if row["h_score"] is not None else None,
+                        "status": str(row["h_status"] or ""),
+                        "details": _json_object(details_by_id.get(history_id)),
+                        "created_at": float(row["h_created_at"] or 0),
+                    },
+                )
 
     def latest_selected_subtitle_for_media_or_filename(
         self,
@@ -4513,7 +5290,9 @@ class Database:
                             (int(media_id), int(episode)),
                         )
                     )
-            suffix = "%/" + video_path.name.replace("%", "\\%").replace("_", "\\_")
+            # The escape character itself first: a "\" in the name made the next character a
+            # literal (or a wildcard, "\_"), so such a file never found its own selection.
+            suffix = "%/" + video_path.name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append(("video_path LIKE ? ESCAPE '\\'", (suffix,)))
 
             for where, args in clauses:
@@ -4622,10 +5401,6 @@ class Database:
                     "UPDATE playlists SET updated_at=? WHERE id=?",
                     (now, int(row["playlist_id"])),
                 )
-
-    def delete_playlist(self, playlist_id: int) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM playlists WHERE id=?", (int(playlist_id),))
 
     def upgrade_jobs(self, *, limit: int = 50) -> list[dict[str, object]]:
         with self.connect() as conn:
@@ -4764,10 +5539,6 @@ class Database:
                 "UPDATE anime SET user_score=?,updated_at=? WHERE media_id=?",
                 (float(score) if score is not None else None, time.time(), int(media_id)),
             )
-
-    def delete_anime(self, media_id: int) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM anime WHERE media_id=?", (int(media_id),))
 
     def schedule_anime_cleanup(self, media_id: int, after_hours: float) -> int:
         now = time.time()
@@ -4925,7 +5696,17 @@ class Database:
             ).fetchone()
             if row is None:
                 return None
-            if bool(row["enabled"]) and advance_unlocks:
+            # The UPDATE took the write lock on every Home snapshot even when
+            # nothing was due; check first so reads stay reads.
+            if (
+                bool(row["enabled"])
+                and advance_unlocks
+                and conn.execute(
+                    "SELECT 1 FROM personal_release_items "
+                    "WHERE schedule_id=? AND unlocked_once=0 AND unlock_at_utc<=? LIMIT 1",
+                    (int(row["schedule_id"]), current),
+                ).fetchone()
+            ):
                 conn.execute(
                     """
                     UPDATE personal_release_items
@@ -4992,6 +5773,26 @@ class Database:
             for anime_id in ids
             if (schedule := self.personal_release_schedule(anime_id, now=current)) is not None
         ]
+
+    def personal_release_upcoming_counts(
+        self, start_utc: float, end_utc: float, *, profile_id: str = "default"
+    ) -> dict[int, int]:
+        """Unwatched items unlocking in (start, end] per anime with an enabled schedule (0 included)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.anime_id AS anime_id,
+                       COUNT(i.logical_episode_id) AS upcoming
+                FROM personal_release_schedules s
+                LEFT JOIN personal_release_items i
+                  ON i.schedule_id=s.schedule_id AND i.watched_at IS NULL
+                 AND i.unlock_at_utc>? AND i.unlock_at_utc<=?
+                WHERE s.enabled=1 AND s.profile_id=?
+                GROUP BY s.anime_id
+                """,
+                (float(start_utc), float(end_utc), str(profile_id)),
+            ).fetchall()
+        return {int(row["anime_id"]): int(row["upcoming"] or 0) for row in rows}
 
     def save_personal_release_schedule(
         self,
@@ -5246,6 +6047,23 @@ class Database:
             ).fetchone()
             return row is not None
 
+    def personal_release_retained_items(self) -> set[tuple[int, int]]:
+        """Every (media id, episode) personal_release_item_retained() is True for, in one query."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT s.anime_id AS media_id, i.logical_episode_id AS episode
+                FROM personal_release_schedules s
+                JOIN personal_release_items i ON i.schedule_id=s.schedule_id
+                WHERE s.enabled=1 AND i.watched_at IS NULL
+                """
+            ).fetchall()
+        return {
+            (int(row["media_id"]), int(row["episode"]))
+            for row in rows
+            if row["media_id"] is not None and row["episode"] is not None
+        }
+
     def reconcile_anilist_progress(self, media_id: int, progress: int) -> int:
         """Undo local watched markers for episodes no longer watched on AniList.
 
@@ -5274,16 +6092,32 @@ class Database:
             )
             return max(0, int(cursor.rowcount or 0))
 
-    def repair_missing_cleanup_schedule(self, after_hours: float) -> int:
+    def repair_missing_cleanup_schedule(self, after_hours: float, *, library_root: Path | None = None) -> int:
         """Repair watched rows whose cleanup timestamp was never persisted.
 
         The primary repair handles explicit ``state='watched'`` rows. A second
         conservative branch repairs recent managed episodes only when both
         AniList progress and recorded active playback prove the episode was
         watched. This avoids treating arbitrary local files as disposable.
+        Managed means a torrent hash, or ``downloaded_at`` for a file inside
+        ``library_root``: older versions also set ``downloaded_at`` for a video
+        dropped on the window, which stays the user's own file.
         """
         delay_seconds = max(0.0, float(after_hours)) * 3600.0
         now = time.time()
+        try:
+            root = Path(library_root).expanduser().resolve() if library_root is not None else None
+        except OSError:
+            root = None
+
+        def downloaded_inside_root(video_path: object) -> bool:
+            if root is None:
+                return False
+            try:
+                return root in Path(str(video_path)).expanduser().resolve(strict=False).parents
+            except OSError:
+                return False
+
         with self.connect() as conn:
             explicit = conn.execute(
                 """
@@ -5296,37 +6130,48 @@ class Database:
                 """,
                 (now, now, delay_seconds, now),
             )
-            evidence = conn.execute(
+            candidates = conn.execute(
                 """
-                UPDATE episodes
-                SET state='watched',
-                    watched_at=COALESCE(playback_updated_at, updated_at, downloaded_at, ?),
-                    delete_after=COALESCE(playback_updated_at, updated_at, downloaded_at, ?) + ?,
-                    playback_position=NULL,
-                    updated_at=?
-                WHERE id IN (
-                    SELECT e.id
-                    FROM episodes e
-                    JOIN anime a ON a.media_id=e.media_id
-                    WHERE e.state!='watched'
-                      AND e.watched_at IS NULL
-                      AND e.delete_after IS NULL
-                      AND e.episode IS NOT NULL
-                      AND COALESCE(e.media_episode_end,e.episode)<=a.progress
-                      AND (e.torrent_hash!='' OR e.downloaded_at IS NOT NULL)
-                      AND e.playback_duration IS NOT NULL
-                      AND e.playback_duration>0
-                      AND e.playback_active_seconds >=
-                          CASE
-                              WHEN e.playback_duration * 0.65 > 180
-                              THEN e.playback_duration * 0.65
-                              ELSE 180
-                          END
+                SELECT e.id,e.torrent_hash,e.video_path
+                FROM episodes e
+                JOIN anime a ON a.media_id=e.media_id
+                WHERE e.state!='watched'
+                  AND e.watched_at IS NULL
+                  AND e.delete_after IS NULL
+                  AND e.episode IS NOT NULL
+                  AND COALESCE(e.media_episode_end,e.episode)<=a.progress
+                  AND (e.torrent_hash!='' OR e.downloaded_at IS NOT NULL)
+                  AND e.playback_duration IS NOT NULL
+                  AND e.playback_duration>0
+                  AND e.playback_active_seconds >=
+                      CASE
+                          WHEN e.playback_duration * 0.65 > 180
+                          THEN e.playback_duration * 0.65
+                          ELSE 180
+                      END
+                """
+            ).fetchall()
+            owned_ids = [
+                int(row["id"])
+                for row in candidates
+                if str(row["torrent_hash"] or "").strip() or downloaded_inside_root(row["video_path"])
+            ]
+            evidence_count = 0
+            for row_id in owned_ids:
+                evidence = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET state='watched',
+                        watched_at=COALESCE(playback_updated_at, updated_at, downloaded_at, ?),
+                        delete_after=COALESCE(playback_updated_at, updated_at, downloaded_at, ?) + ?,
+                        playback_position=NULL,
+                        updated_at=?
+                    WHERE id=? AND state!='watched' AND watched_at IS NULL AND delete_after IS NULL
+                    """,
+                    (now, now, delay_seconds, now, row_id),
                 )
-                """,
-                (now, now, delay_seconds, now),
-            )
-            return max(0, int(explicit.rowcount or 0)) + max(0, int(evidence.rowcount or 0))
+                evidence_count += max(0, int(evidence.rowcount or 0))
+            return max(0, int(explicit.rowcount or 0)) + evidence_count
 
     def reconcile_watched_cleanup(self, after_hours: float) -> int:
         """Repair watched rows and apply the current cleanup delay.
@@ -5479,6 +6324,29 @@ class Database:
             )
             conn.execute("UPDATE playlist_items SET video_path=? WHERE video_path=?", (new_value, old_value))
         return True
+
+    def set_episode_identity(
+        self, video_path: Path, media_id: int | None, episode: int | None, title: str
+    ) -> bool:
+        """Give one file another title and episode (an extra file the person kept).
+
+        Unlike upsert_episode this can clear both: a file of no known title has neither.
+        Its subtitle job starts over for the new identity.
+        """
+        now = time.time()
+        with self.connect() as conn:
+            if media_id is not None:
+                self._ensure_anime_parent(conn, media_id, Path(video_path).stem)
+            cursor = conn.execute(
+                "UPDATE episodes SET media_id=?,episode=?,media_episode=?,release_episode=?,"
+                "media_episode_end=NULL,title=?,updated_at=? WHERE video_path=?",
+                (media_id, episode, episode, episode, str(title), now, str(video_path)),
+            )
+            conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),))
+            if episode is not None:
+                # A set-aside special that gets an episode is decided: no longer set aside.
+                conn.execute("DELETE FROM state WHERE key=?", (season_zero_set_aside_key(video_path),))
+            return bool(cursor.rowcount)
 
     def delete_episode_record(self, video_path: Path) -> None:
         with self.connect() as conn:

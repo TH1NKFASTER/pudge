@@ -258,13 +258,10 @@ def test_cover_refresh_never_leaves_a_truncated_cover(tmp_path: Path, monkeypatc
             return None
 
     monkeypatch.setattr(manager_module.httpx, "get", lambda *a, **k: Response())
-    real_write = Path.write_bytes
+    from write_failure_support import disk_full_while_writing
 
-    def dying_write(self: Path, data: bytes) -> int:
-        real_write(self, data[:5])
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(Path, "write_bytes", dying_write)
-    assert api.manager.cover_path(anime) == cached
-    monkeypatch.setattr(Path, "write_bytes", real_write)
+    with disk_full_while_writing(cached) as doomed:
+        assert api.manager.cover_path(anime) == cached
+    assert doomed  # the refresh did try to write the cover
     assert cached.read_bytes() == b"old-cover-bytes"
+    assert [p.name for p in cached.parent.iterdir() if p.name.startswith(".")] == []

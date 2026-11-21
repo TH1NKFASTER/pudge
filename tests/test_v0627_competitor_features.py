@@ -112,8 +112,6 @@ def test_database_stores_subtitle_history_and_smart_queues(tmp_path: Path) -> No
     assert queue["items"][0]["state"] == "pending"
     db.mark_playlist_item(queue["items"][0]["id"], "completed")
     assert db.playlist(queue_id)["items"][0]["state"] == "completed"
-    db.delete_playlist(queue_id)
-    assert db.playlist(queue_id) is None
 
 
 def test_backup_round_trip_restores_database_config_and_cached_subtitle(tmp_path: Path) -> None:
@@ -269,7 +267,8 @@ def test_settings_back_up_and_restore_everything(page) -> None:
         assert out["maintenance"] is True
         assert result.calls_of("create_full_backup") == [[]] and out["created"] == texts["created"]
         assert out["question"] == texts["question"] and out["afterCancel"] == 0
-        assert result.calls_of("restore_full_backup") == [[]]
+        # The confirmation also asks which Mac the backup is from (test_fix_iphone_restore_as_new_mac.py).
+        assert result.calls_of("restore_full_backup") == [["replace"]]
         assert out["restored"] == texts["restored"] and out["page"] == "settings" and out["shows"] is True
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import bisect
+import os
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -206,4 +208,9 @@ def retime_sup(source: Path, destination: Path, mapper: Callable[[float], float]
         struct.pack_into(">I", data, segment.offset + 6, new_dts)
         previous_pts = new_pts
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(data)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_bytes(data)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)

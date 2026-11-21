@@ -156,7 +156,7 @@ def test_download_actions_go_to_the_torrent_client_that_owns_the_download(page) 
         """
         void openDownloadCenter(null);
         await __tick(100);
-        const actions = [...new Set([...document.querySelectorAll('#modalBody button')].map(b => b.dataset.action))];
+        const actions = [...new Set([...document.querySelectorAll('#modalBody button')].map(b => b.dataset.action).filter(Boolean))];  // sort/selection buttons have none
         await __click('#modalBody [data-hash=bbb][data-action=torrent-pause]');
         await __tick(10);
         await __click('#modalBody [data-hash=aaa][data-action=torrent-remove]');
@@ -215,8 +215,11 @@ def test_mpv_translation_uses_sixteen_previous_lines_and_the_english_track_as_co
     args = [line[4:] for line in out.splitlines() if line.startswith("ARG:")]
     assert "LAUNCHED:1" in out and "PAUSED:true" in out  # one helper, no separate study window
     assert args[:4] == ["python3", "-m", "pudge.cli", "--subtitle-translate"]
-    assert args[args.index("--subtitle-study-text") + 1] == "セリフ20"
-    context = args[args.index("--subtitle-study-context") + 1].split("|")
+    # One argument each: a subtitle line may start with "-".
+    assert "--subtitle-study-text=セリフ20" in args
+    [context] = [
+        arg.split("=", 1)[1].split("|") for arg in args if arg.startswith("--subtitle-study-context=")
+    ]
     assert context == [
         "Previous Japanese subtitles:",
         *[f"セリフ{k}" for k in range(4, 20)],

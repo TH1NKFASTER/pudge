@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .branding import APP_NAME, APP_SLUG, DEFAULT_ENERGY_LOG_PATH
+from .private_files import create_private_file
 
 ENERGY_LOG_PATH = DEFAULT_ENERGY_LOG_PATH
 
@@ -26,6 +27,9 @@ class EnergyDiagnosticsMonitor:
 
     # On battery a sample (``ps`` over every process) is taken at most every 2 minutes.
     BATTERY_INTERVAL_SECONDS = 120.0
+    # While the window is in the background or hidden, at most every 5 minutes: the
+    # sampler itself woke an idle Mac every 30 seconds for the whole session.
+    INACTIVE_INTERVAL_SECONDS = 300.0
 
     def __init__(
         self,
@@ -33,10 +37,12 @@ class EnergyDiagnosticsMonitor:
         interval_seconds: float = 30.0,
         logger: Any | None = None,
         on_battery: Callable[[], bool | None] | None = None,
+        window_active: Callable[[], bool | None] | None = None,
     ) -> None:
         self.interval_seconds = max(10.0, float(interval_seconds))
         self.logger = logger
         self._on_battery = on_battery
+        self._window_active = window_active
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -68,7 +74,16 @@ class EnergyDiagnosticsMonitor:
         self.interval_seconds = max(10.0, float(seconds))
 
     def current_interval(self) -> float:
-        """The configured interval, lengthened to 2 minutes while the Mac runs on battery."""
+        """The configured interval, lengthened to 2 minutes while the Mac runs on battery
+        and to 5 minutes while the window is not in use."""
+        interval = self.interval_seconds
+        if self._window_active is not None:
+            try:
+                active = self._window_active()
+            except Exception:  # noqa: BLE001 - unknown window state keeps the configured pace
+                active = None
+            if active is False:
+                interval = max(interval, self.INACTIVE_INTERVAL_SECONDS)
         on_battery = None
         if self._on_battery is not None:
             try:
@@ -76,8 +91,8 @@ class EnergyDiagnosticsMonitor:
             except Exception:  # noqa: BLE001 - an unknown power source keeps the configured pace
                 on_battery = None
         if on_battery is True:
-            return max(self.interval_seconds, self.BATTERY_INTERVAL_SECONDS)
-        return self.interval_seconds
+            return max(interval, self.BATTERY_INTERVAL_SECONDS)
+        return interval
 
     @staticmethod
     def _process_rows() -> list[dict[str, Any]]:
@@ -173,7 +188,7 @@ class EnergyDiagnosticsMonitor:
             return "qbittorrent"
         if "aria2c" in value:
             return "aria2"
-        if executable.endswith("/7zz") or executable.endswith("/7z") or executable in {"7zz", "7z"}:
+        if executable.endswith(("/7zz", "/7z", "/bsdtar")) or executable in {"7zz", "7z", "bsdtar"}:
             return "archive-worker"
         if "ffmpeg" in value or "ffprobe" in value:
             return "media-worker"
@@ -333,6 +348,8 @@ class EnergyDiagnosticsMonitor:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._rotate(path)
+            if not path.exists():
+                create_private_file(path)  # process lists and paths: this user's only
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         except OSError as exc:

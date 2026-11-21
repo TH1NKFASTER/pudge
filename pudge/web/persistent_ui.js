@@ -1,7 +1,7 @@
 /* Preferences survive private WebKit storage and changing HTTP ports. */
 (function(g){
   'use strict';
-  const allowed=new Set(['pudge.assistant.v1','pudge.assistant.geometry.v1','pudge.readTogether.v1']);
+  const allowed=new Set(['pudge.assistant.v1','pudge.assistant.geometry.v1','pudge.assistant.dock.v1','pudge.readTogether.v1']);
   const values={...(g.__pudgeUiBootstrap?.values||{})},dirty=new Map(),running=new Map(),retries=new Map();
   function get(key){
     if(Object.prototype.hasOwnProperty.call(values,key))return values[key];
@@ -34,7 +34,9 @@
     void drain(key);
   }
   async function flush(){await Promise.all([...dirty.keys(),...running.keys()].map(drain));}
-  g.PudgeUiStorage={get,set,flush};
+  // Low RAM mode: the hidden page is not let go while a preference is still on its way.
+  function pending(){return dirty.size+running.size>0;}
+  g.PudgeUiStorage={get,set,flush,pending};
   g.addEventListener?.('pywebviewready',()=>{void flush();});
   g.addEventListener?.('pagehide',()=>{void flush();});
 })(window);

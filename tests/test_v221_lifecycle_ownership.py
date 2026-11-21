@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +8,6 @@ from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from pudge.task_supervisor import TaskSupervisor
 from pudge.web_app import WebAppApi
 from pudge.work_scheduler import WorkPriority, WorkScheduler
 
@@ -187,26 +184,3 @@ def test_scheduler_filesystem_failure_does_not_leak_local_lock(tmp_path: Path) -
     lease = scheduler.acquire_heavy("recovered", foreground_sensitive=False)
     assert lease is not None
     lease.release()
-
-
-def test_task_supervisor_drains_verbose_child_without_pipe_deadlock() -> None:
-    supervisor = TaskSupervisor()
-    try:
-        code, stdout, stderr = supervisor.run_process(
-            "verbose",
-            [
-                sys.executable,
-                "-c",
-                "import sys; sys.stdout.buffer.write(b'x'*1048576); "
-                "sys.stderr.buffer.write(b'y'*1048576); sys.stdout.flush(); sys.stderr.flush()",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-        )
-        assert code == 0
-        assert len(stdout) == 1048576
-        assert len(stderr) == 1048576
-        assert supervisor._processes == {}
-    finally:
-        supervisor.shutdown()

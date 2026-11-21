@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pudge.subtitle_formats import parse_srt, write_srt
 from pudge.syncing import _restore_embedded_opening_clock_scaffold
+from subtitle_rebuild_support import assert_not_prepared_again, assert_rebuilding_with_subtitles_kept
 
 
 def _spread(start: float, end: float, count: int) -> list[float]:
@@ -211,9 +212,8 @@ def test_requeue_rebuilds_cold_open_shifted_by_alass_and_scaffold(tmp_path: Path
 
     assert manager._requeue_double_opening_scaffold() == 1
     repaired = manager.db.episode_by_path(bad)
-    assert repaired is not None and repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
-    untouched = manager.db.episode_by_path(good)
-    assert untouched is not None and untouched.subtitle_path is not None
+    assert repaired is not None
+    assert_rebuilding_with_subtitles_kept(manager, bad)  # kept while it is prepared again
+    assert_not_prepared_again(manager, good)
     assert not err("jobs.requeueOpeningScaffold").startswith("error.")
     assert manager._requeue_double_opening_scaffold() == 0

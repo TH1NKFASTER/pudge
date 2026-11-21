@@ -16,6 +16,7 @@ from typing import Iterable
 
 from PIL import Image
 
+from .subtitle_formats import write_exact_srt
 from .pgs import (
     END_SEGMENT,
     HEADER_SIZE,
@@ -307,6 +308,11 @@ def _iter_pgs_file_segments(path: Path) -> Iterable[PGSSegment]:
             offset += HEADER_SIZE + payload_length
 
 
+# The widest PGS display or object drawn (a disc's display is 1920 x 1080, UHD 3840 x 2160): a
+# damaged segment can claim up to 65535 x 65535, a 17 GB canvas or bitmap for one display.
+_PGS_MAX_DIMENSION = 4096
+
+
 def iter_pgs_compositions(path: Path) -> Iterable[tuple[float, Image.Image | None]]:
     """Yield one rendered PGS display at a time.
 
@@ -336,7 +342,8 @@ def iter_pgs_compositions(path: Path) -> Iterable[tuple[float, Image.Image | Non
         elif segment.segment_type == ODS_SEGMENT:
             _consume_object_segment(segment.payload, chunks, objects)
         elif segment.segment_type == END_SEGMENT and current is not None:
-            if not current.objects:
+            if not current.objects or max(current.width, current.height) > _PGS_MAX_DIMENSION:
+                # Nothing shown (an oversized display is a damaged one: not drawn).
                 yield current.time_seconds, None
                 current = None
                 continue
@@ -347,6 +354,8 @@ def iter_pgs_compositions(path: Path) -> Iterable[tuple[float, Image.Image | Non
                 bitmap = objects.get(item.object_id)
                 if bitmap is None or not bitmap.data:
                     continue
+                if max(bitmap.width, bitmap.height) > _PGS_MAX_DIMENSION:
+                    continue  # a damaged object (see _PGS_MAX_DIMENSION)
                 layer = _decode_rle(bitmap, palette)
                 try:
                     canvas.alpha_composite(layer, (item.x, item.y))
@@ -359,11 +368,6 @@ def iter_pgs_compositions(path: Path) -> Iterable[tuple[float, Image.Image | Non
                 canvas.close()
                 yield current.time_seconds, None
             current = None
-
-
-def decode_pgs_compositions(path: Path) -> list[tuple[float, Image.Image | None]]:
-    """Compatibility helper for tests/tools; OCR itself uses the streaming iterator."""
-    return list(iter_pgs_compositions(path))
 
 
 def _vision_recognize(image: Image.Image) -> str:
@@ -443,22 +447,6 @@ def _normalize_ocr_text(value: str) -> str:
         if line:
             lines.append(line)
     return "\n".join(lines)
-
-
-def _srt_timestamp(seconds: float) -> str:
-    milliseconds = max(0, int(round(float(seconds) * 1000)))
-    hours, milliseconds = divmod(milliseconds, 3_600_000)
-    minutes, milliseconds = divmod(milliseconds, 60_000)
-    whole_seconds, milliseconds = divmod(milliseconds, 1000)
-    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
-
-
-def _write_srt(cues: Iterable[OCRCue], destination: Path) -> None:
-    blocks = []
-    for index, cue in enumerate(cues, start=1):
-        blocks.append(f"{index}\n{_srt_timestamp(cue.start)} --> {_srt_timestamp(cue.end)}\n{cue.text}\n")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text("\n".join(blocks), encoding="utf-8")
 
 
 # Extracting one PGS track reads the whole video. A stalled network volume must
@@ -710,7 +698,7 @@ def _ocr_bitmap_source(video: Path, source: Path, output: Path) -> tuple[Path | 
             "recognized_count": recognized,
         }
     quality = evaluate_ocr_quality(cues, display_count)
-    _write_srt(cues, output)
+    write_exact_srt([(cue.start, cue.end, cue.text) for cue in cues], output)
     logger.info(
         "RESULT step=subtitle.ocr video=%s source=%s cues=%s displays=%s output=%s",
         video.name,

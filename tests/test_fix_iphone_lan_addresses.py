@@ -143,6 +143,9 @@ def test_bonjour_runs_only_on_private_lan_interfaces_and_follows_network_changes
     monkeypatch.setattr(web_app.sys, "platform", "darwin")
     monkeypatch.setattr(web_app.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(web_app.subprocess, "Popen", _Process)
+    # Advertised only once a phone is paired (test_fix_iphone_connection_slots_and_bonjour.py covers that).
+    with api._iphone_service.db.connect() as conn:
+        conn.execute("INSERT INTO iphone_devices(id,name,token_hash) VALUES('d','iPhone','x')")
 
     api._advertise_iphone()
     started = {process.argv[2]: process for process in _Process.started}

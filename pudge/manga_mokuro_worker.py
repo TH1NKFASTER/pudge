@@ -51,11 +51,26 @@ class _PageOcr:
         return {"page": json.loads(json.dumps(result, ensure_ascii=False, default=_json_default))}
 
 
+# pudge.archive_limits.IMAGE_MEMBER_LIMIT (this interpreter cannot import pudge).
+_PAGE_LIMIT = 256 * 1024 * 1024
+
+
 def _read_page(request: dict) -> bytes:
+    """One page's bytes, refused past the page limit (the declared size can lie)."""
+    limit = _PAGE_LIMIT
     if request.get("archive"):
         with zipfile.ZipFile(str(request["archive"])) as archive:
-            return archive.read(str(request["name"]))
-    return Path(str(request["path"])).read_bytes()
+            info = archive.getinfo(str(request["name"]))
+            if info.file_size > limit:
+                raise ValueError("page_too_large")
+            with archive.open(info) as handle:
+                data = handle.read(limit + 1)
+    else:
+        with Path(str(request["path"])).open("rb") as handle:
+            data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("page_too_large")
+    return data
 
 
 def serve() -> int:

@@ -125,6 +125,10 @@ def test_storage_poll_recomputes_real_usage_after_cache_expires(tmp_path, monkey
     now[0] += 1
     assert api._storage_payload(refresh=False)["used_bytes"] == 0
     now[0] += 60
+    # An expired status is answered at once and checked again in the background (the walk
+    # used to run inside a Home build); the next answer has the real usage.
+    assert api._storage_payload(refresh=False)["used_bytes"] == 0
+    api._storage_check_thread.join(5)
     assert api._storage_payload(refresh=False)["used_bytes"] == 1234
 
 
@@ -155,8 +159,11 @@ def _shutdown_api(tmp_path):
     return api
 
 
-def test_refused_update_leaves_task_admission_and_runtime_usable(tmp_path):
+def test_refused_update_leaves_task_admission_and_runtime_usable(tmp_path, monkeypatch):
     api = _shutdown_api(tmp_path)
+    # The update waits up to 3 s for running tasks; the blocked writer below never stops.
+    quiesce = api.task_supervisor.quiesce
+    monkeypatch.setattr(api.task_supervisor, "quiesce", lambda *, timeout=5.0: quiesce(timeout=0.2))
     release = threading.Event()
     worker = api.task_supervisor.start("blocked-writer", lambda: release.wait(10))
     try:
@@ -174,10 +181,16 @@ def test_refused_update_leaves_task_admission_and_runtime_usable(tmp_path):
 
 
 def test_successful_update_preflight_keeps_runtime_live_until_quit(tmp_path):
+    # The preflight keeps the window usable, but new background tasks (and the agent) stay
+    # off: the installer starts next (review SCEN-13). If it cannot start, everything resumes.
     api = _shutdown_api(tmp_path)
     try:
         api._prepare_update_shutdown()
         assert not getattr(api, "_closing", False)
+        assert api.manager.db.get_state("runtime", "live") == "live"
+        with pytest.raises(RuntimeError, match="suspended"):
+            api.task_supervisor.start("after-preflight", lambda: None)
+        api._resume_after_failed_update()
         task = api.task_supervisor.start(
             "after-preflight", lambda: api.manager.db.set_state("spawn-failed", "recoverable")
         )
@@ -235,7 +248,7 @@ save_playback(Database(db,initialize=False),video,position=47,duration=100,activ
         assert ready.exists()
         api.close()
         assert launcher.poll() is None
-        assert worker.wait(timeout=2) != 0
+        assert worker.wait(timeout=30) != 0
         release.write_text("finish")
         assert launcher.wait(timeout=5) == 0
         assert api.manager.db.playback_evidence(video)["position"] == 47

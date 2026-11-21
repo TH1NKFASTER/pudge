@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import html
+import itertools
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -24,19 +26,26 @@ import httpx
 from rapidfuzz import fuzz
 
 from .alignment_quality import build_alignment_report
+from .cache_management import AUDIOBOOK_CACHE_NAMES_PREFIX
+from .fsutil import atomic_write_json, temporary_sibling
 from .audio_activity import (
     analyze_audio_activity as analyze_audio_activity,
     gate_activity_regions as gate_activity_regions,
     merge_activity_regions,
 )
 from .database import Database
+from .database_storage import unpack_json
 from .i18n import err, t
-from . import library_overrides
+from .junk_files import junk_part, junk_path
+from . import audiobook_finish, library_overrides
+from .anime_audiobooks import is_anime_audiobook_path
+from .memory_diagnostics import memory_step
 from .metadata_cache import MetadataCache
 from .player import mpv_supports_option
 from .process_priority import mark_background
 from .work_scheduler import WorkPriority
 from .reading_audio_alignment import (
+    MIN_ANCHORS_PER_100_CHARACTERS,
     align_light_novel_to_transcript,
     chapter_audio_text,
     normalize_reading_text,
@@ -57,6 +66,8 @@ _STOP_GRACE_SECONDS = 0.12
 _STOP_IPC_TIMEOUT = 0.05
 _PLAYBACK_STALL_SECONDS = 1.1
 _PLAYBACK_MOTION_EPSILON = 0.015
+# Numbers the playback sessions of this process (part of each mpv socket's name).
+_PLAYBACK_SESSION_NUMBERS = itertools.count(1)
 _STT_CHUNK_SECONDS = 300.0
 _STT_MLX_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 _STT_MLX_MEMORY_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
@@ -166,6 +177,9 @@ _CHAPTER_START_PRECISION_BEFORE_SECONDS = 24.0
 _CHAPTER_START_PRECISION_AFTER_SECONDS = 48.0
 _CHAPTER_START_READING_SOURCE_LIMIT = 320
 _CHAPTER_START_JITEN_BASE = "https://api.jiten.moe/api"
+# Longest wait for Jiten's budget or a Retry-After while the chapter-start hints are asked
+# for (the alignment may hold the heavy slot meanwhile).
+_CHAPTER_START_JITEN_MAX_WAIT_SECONDS = 5.0
 
 
 _READING_NOTATION_RE = re.compile(r"([\u3400-\u9fff々〆ヵヶ]+)\[([^\]]+)\]")
@@ -271,7 +285,7 @@ def _reading_hints_from_cached_parse(
     hints.sort(key=lambda row: (int(row["offset_start"]), int(row["offset_end"])))
     # Keep all parsed reading hints inside the already-bounded source window.
     # A historical 64-token cap happened to end at offset ~142 in Spice and
-    # Wolf II / 第三幕, exactly before 検問を通り通行証をもらって.  The token
+    # Wolf II / 第三幕, exactly before a run of long compound nouns.  The token
     # parser knew those words, but the runtime bridge never received their
     # readings, so it could only linearly interpolate one coarse 142→155 gap.
     return hints
@@ -480,7 +494,8 @@ def terminate_orphaned_audiobook_players(
             continue
         ipc_text = next((value for value in ipc_match.groups() if value), "")
         ipc_path = Path(ipc_text).expanduser()
-        owner_match = re.fullmatch(r"book-\d+-(\d+)\.sock", ipc_path.name)
+        # book-<id>-<pid>.sock (older) and book-<id>-<pid>-<session>.sock (_play_locked now).
+        owner_match = re.fullmatch(r"book-\d+-(\d+)(?:-[0-9a-f]+-[0-9a-f]+)?\.sock", ipc_path.name)
         if not owner_match:
             continue
         try:
@@ -1025,8 +1040,13 @@ def _roman_volume_value(token: str) -> int | None:
 
 
 def _audiobook_series_title(value: str, *, volume: int | None = None) -> str:
-    text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).strip()
+    # A wave dash 〜 is the tilde ～ (~ after NFKC): one series title for both spellings.
+    text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).replace("〜", "~").strip()
     text = re.sub(r"^\s*\[[^\]]{1,80}\]\s*", "", text)
+    # A linked light novel's store title ends in its imprint after the volume, e.g.
+    # ``作品 ~副題~ 2 (文庫)``: without it every volume was a series of its own.
+    text = re.sub(r"\s*[（(][^()（）]{0,80}[)）]\s*$", "", text)
+    text = re.sub(r"\s*[<＜][^<>＜＞]{1,160}[>＞]\s*$", "", text)
     text = re.sub(
         r"(?i)\[(?:audiobook\.jp|audible|amazon|asin|storytel|kikubon|listen|audio)[^\]]{0,100}\]", " ", text
     )
@@ -1052,6 +1072,9 @@ def _audiobook_series_title(value: str, *, volume: int | None = None) -> str:
             roman = re.search(r"\s*(?<![A-Za-z])([IVXLCDM]{1,8})\s*$", text)
             if roman and _roman_volume_value(roman.group(1)) == int(volume):
                 text = text[: roman.start()].rstrip(" ～~-/")
+    # The closing ~ of a subtitle went with the trailing marks above: 作品 ~副題 -> 作品 ~副題~.
+    if text.count("~") == 1 and re.search(r"\s~\S", text) and not text.endswith("~"):
+        text += "~"
     return text
 
 
@@ -1128,6 +1151,9 @@ class AudiobookService:
         self._transcription_summary_cache: dict[Path, tuple[tuple[int, int], dict[str, Any]]] = {}
         self._alignment_payload_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
         self._alignment_report_cache: dict[tuple[int, int, str], dict[str, Any] | None] = {}
+        # Last use of the two caches above: a parsed alignment is tens of MB (a long book
+        # 100+ MB); after ALIGNMENT_CACHE_IDLE_SECONDS unused they go (read again from disk).
+        self._alignment_cache_used_at = time.monotonic()
         self._reader_parse_alignment_refresh_seen: set[tuple[int, int, str]] = set()
         # v134: upgrades used to leave pre-chunking MLX workers orphaned under launchd.
         # Clean only the unmistakable legacy file-0001.json workers; current chunk workers survive.
@@ -1301,7 +1327,9 @@ class AudiobookService:
                 }
             )
         self._probe_cache.put(key, {"duration": duration, "chapters": chapters})
-        self._probe_cache.prune(older_than_seconds=365 * 24 * 3600, max_entries=2000)
+        self._probe_cache.prune(
+            older_than_seconds=365 * 24 * 3600, max_entries=2000, min_interval_seconds=600
+        )
         return duration, chapters
 
     def _embedded_cover_paths(self, path: Path) -> tuple[Path, Path, Path] | None:
@@ -1424,13 +1452,19 @@ class AudiobookService:
         return not target.is_file() and not missing.exists()
 
     def _folder_files(self, folder: Path) -> list[Path]:
-        rows = [
-            path.resolve()
+        # Sort by the place inside the folder, then resolve: a symlinked file
+        # resolves outside the folder, and relative_to() on it aborted the import.
+        # AppleDouble "._01.mp3" companions (exFAT drives, NAS shares), __MACOSX/ and
+        # hidden folders carry an audio suffix but no audio: ffprobe failed on them.
+        found = [
+            path
             for path in folder.rglob("*")
-            if path.is_file() and path.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+            if path.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+            and not junk_path(path, folder)
+            and path.is_file()
         ]
-        rows.sort(key=lambda path: _natural_key(str(path.relative_to(folder))))
-        return rows
+        found.sort(key=lambda path: _natural_key(str(path.relative_to(folder))))
+        return [path.resolve() for path in found]
 
     @staticmethod
     def _looks_like_disc_folder(path: Path) -> bool:
@@ -1454,10 +1488,12 @@ class AudiobookService:
             direct_audio = [
                 item
                 for item in folder.iterdir()
-                if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+                if item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+                and not junk_part(item.name)
+                and item.is_file()
             ]
             children = [
-                item.resolve() for item in folder.iterdir() if item.is_dir() and not item.name.startswith(".")
+                item.resolve() for item in folder.iterdir() if item.is_dir() and not junk_part(item.name)
             ]
         except OSError as exc:
             raise ValueError(err("audiobook.folderUnreadable", error=exc)) from exc
@@ -1468,22 +1504,6 @@ class AudiobookService:
         if len(groups) >= 2 and not all(self._looks_like_disc_folder(path) for path in groups):
             return groups
         return [folder]
-
-    def import_folder_collection(
-        self,
-        folder: Path,
-        *,
-        auto_link: bool = True,
-        prepare_transcription: bool = True,
-    ) -> list[dict[str, Any]]:
-        return [
-            self.import_folder(
-                target,
-                auto_link=auto_link,
-                prepare_transcription=prepare_transcription,
-            )
-            for target in self.folder_import_targets(folder)
-        ]
 
     def _upsert(
         self,
@@ -1620,6 +1640,26 @@ class AudiobookService:
             with self._lock:
                 self._metadata_probe_pending.discard(int(book_id))
 
+    def _made_from_anime(self, path: Path) -> dict[str, Any] | None:
+        """The book of a file or folder made from anime episodes (anime_audiobooks), when it is
+        in the library already. Importing it again (a drop, a watched folder) must not rewrite
+        it: its title and chapter names became the file names ("Episode 001")."""
+        if not is_anime_audiobook_path(path):
+            return None
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT id FROM audiobooks WHERE path=?", (str(path),)).fetchone()
+            rows = [] if row is not None else conn.execute("SELECT id,path FROM audiobooks").fetchall()
+        if row is not None:
+            return self.book(int(row["id"]))
+        for other in rows:  # stored under another spelling of the folder (a symlinked library)
+            stored = Path(str(other["path"]))
+            try:
+                if stored.name == path.name and stored.resolve() == path.resolve():
+                    return self.book(int(other["id"]))
+            except OSError:
+                continue
+        return None
+
     def import_file(
         self,
         path: Path,
@@ -1631,6 +1671,9 @@ class AudiobookService:
         path = path.expanduser().resolve()
         if not path.is_file() or path.suffix.casefold() not in AUDIOBOOK_EXTENSIONS:
             raise ValueError(err("audiobook.unsupportedFormat"))
+        made = self._made_from_anime(path)
+        if made is not None:
+            return made
         metadata_pending = False
         try:
             # Local files normally probe in milliseconds.  iCloud placeholders
@@ -1694,6 +1737,9 @@ class AudiobookService:
         folder = folder.expanduser().resolve()
         if not folder.is_dir():
             raise ValueError(err("audiobook.folderMissing"))
+        made = self._made_from_anime(folder)
+        if made is not None:
+            return made
         paths = self._folder_files(folder)
         if not paths:
             raise ValueError(err("audiobook.noAudioFiles"))
@@ -1701,8 +1747,17 @@ class AudiobookService:
         chapters: list[dict[str, Any]] = []
         cursor = 0.0
         chapter_index = 0
-        for index, path in enumerate(paths):
-            duration, embedded = self._probe(path)
+        first_error: Exception | None = None
+        for path in paths:
+            try:
+                duration, embedded = self._probe(path)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:  # a hung ffprobe: skipped too
+                # One damaged or mislabelled file (ffprobe cannot read it) is left
+                # out instead of failing the whole book.
+                LOGGER.warning("SKIP audiobook.unreadable_file path=%s error=%r", path, str(exc)[:300])
+                first_error = first_error or exc
+                continue
+            index = len(files)
             start = cursor
             end = start + max(0.0, duration)
             files.append(
@@ -1732,6 +1787,8 @@ class AudiobookService:
                 chapters.append({"index": chapter_index, "title": path.stem, "start": start, "end": end})
                 chapter_index += 1
             cursor = end
+        if not files:
+            raise first_error if first_error is not None else ValueError(err("audiobook.noAudioFiles"))
         book = self._upsert(
             path=folder,
             title=str(title_override or folder.name),
@@ -1932,6 +1989,15 @@ class AudiobookService:
                 if has_novels is not None
                 else None
             )
+            linked_finished = False
+            if linked_novel is not None:
+                try:
+                    finished_row = conn.execute(
+                        "SELECT finished FROM ln_books WHERE id=?", (int(linked_novel["id"]),)
+                    ).fetchone()
+                    linked_finished = bool(finished_row is not None and finished_row["finished"])
+                except sqlite3.Error:
+                    linked_finished = False  # an older light-novel table without the flag
         if row is None:
             raise KeyError(err("audiobook.unknownBook", bookId=book_id))
         chapter_payload = [
@@ -1992,6 +2058,12 @@ class AudiobookService:
             "multi_file": Path(str(row["path"])).is_dir() or file_count > 1,
             "file_count": file_count,
             "tts_generated": tts_generated,
+            # Text that follows the audio (the player's Text panel): a linked light
+            # novel, or the subtitles of an audiobook made from anime episodes.
+            "read_along": linked_novel is not None or is_anime_audiobook_path(book_path),
+            # What that text was made from: the player keeps the lines of a book until
+            # this changes (an anime audiobook made again has other lines at other times).
+            "read_along_revision": self._read_along_revision(book_path, linked_novel),
             "chapters": chapter_payload,
             "current_chapter": current_chapter,
             "bookmarks": self._bookmarks(int(book_id)),
@@ -2017,14 +2089,30 @@ class AudiobookService:
                 if linked_novel is not None and linked_novel["anilist_id"] is not None
                 else ""
             ),
-            "linked_light_novel": dict(linked_novel) if linked_novel is not None else None,
+            # `finished`: the volume is marked read (a finished audiobook offers to mark it).
+            "linked_light_novel": dict(linked_novel) | {"finished": linked_finished}
+            if linked_novel is not None
+            else None,
             "series_title": series_title,
             "series_key": _audiobook_title_key(series_title),
             "volume": int(inferred_volume),
             "cover_url": external_cover or embedded_cover,
             "cover_pending": cover_pending,
             "metadata_pending": int(book_id) in self._metadata_probe_pending,
-        } | self._shelf_override(int(book_id), series_title, int(inferred_volume))
+        } | self._shelf_override(int(book_id), series_title, int(inferred_volume), book_path)
+
+    @staticmethod
+    def _read_along_revision(book_path: Path, linked_novel: Any) -> str:
+        if linked_novel is not None:
+            return f"ln:{int(linked_novel['id'])}"
+        from .anime_audiobooks import MARKER
+
+        folder = book_path if book_path.is_dir() else book_path.parent
+        try:
+            # The manifest is saved with every episode made (and with its text).
+            return f"anime:{(folder / MARKER).stat().st_mtime_ns}"
+        except OSError:
+            return ""
 
     def _metadata_overrides(self) -> dict[int, dict[str, Any]]:
         cached = getattr(self, "_overrides", None)
@@ -2034,7 +2122,9 @@ class AudiobookService:
             self._overrides = cached
         return cached
 
-    def _shelf_override(self, book_id: int, series_title: str, volume: int) -> dict[str, Any]:
+    def _shelf_override(
+        self, book_id: int, series_title: str, volume: int, path: Path | str | None = None
+    ) -> dict[str, Any]:
         """Hand-made volume/series correction for one audiobook payload ({} when none)."""
         override = self._metadata_overrides().get(int(book_id))
         if not override:
@@ -2045,7 +2135,60 @@ class AudiobookService:
             "series_key": _audiobook_title_key(series_title),
             "volume": int(volume),
         }
-        return library_overrides.apply(item, override, _audiobook_title_key)
+        item = library_overrides.apply(item, override, _audiobook_title_key)
+        if path is not None and str(override.get("series_title") or "") and is_anime_audiobook_path(path):
+            # Books made from anime episodes carry the anime's title as their series. An
+            # audiobook series of the same name (the light novel it is based on) is another
+            # shelf: there "volume 3" is a book, here it is episode 3. The shelf is named
+            # apart only when both exist (the iPhone groups by the name).
+            key = _audiobook_title_key(str(item.get("series_title") or ""))
+            if key:
+                item["series_key"] = library_overrides.ANIME_SHELF_PREFIX + key
+                if key in self._plain_shelf_keys():
+                    item["series_title"] = library_overrides.anime_shelf_title(str(item["series_title"]))
+        return item
+
+    def _plain_shelf_keys(self) -> frozenset[str]:
+        """Series keys of the audiobooks that were not made from anime episodes."""
+        overrides = self._metadata_overrides()
+        with self.db.connect() as conn:
+            stamp_row = conn.execute("SELECT COUNT(*),MAX(updated_at),MAX(id) FROM audiobooks").fetchone()
+            stamp = (tuple(stamp_row), id(overrides))
+            cached = getattr(self, "_plain_shelves", None)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            books = conn.execute("SELECT id,title,path FROM audiobooks").fetchall()
+            linked: dict[int, tuple[str, int]] = {}
+            try:
+                for row in conn.execute(
+                    "SELECT l.audiobook_id,b.title,b.volume FROM reading_audio_links l "
+                    "JOIN ln_books b ON b.id=l.ln_book_id ORDER BY l.updated_at"
+                ):
+                    linked[int(row["audiobook_id"])] = (str(row["title"] or ""), int(row["volume"] or 0))
+            except sqlite3.Error:
+                linked = {}  # no light-novel tables yet
+        keys: set[str] = set()
+        for row in books:
+            book_id, title, path = int(row["id"]), str(row["title"] or ""), str(row["path"] or "")
+            named = str((overrides.get(book_id) or {}).get("series_title") or "")
+            if named:
+                if not is_anime_audiobook_path(path):
+                    keys.add(_audiobook_title_key(named))
+                continue
+            linked_title, linked_volume = linked.get(book_id, ("", 0))
+            inferred = linked_volume or (
+                _audiobook_volume(title)
+                or _audiobook_volume(path)
+                or _audiobook_volume(_audiobook_path_label(path))
+                or 0
+            )
+            keys.add(
+                _audiobook_title_key(_audiobook_series_title(linked_title or title, volume=inferred) or title)
+            )
+        keys.discard("")
+        result = frozenset(keys)
+        self._plain_shelves = (stamp, result)
+        return result
 
     def set_metadata_override(self, book_id: int, *, volume: int | None, series_title: str) -> dict[str, Any]:
         """Store a hand-made volume/series correction; it wins over the file name and the linked LN."""
@@ -2085,6 +2228,10 @@ class AudiobookService:
             ).fetchone()
             if audio is None:
                 self._last_auto_link_reason = "no-audio"
+                return None
+            if is_anime_audiobook_path(str(audio["path"])):
+                # Made from an anime episode: its text is the subtitles, never a light novel.
+                self._last_auto_link_reason = "anime-audiobook"
                 return None
             existing = conn.execute(
                 "SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id=? LIMIT 1",
@@ -2266,7 +2413,7 @@ class AudiobookService:
                         else None
                     ),
                 }
-                | self._shelf_override(book_id, series_title, int(inferred_volume))
+                | self._shelf_override(book_id, series_title, int(inferred_volume), str(row["path"] or ""))
             )
         return result
 
@@ -2338,6 +2485,7 @@ class AudiobookService:
                         audiobook_id,
                         priority=WorkPriority.BACKGROUND,
                     )
+        self._save_content_identities(force=True)
         return {"books": books}
 
     def sidebar_state(self) -> dict[str, Any]:
@@ -2380,6 +2528,10 @@ class AudiobookService:
                 self.prepare_alignment(int(row["ln_book_id"]), priority=WorkPriority.BACKGROUND)
             except Exception:
                 continue
+        try:
+            self.touch_book_caches()
+        except (OSError, sqlite3.Error) as exc:
+            LOGGER.debug("SKIP step=audiobook.cache_touch error=%r", str(exc))
         return resumed
 
     def set_position(self, book_id: int, position: float) -> None:
@@ -2392,7 +2544,7 @@ class AudiobookService:
                 raise KeyError(err("audiobook.unknownBook", bookId=book_id))
             duration = float(row["duration"] or 0.0)
             value = max(0.0, min(float(position), duration or float(position)))
-            reached_end = bool(duration > 0 and value >= duration * 0.98)
+            reached_end = audiobook_finish.reached_end(value, duration)
             # "Finished" is only ever set here (like light novels): seeking back
             # to re-listen keeps it; "Mark unfinished" clears it explicitly.
             conn.execute(
@@ -2494,12 +2646,14 @@ class AudiobookService:
             except (TypeError, ValueError):
                 return None
 
-        def read_index() -> int:
+        def read_index() -> int | None:
+            # None: the read failed (mpv busy past the IPC deadline). It used to count as
+            # the first file, and a later file's own clock was saved as the book's place.
             raw_index = self._ipc_get(ipc_path, "playlist-pos")
             try:
-                return int(raw_index) if raw_index is not None else 0
+                return int(raw_index) if raw_index is not None else None
             except (TypeError, ValueError):
-                return 0
+                return None
 
         files = self._position_file_rows(book_id)
         if len(files) <= 1:
@@ -2517,7 +2671,7 @@ class AudiobookService:
             if after != index:
                 index = after
                 local = 0.0
-        if local is None:
+        if local is None or index is None:
             return None
         match = next((row for row in files if int(row["file_index"]) == index), None)
         if match is None:
@@ -2940,7 +3094,10 @@ class AudiobookService:
 
         ipc_dir = self.cache_dir / "audiobook-ipc"
         ipc_dir.mkdir(parents=True, exist_ok=True)
-        session_id = f"{time.monotonic_ns():x}-{threading.get_ident():x}"
+        # Short: the socket's whole path must fit a Unix socket address (103 bytes on macOS).
+        # "<monotonic ns>-<thread id>" left room for a user folder name of only about 13-16
+        # characters; past it mpv opened no socket, and no place of the book was saved.
+        session_id = f"{os.urandom(3).hex()}-{next(_PLAYBACK_SESSION_NUMBERS):x}"
         if mobile is not None:
             asset = mobile.asset_for_book(book_id)
             if asset is not None:
@@ -2997,7 +3154,12 @@ class AudiobookService:
 
             if sys.platform == "darwin" and mpv_supports_option(self.mpv, "macos-app-activation-policy"):
                 command.insert(1, "--macos-app-activation-policy=accessory")
-            process = subprocess.Popen(command, env=worker_environment())
+            try:
+                process = subprocess.Popen(command, env=worker_environment())
+            except FileNotFoundError as exc:
+                # mpv is optional (install.sh no longer installs it): the window turns this
+                # message into an offer to install mpv instead of a raw "No such file" error.
+                raise RuntimeError(err("media.mpvMissing")) from exc
             self._review_contexts[book_id] = {
                 **(review_context or {"origin": "audio", "consumer": "sidebar", "pending_chapter": None}),
                 "session": session_id,
@@ -3347,7 +3509,7 @@ class AudiobookService:
             # Clearing the mark keeps where you are, except at the very end
             # (that would count as finished again on the next save).
             current = float(book.get("position") or 0.0)
-            position = 0.0 if duration > 0 and current >= duration * 0.98 else current
+            position = 0.0 if audiobook_finish.reached_end(current, duration) else current
         mobile = getattr(self, "mobile_progress", None)
         if mobile is not None and mobile.mark_mac_finished(int(book_id), bool(finished), position=position):
             return {"ok": True, "book": self.book(int(book_id))}
@@ -3366,6 +3528,73 @@ class AudiobookService:
         except OSError:
             return str(path)
 
+    # The content identities of the library's audio files, kept across launches (per path,
+    # size and modification time). Each launch named every file again (touch_book_caches,
+    # the Audiobooks tab) by reading four 64 KB samples of it: hundreds of MB, and minutes
+    # of seeking on an external disk. Beyond 8192 files the memory cache was emptied, and
+    # each listing read them all again.
+    CONTENT_IDENTITY_FILE = "audiobook-content-ids.json"
+    _CONTENT_IDENTITY_LIMIT = 50_000
+
+    def _content_identity_store(self) -> dict[tuple[str, int, int], str]:
+        store = self.__dict__.get("_content_identity_cache")
+        if store is not None:
+            return store
+        with self.__dict__.setdefault("_content_identity_lock", threading.Lock()):
+            store = self.__dict__.get("_content_identity_cache")
+            if store is not None:
+                return store
+            store = {}
+            cache_dir = getattr(self, "cache_dir", None)
+            rows: Any = None
+            if cache_dir is not None:
+                try:
+                    data = json.loads(
+                        (Path(cache_dir) / self.CONTENT_IDENTITY_FILE).read_text(encoding="utf-8")
+                    )
+                    rows = data.get("ids") if isinstance(data, dict) and data.get("schema") == 1 else None
+                except (OSError, ValueError):
+                    rows = None
+            for row in rows if isinstance(rows, list) else []:
+                try:
+                    path, size, mtime_ns, value = row
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, str) and value.startswith("c:"):
+                    try:
+                        store[(str(path), int(size), int(mtime_ns))] = value
+                    except (TypeError, ValueError):
+                        continue
+            self.__dict__["_content_identity_cache"] = store
+            return store
+
+    def _save_content_identities(self, *, force: bool = False) -> None:
+        """Write the identities named since the last write (at most every 10 s unless forced)."""
+        cache_dir = getattr(self, "cache_dir", None)
+        if cache_dir is None or not self.__dict__.get("_content_identities_dirty"):
+            return
+        now = time.monotonic()
+        if not force and now - float(self.__dict__.get("_content_identities_saved_at") or 0.0) < 10.0:
+            return
+        self.__dict__["_content_identities_dirty"] = False
+        self.__dict__["_content_identities_saved_at"] = now
+        rows = [
+            [key[0], key[1], key[2], value]
+            for key, value in list(self._content_identity_store().items())
+            if value.startswith("c:")
+        ]
+        try:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                Path(cache_dir) / self.CONTENT_IDENTITY_FILE,
+                {"schema": 1, "ids": rows},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except OSError as exc:
+            self.__dict__["_content_identities_dirty"] = True
+            LOGGER.debug("SKIP step=audiobook.content_ids_save error=%r", str(exc))
+
     def _content_identity(self, path: Path) -> str:
         """Rename-proof identity of one audio file (sampled content, cached per stat)."""
         try:
@@ -3373,16 +3602,19 @@ class AudiobookService:
         except OSError:
             return str(path)
         key = (str(path), int(stat.st_size), int(stat.st_mtime_ns))
-        cache = self.__dict__.setdefault("_content_identity_cache", {})
+        cache = self._content_identity_store()
         value = cache.get(key)
         if value is None:
             try:
                 value = "c:" + _sampled_content_digest(path, int(stat.st_size))
             except OSError:
                 value = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-            if len(cache) > 8192:
-                cache.clear()
+            if len(cache) >= self._CONTENT_IDENTITY_LIMIT:
+                # The oldest fifth goes (files changed or removed long ago, mostly).
+                for old in list(cache)[: len(cache) // 5]:
+                    cache.pop(old, None)
             cache[key] = value
+            self.__dict__["_content_identities_dirty"] = True
         return value
 
     def _file_identity(self, path: Path, *, legacy: bool) -> str:
@@ -3410,6 +3642,7 @@ class AudiobookService:
         value = digest.hexdigest()[:28]
         with self._lock:
             self._fingerprint_cache[key] = (now, value)
+        self._save_content_identities()
         return value
 
     def _transcript_path(self, audiobook_id: int) -> Path:
@@ -3433,9 +3666,12 @@ class AudiobookService:
             return target.is_file()
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".adopt.tmp")
-            shutil.copyfile(legacy, temporary)
-            temporary.replace(target)
+            temporary = temporary_sibling(target)
+            try:
+                shutil.copyfile(legacy, temporary)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
         except OSError:
             return False
         LOGGER.info("Audiobook cache adopted content key from=%s to=%s", legacy.name, target.name)
@@ -3474,9 +3710,7 @@ class AudiobookService:
             return None
         target.parent.mkdir(parents=True, exist_ok=True)
         migrated = {**payload, "schema": "audiobook-stt-v3", "migrated_from": "audiobook-stt-v2"}
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(migrated, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(target)
+        atomic_write_json(target, migrated, ensure_ascii=False)
         return target
 
     def _activity_fingerprint(self, audiobook_id: int, *, legacy: bool = False) -> str:
@@ -3573,9 +3807,64 @@ class AudiobookService:
             else None
         )
 
+    def _transcript_opening(self, audiobook_id: int) -> str:
+        """Text of the first 160 recognized segments of a book's transcript ("" without one).
+
+        Kept per transcript file: the link dialog compares it with the light novel's opening
+        on every search, and parsed each transcribed book's whole transcript (megabytes of
+        word timings) for it."""
+        path = self._transcript_path(int(audiobook_id))
+        cache = self.__dict__.setdefault("_transcript_opening_cache", {})
+        try:
+            stat = path.stat()
+            stamp: tuple[int, int] | None = (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            stamp = None
+        entry = cache.get(path)
+        if stamp is not None and entry is not None and entry[0] == stamp:
+            return entry[1]
+        transcript = self._load_transcript(int(audiobook_id))
+        if transcript is None:
+            return ""
+        text = "".join(
+            str(segment.get("text") or "")
+            for segment in (transcript.get("segments") or [])[:160]
+            if isinstance(segment, dict)
+        )
+        if stamp is not None:
+            if len(cache) >= 64:
+                cache.pop(next(iter(cache)))
+            cache[path] = (stamp, text)
+        return text
+
+    def _remember_cache_names(self, audiobook_id: int, transcript: Path) -> None:
+        """Store the book's speech-to-text cache names for the cache cleanup (only on change).
+
+        They are named by the audio's content, which the cleanup cannot read; names
+        computed while a file is away would be path-based, so they are not stored then.
+        """
+        memo = self.__dict__.setdefault("_cache_names_memo", {})
+        if memo.get(int(audiobook_id)) == transcript.name:
+            return
+        memo[int(audiobook_id)] = transcript.name
+        try:
+            rows = self._file_rows(int(audiobook_id))
+            if not rows or not all(Path(str(row["path"])).is_file() for row in rows):
+                return
+            names = [
+                f"audiobook-transcripts/{transcript.name}",
+                f"audiobook-transcripts/{self._transcription_checkpoint_dir(transcript).name}",
+                f"audiobook-activity/{self._activity_path(int(audiobook_id)).name}",
+            ]
+            self.db.set_state(f"{AUDIOBOOK_CACHE_NAMES_PREFIX}{int(audiobook_id)}", json.dumps(names))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            memo.pop(int(audiobook_id), None)
+            LOGGER.debug("SKIP step=audiobook.cache_names book_id=%s error=%r", audiobook_id, str(exc))
+
     def transcription_status(self, audiobook_id: int) -> dict[str, Any]:
         audiobook_id = int(audiobook_id)
         path = self._transcript_path(audiobook_id)
+        self._remember_cache_names(audiobook_id, path)
         try:
             stat = path.stat()
             stamp = (stat.st_mtime_ns, stat.st_size)
@@ -3767,7 +4056,14 @@ class AudiobookService:
             "flac",
             str(destination),
         ]
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        # stderr goes to a file: damaged audio makes ffmpeg write ~100 KB of errors,
+        # which filled a pipe read only after exit and stalled it until the timeout.
+        stderr_file = tempfile.TemporaryFile()
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr_file)
+        except BaseException:
+            stderr_file.close()
+            raise
         started = time.monotonic()
         try:
             while process.poll() is None:
@@ -3788,12 +4084,28 @@ class AudiobookService:
                         process.wait(timeout=3)
                     raise RuntimeError(err("audiobook.sttChunkExtractTimeout"))
                 time.sleep(0.08)
-            stderr = process.stderr.read() if process.stderr is not None else ""
             if process.returncode != 0 or not destination.is_file():
+                size = stderr_file.seek(0, os.SEEK_END)
+                stderr_file.seek(max(0, size - 4096))
+                stderr = stderr_file.read().decode("utf-8", errors="replace")
                 raise RuntimeError((stderr or "ffmpeg could not extract STT chunk").strip()[-1200:])
         finally:
-            if process.stderr is not None:
-                process.stderr.close()
+            stderr_file.close()
+
+    def _stt_yield_reason(self, priority: WorkPriority) -> str | None:
+        """Why speech-to-text should give up its heavy-work slot before the next chunk."""
+        scheduler = self.work_scheduler
+        if scheduler is None:
+            return None
+        try:
+            should_yield = getattr(scheduler, "should_yield_to_higher_priority", None)
+            if callable(should_yield) and should_yield(priority):
+                return "heavy_work"
+            wait_reason = getattr(scheduler, "background_wait_reason", None)
+            return wait_reason(priority=priority, resource="cpu") if callable(wait_reason) else None
+        except Exception as exc:  # noqa: BLE001 - a policy probe never stops the job
+            LOGGER.debug("SKIP step=audiobook.stt_yield_check error=%r", str(exc))
+            return None
 
     def _start_stt_worker(self, environment: dict[str, str], stderr_path: Path) -> _SttWorker:
         command = [self.python, "-m", "pudge.subtitles.stt_worker", "--serve", self.stt_model]
@@ -3851,6 +4163,7 @@ class AudiobookService:
         output.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = self._transcription_checkpoint_dir(output)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._remember_cache_names(audiobook_id, output)
         current_audio: Path | None = None
         current_progress: Path | None = None
         worker: _SttWorker | None = None
@@ -3929,6 +4242,52 @@ class AudiobookService:
                         },
                     )
                     continue
+
+                yield_reason = self._stt_yield_reason(requested_priority) if heavy_lease is not None else None
+                if yield_reason is not None:
+                    # Between chunks the job steps aside for higher-priority work (page
+                    # OCR, fresh subtitles), playback, battery or heat: it used to hold
+                    # the one heavy-work slot for the whole book, often hours. Finished
+                    # chunks stay checkpointed; only the model is loaded again.
+                    LOGGER.info(
+                        "PAUSE step=audiobook.stt book_id=%s chunk=%s reason=%s",
+                        audiobook_id,
+                        chunk_number,
+                        yield_reason,
+                    )
+                    if worker is not None:
+                        with self._lock:
+                            if self._transcription_processes.get(audiobook_id) is worker.process:
+                                self._transcription_processes.pop(audiobook_id, None)
+                        worker.stop()  # frees the model's memory
+                        worker = None
+                    heavy_lease.release()
+                    heavy_lease = None
+                    self._set_transcription_job(
+                        audiobook_id,
+                        {
+                            "status": "queued",
+                            "ready": False,
+                            "phase": "waiting_for_policy",
+                            "wait_reason": yield_reason,
+                            "chunk": chunk_number,
+                            "chunk_count": int(chunk["total_chunks"]),
+                            "progress_percent": completed_duration / total_duration * 100.0
+                            if total_duration
+                            else 0.0,
+                        },
+                    )
+                    heavy_lease = self.work_scheduler.acquire_heavy(
+                        "audiobook-stt",
+                        blocking=True,
+                        foreground_sensitive=True,
+                        wait_for_foreground=True,
+                        cancel_event=cancel_event,
+                        priority=requested_priority,
+                    )
+                    if heavy_lease is None:
+                        raise InterruptedError(err("audiobook.transcriptionCancelled"))
+                    LOGGER.info("RESUME step=audiobook.stt book_id=%s chunk=%s", audiobook_id, chunk_number)
 
                 current_progress = checkpoint_dir / f"chunk-{chunk_number:05d}.progress.json"
                 current_progress.unlink(missing_ok=True)
@@ -4152,11 +4511,9 @@ class AudiobookService:
                 "chunk_seconds": _STT_CHUNK_SECONDS,
                 "segments": all_segments,
             }
-            temporary = output.with_suffix(output.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-            )
-            temporary.replace(output)
+            atomic_write_json(output, payload, ensure_ascii=False, separators=(",", ":"))
+            # The per-chunk results (and the worker's log) only duplicated the transcript.
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
             self._set_transcription_job(
                 audiobook_id,
                 {
@@ -4577,7 +4934,7 @@ class AudiobookService:
                 if cached is None:
                     continue
                 try:
-                    parsed = json.loads(str(cached["parsed_json"] or ""))
+                    parsed = unpack_json(cached["parsed_json"] or "")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
                 if not isinstance(parsed, dict):
@@ -4704,7 +5061,7 @@ class AudiobookService:
                 cached = None
         if cached is not None:
             try:
-                parsed = json.loads(str(cached["parsed_json"] or ""))
+                parsed = unpack_json(cached["parsed_json"] or "")
             except (TypeError, ValueError, json.JSONDecodeError, KeyError, IndexError):
                 parsed = None
             if isinstance(parsed, dict):
@@ -4730,12 +5087,12 @@ class AudiobookService:
             and isinstance(payload.get("hints"), list)
         ):
             hints = [dict(row) for row in payload.get("hints") or [] if isinstance(row, dict)]
-            if hints:
-                return hints, {
-                    "source": "prefix_cache",
-                    "hint_count": len(hints),
-                    "chapter_index": int(chapter_index),
-                }
+            # A cached empty answer counts too: the chapter start has no readings to give.
+            return hints, {
+                "source": "prefix_cache",
+                "hint_count": len(hints),
+                "chapter_index": int(chapter_index),
+            }
 
         with self.db.connect() as conn:
             try:
@@ -4775,32 +5132,35 @@ class AudiobookService:
         }
         last_error = ""
         result: dict[str, Any] | None = None
-        for attempt in range(3):
-            try:
-                response = httpx.post(
-                    f"{_CHAPTER_START_JITEN_BASE}/reader/parse",
-                    headers=headers,
-                    json={"text": paragraphs},
-                    timeout=30,
-                )
-                if response.status_code == 429 or response.status_code >= 500:
-                    if attempt < 2:
-                        time.sleep(0.6 * (2**attempt))
-                        continue
-                response.raise_for_status()
-                candidate = response.json() if response.content else {}
-                if isinstance(candidate, dict) and not candidate.get("error_message"):
-                    result = candidate
-                    break
+        from . import jiten_client
+
+        try:
+            # The app's one Jiten client: request and parse budgets, Retry-After,
+            # the outage pause; 4xx answers are not retried. The alignment may hold the
+            # heavy work slot meanwhile (OCR and STT wait for it): never wait long here,
+            # the chapter start is refined without readings instead.
+            response = jiten_client.request(
+                "POST",
+                f"{_CHAPTER_START_JITEN_BASE}/reader/parse",
+                headers=headers,
+                json={"text": paragraphs},
+                timeout=15,
+                attempts=2,
+                interactive=False,
+                max_wait=_CHAPTER_START_JITEN_MAX_WAIT_SECONDS,
+            )
+            response.raise_for_status()
+            candidate = response.json() if response.content else {}
+            if isinstance(candidate, dict) and not candidate.get("error_message"):
+                result = candidate
+            else:
                 last_error = (
                     str(candidate.get("error_message") or "invalid-jiten-response")
                     if isinstance(candidate, dict)
                     else "invalid-jiten-response"
                 )
-            except (httpx.HTTPError, ValueError, TypeError) as exc:
-                last_error = str(exc)
-                if attempt < 2:
-                    time.sleep(0.6 * (2**attempt))
+        except (jiten_client.JitenRefused, httpx.HTTPError, ValueError, TypeError) as exc:
+            last_error = str(exc)
 
         if result is None:
             return [], {
@@ -4840,20 +5200,15 @@ class AudiobookService:
             "jiten_vocabulary_count": int(len(vocabulary_rows)) if isinstance(vocabulary_rows, list) else 0,
             "jiten_reading_field_count": int(reading_field_count),
         }
-        if hints:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            saved = {
-                "schema": "chapter-start-reading-v1",
-                "text_hash": digest,
-                "created_at": time.time(),
-                "hints": hints,
-            }
-            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(saved, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temporary.replace(cache_path)
+        # Also no hints: Jiten answered, and asking again gives the same.
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        saved = {
+            "schema": "chapter-start-reading-v1",
+            "text_hash": digest,
+            "created_at": time.time(),
+            "hints": hints,
+        }
+        atomic_write_json(cache_path, saved, ensure_ascii=False, separators=(",", ":"))
         return hints, metadata
 
     def _extract_global_audio_window(
@@ -4964,6 +5319,9 @@ class AudiobookService:
         chapter_index: int,
         reference_time: float,
         total_duration: float,
+        ln_book_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+        background: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         model = self._chapter_start_precision_model()
         cache = self._chapter_start_precision_cache_path(alignment_output, chapter_index)
@@ -5030,21 +5388,20 @@ class AudiobookService:
             )
             environment.setdefault("PUDGE_MLX_CACHE_LIMIT_BYTES", str(_STT_MLX_CACHE_LIMIT_BYTES))
             environment.setdefault("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(_STT_MLX_MEMORY_LIMIT_BYTES))
-            completed = subprocess.run(
+            if background:
+                mark_background(environment)
+            # Registered with the attempt: cancelling, relinking or quitting stops it.
+            returncode, output = self._run_alignment_child(
                 command,
-                env=environment,
-                text=True,
-                capture_output=True,
+                environment,
+                log_path=work / "worker.log",
                 timeout=max(20 * 60.0, actual_duration * 12.0),
-                check=False,
+                ln_book_id=ln_book_id,
+                cancel_event=cancel_event,
             )
             payload = self._valid_stt_chunk_result(result_path)
-            if completed.returncode != 0 or payload is None:
-                raise RuntimeError(
-                    (completed.stderr or completed.stdout or "precision chapter-start STT failed").strip()[
-                        -1200:
-                    ]
-                )
+            if returncode != 0 or payload is None:
+                raise RuntimeError(output or "precision chapter-start STT failed")
             shifted = self._shift_transcription_segments(
                 [item for item in payload.get("segments") or [] if isinstance(item, dict)],
                 actual_start,
@@ -5059,17 +5416,15 @@ class AudiobookService:
                 "created_at": time.time(),
                 "segments": shifted,
             }
-            temporary = cache.with_suffix(cache.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(saved, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-            )
-            temporary.replace(cache)
+            atomic_write_json(cache, saved, ensure_ascii=False, separators=(",", ":"))
             return shifted, {
                 "cached": False,
                 "model": model,
                 "window_start": saved["window_start"],
                 "window_end": saved["window_end"],
             }
+        except InterruptedError:
+            raise
         except Exception as exc:
             LOGGER.warning(
                 "Chapter-start precision STT failed audio=%s chapter=%s model=%s: %s",
@@ -5138,6 +5493,7 @@ class AudiobookService:
             report_cache = {}
             self._alignment_report_cache = report_cache
         with self._lock:
+            self._alignment_cache_used_at = time.monotonic()
             if cache_key in report_cache:
                 cached = report_cache[cache_key]
                 return dict(cached) if isinstance(cached, dict) else None
@@ -5241,6 +5597,26 @@ class AudiobookService:
             chapter["_runtime_precision_segments"] = precision_segments
         payload.pop("_runtime_audio_position_index", None)
 
+    ALIGNMENT_CACHE_IDLE_SECONDS = 900.0
+
+    def release_idle(self, force: bool = False) -> int:
+        """Forget parsed alignments and reports nobody asked for in 15 minutes (``force``: now)."""
+        lock = getattr(self, "_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return 0
+        try:
+            used_at = float(getattr(self, "_alignment_cache_used_at", 0.0))
+            if not (force or time.monotonic() - used_at >= self.ALIGNMENT_CACHE_IDLE_SECONDS):
+                return 0
+            payloads = getattr(self, "_alignment_payload_cache", None) or {}
+            reports = getattr(self, "_alignment_report_cache", None) or {}
+            dropped = len(payloads) + len(reports)
+            payloads.clear()
+            reports.clear()
+            return dropped
+        finally:
+            lock.release()
+
     def _load_alignment(self, ln_book_id: int, audiobook_id: int) -> dict[str, Any] | None:
         ln_book_id, audiobook_id = int(ln_book_id), int(audiobook_id)
         path = self._alignment_path(ln_book_id, audiobook_id)
@@ -5254,15 +5630,17 @@ class AudiobookService:
                 self._adopt_cache_file(legacy.with_suffix(".report.json"), path.with_suffix(".report.json"))
         cache_key = (ln_book_id, audiobook_id, path.stem)
         with self._lock:
+            self._alignment_cache_used_at = time.monotonic()
             cached = self._alignment_payload_cache.pop(cache_key, None)
             if cached is not None:
                 self._alignment_payload_cache[cache_key] = cached  # most recent last
         if cached is not None:
             return cached
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            payload = None
+        with memory_step(LOGGER, "audiobook.alignment_load", ln_book=ln_book_id, audiobook=audiobook_id):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                payload = None
         if not (isinstance(payload, dict) and payload.get("schema") == "reading-audio-v3"):
             payload = self._migrate_compatible_alignment(ln_book_id, audiobook_id, path)
         if isinstance(payload, dict) and payload.get("schema") == "reading-audio-v3":
@@ -5279,6 +5657,31 @@ class AudiobookService:
         return None
 
     def _migrate_compatible_alignment(
+        self, ln_book_id: int, audiobook_id: int, destination: Path
+    ) -> dict[str, Any] | None:
+        """``_scan_compatible_alignment`` once per alignment folder state: a miss (nothing
+        compatible, e.g. while STT for a linked book still runs) is remembered until a file is
+        added or removed there, instead of parsing every cached alignment on each reader poll."""
+        root = self.cache_dir / "reading-audio-alignment"
+        try:
+            # The folder and its files' times (stat only, no JSON read): a file written in place
+            # counts as a change too.
+            with os.scandir(root) as entries:
+                times = [entry.stat().st_mtime_ns for entry in entries if entry.name.endswith(".json")]
+            signature = (destination.stem, root.stat().st_mtime_ns, len(times), max(times, default=0))
+        except OSError:
+            signature = None
+        misses = self.__dict__.setdefault("_alignment_migration_misses", set())
+        if signature is not None and signature in misses:
+            return None
+        payload = self._scan_compatible_alignment(ln_book_id, audiobook_id, destination)
+        if payload is None and signature is not None:
+            if len(misses) > 256:
+                misses.clear()
+            misses.add(signature)
+        return payload
+
+    def _scan_compatible_alignment(
         self, ln_book_id: int, audiobook_id: int, destination: Path
     ) -> dict[str, Any] | None:
         """Reuse a pre-title-fingerprint alignment when chapter text is identical.
@@ -5383,11 +5786,7 @@ class AudiobookService:
             migrated_processing["migrated_from_fingerprint"] = candidate.stem
             migrated["processing"] = migrated_processing
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(migrated, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-            )
-            temporary.replace(destination)
+            atomic_write_json(destination, migrated, ensure_ascii=False, separators=(",", ":"))
             report = build_alignment_report(
                 migrated,
                 [
@@ -5396,11 +5795,7 @@ class AudiobookService:
                 ],
             )
             report_path = destination.with_suffix(".report.json")
-            report_tmp = report_path.with_suffix(".tmp")
-            report_tmp.write_text(
-                json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-            )
-            report_tmp.replace(report_path)
+            atomic_write_json(report_path, report, ensure_ascii=False, separators=(",", ":"))
             return migrated
         return None
 
@@ -5544,6 +5939,111 @@ class AudiobookService:
                 "audiobook_id": int(audiobook_id),
             }
 
+    def _alignment_heavy_lease(
+        self,
+        ln_book_id: int,
+        audiobook_id: int,
+        generation: int,
+        cancel_event: threading.Event,
+        priority: WorkPriority,
+        lease: Any | None = None,
+    ) -> Any | None:
+        """The heavy-work slot for an alignment step (kept, or given up and taken again)."""
+        scheduler = self.work_scheduler
+        if scheduler is None:
+            return lease
+        if lease is not None:
+            reason = self._stt_yield_reason(priority)
+            if reason is None:
+                return lease
+            LOGGER.info("PAUSE step=ln_audio.align ln=%s reason=%s", ln_book_id, reason)
+            lease.release()
+        else:
+            lease = scheduler.acquire_heavy(
+                "audiobook-alignment", blocking=False, foreground_sensitive=True, priority=priority
+            )
+            if lease is not None:
+                return lease
+            reason = self._stt_yield_reason(priority) or "heavy_work"
+        self._set_alignment_job(
+            ln_book_id,
+            audiobook_id,
+            {"status": "queued", "ready": False, "wait_reason": reason},
+            generation=generation,
+            cancel_event=cancel_event,
+        )
+        lease = scheduler.acquire_heavy(
+            "audiobook-alignment",
+            blocking=True,
+            foreground_sensitive=True,
+            wait_for_foreground=True,
+            cancel_event=cancel_event,
+            priority=priority,
+        )
+        if lease is None:
+            raise InterruptedError(err("audiobook.alignmentCancelled"))
+        self._set_alignment_job(
+            ln_book_id,
+            audiobook_id,
+            {"status": "aligning", "ready": False, "wait_reason": ""},
+            generation=generation,
+            cancel_event=cancel_event,
+        )
+        return lease
+
+    def _run_alignment_child(
+        self,
+        command: list[str],
+        environment: dict[str, str],
+        *,
+        log_path: Path,
+        timeout: float,
+        ln_book_id: int | None,
+        cancel_event: threading.Event | None,
+    ) -> tuple[int, str]:
+        """A helper process of an alignment attempt, registered so cancel and quit stop it.
+
+        Returns its exit code and the end of its output. Raises InterruptedError
+        (cancelled) or subprocess.TimeoutExpired.
+        """
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                command, env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT
+            )
+        if ln_book_id is not None:
+            with self._lock:
+                self._alignment_processes[int(ln_book_id)] = process
+        try:
+            started = time.monotonic()
+            while process.poll() is None:
+                cancelled = (
+                    cancel_event is not None and cancel_event.is_set()
+                ) or self._closed_event.is_set()
+                if cancelled or time.monotonic() - started > timeout:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    if cancelled:
+                        raise InterruptedError(err("audiobook.alignmentCancelled"))
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(0.1)
+            # Stopped from outside (a cancelled attempt, quitting): not a failure of the step.
+            if (cancel_event is not None and cancel_event.is_set()) or self._closed_event.is_set():
+                raise InterruptedError(err("audiobook.alignmentCancelled"))
+        finally:
+            if ln_book_id is not None:
+                with self._lock:
+                    if self._alignment_processes.get(int(ln_book_id)) is process:
+                        self._alignment_processes.pop(int(ln_book_id), None)
+        try:
+            output = log_path.read_text(encoding="utf-8", errors="replace").strip()[-1200:]
+        except OSError:
+            output = ""
+        return int(process.returncode or 0), output
+
     def _prepare_alignment_worker(
         self,
         ln_book_id: int,
@@ -5583,10 +6083,15 @@ class AudiobookService:
                 status = self.transcription_status(int(audiobook_id))
                 raise RuntimeError(str(status.get("error") or err("audiobook.transcriptionUnavailable")))
             all_segments = [dict(item) for item in transcript.get("segments") or [] if isinstance(item, dict)]
+            # The alignment child and the chapter-start speech-to-text run in the heavy-work
+            # slot like the transcription: two MLX processes used to run side by side.
+            heavy_lease = self._alignment_heavy_lease(
+                ln_book_id, audiobook_id, generation, cancel_event, requested_priority
+            )
             self._set_alignment_job(
                 ln_book_id,
                 audiobook_id,
-                {"status": "aligning", "ready": False},
+                {"status": "aligning", "ready": False, "wait_reason": ""},
                 generation=generation,
                 cancel_event=cancel_event,
             )
@@ -5609,6 +6114,7 @@ class AudiobookService:
                     model=self.stt_model,
                     speech_regions=speech_regions,
                     chapter_start_reading_hints=chapter_start_reading_hints,
+                    minimum_anchor_density=MIN_ANCHORS_PER_100_CHARACTERS,
                 ),
                 ln_book_id=int(ln_book_id),
                 cancel_event=cancel_event,
@@ -5638,6 +6144,10 @@ class AudiobookService:
                 chapter_rows = {int(row.get("chapter_index") or 0): row for row in chapters}
                 for candidate in precision_candidates:
                     self._require_alignment_attempt(ln_book_id, audiobook_id, generation, cancel_event)
+                    # Each chapter-start window may give the slot to more urgent work first.
+                    heavy_lease = self._alignment_heavy_lease(
+                        ln_book_id, audiobook_id, generation, cancel_event, requested_priority, heavy_lease
+                    )
                     chapter_index = int(candidate.get("chapter_index") or 0)
                     reference_time = self._alignment_chapter_reference_time(candidate)
                     reading_metadata: dict[str, Any] = {
@@ -5660,6 +6170,9 @@ class AudiobookService:
                         chapter_index=chapter_index,
                         reference_time=reference_time,
                         total_duration=book_duration,
+                        ln_book_id=int(ln_book_id),
+                        cancel_event=cancel_event,
+                        background=requested_priority >= WorkPriority.BACKGROUND,
                     )
                     metadata = {
                         **metadata,
@@ -5691,6 +6204,7 @@ class AudiobookService:
                             speech_regions=speech_regions,
                             chapter_start_segments=precision_segments,
                             chapter_start_reading_hints=chapter_start_reading_hints,
+                            minimum_anchor_density=MIN_ANCHORS_PER_100_CHARACTERS,
                         ),
                         ln_book_id=int(ln_book_id),
                         cancel_event=cancel_event,
@@ -5826,7 +6340,13 @@ class AudiobookService:
             self._set_alignment_job(
                 ln_book_id,
                 audiobook_id,
-                {"status": "error", "ready": False, "error": str(exc)},
+                {
+                    "status": "error",
+                    "ready": False,
+                    "error": str(exc),
+                    # The reader offers to link another audiobook.
+                    "mismatch": str(exc) == err("audiobook.audioDoesNotMatchText"),
+                },
                 generation=generation,
                 cancel_event=cancel_event,
             )
@@ -5933,46 +6453,6 @@ class AudiobookService:
                         self._alignment_processes.pop(int(ln_book_id), None)
             for path in (request_path, result_path, stderr_path):
                 path.unlink(missing_ok=True)
-
-    def alignment_report(self, ln_book_id: int) -> dict[str, Any]:
-        link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
-        if link is None:
-            return {"status": "unlinked", "ready": False}
-        audiobook_id = int(link["book"]["id"])
-        report = self._load_alignment_report(int(ln_book_id), audiobook_id)
-        if report is None:
-            alignment = self._load_alignment(int(ln_book_id), audiobook_id)
-            if alignment is None:
-                return {"status": "not_prepared", "ready": False}
-            with self.db.connect() as conn:
-                chapters = [
-                    dict(row)
-                    for row in conn.execute(
-                        "SELECT chapter_index,title,text FROM ln_chapters WHERE book_id=? ORDER BY chapter_index",
-                        (int(ln_book_id),),
-                    ).fetchall()
-                ]
-            report = build_alignment_report(alignment, chapters)
-        return {"status": "ready", "ready": True, **report}
-
-    def reprocess_alignment(
-        self,
-        ln_book_id: int,
-        *,
-        clear_transcription: bool = False,
-    ) -> dict[str, Any]:
-        link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
-        if link is None:
-            raise KeyError(err("audiobook.noLinkedAudiobook", bookId=ln_book_id))
-        audiobook_id = int(link["book"]["id"])
-        with self._lock:
-            self._cancel_alignment_attempt_locked(int(ln_book_id))
-            self._alignment_jobs.pop(int(ln_book_id), None)
-        self._alignment_path(int(ln_book_id), audiobook_id).unlink(missing_ok=True)
-        self._alignment_report_path(int(ln_book_id), audiobook_id).unlink(missing_ok=True)
-        if clear_transcription:
-            self._transcript_path(audiobook_id).unlink(missing_ok=True)
-        return self.prepare_alignment(int(ln_book_id), force=False)
 
     def prepare_alignment(
         self,
@@ -6101,11 +6581,8 @@ class AudiobookService:
             if cc:
                 signals.append(f"{cc} audio chapters")
             # Existing transcript is useful evidence, but candidate discovery must never launch STT.
-            transcript = self._load_transcript(aid)
-            if transcript and ln_sample:
-                spoken = jpkey(
-                    "".join(str(seg.get("text") or "") for seg in (transcript.get("segments") or [])[:160])
-                )[:12000]
+            if ln_sample:
+                spoken = jpkey(self._transcript_opening(aid))[:12000]
                 if spoken:
                     grams = lambda x: {x[i : i + 4] for i in range(max(0, len(x) - 3))}
                     a, b = grams(ln_sample), grams(spoken)
@@ -6175,18 +6652,6 @@ class AudiobookService:
             ]:
                 contexts.pop(audiobook_id, None)
         return {"ok": True}
-
-    def stop_for_light_novel(self, ln_book_id: int) -> dict[str, Any]:
-        link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
-        if link is None:
-            return {"ok": True, "stopped": False, "audiobook_id": None}
-        audiobook_id = int(link["book"]["id"])
-        result = self.stop(audiobook_id)
-        return {
-            "ok": True,
-            "stopped": bool(result.get("stopped")),
-            "audiobook_id": audiobook_id,
-        }
 
     def link_for_light_novel(
         self, ln_book_id: int, *, include_alignment: bool = True, include_transcription: bool = True
@@ -6484,6 +6949,101 @@ class AudiobookService:
             "speed": float(book["speed"] or 1.0),
         }
 
+    def _file_span_signature(self, audiobook_id: int) -> tuple[tuple[int, float, float], ...]:
+        """Its files' places in the book: books whose caches could be the same share it."""
+        return tuple(
+            (int(row["file_index"]), round(float(row["start"]), 3), round(float(row["end"]), 3))
+            for row in self._file_rows(int(audiobook_id))
+        )
+
+    def _book_cache_files(self, audiobook_id: int, ln_book_ids: list[int]) -> set[Path]:
+        """Alignment caches of a book's LN links (minutes to make again).
+
+        Its speech-to-text and speech map stay: they are named by the audio's
+        content, so adding the same files again reuses hours of Whisper; the cache
+        maintenance removes those no book used for half a year (touch_book_caches).
+        """
+        files: set[Path] = set()
+        for ln_book_id in ln_book_ids:
+            alignment = self._alignment_path(int(ln_book_id), int(audiobook_id))
+            files.update({alignment, self._alignment_report_path(int(ln_book_id), int(audiobook_id))})
+            try:
+                files.update(
+                    (self.cache_dir / "reading-audio-chapter-start-stt").glob(f"{alignment.stem}-ch*.json")
+                )
+            except OSError:
+                pass
+        return files
+
+    def _prune_deleted_book_caches(self, doomed: set[Path], signatures: set[tuple[Any, ...]]) -> int:
+        """Remove alignment caches of deleted books that no remaining link uses.
+
+        Caches are named by the content, so they outlived the books (and were never
+        evicted). A remaining copy of the same audio keeps them.
+        """
+        if not doomed:
+            return 0
+        kept: set[Path] = set()
+        with self.db.connect() as conn:
+            remaining = [int(row["id"]) for row in conn.execute("SELECT id FROM audiobooks").fetchall()]
+            links = conn.execute("SELECT ln_book_id,audiobook_id FROM reading_audio_links").fetchall()
+        for audiobook_id in remaining:
+            if self._file_span_signature(audiobook_id) not in signatures:
+                continue
+            kept |= self._book_cache_files(
+                audiobook_id,
+                [int(row["ln_book_id"]) for row in links if int(row["audiobook_id"]) == audiobook_id],
+            )
+        removed = 0
+        for path in doomed - kept:
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                elif path.exists() or path.is_symlink():
+                    path.unlink()
+                else:
+                    continue
+                removed += 1
+            except OSError as exc:
+                LOGGER.debug("SKIP step=audiobook.cache_prune path=%s error=%r", path, str(exc))
+        if removed:
+            LOGGER.info("DONE step=audiobook.cache_prune removed=%s", removed)
+        return removed
+
+    def touch_book_caches(self, *, now: float | None = None) -> int:
+        """Mark the speech-to-text, chunks and speech maps of the library's books as used.
+
+        The cache maintenance removes the ones unused for half a year (a deleted
+        book's). A book whose files are away (an unplugged drive) cannot be named by
+        content here; its caches are marked again when the files are back.
+        """
+        current = float(time.time() if now is None else now)
+        touched = 0
+        with self.db.connect() as conn:
+            ids = [int(row["id"]) for row in conn.execute("SELECT id FROM audiobooks").fetchall()]
+        for audiobook_id in ids:
+            try:
+                if not all(Path(str(row["path"])).is_file() for row in self._file_rows(audiobook_id)):
+                    continue
+                transcript = self._transcript_path(audiobook_id)
+                self._remember_cache_names(audiobook_id, transcript)
+                paths = (
+                    transcript,
+                    self._transcription_checkpoint_dir(transcript),
+                    self._activity_path(audiobook_id),
+                )
+            except (OSError, ValueError, sqlite3.Error):
+                continue
+            for path in paths:
+                try:
+                    if path.exists() and current - path.stat().st_mtime > 24 * 3600:
+                        os.utime(path, (current, current))
+                        touched += 1
+                except OSError:
+                    continue
+        self._save_content_identities(force=True)
+        return touched
+
     def delete_many(self, book_ids: list[int], *, delete_files: bool = False) -> dict[str, Any]:
         ids = list(dict.fromkeys(int(value) for value in book_ids if int(value) > 0))
         if not ids:
@@ -6492,8 +7052,20 @@ class AudiobookService:
         with self.db.connect() as conn:
             placeholders = ",".join("?" for _ in ids)
             links = conn.execute(
-                f"SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})", ids
+                f"SELECT ln_book_id,audiobook_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})",
+                ids,
             ).fetchall()
+        # Named while the rows (and their files) are still there.
+        cache_files: dict[int, set[Path]] = {}
+        signatures: dict[int, tuple[Any, ...]] = {}
+        for book_id in ids:
+            try:
+                cache_files[book_id] = self._book_cache_files(
+                    book_id, [int(row["ln_book_id"]) for row in links if int(row["audiobook_id"]) == book_id]
+                )
+                signatures[book_id] = self._file_span_signature(book_id)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                LOGGER.debug("SKIP step=audiobook.cache_names book_id=%s error=%r", book_id, str(exc))
         for link in links:
             self.unlink_light_novel(int(link["ln_book_id"]))
         # Only touch expensive runtime state for jobs/players that actually exist.
@@ -6533,13 +7105,26 @@ class AudiobookService:
             ):
                 conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", ids)
             conn.execute(f"DELETE FROM audiobooks WHERE id IN ({placeholders})", ids)
+            # Their speech-to-text is no longer the library's: it ages out (cache cleanup).
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(f"{AUDIOBOOK_CACHE_NAMES_PREFIX}{book_id}",) for book_id in ids],
+            )
             library_overrides.forget(conn, "audiobook", ids)
             self._overrides = None
 
         removed = [book_id for book_id in ids if book_id in found]
+        try:
+            self._prune_deleted_book_caches(
+                set().union(*(cache_files.get(book_id, set()) for book_id in removed)),
+                {signatures[book_id] for book_id in removed if book_id in signatures},
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            LOGGER.warning("SKIP step=audiobook.cache_prune error=%r", str(exc))
         # P10: no review boundary, speed or position sample may outlive the row.
         with self._lock:
             for book_id in ids:
+                self.__dict__.get("_cache_names_memo", {}).pop(book_id, None)
                 for name in ("_review_contexts", "_speeds", "_position_generations", "_last_positions"):
                     getattr(self, name, {}).pop(book_id, None)
         if delete_files:

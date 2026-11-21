@@ -303,10 +303,10 @@ def test_numbering_failures_are_logged(caplog, tmp_path):
 
 
 def test_mirror_without_seeders_is_unknown_not_dead():
-    rss = """<?xml version="1.0"?><rss xmlns:nyaa="https://nyaa.net/xmlns/nyaa"><channel>
-      <item><title>[Group] Show - 03 [1080p].mkv</title><link>https://nyaa.net/download/1.torrent</link><guid>https://nyaa.net/view/1</guid>
+    rss = """<?xml version="1.0"?><rss xmlns:nyaa="https://mirror-a.invalid/xmlns/nyaa"><channel>
+      <item><title>[Group] Show - 03 [1080p].mkv</title><link>https://mirror-a.invalid/download/1.torrent</link><guid>https://mirror-a.invalid/view/1</guid>
       <nyaa:infoHash>abc</nyaa:infoHash><nyaa:size>1.0 GiB</nyaa:size></item>
-      <item><title>[Group] Show - 03 [1080p] v2.mkv</title><link>https://nyaa.net/download/2.torrent</link><guid>https://nyaa.net/view/2</guid>
+      <item><title>[Group] Show - 03 [1080p] v2.mkv</title><link>https://mirror-a.invalid/download/2.torrent</link><guid>https://mirror-a.invalid/view/2</guid>
       <nyaa:infoHash>def</nyaa:infoHash><nyaa:size>1.0 GiB</nyaa:size><nyaa:seeders>0</nyaa:seeders></item>
     </channel></rss>"""
     unknown, dead = nyaa.parse_rss(rss)
@@ -341,7 +341,7 @@ def test_mirror_without_seeders_is_unknown_not_dead():
 
 def test_manual_search_runs_queries_in_parallel_and_caches_them(monkeypatch):
     nyaa._MANUAL_QUERY_CACHE.clear()
-    client = nyaa.NyaaClient("https://nyaa.si")
+    client = nyaa.NyaaClient("https://releases.invalid")
     seen = []
     active = {"now": 0, "max": 0}
     import threading
@@ -371,7 +371,7 @@ def test_manual_search_runs_queries_in_parallel_and_caches_them(monkeypatch):
 
 def test_manual_search_stops_at_the_deadline(monkeypatch):
     nyaa._MANUAL_QUERY_CACHE.clear()
-    client = nyaa.NyaaClient("https://nyaa.si")
+    client = nyaa.NyaaClient("https://releases.invalid")
     monkeypatch.setattr(nyaa, "MANUAL_SEARCH_DEADLINE_SECONDS", 0.2)
     monkeypatch.setattr(client, "search", lambda query, **_k: time.sleep(0.5) or [])
     started = time.monotonic()

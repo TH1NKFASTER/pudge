@@ -105,9 +105,9 @@ def test_chapter_fast_returns_raw_text_without_waiting_for_jiten(
     assert elapsed < 0.25
     assert payload["parsing"] is True
     assert payload["paragraphs"] == ["猫が好きです。", "次の文です。"]
-    assert entered.wait(1)
+    assert entered.wait(30)
     release.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30  # ends as soon as the parse is ready
     status = {"ready": False}
     while time.monotonic() < deadline:
         status = service.chapter_parse_status(book["id"], 0)

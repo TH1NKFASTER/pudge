@@ -55,7 +55,7 @@ def test_compact_status_and_download_center_rates(page) -> None:
             const later = __text('#currentContent [data-media-id="7"] [data-live-download="aaa"]');
             void openDownloadCenter(null); await __tick(100);
             const noEta = compactDownloadStatus({...DOWNLOAD, eta_seconds: 0});
-            return {card, later, noEta, row: __text('#modalBody [data-download-hash="aaa"]'),
+            return {card, later, noEta, row: __text('#modalBody [data-torrent-row="aaa"]'),
                     eta: PudgeI18n.t('home.eta', {time: torrentEta(600)}), down: torrentRate(2097152), up: torrentRate(1024),
                     downloading: torrentUiLabel('downloading', ui.lang)};
             """.replace("DOWNLOAD", json.dumps(DOWNLOAD)),
@@ -68,5 +68,5 @@ def test_compact_status_and_download_center_rates(page) -> None:
         assert out["card"] == out["later"] == f"42% · {out['eta']}"
         assert out["down"] not in out["card"] and out["downloading"] not in out["card"]
         assert out["noEta"] == "42%"  # no ETA until the backend knows one
-        # The download center row has the rates in both directions.
-        assert f"↓\n{out['down']}\n↑\n{out['up']}" in out["row"]
+        # The download center row has the rates in both directions (its ↓ and ↑ columns).
+        assert f"{out['down']}\n{out['up']}" in out["row"]

@@ -62,7 +62,7 @@ def test_vn_permission_preflight_is_diagnostic_and_capture_still_starts(monkeypa
     monkeypatch.setattr(service, "_capture_loop", fake_loop)
     service.start(123, "Game")
 
-    assert entered.wait(1.0)
+    assert entered.wait(30)
     state = service.state()
     assert state.get("error_code") != "permission_required"
     assert state["capture_backend"] == "screencapturekit"

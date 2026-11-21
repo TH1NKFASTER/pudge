@@ -83,3 +83,17 @@ a.sidebar-due-word:focus-visible{outline:2px solid var(--accent,#8196ff);outline
 /* Same visual as media.css .audiobook-chapter-hover; repeated so the float document (no media.css) renders it too. */
 .sidebar-audio-scrubber .audiobook-chapter-hover{position:absolute;z-index:2;top:50%;height:8px;transform:translateY(-50%);border:1px solid rgba(87,211,140,.95);border-radius:999px;background:repeating-linear-gradient(135deg,rgba(87,211,140,.92) 0 3px,rgba(87,211,140,.2) 3px 6px);box-shadow:0 0 0 1px rgba(5,12,22,.45),0 0 10px rgba(87,211,140,.28);pointer-events:none;opacity:0;transition:opacity .08s ease}
 .sidebar-audio-scrubber .audiobook-chapter-hover.show{opacity:1}
+/* Read-along text (audiobook_transcript.js): the "Text" toggle sits between the player's times. */
+.sidebar-audio-time{align-items:center}
+.sidebar-audio-text-toggle{padding:1px 7px;font-size:9px;line-height:1.4;border-radius:99px;color:var(--muted)}.sidebar-audio-text-toggle.active{color:#fff;background:var(--accent,#4a68e0);border-color:var(--accent,#4a68e0)}
+.sidebar-audio.transcript-open [data-sc-live-text]{display:none}
+.sidebar-audio-transcript{position:relative;display:flex;flex-direction:column;min-height:0;height:16em;max-width:100%}
+.abt-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:2px 1px;font-family:var(--ln-font-family,"Hiragino Mincho ProN","Yu Mincho",serif);font-size:13px;line-height:1.6;user-select:text;-webkit-user-select:text}
+.abt-line{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px;align-items:baseline;padding:2px 4px;border-radius:5px;cursor:pointer;content-visibility:auto;contain-intrinsic-size:auto 1.6em;opacity:.72}
+.abt-line:hover{background:rgba(111,140,255,.07);opacity:1}.abt-line.current{background:rgba(111,140,255,.16);opacity:1}
+.abt-time{padding:0;border:0;background:transparent;color:var(--muted);font:9px/1.8 -apple-system,BlinkMacSystemFont,sans-serif;font-variant-numeric:tabular-nums;cursor:pointer}.abt-time:hover{background:transparent;color:var(--accent-text,#8aa2ff)}
+.abt-text{min-width:0;overflow-wrap:anywhere}.abt-text p{margin:0;display:inline}.abt-text .pudge-study-word{cursor:pointer}.abt-text rt{font-size:.5em}
+.abt-chapter{margin:6px 4px 2px;color:var(--muted);font:600 9px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;text-transform:uppercase;letter-spacing:.06em}
+.abt-status{padding:8px 4px;color:var(--muted);font:11px/1.4 -apple-system,BlinkMacSystemFont,sans-serif}
+.abt-follow{position:absolute;right:6px;bottom:6px;padding:3px 9px;font-size:10px;border-radius:99px;background:var(--accent,#4a68e0);border-color:var(--accent,#4a68e0);color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.sidebar-audio.text-in-float .sidebar-audio-transcript{display:none}

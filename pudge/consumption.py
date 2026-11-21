@@ -5,6 +5,7 @@ import json
 import math
 import os
 import platform
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .database import Database
+from .database import STATE_PREFIX_SQL, Database, state_prefix_bounds
 
 # Lower is stronger: aliases that identify this exact file/library item.
 _ALIAS_PRIORITY = {"content": 0, "path": 1, "video_path": 1, "legacy_fingerprint": 2, "local": 3}
@@ -100,6 +101,48 @@ def _file_sample_fingerprint(path: Path, *, sample_bytes: int = 65536) -> str:
         return ""
 
 
+class VnReadingGate:
+    """Whether a running visual-novel capture counts as reading right now.
+
+    Capture time is an estimate of reading time. It is not reading while the capture is
+    paused (the Screen text panel pauses it while the game is in the background) or once no
+    new text was read for IDLE_SECONDS (the game left open; the same 5 minutes without an
+    interaction that stop the light-novel and manga readers' clocks). New text counts again
+    at once. ``now`` is a monotonic clock value.
+    """
+
+    IDLE_SECONDS = 300.0
+
+    def __init__(self) -> None:
+        self._marker: tuple[Any, ...] | None = None
+        self._changed_at = 0.0
+        self._paused = False
+
+    def reading(self, session_id: str, state: dict[str, Any], now: float) -> bool:
+        if not session_id or not state.get("running"):
+            self._marker = None
+            self._paused = False
+            return False
+        transcript = state.get("transcript") or []
+        last = transcript[-1] if transcript else None
+        marker = (
+            str(session_id),
+            state.get("generation"),
+            state.get("current_text_id"),
+            last.get("id") if isinstance(last, dict) else None,
+        )
+        paused = bool(state.get("paused"))
+        if marker != self._marker or (self._paused and not paused):
+            # New text, a capture that just started (its first text is still to come) or
+            # the game brought back to the front: reading from now on.
+            self._marker = marker
+            self._changed_at = float(now)
+        self._paused = paused
+        if paused:
+            return False
+        return float(now) - self._changed_at <= self.IDLE_SECONDS
+
+
 class ConsumptionLedger:
     """Durable, append-only foundation for immersion statistics.
 
@@ -108,9 +151,16 @@ class ConsumptionLedger:
     the existing media tables and is never reconstructed from this ledger.
     """
 
+    # A reader or player reports every 5 s. Naming its book again each time re-read every
+    # audio file's samples (an audiobook), every chapter's text (a light novel) or the
+    # archive's ends (manga); the name is kept this long instead.
+    MEDIA_REF_SECONDS = 60.0
+
     def __init__(self, database: Database, *, logger: Any = None) -> None:
         self.database = database
         self.logger = logger
+        self._media_refs: dict[tuple[str, int], tuple[float, ConsumptionMediaRef]] = {}
+        self._media_refs_lock = threading.Lock()
 
     @staticmethod
     def _history_epoch_conn(conn: Any) -> int:
@@ -123,10 +173,6 @@ class ConsumptionLedger:
             )
             return 0
         return int(row["reset_epoch"] or 0)
-
-    def history_epoch(self) -> int:
-        with self.database.connect() as conn:
-            return self._history_epoch_conn(conn)
 
     @staticmethod
     def _ensure_remote_device(conn: Any, device_id: str, device_name: str = "") -> None:
@@ -313,6 +359,8 @@ class ConsumptionLedger:
                 """,
                 (now, now, str(kind or "").casefold(), str(local_id)),
             )
+        with self._media_refs_lock:
+            self._media_refs.clear()
         return bool(cursor.rowcount)
 
     def anime_episode_media(self, video_path: Path) -> ConsumptionMediaRef | None:
@@ -880,13 +928,30 @@ class ConsumptionLedger:
 
     def _media_for_local(self, kind: str, local_id: int) -> ConsumptionMediaRef | None:
         normalized = str(kind or "").strip().casefold()
-        if normalized in {"light_novel", "novel", "ln"}:
-            return self.light_novel_media(int(local_id))
-        if normalized == "manga":
-            return self.manga_media(int(local_id))
-        if normalized == "audiobook":
-            return self.audiobook_media(int(local_id))
-        return None
+        if normalized in {"novel", "ln"}:
+            normalized = "light_novel"
+        if normalized not in {"light_novel", "manga", "audiobook"}:
+            return None
+        key = (normalized, int(local_id))
+        now = time.monotonic()
+        with self._media_refs_lock:
+            kept = self._media_refs.get(key)
+        if kept is not None and 0.0 <= now - kept[0] < self.MEDIA_REF_SECONDS:
+            return kept[1]
+        if normalized == "light_novel":
+            media_ref = self.light_novel_media(int(local_id))
+        elif normalized == "manga":
+            media_ref = self.manga_media(int(local_id))
+        else:
+            media_ref = self.audiobook_media(int(local_id))
+        with self._media_refs_lock:
+            if media_ref is None:
+                self._media_refs.pop(key, None)
+            else:
+                if len(self._media_refs) > 64:
+                    self._media_refs.clear()
+                self._media_refs[key] = (now, media_ref)
+        return media_ref
 
     def record_reader_activity(
         self,
@@ -1241,7 +1306,9 @@ class ConsumptionLedger:
         conn.execute("DELETE FROM consumption_manual_entries")
         conn.execute("DELETE FROM consumption_daily_rollups")
         # Statistics volume summaries (consumption_statistics.VOLUME_ROLLUP_PREFIX).
-        conn.execute("DELETE FROM state WHERE substr(key,1,26)='consumption_volume_rollup:'")
+        conn.execute(
+            f"DELETE FROM state WHERE {STATE_PREFIX_SQL}", state_prefix_bounds("consumption_volume_rollup:")
+        )
         conn.execute(
             """INSERT INTO consumption_history_state(profile_id,reset_epoch,reset_at_utc) VALUES('default',?,?)
                ON CONFLICT(profile_id) DO UPDATE SET reset_epoch=excluded.reset_epoch,reset_at_utc=excluded.reset_at_utc""",
@@ -1254,16 +1321,3 @@ class ConsumptionLedger:
             epoch = self._history_epoch_conn(conn) + 1
             self._delete_history_conn(conn, new_epoch=epoch, reset_at=now)
         return {"ok": True, "reset_epoch": epoch, "reset_at_utc": now}
-
-    def ledger_counts(self) -> dict[str, int]:
-        with self.database.connect() as conn:
-            values = {}
-            for key, table in (
-                ("media", "consumption_media"),
-                ("sessions", "consumption_sessions"),
-                ("events", "consumption_events"),
-                ("vn_titles", "vn_titles"),
-            ):
-                row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
-                values[key] = int(row["n"] if row else 0)
-        return values

@@ -12,7 +12,7 @@ def _story() -> str:
     # Deliberately varied Japanese text so prefix matching is not driven by
     # common particles alone.
     base = (
-        "小高い丘が延々と続く。朝靄の向こうで荷馬車の鈴が静かに鳴った。"
+        "白い砂浜が延々と続く。朝靄の向こうで荷馬車の鈴が静かに鳴った。"
         "旅人は革の手綱を握り直し遠くの町へ続く道を見つめていた。"
         "冷たい風が麦畑を渡り古い外套の裾を揺らした。"
         "やがて雲の切れ間から淡い陽射しが差し込み道標の文字を照らした。"

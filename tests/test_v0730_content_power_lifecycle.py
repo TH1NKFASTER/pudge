@@ -280,10 +280,13 @@ def test_select_hidden_disabled_and_reenabled_behavior():
     subprocess.run(["node", str(Path(__file__).parent / "js/select_visibility.cjs")], check=True)
 
 
-def test_scheduler_checks_database_before_constructing_manager(tmp_path):
+def test_scheduler_checks_database_before_constructing_manager(tmp_path, monkeypatch):
     from pudge.agent import scheduled_work_due
     from pudge.manager_models import LibraryAnime
 
+    # Heavy work is due only while Pudge is open and its window is not in use (review MAC-5).
+    monkeypatch.setattr("pudge.agent.app_session_active", lambda: True)
+    monkeypatch.setattr("pudge.agent.app_session_window_active", lambda: False)
     cfg = AppConfig()
     cfg.library.database_path = tmp_path / "db.sqlite3"
     cfg.anilist.enabled = False

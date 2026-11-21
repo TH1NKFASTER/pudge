@@ -97,6 +97,20 @@ def _ln_range(media: dict[str, Any]) -> tuple[str, float, float] | None:
     return chapter0, start, end
 
 
+def ln_segment_characters(segment: dict[str, Any]) -> float:
+    """Characters aggregate_volume counts as consumed for one light-novel segment."""
+    if _kind(segment.get("kind")) != "light_novel":
+        return 0.0
+    total = 0.0
+    for media in segment.get("media") or []:
+        if not str(media.get("media_uuid") or ""):
+            continue
+        interval = _ln_range(media)
+        if interval is not None:
+            total += interval[2] - interval[1]
+    return total
+
+
 def _manga_page(media: dict[str, Any]) -> str:
     locator = media.get("locator_end") or media.get("locator_start") or {}
     page = str(locator.get("page_id") or "").strip()
@@ -104,6 +118,19 @@ def _manga_page(media: dict[str, Any]) -> str:
         return page
     value = locator.get("page_index")
     return f"page:{int(value or 0)}"
+
+
+def _manga_shown(media: dict[str, Any]) -> tuple[str, ...]:
+    """The pages on screen: one, or both of two pages side by side (`page_ids`)."""
+    locator = media.get("locator_end") or media.get("locator_start") or {}
+    pair = locator.get("page_ids")
+    if (
+        isinstance(pair, list)
+        and 1 <= len(pair) <= 2
+        and all(isinstance(item, str) and item.strip() for item in pair)
+    ):
+        return tuple(dict.fromkeys(item.strip() for item in pair))
+    return (_manga_page(media),)
 
 
 def _media_metadata(database: Database) -> dict[str, dict[str, Any]]:
@@ -128,7 +155,8 @@ def _media_metadata(database: Database) -> dict[str, dict[str, Any]]:
 def _manga_visits(segments: list[dict[str, Any]]) -> dict[tuple[str, str], list[str]]:
     # Stable page visits, not heartbeats. A visit is accepted only after enough
     # dwell, and leaving + returning creates a repeat visit.
-    observations: dict[tuple[str, str], list[tuple[float, float, str]]] = defaultdict(list)
+    # Two pages side by side are one visit of both pages (each counted once).
+    observations: dict[tuple[str, str], list[tuple[float, float, tuple[str, ...]]]] = defaultdict(list)
     for segment in segments:
         if _kind(segment.get("kind")) != "manga":
             continue
@@ -139,12 +167,12 @@ def _manga_visits(segments: list[dict[str, Any]]) -> dict[tuple[str, str], list[
                 continue
             revision = str(media.get("source_revision") or "")
             observations[(media_uuid, revision)].append(
-                (float(segment.get("start") or 0.0), seconds, _manga_page(media))
+                (float(segment.get("start") or 0.0), seconds, _manga_shown(media))
             )
     result: dict[tuple[str, str], list[str]] = defaultdict(list)
     for key, rows in observations.items():
         rows.sort()
-        current_page = ""
+        current_page: tuple[str, ...] = ()
         dwell = 0.0
         last_start: float | None = None
         for start, seconds, page in rows:
@@ -154,14 +182,14 @@ def _manga_visits(segments: list[dict[str, Any]]) -> dict[tuple[str, str], list[
             )
             if split:
                 if dwell >= MANGA_DWELL_SECONDS:
-                    result[key].append(current_page)
-                current_page, dwell = "", 0.0
+                    result[key].extend(current_page)
+                current_page, dwell = (), 0.0
             if not current_page:
                 current_page = page
             dwell += seconds
             last_start = start
         if current_page and dwell >= MANGA_DWELL_SECONDS:
-            result[key].append(current_page)
+            result[key].extend(current_page)
     return result
 
 

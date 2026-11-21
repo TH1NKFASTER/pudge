@@ -20,8 +20,8 @@ def _release(*, group: str, published: str, seeders: int = 0) -> NyaaRelease:
             f"[{group}] From Old Country Bumpkin to Master Swordsman "
             "S02E05 1080p AMZN WEB-DL MULTi DDP2.0 H.264"
         ),
-        link="https://nyaa.si/view/1",
-        torrent_url="https://nyaa.si/download/1.torrent",
+        link="https://releases.invalid/view/1",
+        torrent_url="https://releases.invalid/download/1.torrent",
         info_hash="a" * 40,
         size_text="1.4 GiB",
         size_bytes=1400 * 1024**2,
@@ -40,7 +40,7 @@ def _release(*, group: str, published: str, seeders: int = 0) -> NyaaRelease:
 
 def test_parse_rss_keeps_prefix_group_and_extracts_suffix_group() -> None:
     xml = """<?xml version="1.0"?>
-<rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel>
+<rss version="2.0" xmlns:nyaa="https://releases.invalid/xmlns/nyaa"><channel>
 <item><title>[ToonsHub] Example S02E05 1080p</title><link>x</link><guid>x</guid>
 <pubDate>Wed, 05 Aug 2026 17:00:00 +0000</pubDate><nyaa:seeders>0</nyaa:seeders>
 <nyaa:infoHash>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</nyaa:infoHash></item>

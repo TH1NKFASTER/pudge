@@ -1,4 +1,4 @@
-"""Jiten and jpdb tokens live in the macOS Keychain like every other secret.
+"""Jiten and jpdb tokens and the TTS server key live in the macOS Keychain like every other secret.
 
 SQLite keeps an empty value. A token still found in the database (older
 versions, or a system without the Keychain) is used as is and moved to the
@@ -13,7 +13,12 @@ import threading
 
 from .secrets_store import SecretStore
 
-KEYCHAIN_ACCOUNTS = {"jiten_api_key": "ln-jiten-api-key", "jpdb_api_token": "ln-jpdb-api-token"}
+KEYCHAIN_ACCOUNTS = {
+    "jiten_api_key": "ln-jiten-api-key",
+    "jpdb_api_token": "ln-jpdb-api-token",
+    # The API key of an external (OpenAI-compatible) TTS server for audiobooks.
+    "irodori_tts_api_key": "ln-irodori-tts-api-key",
+}
 
 _LOGGER = logging.getLogger(__name__)
 _STORE = SecretStore()

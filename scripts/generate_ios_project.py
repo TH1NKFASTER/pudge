@@ -7,11 +7,28 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import tomllib
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 IOS = ROOT / "ios"
 objects: dict[str, dict] = {}
+
+# The app's commit goes into the built Info.plist (PudgeGitCommit: Settings → Version and the
+# diagnostics report). Without git (a downloaded copy) it stays "unknown"; it never fails a build.
+COMMIT_SCRIPT = (
+    'plist="$TARGET_BUILD_DIR/$INFOPLIST_PATH"\n'
+    'commit=$(git -C "$SRCROOT" rev-parse --short=12 HEAD 2>/dev/null || true)\n'
+    'if [ -n "$commit" ] && [ -n "$(git -C "$SRCROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then '
+    'commit="$commit-dirty"; fi\n'
+    '/usr/libexec/PlistBuddy -c "Set :PudgeGitCommit ${commit:-unknown}" "$plist" 2>/dev/null || true\n'
+)
+
+
+def pudge_version() -> str:
+    """The iOS app's version is Pudge's (pyproject), as the Mac shows it."""
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        return str(tomllib.load(handle)["project"]["version"])
 
 
 def uid(name: str) -> str:
@@ -138,10 +155,29 @@ def generate() -> None:
                 runOnlyForDeploymentPostprocessing=0,
             ),
         ]
+        if app:
+            phases.append(
+                obj(
+                    "Pudge-commit",
+                    "PBXShellScriptBuildPhase",
+                    alwaysOutOfDate=1,
+                    buildActionMask=2147483647,
+                    files=[],
+                    inputFileListPaths=[],
+                    inputPaths=["$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)"],
+                    name="Record git commit",
+                    outputFileListPaths=[],
+                    outputPaths=[],
+                    runOnlyForDeploymentPostprocessing=0,
+                    shellPath="/bin/sh",
+                    shellScript=COMMIT_SCRIPT,
+                    showEnvVarsInLog=0,
+                )
+            )
         settings = {
             "PRODUCT_NAME": "$(TARGET_NAME)",
             "SWIFT_VERSION": "5.0",
-            "IPHONEOS_DEPLOYMENT_TARGET": "18.0",
+            "IPHONEOS_DEPLOYMENT_TARGET": "17.0",
             "TARGETED_DEVICE_FAMILY": "1,2",
             "CODE_SIGN_STYLE": "Automatic",
             "SDKROOT": "iphoneos",
@@ -155,9 +191,11 @@ def generate() -> None:
                     "INFOPLIST_FILE": "Pudge/Info.plist",
                     "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
                     "CURRENT_PROJECT_VERSION": "1",
-                    "MARKETING_VERSION": "0.7.30",
+                    "MARKETING_VERSION": pudge_version(),
                     "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
                     "ENABLE_TESTABILITY": "YES",
+                    # The commit script reads the repository's .git (outside the sandbox).
+                    "ENABLE_USER_SCRIPT_SANDBOXING": "NO",
                 }
             )
         else:

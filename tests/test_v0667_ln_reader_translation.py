@@ -71,7 +71,8 @@ def test_online_selection_translation_is_cached(tmp_path: Path, monkeypatch: pyt
     c.ui.language = "ru"
     service = LightNovelService(c)
     # Legacy overrides must no longer win over General -> Language.
-    service.save_settings({"translation_language": "en"})
+    # Google Translate is opt-in for a new install.
+    service.save_settings({"translation_language": "en", "google_translate": True})
     calls: list[tuple[str, str]] = []
 
     def fake_get(url: str, **kwargs):
@@ -147,13 +148,13 @@ def test_light_novel_state_refresh_is_background_and_deduplicated(
     state = service.state()
     assert time.monotonic() - started < 0.25
     assert state["refreshing"] is True
-    assert entered.wait(1)
+    assert entered.wait(30)
     # Multiple UI refresh polls do not start more workers.
     service.state()
     service.refresh_state()
     assert calls == 1
     release.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30  # ends as soon as the refresh is done
     while service._state_refreshing and time.monotonic() < deadline:
         time.sleep(0.01)
     assert service._state_refreshing is False

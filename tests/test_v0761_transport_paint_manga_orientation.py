@@ -71,7 +71,7 @@ def test_quick_pause_and_resume_keep_the_text_moving(page) -> None:
 def test_reader_draws_old_cached_horizontal_bubbles_vertically(page) -> None:
     # Regions from an OCR artifact made before the backend normalized orientation.
     bubble = {
-        "text": "おれの財宝か？欲しけりゃくれてやる",
+        "text": "きょうは雨？図書館で本を読むよ",
         "orientation": "horizontal",
         "detector": "vision-contrast+vision-original+vision-rectangles",
         "x": 0.697947,
@@ -80,7 +80,7 @@ def test_reader_draws_old_cached_horizontal_bubbles_vertically(page) -> None:
         "height": 0.0945,
     }
     caption = {
-        "text": "冒険の夜明け",
+        "text": "冒険の始まり",
         "orientation": "horizontal",
         "detector": "vision-contrast+vision-original",
         "x": 0.1,
@@ -100,11 +100,11 @@ def test_reader_draws_old_cached_horizontal_bubbles_vertically(page) -> None:
         before="__api.manga_export_ocr_debug = async () => ({path: '/logs/ocr.zip'});",
     )
     out = result.value
-    assert out["drawn"] == {"おれの財宝か？欲しけりゃくれてやる": True, "冒険の夜明け": False}
+    assert out["drawn"] == {"きょうは雨？図書館で本を読むよ": True, "冒険の始まり": False}
     # The OCR debug log says how each region was drawn, and why.
     assert sorted(out["overlays"]) == [
-        ["おれの財宝か？欲しけりゃくれてやる", "vertical", "low-confidence-vision-japanese"],
-        ["冒険の夜明け", "horizontal", "horizontal"],
+        ["きょうは雨？図書館で本を読むよ", "vertical", "low-confidence-vision-japanese"],
+        ["冒険の始まり", "horizontal", "horizontal"],
     ]
     # A vertical bubble's text runs top to bottom, right to left.
     assert (

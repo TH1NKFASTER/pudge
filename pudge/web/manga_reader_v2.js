@@ -64,12 +64,36 @@
   let verticalPersistTimer = null;
   let pageRenderGeneration = 0;
   let preparationPollTimer = null;
+  // The page's hidden-window poll policy (index.html schedulePoll; FE-3/FE-4).
+  const schedulePoll = (callback, visibleMs, hiddenMs = 15000) => {
+    if (typeof window.pudgeSchedulePoll === 'function') return window.pudgeSchedulePoll(callback, visibleMs, hiddenMs);
+    const timer = setTimeout(callback, document.hidden ? Math.max(visibleMs, hiddenMs) : visibleMs);
+    return {cancel: () => clearTimeout(timer)};
+  };
   let preparationPollInFlight = false;
   let preparationPollGeneration = 0;
   let mangaContextBook = null;
   let mangaContextSeries = null;
   let mangaRegionContext = null;
   let pagedVisibleCount = 1;
+  // Two-page mode: the pages shown together, as the Mac serves them to every reader (the
+  // iPhone/iPad too): the cover alone, then pairs; a wide page alone and the pairs start
+  // again after it; "Shift pairs by one page" per volume. {book_id, spreads, shift, wide}.
+  let currentSpreads = null;
+  let spreadsRequest = null;
+  // "Shift pairs by one page" / "Align scanned pages" changed here and not yet saved on the Mac:
+  // the newest change wins, a refresh meanwhile does not undo it.
+  let spreadSettingSequence = 0;
+  let spreadSettingsSaving = 0;
+  // Saves go to the Mac one after the other, in the order made (each bridge call has its own
+  // thread: two quick changes could otherwise land in the other order).
+  let spreadSettingChain = Promise.resolve();
+  let alignmentPoll = null;
+  // The saved place when the two-page mode showed it in a pair that starts one page
+  // earlier (opened or switched there): kept until the reader turns.
+  let anchoredFrom = null;
+  // The table the pages on screen were paired with.
+  let renderedTable = null;
   const selectedBookIds = new Set();
   const libraryOcrPollers = new Map();
 
@@ -415,10 +439,14 @@
       .map(value => value === `${percent}%`
         ? `<span data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}">${esc(value)}</span>`
         : `<span>${esc(value)}</span>`)
-      .join('') + scoreHtml;
+      .join('') + scoreHtml
+      // The archive or image folder moved or was deleted: opening the card offers Find….
+      + (book.missing ? `<span class="manga-missing-badge">${esc(PudgeI18n.t('manga.filesNotFound'))}</span>` : '');
     const cover = `<div class="ln-card-cover cover-placeholder" data-cover-placeholder="${id}" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''}>${PudgeI18n.t('label.cover')}</div><img class="ln-card-cover" data-cover-book="${id}" data-pudge-cover-kind="manga" data-pudge-cover-id="${id}" alt="" loading="lazy" decoding="async" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''} hidden>`;
     const jiten = linkedId ? `<div class="planned-jiten" data-library-card-jiten data-manga-card-jiten="${linkedId}" data-jiten-book="${id}" data-jiten-volume="${volume}"><span class="planned-jiten-loading">Jiten…</span></div>` : '';
-    return `<article class="ln-card ln-entry ${compact ? 'compact' : ''} ${selectedBookIds.has(id) ? 'selected' : ''}" data-manga-book="${id}" data-manga-v2-action="read" data-id="${id}">${cover}<div class="ln-card-body"><h3>${title}</h3><div class="ln-card-meta">${facts}</div><div class="ln-card-progress" data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}"><span style="width:${percent}%"></span></div>${jiten}</div></article>`;
+    // Downloaded on a paired iPhone/iPad (device_copies.js): beside the title, as the light novels' badges.
+    const copies = window.PudgeDeviceCopies?.slot?.('manga', [id], compact ? 'row' : 'info') || '';
+    return `<article class="ln-card ln-entry ${compact ? 'compact' : ''} ${selectedBookIds.has(id) ? 'selected' : ''} ${book.missing ? 'manga-missing' : ''}" data-manga-book="${id}" data-manga-v2-action="read" data-id="${id}">${cover}<div class="ln-card-body"><h3>${title}${copies}</h3><div class="ln-card-meta">${facts}</div><div class="ln-card-progress" data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}"><span style="width:${percent}%"></span></div>${jiten}</div></article>`;
   }
 
   // Covers resolve asynchronously and are cached by resolveCover(); the same
@@ -465,7 +493,8 @@
     const continueButton = unfinished
       ? `<button type="button" class="ln-group-continue manga-series-continue" data-manga-v2-action="read" data-id="${Number(current.id)}">${PudgeI18n.t('ln.continueVolume', {volume: Number(volumeNumber(current))})}</button>`
       : '';
-    return `<section class="ln-series-group" data-manga-group-open="series" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}</strong>${seriesStats}${continueButton}</div><span class="ln-series-count">${PudgeI18n.tn('media.volumeCount', group.books.length)}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
+    const copies = window.PudgeDeviceCopies?.slot?.('manga', group.books.map(book => book.id), 'info') || '';
+    return `<section class="ln-series-group" data-manga-group-open="series" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}${copies}</strong>${seriesStats}${continueButton}</div><span class="ln-series-count">${PudgeI18n.tn('media.volumeCount', group.books.length)}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
   }
 
   function mangaShelfContinue(groups) {
@@ -488,7 +517,8 @@
     const counts = `${PudgeI18n.tn('manga.seriesCount', groups.length)} · ${PudgeI18n.tn('media.volumeCount', Number(shelf.bookCount || 0))}${shelf.ambiguous ? (PudgeI18n.t('ui.relationOrderAmbiguous')) : ''}`;
     const hidden = Number(shelf.hiddenSeriesCount || 0);
     const toggle = hidden > 0 || shelf.expanded ? `<button class="library-shelf-toggle" data-library-shelf-toggle="${esc(shelf.key)}">${shelf.expanded ? (PudgeI18n.t('ui.collapse')) : (PudgeI18n.t('ui.more',{hidden:hidden}))}</button>` : '';
-    return `<section class="ln-franchise-group library-shelf" data-manga-franchise-ids="${ids}" data-library-shelf-key="${esc(shelf.key)}" data-library-shelf-ambiguous="${shelf.ambiguous ? '1' : '0'}"><div class="library-shelf-head"><div class="library-shelf-title"><strong>${esc(shelf.title || groups[0]?.title || '')}</strong><span class="library-shelf-meta">${counts}</span>${continueText ? `<span class="library-shelf-continue">${continueText}</span>` : ''}</div>${toggle}</div><div class="ln-franchise-series">${visible.map(mangaSeriesGroupHtml).join('')}</div></section>`;
+    const copies = window.PudgeDeviceCopies?.slot?.('manga', ids.split(','), 'info') || '';
+    return `<section class="ln-franchise-group library-shelf" data-manga-franchise-ids="${ids}" data-library-shelf-key="${esc(shelf.key)}" data-library-shelf-ambiguous="${shelf.ambiguous ? '1' : '0'}"><div class="library-shelf-head"><div class="library-shelf-title"><strong>${esc(shelf.title || groups[0]?.title || '')}${copies}</strong><span class="library-shelf-meta">${counts}</span>${continueText ? `<span class="library-shelf-continue">${continueText}</span>` : ''}</div>${toggle}</div><div class="ln-franchise-series">${visible.map(mangaSeriesGroupHtml).join('')}</div></section>`;
   }
 
   function mangaLibraryGroups(books) {
@@ -536,6 +566,7 @@
         Number(book.page_count || 0), Number(book.read_pages || 0),
         Number(book.anilist_id || 0), Number(book.mean_score || 0), Number(book.user_score || 0),
         Boolean(book.ocr_complete), Number(book.ocr_cached_pages || 0), String(book.site_url || ''), String(book.franchise_key || ''), Number(book.franchise_order || 0),
+        Boolean(book.missing),
       ]),
     ]);
   }
@@ -580,13 +611,20 @@
     }
   }
 
-  async function injectBook(book) {
-    if (!book) return;
-    const id = Number(book.id);
+  // A Finder drop of several volumes adds them all with one redraw (it used to add
+  // only the first one).
+  async function injectBooks(books) {
+    const rows = (books || []).filter(book => book && Number(book.id));
+    if (!rows.length) return;
+    const ids = new Set(rows.map(book => Number(book.id)));
     state = state || {books: []};
-    state.books = [...(state.books || []).filter(item => Number(item.id) !== id), book];
+    state.books = [...(state.books || []).filter(item => !ids.has(Number(item.id))), ...rows];
     await renderLibrary(false);
     setTimeout(() => void renderLibrary(true), 900);
+  }
+
+  async function injectBook(book) {
+    await injectBooks([book]);
   }
 
   function buildReader() {
@@ -627,6 +665,14 @@
             <option value="double">${PudgeI18n.t('manga.doublePage')}</option>
             <option value="vertical">${PudgeI18n.t('manga.verticalScroll')}</option>
           </select>
+        </label>
+        <label class="manga-v2-check" hidden>
+          <input type="checkbox" data-manga-pair-shift>
+          ${PudgeI18n.t('manga.shiftPairs')}
+        </label>
+        <label class="manga-v2-check" hidden>
+          <input type="checkbox" data-manga-page-align>
+          ${PudgeI18n.t('manga.alignPages')}
         </label>
         <label>${PudgeI18n.t('manga.direction')}
           <select data-manga-setting="direction">
@@ -720,6 +766,7 @@
     const gap = $('mangaV2GapValue');
     if (zoom) zoom.textContent = `${settings.zoom}%`;
     if (gap) gap.textContent = `${settings.gap}px`;
+    syncPairShiftControl();
   }
 
   function applyReaderSettings() {
@@ -842,7 +889,12 @@
 
   async function persistVisiblePage() {
     if (!currentBook || currentPageCount <= 0) return;
-    await setResumePage(currentPage);
+    // A pair shown around the saved place (opened or switched to two pages) is no turn:
+    // the place stays the page it was. By the table the pages on screen were paired with (a
+    // late call after the pairs changed must not take the page before for the place).
+    const kept = settings.mode === 'double' && anchoredFrom != null && spreadOf(anchoredFrom, renderedTable)[0] === currentPage;
+    if (!kept) anchoredFrom = null;
+    await setResumePage(kept ? anchoredFrom : currentPage);
     if (settings.mode === 'vertical') {
       const viewport = $('mangaV2Viewport');
       const atEnd = viewport && viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 4;
@@ -889,8 +941,8 @@
     const frame = event.target?.closest?.('.manga-v2-page-frame') ||
       document.elementFromPoint(event.clientX, event.clientY)?.closest?.('.manga-v2-page-frame');
     if (!frame) return;
-    const image = frame.querySelector('img');
-    const imageRect = image?.getBoundingClientRect();
+    const imageRect = pageImageRect(frame);
+    const point = screenToPage(frame, event.clientX, event.clientY);
     const region = event.target?.closest?.('.manga-v2-text-region');
     const token = event.target?.closest?.('[data-pudge-study-token]');
     const elements = document.elementsFromPoint(event.clientX, event.clientY)
@@ -905,8 +957,8 @@
     mangaDebugRecord(`pointer_${phase}`, {
       client_x: Number(event.clientX),
       client_y: Number(event.clientY),
-      normalized_x: imageRect?.width ? (event.clientX - imageRect.left) / imageRect.width : null,
-      normalized_y: imageRect?.height ? (event.clientY - imageRect.top) / imageRect.height : null,
+      normalized_x: imageRect?.width ? (point.x - imageRect.left) / imageRect.width : null,
+      normalized_y: imageRect?.height ? (point.y - imageRect.top) / imageRect.height : null,
       frame_page_index: Number(frame.dataset.pageIndex),
       region_index: region ? Number(region.dataset.regionIndex) : null,
       token_text: token ? String(token.textContent || '').trim() : '',
@@ -1359,7 +1411,7 @@
 
   function stopPreparationPoll() {
     preparationPollGeneration += 1;
-    if (preparationPollTimer) clearTimeout(preparationPollTimer);
+    if (preparationPollTimer) preparationPollTimer.cancel();
     preparationPollTimer = null;
   }
 
@@ -1461,11 +1513,12 @@
     const poll = async () => {
       if (generation !== preparationPollGeneration || !currentBook || Number(currentBook.id) !== Number(bookId)) return;
       if (preparationPollInFlight) {
-        preparationPollTimer = setTimeout(() => void poll(), 750);
+        preparationPollTimer = schedulePoll(() => void poll(), 750);
         return;
       }
       preparationPollInFlight = true;
       let active = false;
+      let failed = false;
       try {
         const status = await API().manga_ocr_book_status(Number(bookId));
         if (generation !== preparationPollGeneration || !currentBook || Number(currentBook.id) !== Number(bookId)) return;
@@ -1485,10 +1538,12 @@
       } catch (error) {
         console.debug?.('Manga preparation status unavailable:', error);
         active = true;
+        failed = true;
       } finally {
         preparationPollInFlight = false;
         if (active && generation === preparationPollGeneration && currentBook && Number(currentBook.id) === Number(bookId)) {
-          preparationPollTimer = setTimeout(() => void poll(), 750);
+          // 750 ms while reading; hidden 15 s; an unavailable status is asked again more slowly.
+          preparationPollTimer = schedulePoll(() => void poll(), failed ? 3000 : 750);
         }
       }
     };
@@ -1766,8 +1821,11 @@
     const ocr = book.ocr_complete
       ? (PudgeI18n.t('manga.rebuildVolumeOcr'))
       : (PudgeI18n.t('manga.ocrVolume'));
+    const relink = book.missing
+      ? `<button data-manga-context-action="relink">${PudgeI18n.t('manga.find')}</button>`
+      : '';
     menu.innerHTML = `
-      ${select}<button data-manga-context-action="read">${PudgeI18n.t('ui.read')}</button>
+      ${select}${relink}<button data-manga-context-action="read">${PudgeI18n.t('ui.read')}</button>
       ${openAniList}${link}${names}
       <button data-manga-context-action="edit-metadata">${PudgeI18n.t('ui.editVolumeAndSeries')}</button>
       <button data-manga-context-action="ocr-book" ${state?.ocr_available ? '' : 'disabled'}>${ocr}</button>
@@ -1809,21 +1867,55 @@
     positionMangaContextMenu(menu, x, y);
   }
 
-  async function pollLibraryBookOcr(bookId) {
+  // One poller for every volume whose OCR was started from the library (FE-3): "OCR all
+  // volumes" on 20 volumes used to run 20 pollers at 900 ms (~22 status calls/s, each
+  // reading the volume's OCR cache) for hours, hidden or not. Every 3 s (hidden: 15 s)
+  // one cheap call says which jobs still run; a volume's full status is read once, when
+  // its job has ended.
+  let libraryOcrPoll = null;
+  let libraryOcrPolling = false;
+  const LIBRARY_OCR_POLL_MS = 3000;
+
+  function scheduleLibraryOcrPoll(delay = LIBRARY_OCR_POLL_MS) {
+    if (libraryOcrPoll || libraryOcrPolling || !libraryOcrPollers.size) return;
+    libraryOcrPoll = schedulePoll(() => { libraryOcrPoll = null; void pollLibraryOcr(); }, delay);
+  }
+
+  async function libraryOcrFinished(bookId) {
+    const status = await API().manga_ocr_book_status(Number(bookId));
+    if (status.running) return false;
+    libraryOcrPollers.delete(Number(bookId));
+    return status;
+  }
+
+  async function pollLibraryOcr() {
+    if (libraryOcrPolling) return;
+    libraryOcrPolling = true;
+    const finished = [];
     try {
-      const status = await API().manga_ocr_book_status(Number(bookId));
-      if (status.running) {
-        const timer = setTimeout(() => void pollLibraryBookOcr(Number(bookId)), 900);
-        libraryOcrPollers.set(Number(bookId), timer);
-        return;
+      const ids = [...libraryOcrPollers.keys()];
+      let running = null;
+      if (ids.length && API()?.manga_ocr_running_books) {
+        try { running = await API().manga_ocr_running_books(ids); } catch (_) { running = null; }
       }
-      libraryOcrPollers.delete(Number(bookId));
-      await renderLibrary();
-      if (status.complete) window.toast?.(PudgeI18n.t('manga.volumeOcrReady'));
-      else if (status.errors?.length) window.toast?.(status.errors.join(' • '));
-    } catch (error) {
-      libraryOcrPollers.delete(Number(bookId));
-      window.toast?.(error?.message || String(error));
+      for (const bookId of ids) {
+        if (running && running[String(bookId)]) continue;
+        try {
+          const status = await libraryOcrFinished(bookId);
+          if (status) finished.push(status);
+        } catch (error) {
+          libraryOcrPollers.delete(Number(bookId));
+          window.toast?.(error?.message || String(error));
+        }
+      }
+      if (finished.length) await renderLibrary();
+      for (const status of finished) {
+        if (status.complete) window.toast?.(PudgeI18n.t('manga.volumeOcrReady'));
+        else if (status.errors?.length) window.toast?.(status.errors.join(' • '));
+      }
+    } finally {
+      libraryOcrPolling = false;
+      scheduleLibraryOcrPoll();
     }
   }
 
@@ -1833,8 +1925,8 @@
     try {
       await API().start_manga_ocr_book(bookId, Boolean(refresh));
       window.toast?.(PudgeI18n.t('manga.volumeOcrStarted'));
-      libraryOcrPollers.set(bookId, null);
-      await pollLibraryBookOcr(bookId);
+      libraryOcrPollers.set(bookId, true);
+      scheduleLibraryOcrPoll(900);
     } catch (error) {
       libraryOcrPollers.delete(bookId);
       window.toast?.(error?.message || String(error));
@@ -1849,13 +1941,13 @@
       const bookId = Number(book.id);
       try {
         await API().start_manga_ocr_book(bookId, Boolean(rebuild));
-        libraryOcrPollers.set(bookId, null);
-        void pollLibraryBookOcr(bookId);
+        libraryOcrPollers.set(bookId, true);
       } catch (error) {
         libraryOcrPollers.delete(bookId);
         window.toast?.(error?.message || String(error));
       }
     }
+    scheduleLibraryOcrPoll(900);
   }
 
   function isDoublePage(page) {
@@ -1902,13 +1994,330 @@
     const requested = Math.trunc(Number(pageNumber));
     if (!Number.isFinite(requested) || requested < 1 || requested > currentPageCount) return false;
     clearMangaTransientOverlays();
-    currentPage = requested - 1;
+    anchoredFrom = null;
+    if (settings.mode === 'double') await ensureSpreads();
+    const target = settings.mode === 'double' ? spreadOf(requested - 1)[0] : requested - 1;
+    currentPage = target;
     await showCurrent();
-    if(currentPage!==requested-1)return false;
+    if(currentPage!==target)return false;
     await setResumePage(currentPage);
     updatePageLabel();
     closePagePicker();
     return true;
+  }
+
+  async function ensureSpreads({force = false} = {}) {
+    if (!currentBook || !API()?.manga_spreads) return null;
+    const bookId = Number(currentBook.id);
+    if (!force && currentSpreads && Number(currentSpreads.book_id) === bookId) return currentSpreads;
+    if (!force && spreadsRequest && spreadsRequest.bookId === bookId) return spreadsRequest.promise;
+    const promise = (async () => {
+      try {
+        const answer = await API().manga_spreads(bookId);
+        if (!currentBook || Number(currentBook.id) !== bookId || !Array.isArray(answer?.spreads)) return null;
+        currentSpreads = {...answer, book_id: bookId};
+        syncPairShiftControl();
+        scheduleAlignmentPoll();
+        return currentSpreads;
+      } catch (error) {
+        console.debug?.('Manga spreads unavailable:', error);
+        return null;
+      } finally {
+        if (spreadsRequest?.promise === promise) spreadsRequest = null;
+      }
+    })();
+    spreadsRequest = {bookId, promise};
+    return promise;
+  }
+
+  function currentSpreadTable() {
+    return currentBook && currentSpreads && Number(currentSpreads.book_id) === Number(currentBook.id)
+      ? currentSpreads.spreads : null;
+  }
+
+  /** The spread showing a page (one page alone when the table is not known). */
+  function spreadOf(index, table = currentSpreadTable()) {
+    const page = Number(index);
+    if (!table?.length) return [page];
+    return table.find(spread => spread.includes(page)) || (page < table[0][0] ? table[0] : table[table.length - 1]);
+  }
+
+  /** Two-page mode: the reader shows the spread holding the place (its first page). */
+  async function anchorToSpread() {
+    if (settings.mode !== 'double' || !currentBook) return;
+    await ensureSpreads();
+    // Paired anew (opened, switched, shifted): the spread holding the place, not the page shown.
+    const place = anchoredFrom ?? currentPage;
+    const first = spreadOf(place)[0];
+    anchoredFrom = first === place ? null : place;
+    currentPage = first;
+  }
+
+  function syncPairShiftControl() {
+    const tableKnown = Boolean(currentSpreadTable());
+    for (const [selector, value] of [
+      ['[data-manga-pair-shift]', tableKnown && currentSpreads.shift],
+      ['[data-manga-page-align]', tableKnown && currentSpreads.align !== false],
+    ]) {
+      const control = document.querySelector(selector);
+      if (!control) continue;
+      control.checked = Boolean(value);
+      const row = control.closest('label');
+      if (row) row.hidden = settings.mode !== 'double';
+    }
+  }
+
+  /** The two-page table (pudge/manga_spreads.py; the same cases, tests/fixtures/manga_spreads.json),
+   * made here too so a change of "Shift pairs by one page" re-pairs the pages at once. */
+  function spreadTable(count, wide = [], shift = false) {
+    const total = Math.max(0, Math.trunc(Number(count) || 0));
+    if (total <= 0) return [];
+    const alone = new Set((wide || []).map(Number));
+    const out = [[0]];
+    let index = 1;
+    if (shift && index < total) out.push([index++]);
+    while (index < total) {
+      if (!alone.has(index) && index + 1 < total && !alone.has(index + 1)) {
+        out.push([index, index + 1]);
+        index += 2;
+      } else {
+        out.push([index++]);
+      }
+    }
+    return out;
+  }
+
+  function sameTable(a, b) {
+    return JSON.stringify(a || null) === JSON.stringify(b || null);
+  }
+
+  /** "Shift pairs by one page" ({shift}) or "Align scanned pages" ({align}) for this volume:
+   * shown at once, at the same place (the page read stays on screen in its new pair), and
+   * saved on the Mac in the background; when saving fails it goes back, with the error. */
+  async function changeSpreadSetting(change) {
+    if (!currentBook) return;
+    const bookId = Number(currentBook.id);
+    const same = () => currentBook && Number(currentBook.id) === bookId;
+    const shifting = Object.prototype.hasOwnProperty.call(change, 'shift');
+    const send = () => shifting
+      ? API().manga_set_pair_shift(bookId, Boolean(change.shift))
+      : API().manga_set_page_align(bookId, Boolean(change.align));
+    const save = () => {
+      const saving = spreadSettingChain.then(send, send);
+      spreadSettingChain = saving.catch(() => {});
+      return saving;
+    };
+    if (!currentSpreadTable()) {
+      // The table is not known here yet: as the Mac answers.
+      try {
+        const answer = await save();
+        if (same() && Array.isArray(answer?.spreads)) currentSpreads = {...answer, book_id: bookId};
+      } catch (error) {
+        window.toast?.(String(error?.message || error));
+      }
+      syncPairShiftControl();
+      if (same()) await showCurrent({reviewApproved: true});
+      return;
+    }
+    const before = currentSpreads;
+    const next = {...before, ...change};
+    if (shifting) {
+      const count = before.spreads.reduce((total, spread) => total + spread.length, 0);
+      next.spreads = spreadTable(count, before.wide || [], Boolean(change.shift));
+    }
+    currentSpreads = next;
+    const sequence = ++spreadSettingSequence;
+    spreadSettingsSaving += 1;
+    syncPairShiftControl();
+    const shown = shifting ? showCurrent({reviewApproved: true}) : Promise.resolve(applyPageAlignment());
+    try {
+      const answer = await save();
+      await shown;
+      if (sequence !== spreadSettingSequence || !same() || !Array.isArray(answer?.spreads)) return;
+      const repair = !sameTable(currentSpreads.spreads, answer.spreads);
+      currentSpreads = {...answer, book_id: bookId};
+      syncPairShiftControl();
+      if (repair) await showCurrent({reviewApproved: true});
+      else applyPageAlignment();
+      scheduleAlignmentPoll();
+    } catch (error) {
+      await shown;
+      if (sequence === spreadSettingSequence && same()) {
+        currentSpreads = before;
+        syncPairShiftControl();
+        if (shifting) await showCurrent({reviewApproved: true});
+        else applyPageAlignment();
+      }
+      window.toast?.(String(error?.message || error));
+      scheduleAlignmentPoll();
+    } finally {
+      spreadSettingsSaving -= 1;
+    }
+  }
+
+  function setPairShift(shift) {
+    return changeSpreadSetting({shift: Boolean(shift)});
+  }
+
+  /** The table as the Mac has it now (changed on a phone, the alignment worked out further):
+   * the open reader re-pairs at its place, never turning a page. */
+  async function refreshSpreads() {
+    if (!currentBook || settings.mode !== 'double' || !API()?.manga_spreads) return;
+    // A change made here goes first: ask again after it (the poll goes on meanwhile).
+    if (spreadSettingsSaving) { scheduleAlignmentPoll(); return; }
+    const bookId = Number(currentBook.id);
+    const sequence = spreadSettingSequence;
+    let answer = null;
+    try {
+      answer = await API().manga_spreads(bookId);
+    } catch (_) {
+      scheduleAlignmentPoll();
+      return;
+    }
+    if (!currentBook || Number(currentBook.id) !== bookId) return;
+    // Asked before a change made here meanwhile: that answer would undo it.
+    if (sequence !== spreadSettingSequence || spreadSettingsSaving || !Array.isArray(answer?.spreads)) {
+      scheduleAlignmentPoll();
+      return;
+    }
+    const previous = currentSpreads;
+    currentSpreads = {...answer, book_id: bookId};
+    syncPairShiftControl();
+    if (!sameTable(previous?.spreads, answer.spreads)) await showCurrent({reviewApproved: true});
+    else if (JSON.stringify(previous?.alignment ?? null) !== JSON.stringify(answer.alignment ?? null) ||
+             previous?.align !== answer.align) applyPageAlignment();
+    scheduleAlignmentPoll();
+  }
+
+  /** While the Mac is still working out the volume's alignment, ask again now and then. */
+  function scheduleAlignmentPoll() {
+    alignmentPoll?.cancel?.();
+    alignmentPoll = null;
+    const pending = Number(currentSpreads?.alignment?.pending || 0);
+    if (!currentBook || settings.mode !== 'double' || currentSpreads?.align === false || pending <= 0) return;
+    alignmentPoll = schedulePoll(() => { alignmentPoll = null; void refreshSpreads(); }, 2500, 15000);
+  }
+
+  // ------------------------------------------------------------- aligned scanned pages
+  // Two-page mode: each page drawn straightened, scaled and moved (pudge/manga_align.py, the
+  // same transforms on the iPhone/iPad): its picture and its text boxes together, around the
+  // page's centre; a pair is drawn at one height and each page is cut off at the gutter, with
+  // its backing behind it. The frame keeps the page's place: taps are mapped through it.
+
+  /** The served transforms of the pages shown (lower page first), or null. */
+  function alignmentFor(pages) {
+    const spreads = currentSpreads;
+    if (settings.mode !== 'double' || !currentBook || !spreads?.alignment || spreads.align === false ||
+        Number(spreads.book_id) !== Number(currentBook.id)) return null;
+    if (pages.length === 2) {
+      const entry = spreads.alignment.pairs?.[`${pages[0]}-${pages[1]}`];
+      const found = entry?.[settings.direction === 'ltr' ? 'ltr' : 'rtl'];
+      return Array.isArray(found) && found.length === 2 ? found : null;
+    }
+    if (pages.length === 1) {
+      const one = spreads.alignment.single?.[String(pages[0])];
+      return one ? [one] : null;
+    }
+    return null;
+  }
+
+  /** CSS for one transform: the transform of the page's layers and its backing. */
+  function alignmentStyle(transform) {
+    const t = transform || {};
+    const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+    const scale = Number.isFinite(Number(t.scale)) && Number(t.scale) > 0 ? Number(t.scale) : 1;
+    const style = {
+      transform: `translate(${number(t.dx) * 100}%, ${number(t.dy) * 100}%) rotate(${number(t.angle)}deg) scale(${scale})`,
+      gutter: t.gutter === 'left' || t.gutter === 'right' ? t.gutter : '',
+      backing: null,
+    };
+    const box = Array.isArray(t.backing) && t.backing.length === 4 ? t.backing.map(number) : null;
+    if (box && box[2] > box[0] && box[3] > box[1]) {
+      style.backing = {
+        left: `${box[0] * 100}%`, top: `${box[1] * 100}%`,
+        width: `${(box[2] - box[0]) * 100}%`, height: `${(box[3] - box[1]) * 100}%`,
+        fill: /^#[0-9a-f]{6}$/i.test(String(t.fill || '')) ? String(t.fill) : '#ffffff',
+      };
+    }
+    return style;
+  }
+
+  function setFrameAlignment(frame, transform) {
+    const names = ['--manga-align', '--manga-align-left', '--manga-align-top', '--manga-align-width',
+      '--manga-align-height', '--manga-align-fill'];
+    if (!transform) {
+      frame.classList.remove('aligned');
+      frame.__align = null;
+      delete frame.dataset.alignGutter;
+      delete frame.dataset.alignBacking;
+      names.forEach(name => frame.style.removeProperty(name));
+      return;
+    }
+    const style = alignmentStyle(transform);
+    frame.__align = transform;
+    frame.classList.add('aligned');
+    frame.style.setProperty('--manga-align', style.transform);
+    if (style.gutter) frame.dataset.alignGutter = style.gutter; else delete frame.dataset.alignGutter;
+    if (style.backing) {
+      frame.dataset.alignBacking = '1';
+      frame.style.setProperty('--manga-align-left', style.backing.left);
+      frame.style.setProperty('--manga-align-top', style.backing.top);
+      frame.style.setProperty('--manga-align-width', style.backing.width);
+      frame.style.setProperty('--manga-align-height', style.backing.height);
+      frame.style.setProperty('--manga-align-fill', style.backing.fill);
+    } else {
+      delete frame.dataset.alignBacking;
+    }
+  }
+
+  /** The pages on screen drawn with their transforms (or plainly: off, unknown, one page each). */
+  function applyPageAlignment() {
+    const frames = [...($('mangaV2Pages')?.querySelectorAll('.manga-v2-page-frame') || [])];
+    const pages = frames.map(frame => Number(frame.dataset.pageIndex)).sort((a, b) => a - b);
+    const found = frames.length && !frames.some(frame => frame.dataset.spread === '1') ? alignmentFor(pages) : null;
+    frames.forEach(frame => {
+      setFrameAlignment(frame, found ? found[pages.indexOf(Number(frame.dataset.pageIndex))] : null);
+      // A pair with any alignment is drawn at one height, also when one page is left as it is.
+      if (found && pages.length === 2) frame.dataset.alignPair = '1'; else delete frame.dataset.alignPair;
+    });
+    applyPageSizing();
+  }
+
+  /** A transform's math (pudge/manga_align.py apply/invert) in screen pixels around `box`. */
+  function alignPoint(transform, box, x, y, backwards = false) {
+    if (!transform || !box?.width || !box?.height) return {x, y};
+    const angle = Number(transform.angle || 0) * Math.PI / 180;
+    const scale = Number(transform.scale) > 0 ? Number(transform.scale) : 1;
+    const cx = box.left + box.width / 2, cy = box.top + box.height / 2;
+    const dx = Number(transform.dx || 0) * box.width, dy = Number(transform.dy || 0) * box.height;
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    if (backwards) {
+      const px = x - cx - dx, py = y - cy - dy;
+      return {x: cx + (px * cos + py * sin) / scale, y: cy + (-px * sin + py * cos) / scale};
+    }
+    const px = x - cx, py = y - cy;
+    return {x: cx + scale * (px * cos - py * sin) + dx, y: cy + scale * (px * sin + py * cos) + dy};
+  }
+
+  /** The page's picture as laid out, before its transform (its frame's box when aligned). */
+  function pageImageRect(frame) {
+    if (frame?.__align) return frame.getBoundingClientRect();
+    return frame?.querySelector?.('img')?.getBoundingClientRect?.() || null;
+  }
+
+  /** A point on the screen as a point of the page as laid out (through its transform). */
+  function screenToPage(frame, x, y) {
+    return frame?.__align ? alignPoint(frame.__align, frame.getBoundingClientRect(), x, y, true) : {x, y};
+  }
+
+  /** A rectangle of the page as laid out, where it is on the screen (its bounding box). */
+  function pageRectToScreen(frame, rect) {
+    if (!frame?.__align || !rect) return rect;
+    const box = frame.getBoundingClientRect();
+    const corners = [[rect.left, rect.top], [rect.right, rect.top], [rect.left, rect.bottom], [rect.right, rect.bottom]]
+      .map(([x, y]) => alignPoint(frame.__align, box, x, y));
+    const xs = corners.map(point => point.x), ys = corners.map(point => point.y);
+    return {left: Math.min(...xs), right: Math.max(...xs), top: Math.min(...ys), bottom: Math.max(...ys)};
   }
 
   async function renderPaged() {
@@ -1920,17 +2329,21 @@
     currentPage = Math.max(0, Math.min(currentPage, Math.max(0, currentPageCount - 1)));
     const firstPage = await getPage(currentPage);
     const loaded = [firstPage];
-    if (settings.mode === 'double' && !isDoublePage(firstPage) && currentPage + 1 < currentPageCount) {
-      const secondPage = await getPage(currentPage + 1);
-      if (!isDoublePage(secondPage) && (Math.floor((currentPage+1)/20)===Math.floor(currentPage/20) || await requireMangaPart(currentPage+1))) loaded.push(secondPage);
+    const spread = settings.mode === 'double' ? spreadOf(currentPage) : [currentPage];
+    const partner = spread[0] === currentPage && spread.length > 1 ? Number(spread[1]) : null;
+    if (partner != null && partner < currentPageCount) {
+      const secondPage = await getPage(partner);
+      if (Math.floor(partner/20)===Math.floor(currentPage/20) || await requireMangaPart(partner)) loaded.push(secondPage);
     }
     pagedVisibleCount = Math.max(1, loaded.length);
     if (generation !== pageRenderGeneration || !currentBook || Number(currentBook.id) !== bookId) return;
+    renderedTable = settings.mode === 'double' ? currentSpreadTable() : null;
     pages.innerHTML = loaded.map(page => `
       <figure class="manga-v2-page-frame${isDoublePage(page) ? ' spread' : ''}" data-spread="${isDoublePage(page) ? '1' : '0'}" data-page-index="${Number(page.page_index)}">
         <img src="${esc(pageSource(page))}" alt="${esc(page.name || '')}" decoding="async">
         <div class="manga-v2-text-layer"></div>
       </figure>`).join('');
+    if (settings.mode === 'double') applyPageAlignment();
     updatePageLabel();
     if (settings.mode === 'double' && loaded.length > 1) {
       $('mangaV2PageLabel').textContent = `${loaded[0].page_index + 1}–${loaded[loaded.length - 1].page_index + 1} / ${currentPageCount}`;
@@ -1942,9 +2355,15 @@
     await persistVisiblePage();
     const step = Math.max(1, loaded.length);
     const preload = [];
-    for (const offset of [-step, step]) {
-      const n = currentPage + offset;
-      if (n >= 0 && n < currentPageCount) preload.push(getPage(n).catch(() => null));
+    const table = settings.mode === 'double' ? currentSpreadTable() : null;
+    const at = table ? table.findIndex(item => item.includes(currentPage)) : -1;
+    // Two pages: the spreads before and after, and the pages right next to this pair (the
+    // other pairing shows one of them with these: "Shift pairs by one page" needs nothing new).
+    const around = at >= 0
+      ? [table[at - 1]?.[0], table[at + 1]?.[0], table[at][0] - 1, table[at][table[at].length - 1] + 1]
+      : [currentPage - step, currentPage + step];
+    for (const n of new Set(around)) {
+      if (n != null && n >= 0 && n < currentPageCount) preload.push(getPage(n).catch(() => null));
     }
     Promise.all(preload).finally(() => void persistVisiblePage());
   }
@@ -2073,6 +2492,7 @@
     finally{mangaGatePromise=null;}
   }
   async function showCurrent(options = {}) {
+    await anchorToSpread();
     if(!options.reviewApproved&&!await requireMangaPart(currentPage)){currentPage=approvedPage;updatePageLabel();return false;}
     approvedPage=currentPage;
     applyReaderSettings();
@@ -2086,6 +2506,12 @@
     if (entryGeneration !== bookOpenGeneration) return false;
     const pendingBook = (pendingState.books || []).find(book => Number(book.id) === Number(bookId));
     if (!pendingBook) return false;
+    if (pendingBook.missing && !options.relinked) {
+      // Its archive or image folder moved or was deleted: Find… instead of an empty reader.
+      const relinked = await relinkMangaBook(Number(bookId));
+      if (!relinked || entryGeneration !== bookOpenGeneration) return false;
+      return openBook(bookId, {...options, relinked:true});
+    }
     const approved = !pendingState?.ocr_available || await window.PudgeReviewGate.require('manga', Number(bookId), Math.floor(Number(pendingBook.position || 0) / 20) * 20);
     if (entryGeneration !== bookOpenGeneration || !approved) return false;
     approvedMangaParts.clear();
@@ -2100,6 +2526,9 @@
     currentPage = Number(currentBook.position || 0);
     approvedPage=currentPage;
     currentPageCount = Number(currentBook.page_count || 0);
+    currentSpreads = null;
+    spreadsRequest = null;
+    anchoredFrom = null;
     pageCache = new Map();
     textRegionCache = new Map();
     textRegionResultCache = new Map();
@@ -2150,6 +2579,26 @@
     void ensureCurrentBookPrepared();
   }
 
+  // Find…: the user shows where a volume's moved archive or image folder is now
+  // (a native picker). Its reading progress and, for the same files, OCR stay.
+  async function relinkMangaBook(bookId, ask = true) {
+    const confirmed = !ask || await window.pudgeConfirm?.(
+      PudgeI18n.t('manga.filesNotFoundFind'),
+      {confirmText:PudgeI18n.t('manga.find')},
+    );
+    if (!confirmed) return false;
+    try {
+      const result = await API().choose_manga_location(Number(bookId));
+      if (result?.error) window.toast?.(String(result.error));
+      if (!result || result.cancelled) return false;
+      await renderLibrary(true);
+      return true;
+    } catch (error) {
+      window.toast?.(String(error?.message || error));
+      return false;
+    }
+  }
+
   // Volume OCR that opening the reader started stops when the reader closes
   // or moves to another volume (an OCR started with the toolbar button keeps going).
   function releaseAutoVolumeOcr(bookId) {
@@ -2158,6 +2607,8 @@
   }
 
   function closeReader() {
+    alignmentPoll?.cancel?.();
+    alignmentPoll = null;
     releaseAutoVolumeOcr(currentBook?.id);
     bookOpenGeneration += 1;
     approvedMangaParts.clear();
@@ -2214,25 +2665,24 @@
       // Count currently visible physical pages only after a forward turn.
       await markReadThrough(visibleEnd);
     }
+    anchoredFrom = null;
     if (settings.mode !== 'double') {
       currentPage = Math.max(0, Math.min(currentPageCount - 1, currentPage + Number(delta)));
     } else if (Number(delta) > 0) {
-      currentPage = Math.max(0, Math.min(currentPageCount - 1, currentPage + Math.max(1, pagedVisibleCount)));
+      // The next spread: after the pages shown (a pair cut short by the next review part
+      // shows that part's page next).
+      const next = Math.min(currentPageCount - 1, currentPage + Math.max(1, pagedVisibleCount));
+      currentPage = Math.max(0, spreadOf(next)[0]);
     } else if (currentPage > 0) {
-      const activePage = await getPage(currentPage);
-      if (isDoublePage(activePage)) {
-        currentPage -= 1;
-      } else {
-        const previous = await getPage(currentPage - 1);
-        if (isDoublePage(previous) || currentPage === 1) {
-          currentPage -= 1;
-        } else {
-          currentPage = Math.max(0, currentPage - 2);
-        }
-      }
+      // The previous spread of the same table (the cover alone, a spread alone).
+      const table = currentSpreadTable();
+      const at = table ? table.findIndex(item => item.includes(currentPage)) : -1;
+      currentPage = at > 0 ? Number(table[at - 1][0]) : Math.max(0, currentPage - 1);
     }
     mangaDebugRecord('page_change', {previous_page:previousPage, next_page:currentPage, delta:Number(delta)});
     await showCurrent();
+    // A change made on a phone ("Shift pairs…", "Align…") shows from the next turn on.
+    if (settings.mode === 'double') void refreshSpreads();
   }
 
   async function toggleFullscreen() {
@@ -2249,10 +2699,11 @@
     reader?.classList.toggle('pseudo-fullscreen');
   }
 
-  function sizePageImage(img) {
-    if (!img || !img.naturalWidth || !img.naturalHeight) return;
+  /** The scale a page's picture is drawn at (fit, zoom, the reader's size), or 0. */
+  function pageImageScale(img) {
+    if (!img || !img.naturalWidth || !img.naturalHeight) return 0;
     const viewport = $('mangaV2Viewport');
-    if (!viewport) return;
+    if (!viewport) return 0;
     const zoom = Math.max(.5, Math.min(2.5, Number(settings.zoom || 100) / 100));
     const naturalWidth = Number(img.naturalWidth);
     const naturalHeight = Number(img.naturalHeight);
@@ -2269,7 +2720,23 @@
     if (settings.fit === 'width') baseScale = availableWidth / naturalWidth;
     else if (settings.fit === 'height' && vertical) baseScale = Math.min(1, availableWidth / naturalWidth);
     else if (settings.fit === 'height') baseScale = Math.min(availableHeight / naturalHeight, availableWidth / naturalWidth);
-    const scale = Math.max(.02, baseScale) * zoom;
+    return Math.max(.02, baseScale) * zoom;
+  }
+
+  function sizePageImage(img) {
+    let scale = pageImageScale(img);
+    if (!scale) return;
+    const naturalWidth = Number(img.naturalWidth);
+    const naturalHeight = Number(img.naturalHeight);
+    // An aligned pair is drawn at one height (its transforms are made for that): the lower one.
+    const frame = img.closest?.('.manga-v2-page-frame');
+    if (frame?.dataset?.alignPair) {
+      for (const other of frame.parentElement?.querySelectorAll?.('.manga-v2-page-frame[data-align-pair] img') || []) {
+        const otherScale = other === img ? 0 : pageImageScale(other);
+        const height = otherScale * Number(other.naturalHeight || 0);
+        if (height > 0 && height < naturalHeight * scale) scale = height / naturalHeight;
+      }
+    }
     img.style.width = `${Math.max(1, naturalWidth * scale)}px`;
     img.style.height = `${Math.max(1, naturalHeight * scale)}px`;
     img.style.maxWidth = 'none';
@@ -2413,8 +2880,27 @@
     if (key.startsWith('status')) persistStatusPreferences();
     applyReaderSettings();
     if (key.startsWith('status')) scheduleMangaStatusLayers();
+    if (key === 'mode') {
+      // Back to one page: the place itself, not the first page of its pair.
+      if (anchoredFrom != null) currentPage = anchoredFrom;
+      anchoredFrom = null;
+      syncPairShiftControl();
+    }
     if (key === 'mode' || key === 'direction') void showCurrent();
     else if (key === 'fit' || key === 'zoom' || key === 'gap') requestAnimationFrame(applyPageSizing);
+  });
+
+  // "Shift pairs by one page" and "Align scanned pages": per volume, kept on the Mac (phones
+  // get them too), shown at once.
+  document.addEventListener('change', event => {
+    const shift = event.target.closest?.('[data-manga-pair-shift]');
+    if (shift) { void setPairShift(shift.checked); return; }
+    const align = event.target.closest?.('[data-manga-page-align]');
+    if (align) void changeSpreadSetting({align: Boolean(align.checked)});
+  });
+  // Back to the reader (another app, a phone used meanwhile): the Mac's table again.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && $('mangaReaderV2')?.classList.contains('open')) void refreshSpreads();
   });
 
   document.addEventListener('input', event => {
@@ -2513,21 +2999,10 @@
       anchor_text: String(selection?.anchorNode?.textContent || '').trim().slice(0, 160),
     });
   });
-  function tokenForCharacterOffset(tokens, target) {
-    if (!tokens?.length) return null;
-    const weights = tokens.map(token => Math.max(1, [...String(token.textContent || '').trim()].length));
-    const total = weights.reduce((sum, value) => sum + value, 0);
-    let cursor = Math.max(0, Math.min(Math.max(0, total - .001), Number(target || 0)));
-    for (let index = 0; index < tokens.length; index++) {
-      if (cursor < weights[index]) return tokens[index];
-      cursor -= weights[index];
-    }
-    return tokens[tokens.length - 1] || null;
-  }
 
   function rawRegionRect(frame, regionNode) {
-    const image = frame?.querySelector?.('img');
-    const imageRect = image?.getBoundingClientRect?.();
+    // The page as laid out: an aligned page's points are mapped through its transform.
+    const imageRect = pageImageRect(frame);
     if (!imageRect || !regionNode) return null;
     const x = Number(regionNode.dataset.rawX || 0), y = Number(regionNode.dataset.rawY || 0);
     const width = Number(regionNode.dataset.rawWidth || 0), height = Number(regionNode.dataset.rawHeight || 0);
@@ -2551,6 +3026,7 @@
 
   function mangaRegionAtPoint(frame, clientX, clientY) {
     if (!frame) return null;
+    ({x: clientX, y: clientY} = screenToPage(frame, clientX, clientY));
     const candidates = [...frame.querySelectorAll('.manga-v2-text-region')]
       .map(node => {
         const rawRect = rawRegionRect(frame, node);
@@ -2566,20 +3042,6 @@
 
   // pudge-v0.7.27-manga-exact-hitboxes-v2
   const MANGA_TOKEN_HIT_SLOP_PX = 8;
-
-  function mangaTokenWeight(token) {
-    return Math.max(1, [...String(token?.textContent || '').trim()].length);
-  }
-
-  function mangaTokenIntervals(tokens) {
-    let cursor = 0;
-    return tokens.map((token, tokenIndex) => {
-      const weight = mangaTokenWeight(token);
-      const row = {token, tokenIndex, start:cursor, end:cursor + weight, weight};
-      cursor += weight;
-      return row;
-    });
-  }
 
   function pushMangaTokenBox(boxes, interval, geometry, source) {
     const x = Math.max(0, Math.min(1, Number(geometry.x || 0)));
@@ -3033,7 +3495,8 @@
     const image = frame?.querySelector?.('img');
     if (!image?.naturalWidth || !image?.naturalHeight || !layer) return false;
     const frameRect = frame.getBoundingClientRect();
-    const rect = image.getBoundingClientRect();
+    // An aligned page: the layer takes the picture's laid-out box and its transform.
+    const rect = frame.__align ? frameRect : image.getBoundingClientRect();
     if (!(rect.width > 0 && rect.height > 0)) return false;
     Object.assign(layer.style, {
       left:`${rect.left-frameRect.left}px`, top:`${rect.top-frameRect.top}px`,
@@ -3151,8 +3614,9 @@
 
   function mangaTokenHitAtPoint(frame, regionNode, region, clientX, clientY) {
     if (!frame || !regionNode || !region) return null;
-    const imageRect = frame.querySelector('img')?.getBoundingClientRect?.();
+    const imageRect = pageImageRect(frame);
     if (!imageRect) return null;
+    ({x: clientX, y: clientY} = screenToPage(frame, clientX, clientY));
     const boxes = mangaTokenHitboxes(regionNode, region);
     if (!boxes.length) return null;
     const ranked = boxes.map(box => {
@@ -3169,15 +3633,10 @@
     return ranked[0]?.box || null;
   }
 
-  function mangaTokenAtPoint(frame, regionNode, region, clientX, clientY) {
-    return mangaTokenHitAtPoint(frame, regionNode, region, clientX, clientY)?.token || null;
-  }
-
   async function dispatchMangaVirtualStudyHit(hit, frame) {
     const text = String(hit?.virtualText || '').trim();
     if (!text) return false;
-    const imageRect = frame?.querySelector?.('img')?.getBoundingClientRect?.();
-    const core = mangaTokenBoxClientRect(hit, imageRect, 0);
+    const core = pageRectToScreen(frame, mangaTokenBoxClientRect(hit, pageImageRect(frame), 0));
     if (!core) return false;
     const openText = window.PudgeReadingTools?.study?.openText;
     if (typeof openText !== 'function') return false;
@@ -3416,6 +3875,7 @@
       if (type === 'select-series' && series) toggleSeriesSelection(series.books);
       else if (type === 'read-series' && series) await openBook(Number(mangaCurrentSeriesBook(series.books)?.id || book.id));
       else if (type === 'select') toggleSelection(Number(book.id));
+      else if (type === 'relink') await relinkMangaBook(Number(book.id), false);
       else if (type === 'read') await openBook(Number(book.id));
       else if (type === 'anilist') {
         const id = anilistId(book);
@@ -3586,7 +4046,9 @@
 
 
   document.addEventListener('load', event => {
-    if (event.target?.matches?.('.manga-v2-page-frame img')) sizePageImage(event.target);
+    if (!event.target?.matches?.('.manga-v2-page-frame img')) return;
+    if (event.target.closest('.manga-v2-page-frame')?.dataset?.alignPair) applyPageSizing();
+    else sizePageImage(event.target);
   }, true);
   window.addEventListener('resize', () => requestAnimationFrame(applyPageSizing));
 
@@ -3608,8 +4070,13 @@
   }
 
   window.PudgeMangaReaderV2 = {
+    // The two-page table and the page transforms' math (the shared test cases).
+    spreadTable,
+    alignPoint,
+    alignmentStyle,
     renderLibrary,
     injectBook,
+    injectBooks,
     openBook,
     closeEscapeSurface,
     closeSettingsIfOpen: closeReaderSettings,
@@ -3632,13 +4099,20 @@
       for (const book of books) void startLibraryBookOcr(book, Boolean(book.ocr_complete));
     },
     settings: () => ({...settings}),
-    consumptionContext: () => ({
-      open: Boolean(currentBook && $('mangaReaderV2')?.classList.contains('open')),
-      book_id: Number(currentBook?.id || 0),
-      page_index: Number(currentPage || 0),
-      page_id: String(pageCache.get(`${Number(currentBook?.id || 0)}:${Number(currentPage || 0)}`)?.name || `page:${Number(currentPage || 0)}`),
-      page_count: Number(currentPageCount || 0)
-    })
+    consumptionContext: () => {
+      const id = Number(currentBook?.id || 0), page = Number(currentPage || 0);
+      const name = index => String(pageCache.get(`${id}:${index}`)?.name || `page:${index}`);
+      // Two pages side by side: both are on screen (statistics count each once).
+      const pair = settings.mode === 'double' && pagedVisibleCount > 1 && page + 1 < Number(currentPageCount || 0);
+      return {
+        open: Boolean(currentBook && $('mangaReaderV2')?.classList.contains('open')),
+        book_id: id,
+        page_index: page,
+        page_id: name(page),
+        ...(pair ? {page_ids: [name(page), name(page + 1)]} : {}),
+        page_count: Number(currentPageCount || 0)
+      };
+    }
   };
 
   // pudge-v0.7.27-manga-debug-overlay-v1

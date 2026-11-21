@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -158,15 +159,14 @@ def _select(picker_bridge, action):
     thread.start()
     # Main-run-loop work is deliberately queued, proving the RPC worker does
     # not present Cocoa UI itself. No real TCC request or desktop pixels.
-    for _ in range(100):
-        if queued:
-            break
+    deadline = time.monotonic() + 30  # 100 x 1 ms was too short for a busy Mac
+    while not queued and time.monotonic() < deadline:
         thread.join(0.001)
     queued.pop(0)()
     assert picker.config.modes == 1 and picker.config.changing is False
     assert picker.active and picker.style == 7
     action(picker.observer)
-    thread.join(1)
+    thread.join(30)
     assert not thread.is_alive()
     return session, result
 

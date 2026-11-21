@@ -28,8 +28,8 @@ def _release(
 ) -> NyaaRelease:
     return NyaaRelease(
         title=title,
-        link=f"https://nyaa.si/view/{info_hash}",
-        torrent_url=f"https://nyaa.si/download/{info_hash}.torrent",
+        link=f"https://releases.invalid/view/{info_hash}",
+        torrent_url=f"https://releases.invalid/download/{info_hash}.torrent",
         info_hash=info_hash,
         size_text=f"{size_gib:.1f} GiB",
         size_bytes=int(size_gib * 1024**3),

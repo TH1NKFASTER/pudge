@@ -644,12 +644,14 @@ class DocumentFragment extends ParentNode {
 
 class DOMTokenList {
   constructor(el, attr) { this.__el = el; this.__attr = attr; }
-  __get() {
+  __sync() {
     const text = this.__el.__attrs.get(this.__attr) || '';
     if (this.__text !== text) { this.__text = text; this.__list = text.split(/\s+/).filter(Boolean); }
-    return this.__list.slice();
+    return this.__list;
   }
-  contains(token) { this.__get(); return this.__list.includes(String(token)); }
+  __get() { return this.__sync().slice(); }
+  // No copy: contains() runs for every element of every class query and visibility check.
+  contains(token) { return this.__sync().includes(String(token)); }
   __set(list) { this.__el.setAttribute(this.__attr, [...new Set(list)].join(' ')); }
   get length() { return this.__get().length; }
   get value() { return this.__el.__attrs.get(this.__attr) || ''; }

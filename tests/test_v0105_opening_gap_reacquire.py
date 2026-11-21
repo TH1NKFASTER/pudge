@@ -8,6 +8,7 @@ from pudge.subtitles.timeline_alignment import (
     _merge_activity,
     _post_opening_gap_reacquire,
 )
+from subtitle_rebuild_support import assert_rebuilding_with_subtitles_kept
 
 
 def test_post_opening_gap_reacquires_dominant_later_clock_inside_silence() -> None:
@@ -142,7 +143,6 @@ def test_upgrade_requeues_v6_stt_selection_when_opening_clock_was_reacquired(tmp
     assert manager._requeue_stt_timeline_clock_conflicts() == 1
     repaired = manager.db.episode_by_path(video)
     assert repaired is not None
-    assert repaired.subtitle_path is None
-    assert repaired.state == "waiting_subtitles"
+    assert_rebuilding_with_subtitles_kept(manager, video)  # kept while it is prepared again
     assert manager.db.get_state("subtitle_stt_timeline_conflict_generation", "") == "2"
     assert manager._requeue_stt_timeline_clock_conflicts() == 0

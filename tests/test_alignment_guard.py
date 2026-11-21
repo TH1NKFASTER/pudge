@@ -340,7 +340,19 @@ def test_raw_fallback_disqualification_only_for_hard_negative_results() -> None:
         )
         is True
     )
-    assert syncing.raw_fallback_disqualified({"reference_discontinuity_rejected": True}) is True
+    # Changed (sync benchmark, BLUE REFLECTION RAY E07): a rejected discontinuous map alone
+    # says no trustworthy *map* exists, not that the subtitle is wrong; with nothing else the
+    # episode showed no subtitles. The raw file is now offered "not aligned", but only for an
+    # exact episode identity (the CLI checks the candidate). With any other hard negative it
+    # stays disqualified.
+    assert syncing.raw_fallback_disqualified({"reference_discontinuity_rejected": True}) is False
+    assert syncing.raw_fallback_needs_exact_identity({"reference_discontinuity_rejected": True}) is True
+    assert (
+        syncing.raw_fallback_disqualified(
+            {"reference_discontinuity_rejected": True, "alignment_output_guard": {"status": "rejected"}}
+        )
+        is True
+    )
     assert syncing.raw_fallback_disqualified({"reason": "semantic mismatch"}) is True
     assert syncing.raw_fallback_disqualified({"reason": "semantic_mismatch"}) is True
     assert (
@@ -494,14 +506,14 @@ def test_music_marker_pair_uses_one_nearby_dialogue_clock(tmp_path: Path) -> Non
     raw.write_text(
         "1\n00:00:01,418 --> 00:00:03,420\n♪～\n\n"
         "2\n00:01:27,587 --> 00:01:29,589\n～♪\n\n"
-        "3\n00:01:31,591 --> 00:01:33,468\n決戦の時は来た\n\n"
+        "3\n00:01:31,591 --> 00:01:33,468\nここから先は通さない\n\n"
         "4\n00:01:34,000 --> 00:01:35,000\n次の台詞\n",
         encoding="utf-8",
     )
     final.write_text(
         "1\n00:00:11,230 --> 00:00:13,232\n♪～\n\n"
         "2\n00:01:27,485 --> 00:01:29,487\n～♪\n\n"
-        "3\n00:01:31,489 --> 00:01:33,366\n決戦の時は来た\n\n"
+        "3\n00:01:31,489 --> 00:01:33,366\nここから先は通さない\n\n"
         "4\n00:01:33,898 --> 00:01:34,898\n次の台詞\n",
         encoding="utf-8",
     )

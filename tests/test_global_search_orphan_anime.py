@@ -24,7 +24,7 @@ def _api(
         db=db, incomplete_download_paths=lambda: set(), _path_within=lambda *_: False
     )
     api.light_novels = SimpleNamespace(state=lambda: {"books": []})
-    api.manga = SimpleNamespace(state=lambda: {"books": []})
+    api.manga = SimpleNamespace(search_catalog=lambda: [])
     api.audiobooks = SimpleNamespace(search_catalog=lambda: [])
     api._global_anilist_aliases = lambda ids, allow_network=False: {}
     api._cover_uri = lambda item: ""

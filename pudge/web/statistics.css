@@ -50,6 +50,20 @@
 [data-stats-kind="simultaneous"]{--stats-kind:#9085e9}
 [data-stats-kind="review"]{--stats-kind:#e66767}
 
+/* Reading speed card: the time chart's look (panel, bars, small date labels), one colour. */
+.stats-speed{display:grid;gap:10px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.stats-speed-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.stats-speed-head>.stats-muted{overflow-wrap:anywhere}
+.stats-speed-head .spacer{flex:1 1 0}
+.stats-speed-chart{display:grid;grid-template-columns:repeat(var(--stats-columns,1),minmax(20px,1fr));align-items:end;gap:5px;min-height:170px;padding:6px 0 24px;overflow-x:auto;overflow-y:hidden}
+.stats-speed-col{min-width:20px;width:100%;height:140px;display:flex;align-items:end;position:relative}
+.stats-speed-col:focus-visible{outline:2px solid var(--accent-text);outline-offset:2px}
+.stats-speed-bar{display:block;width:100%;min-height:2px;border-radius:4px 4px 0 0;background:var(--stats-kind,#8a9bb3)}
+.stats-speed-col:hover .stats-speed-bar{filter:brightness(1.15)}
+.stats-speed-bar.stats-speed-unmeasured{height:2px;background:var(--muted);opacity:.5}
+.stats-speed-col small{position:absolute;top:144px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--muted);white-space:nowrap}
+.stats-speed .stats-empty{padding:18px}
+
 .stats-calendar{display:grid;grid-template-columns:repeat(18,minmax(0,1fr));gap:4px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
 .stats-day{aspect-ratio:1;border:1px solid color-mix(in srgb,var(--line) 70%,transparent);border-radius:3px;background:color-mix(in srgb,var(--accent) calc(var(--heat)*80%),var(--panel));cursor:pointer;min-width:0;padding:0}
 
@@ -92,3 +106,17 @@
   .stats-table td.stats-title{grid-column:1/-1;order:-1;min-width:0;font-weight:650}
   .stats-table td[data-label]::before{content:attr(data-label);display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
 }
+/* Word lists (episode_words.js): the "Episode words" dialog and "Met often, not in deck". */
+.word-list-row{grid-template-columns:auto minmax(4em,1fr) minmax(0,1fr) minmax(0,2fr) auto;cursor:pointer}
+.word-list-row>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.word-list-row .word-list-sources{display:block;color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.word-list-row.unnamed .title{font-style:italic}
+.episode-words-picker{margin:0 0 8px}
+.episode-words-notes button{margin-left:6px}
+.stats-met-words{min-width:0;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.stats-met-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;margin-bottom:6px}
+.stats-met-controls{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:6px 0}
+.stats-met-toggle{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer}
+.stats-met-list{max-height:420px;overflow:auto;margin:8px 0;border-top:1px solid var(--line)}
+.stats-met-actions{display:flex;gap:8px;margin:6px 0}
+.stats-met-notes{margin:4px 0}

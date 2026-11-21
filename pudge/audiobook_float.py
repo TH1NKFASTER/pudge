@@ -44,11 +44,6 @@ class AudiobookFloatWindow:
         with self._lock:
             return self._window is not None
 
-    @property
-    def display_book_id(self) -> int | None:
-        with self._lock:
-            return self._display_book_id
-
     def _suppressed_locked(self) -> bool:
         suppression = self._suppression
         return bool(

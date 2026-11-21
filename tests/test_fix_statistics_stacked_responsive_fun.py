@@ -112,7 +112,7 @@ def test_days_carry_time_per_kind_and_the_overview_gets_highlights(tmp_path: Pat
     assert h["longest_session"]["seconds"] == 600.0 and h["longest_session"]["title"] == "Odd Taxi · 1"
     assert h["top_work"] == {"title": "Odd Taxi · 1", "kind": "anime", "seconds": 840.0}
     assert h["anime_episodes"] == 2
-    assert h["ln_characters_per_minute"] == 600 / 120 * 60  # 600 characters in 2 minutes
+    assert h["ln_characters_per_minute"] is None  # 600 characters in 2 minutes: under the 5-minute floor
     assert h["manga_pages_per_hour"] is None
     assert h["words"] is None  # no word sources: no word stats at all
 

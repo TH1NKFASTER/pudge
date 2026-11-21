@@ -55,7 +55,7 @@ def test_spoken_chapter_marker_is_locator_not_text_anchor() -> None:
 
 def test_every_chapter_semantically_verifies_prose_after_spoken_marker() -> None:
     first = (
-        "小高い丘が延々と続く。岩ばかりが目立ち草も木も少ない。旅人は丘の間を縫う細い道を静かに進んでいた。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り人も舟も少ない。旅人は北の浜に沿う細い道を静かに進んでいた。"
     ) * 10
     second = _chapter_two_text()
 
@@ -127,8 +127,8 @@ def test_digit_spoken_marker_also_localizes_kanji_chapter_title() -> None:
 
 def test_first_chapter_credits_then_spoken_marker_then_prose_waits_for_prose() -> None:
     story = (
-        "小高い丘が延々と続く。岩ばかりが目立ち草も木も少ない。"
-        "道は丘と丘の間を縫って作られ旅人は静かに荷馬車を進めた。"
+        "白い砂浜が延々と続く。貝殻ばかりが光り人も舟も少ない。"
+        "細い道は浜に沿って北へと伸び旅人は静かに荷馬車を進めた。"
     ) * 10
     segments = [
         {"start": 2.0, "end": 15.0, "text": "著者出版社朗読制作についてご案内します"},

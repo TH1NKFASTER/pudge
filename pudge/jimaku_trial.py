@@ -11,7 +11,8 @@ from typing import Any
 from .branding import APP_SLUG
 
 
-TRIAL_SECONDS = 48 * 60 * 60
+# A week: deleting the cache folder starts it again, which is acceptable for a trial.
+TRIAL_SECONDS = 7 * 24 * 60 * 60
 _ASSET_NAME = "jimaku-trial-key"
 # Statuses Jimaku answers when it does not accept an API key (invalid, revoked).
 KEY_REJECTED_STATUSES = frozenset({401, 403})
@@ -35,7 +36,7 @@ def _trial_marker(cache_dir: Path) -> Path:
 
 
 def apply_jimaku_trial(config: Any, *, now: float | None = None) -> None:
-    """Use the bundled Jimaku key for 48 hours when no personal key is configured."""
+    """Use the bundled Jimaku key for 7 days when no personal key is configured."""
 
     current_time = float(time.time() if now is None else now)
     jimaku = config.jimaku
@@ -163,7 +164,7 @@ def jimaku_key_problem(config: Any) -> dict[str, Any]:
 
     ``kind`` is ``personal_rejected`` (Jimaku refuses the user's own key),
     ``trial_rejected`` (Jimaku refuses the bundled key) or ``trial_expired`` (the
-    48 hours are over); ``{}`` when there is no problem. ``id`` is the same for one
+    7 days are over); ``{}`` when there is no problem. ``id`` is the same for one
     refused personal key (by its fingerprint) or one trial, so the window shows its
     notice once for each; ``seen`` says it was shown already."""
 

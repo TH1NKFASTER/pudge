@@ -34,7 +34,7 @@ struct PlayerScreen: View {
             ScrollView {
                 if let book = player.book {
                     VStack(spacing: 24) {
-                        BookCover(store: model.store, book: book, width: 160)
+                        BookCover(store: model.store, book: book, width: 160, generation: model.coverGeneration)
                         Text(book.title).font(.title2.bold()).multilineTextAlignment(.center)
                         Text(book.chapters.last(where: { $0.startMs <= player.positionMs })?.title ?? "Audiobook").font(.subheadline).foregroundStyle(.secondary)
                         VStack {
@@ -71,20 +71,31 @@ struct PlayerScreen: View {
                                 Label("Read along", systemImage: "text.book.closed").frame(minHeight: 44)
                             }.buttonStyle(.borderedProminent)
                         }
-                        Button("Finished") { player.pause(); player.save("finish") }
+                        if model.isFinished(book) {
+                            // The end of the book (or Finished): said here, and its light novel offered.
+                            Label("Finished", systemImage: "checkmark.seal.fill").font(.headline).foregroundStyle(PudgeTheme.good)
+                                .accessibilityIdentifier("player-finished")
+                            NovelFinishOffer(model: model, media: model.media, book: book)
+                        } else {
+                            Button("Finished") { player.pause(); player.save("finish") }
+                        }
                         Button("Close player") { player.stop(); dismiss() }.foregroundStyle(.secondary)
                     }.padding(24).frame(maxWidth: 640).frame(maxWidth: .infinity)
                 } else { ContentUnavailableView("Player closed", systemImage: "headphones") }
             }.background(PudgeTheme.background)
+                .task { await model.media.loadNovelListIfNeeded() }
                 .navigationTitle("Now playing").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-                .sheet(item: Binding(get: { reader.map(ReaderTarget.init) }, set: { reader = $0?.id })) { target in
+                // The reader covers the whole screen, as when it is opened from Light Novels: a sheet
+                // over the player's own sheet left an empty band at the top (the cards behind it).
+                .fullScreenCover(item: Binding(get: { reader.map(ReaderTarget.init) }, set: { reader = $0?.id })) { target in
                     NavigationStack {
-                        NovelReaderScreen(media: model.media, bookId: target.id, title: player.book?.title ?? "Light novel")
+                        NovelReaderScreen(media: model.media, bookId: target.id,
+                                          title: model.media.novels.first { $0.id == target.id }?.title ?? player.book?.title ?? "Light novel")
                             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { reader = nil } } }
                     }.tint(PudgeTheme.accent).preferredColorScheme(.dark)
                 }
-                .sheet(isPresented: $readingAlong) {
+                .fullScreenCover(isPresented: $readingAlong) {
                     if let book = player.book, let document = model.readAlong(book) {
                         ReadAlongScreen(player: player, media: model.media, document: document)
                     }
@@ -134,7 +145,7 @@ struct ReadAlongScreen: View {
                                     .contentShape(Rectangle())
                                     .onTapGesture {
                                         follow = true
-                                        let target = chapter.timeMs(atOffset: chapter.sentences[range.lowerBound].start)
+                                        let target = chapter.startMs(ofSentence: range.lowerBound)
                                         Task { try? await player.seek(target) }
                                     }
                             }
@@ -165,10 +176,10 @@ struct ReadAlongScreen: View {
                 })
                 return .handled
             })
-            .sheet(item: $lookup, onDismiss: {
+            .bottomPanel(item: $lookup, onDismiss: {
                 if resumeAfterLookup { resumeAfterLookup = false; if !player.playing { player.resume() } }
             }) { item in WordSheet(media: media, lookup: item) }
-            .navigationTitle(document.title.isEmpty ? "Read along" : document.title).navigationBarTitleDisplayMode(.inline)
+            .japaneseNavigationTitle(document.title.isEmpty ? "Read along" : document.title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                 ToolbarItem(placement: .primaryAction) {

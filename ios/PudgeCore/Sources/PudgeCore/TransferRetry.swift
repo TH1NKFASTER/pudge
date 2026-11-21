@@ -26,6 +26,17 @@ public enum TransferRetry {
         attempt < attempts && isTransient(error)
     }
 
+    /// How long a download that keeps its bytes waits for a Mac that does not answer (quit for an
+    /// update, restarting) before it gives up, counted from the last byte received. The six quick
+    /// attempts alone (about 30 s) gave up while the Mac app updated, and the download started over.
+    public static let patience: Double = 20 * 60
+
+    /// The same for such a download: after the quick attempts it goes on trying while nothing
+    /// has arrived for less than `patience` seconds (`stalledFor`).
+    public static func shouldRetry(_ error: Error, attempt: Int, stalledFor: Double) -> Bool {
+        isTransient(error) && (attempt < attempts || stalledFor < patience)
+    }
+
     /// Seconds to wait before the attempt after `attempt`.
     public static func delay(after attempt: Int) -> Double { min(15, 2 * Double(max(1, attempt))) }
 }

@@ -27,14 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .fsutil import atomic_write_json
 from .audio_fingerprints import (
     ENGINE_VERSION,
     HOP_SECONDS,
@@ -52,6 +51,7 @@ MAX_RAW_EPISODES = 6
 MAX_VARIANTS = 4
 LIBRARY_MAX_BYTES = 32 * 1024 * 1024
 MIN_VARIANT_SHARE = 0.5
+REGROW_SECONDS = 1.5  # a variant-matched segment this much longer than the variant re-cuts it
 KEEP_STATUSES = {"CURRENT", "PLANNING", "REPEATING", "PAUSED"}
 AIRING_STATUSES = {"RELEASING", "NOT_YET_RELEASED", "HIATUS"}
 REGIONS = (("intro", "head", 0), ("outro", "tail", 1))
@@ -183,10 +183,7 @@ class TitleLibrary:
             return
         self.dir.mkdir(parents=True, exist_ok=True)
         self.data["updated_at"] = time.time()
-        fd, tmp = tempfile.mkstemp(prefix=".library.", dir=str(self.dir))
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp, self.path)
+        atomic_write_json(self.path, self.data, ensure_ascii=False, sort_keys=True)
         self.changed = False
 
     def _raw_path(self, episode: int, region: str) -> Path:
@@ -348,6 +345,24 @@ class TitleLibrary:
         self._credit(vid, episode)
         return vid
 
+    def _regrow_variant(self, variant_id: str, fp: AudioFingerprint, start: float, end: float) -> None:
+        """Re-cut a variant from a longer segment it was matched in (partners showed more of it).
+
+        Variants cut from an older, shorter detection (an ED found a few seconds late) would
+        otherwise keep that late start for every later episode of the title.
+        """
+        row = self.data["variants"][variant_id]
+        old = self._load_fp(self._variant_path(variant_id))
+        current = old.duration_seconds if old is not None else float(row.get("duration") or 0.0)
+        if end - start < current + REGROW_SECONDS:
+            return
+        piece = slice_fingerprint(fp, start, end)
+        if piece.size < 8:
+            return
+        self._save_fp(self._variant_path(variant_id), piece, {"variant": variant_id, "kind": row.get("kind")})
+        row["duration"] = round(piece.duration_seconds, 2)
+        self.changed = True
+
     def observe(
         self,
         episode: int,
@@ -362,6 +377,7 @@ class TitleLibrary:
             if region is None:
                 continue
             if variant_id and variant_id in self.data["variants"]:
+                self._regrow_variant(variant_id, fps[0 if kind == "intro" else 1], start, end)
                 self._credit(variant_id, episode)
                 self._set_explained(episode, region, variant_id)
                 continue

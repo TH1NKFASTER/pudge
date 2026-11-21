@@ -214,6 +214,17 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(restored.canResume(identity: "changed-address-or-credential"))
     }
 
+    func testOneTransferIsReadById() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = try LocalStore.open(at: folder)
+        var record = TransferRecord(assetId: asset, part: try manifest().parts[0])
+        record.receivedBytes = 7
+        try store.saveTransfer(record)
+        XCTAssertEqual(try store.transfer(record.id)?.receivedBytes, 7)
+        XCTAssertNil(try store.transfer("missing"))
+    }
+
     func testArchiveFreshnessUsesTheClientObservationWhenClocksDiffer() {
         let copy = LocalResource(resourceId: asset, sha256: String(repeating: "a", count: 64), sizeBytes: 1,
             generation: 1, verified: true, pinned: false, active: false, original: true, transferring: false)
@@ -271,6 +282,16 @@ final class CoreTests: XCTestCase {
         let chapter = document.chapters[0]
         XCTAssertEqual(chapter.timeMs(atOffset: 8), 2000)
         XCTAssertEqual(chapter.paragraphRanges, [0..<2, 2..<3])
+    }
+    func testReadAlongLinesShownAtOnceStartTogether() throws {
+        // Two subtitle lines on screen at the same time: the anchors put the second at the
+        // first one's end; its own time is the moment it is spoken.
+        let chapter = try JSONDecoder().decode(ReadAlongChapter.self, from: Data(#"{"index":0,"title":"","startMs":0,"endMs":9000,"sentences":[{"p":0,"text":"右だ","start":0,"end":2,"t":[1000,3000]},{"p":1,"text":"左だ","start":3,"end":5,"t":[1000,3000]},{"p":2,"text":"終わり","start":6,"end":9}],"anchors":[[1000,0],[3000,2],[3000,5],[6000,6],[8000,9]]}"#.utf8))
+        XCTAssertEqual(chapter.startMs(ofSentence: 0), 1000)
+        XCTAssertEqual(chapter.startMs(ofSentence: 1), 1000)
+        XCTAssertEqual(chapter.timeMs(atOffset: chapter.sentences[1].start), 3000)
+        XCTAssertEqual(chapter.startMs(ofSentence: 2), 6000)  // no own time: by the anchors
+        XCTAssertEqual(chapter.startMs(ofSentence: 9), 0)
     }
     func testStudyTokensSplitTextInUTF16Units() throws {
         let tokens = try JSONDecoder().decode([StudyToken].self, from: Data("[[0,2,5,1,2],[3,4,9,0]]".utf8))
@@ -453,7 +474,7 @@ final class CoreTests: XCTestCase {
         let token = StudyToken(start: 0, end: 1, wordId: 1, readingIndex: 0, state: 1, flags: 3 | (5 << 3))
         XCTAssertEqual(token.jitenState, 4)
         XCTAssertEqual(StudyToken(start: 0, end: 1, wordId: 1, readingIndex: 0, state: 2).jitenState, 4)
-        let look = try! JSONDecoder().decode(SubtitleLook.self, from: Data(#"{"source":"jiten-mpv","theme":"Default","fontFamily":"Hiragino Sans","fontSize":48,"borderSize":3,"unparsed":{"text":"#eeeeee","outline":"#000000","outlineSize":3},"states":[{"text":"#a566ef","outline":"#000000","outlineSize":3}]}"#.utf8))
+        let look = try! JSONDecoder().decode(SubtitleLook.self, from: Data(##"{"source":"jiten-mpv","theme":"Default","fontFamily":"Hiragino Sans","fontSize":48,"borderSize":3,"unparsed":{"text":"#eeeeee","outline":"#000000","outlineSize":3},"states":[{"text":"#a566ef","outline":"#000000","outlineSize":3}]}"##.utf8))
         XCTAssertEqual(look.style(StudyToken(start: 0, end: 1, wordId: 1, readingIndex: 0, state: 0, flags: 1 << 3)).text, "#a566ef")
         XCTAssertEqual(look.style(token).text, "#eeeeee")
         XCTAssertEqual(look.style(nil).text, "#eeeeee")
@@ -579,5 +600,108 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(TransferRetry.shouldRetry(PudgeError.invalid("File size or SHA-256 does not match"), attempt: 1))
         XCTAssertLessThanOrEqual(TransferRetry.delay(after: 10), 15)
         XCTAssertGreaterThan(TransferRetry.delay(after: 1), 0)
+    }
+
+    func testDownloadsOfAPreviousMacGetLocalIdsBelowZero() {
+        let mine = "00000000-0000-0000-0000-00000000000a", previous = "00000000-0000-0000-0000-00000000000b"
+        // Every Mac numbers from 1: the previous Mac's 3 and 17 move below every id in use; this
+        // Mac's, those without an owner (kept before owners were) and those moved already stay.
+        let ids = DownloadOwner.localIds([(id: 17, serverId: previous), (id: 3, serverId: previous), (id: 5, serverId: mine),
+                                          (id: -1, serverId: previous), (id: 8, serverId: nil)], bound: mine)
+        XCTAssertEqual(ids, [3: -2, 17: -3])
+        XCTAssertEqual(DownloadOwner.localIds([(id: 3, serverId: previous)], bound: nil), [:])
+        XCTAssertEqual(DownloadOwner.localIds([(id: 3, serverId: mine)], bound: mine), [:])
+    }
+    func testOpenedPlaceCountsOnlyAfterMovingAway() {
+        // Opened and closed at the same place: not saved (with a fresh time it beat a later place on the Mac).
+        var video = OpenedPlace(position: 600_000, tolerance: 5000)
+        XCTAssertFalse(video.counts(position: 600_000))
+        XCTAssertFalse(video.counts(position: 604_000))
+        XCTAssertTrue(video.counts(position: 640_000))
+        XCTAssertTrue(video.counts(position: 600_000))  // back at the start after moving: a real place
+        var novel = OpenedPlace(chapter: 2, position: 40, tolerance: 2)
+        XCTAssertFalse(novel.counts(chapter: 2, position: 41))
+        XCTAssertTrue(novel.counts(chapter: 3, position: 41))
+        var manga = OpenedPlace(position: 12)
+        XCTAssertFalse(manga.counts(position: 12))
+        XCTAssertTrue(manga.counts(position: 13))
+    }
+    func testVolumeOfAPreviousMacIsRenumberedInItsPackage() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("package.json")
+        let novel = #"{"revision":"r1","title":"本","book":{"id":3,"title":"本","audioAssetId":null,"chapter":1,"offset":0.5,"finished":false,"chapters":[{"index":0,"title":"一","characters":2}]},"item":{"id":3,"title":"本","volume":2,"chapters":1,"chapter":1,"offset":0.5,"finished":false,"hasCover":true,"hasAudio":false,"updatedAt":1700000000.5}}"#
+        try Data(novel.utf8).write(to: file)
+        try ReadingPackage.renumber(folder, id: -2)
+        let book = try JSONDecoder().decode(NovelPackage.self, from: Data(contentsOf: file))
+        XCTAssertEqual(book.book.id, -2)
+        XCTAssertEqual(book.item?.id, -2)
+        XCTAssertEqual(book.book.offset, 0.5)
+        XCTAssertEqual(book.item?.updatedAt, 1700000000.5)
+        XCTAssertNil(book.book.audioAssetId)
+        XCTAssertEqual(book.title, "本")
+        let manga = #"{"revision":"m1","title":"巻","item":{"id":5,"title":"巻","pages":3,"position":2,"readPages":2,"rightToLeft":true,"ocrPages":3,"updatedAt":1},"pages":["0001.jpg","0002.jpg","0003.jpg"],"ocr":true}"#
+        try Data(manga.utf8).write(to: file)
+        try ReadingPackage.renumber(folder, id: -1)
+        let volume = try JSONDecoder().decode(MangaPackage.self, from: Data(contentsOf: file))
+        XCTAssertEqual(volume.item.id, -1)
+        XCTAssertEqual(volume.pages, ["0001.jpg", "0002.jpg", "0003.jpg"])
+        XCTAssertEqual(volume.ocr, true)
+        XCTAssertTrue(volume.item.rightToLeft)
+    }
+    func testUnpackAddsTheRecordBeforeTheNewCopyReplacesTheOldOne() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let target = folder.appendingPathComponent("ln-3"), file = folder.appendingPathComponent("one.pudgepkg")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: target.appendingPathComponent("download.json"))
+        let body = Data("{}".utf8)
+        let entry: [String: Any] = ["name": "package.json", "offset": 0, "size": body.count]
+        let index: [String: Any] = ["format": 1, "files": [entry]]
+        let header = try JSONSerialization.data(withJSONObject: index)
+        var length = UInt64(header.count).bigEndian
+        try (Data("PUDGEPK1".utf8) + Data(bytes: &length, count: 8) + header + body).write(to: file)
+        // A failing addition keeps the old copy whole.
+        XCTAssertThrowsError(try ReadingPackage.unpack(file, into: target) { _ in throw PudgeError.invalid("stop") })
+        XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("download.json")), Data("old".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path + ".unpacking"))
+        // The record is in the new copy the moment it takes the old one's place.
+        try ReadingPackage.unpack(file, into: target) { staged in
+            XCTAssertNotEqual(staged.standardizedFileURL.path, target.standardizedFileURL.path)
+            try Data("new".utf8).write(to: staged.appendingPathComponent("download.json"))
+        }
+        XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("download.json")), Data("new".utf8))
+        XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("package.json")), body)
+    }
+    func testEvictionRemovesAVerifiedArchivedCopyOnce() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = try LocalStore.open(at: folder)
+        let url = folder.appendingPathComponent("test.mp3")
+        try Data("original".utf8).write(to: url)
+        var part = try manifest().parts[0]; part.sha256 = try FileIntegrity.sha256(url); part.sizeBytes = 8
+        try store.markVerified(part, at: url, original: true)
+        let copy = try XCTUnwrap(store.resource(part.resourceId))
+        let receipt = ArchiveReceipt(receiptId: edition, resourceId: part.resourceId, editionId: edition,
+                                     sha256: part.sha256, sizeBytes: 8, verifiedAt: 1, retained: true)
+        try store.evict(resourceId: part.resourceId, expectedGeneration: copy.state.generation, receipt: receipt, nowMs: 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try store.resource(part.resourceId)?.state.verified, false)
+        XCTAssertThrowsError(try store.evict(resourceId: part.resourceId, expectedGeneration: copy.state.generation, receipt: receipt, nowMs: 2))
+    }
+    func testFailedImportForgetsItsFilesAndOnlyBookFormatsAreImported() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = try LocalStore.open(at: folder)
+        let url = folder.appendingPathComponent("test.mp3")
+        try Data("original".utf8).write(to: url)
+        var part = try manifest().parts[0]; part.sha256 = try FileIntegrity.sha256(url); part.sizeBytes = 8
+        try store.markVerified(part, at: url, original: true)
+        try store.forgetResources([part.resourceId])
+        XCTAssertNil(try store.resource(part.resourceId))
+        // The picker also offers AIFF, CAF and audio-only MP4: the library refuses them, so the import does first.
+        for format in ["mp3", "m4a", "m4b", "flac", "opus"] { XCTAssertTrue(AudioManifest.audioExtensions.contains(format), format) }
+        for format in ["aiff", "aif", "caf", "mp4"] { XCTAssertFalse(AudioManifest.audioExtensions.contains(format), format) }
     }
 }

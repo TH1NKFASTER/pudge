@@ -57,11 +57,6 @@ def test_ocr_streams_compositions_without_materializing_display_list(tmp_path: P
         yield 4.0, None
 
     monkeypatch.setattr(ocr, "iter_pgs_compositions", displays)
-    monkeypatch.setattr(
-        ocr,
-        "decode_pgs_compositions",
-        lambda _path: (_ for _ in ()).throw(AssertionError("OCR must not build a display list")),
-    )
     monkeypatch.setattr(ocr, "_vision_recognize", lambda _image: "こんにちは")
 
     output, result = ocr.image_subtitle_to_srt(
