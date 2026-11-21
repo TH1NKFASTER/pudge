@@ -319,7 +319,8 @@ def test_resumed_playback_stops_the_pass_quickly_and_keeps_finished_files(
     assert cached_fingerprints(cache, files[0].identity) is not None
     assert cached_fingerprints(cache, files[1].identity) is not None
     assert cached_fingerprints(cache, files[2].identity) is None
-    # FFmpeg ran at low CPU priority (nice) and was killed, not left running.
-    assert int(nice_file.read_text().strip()) >= 15
+    # FFmpeg ran at low CPU priority (nice 15 on top of Pudge's own: a CI runner can start the
+    # tests below 0, where 15 more gives 5) and was killed, not left running.
+    assert int(nice_file.read_text().strip()) >= min(os.getpriority(os.PRIO_PROCESS, 0) + 15, 19)
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text().strip()), 0)

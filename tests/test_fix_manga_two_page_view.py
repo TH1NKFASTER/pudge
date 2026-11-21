@@ -138,7 +138,13 @@ def test_the_phone_asks_the_mac_for_the_spreads(tmp_path: Path) -> None:
 
     db, manga, book_id, _archive = _volume(tmp_path)
     phone = _phone(tmp_path, db, manga, [])
-    assert _call(phone, "GET", f"manga/{book_id}/spreads") == manga.spread_pages(book_id)
+    from_phone = _call(phone, "GET", f"manga/{book_id}/spreads")
+    # The alignment is worked out meanwhile in the background: its pending count can drop
+    # between the two answers.
+    assert from_phone["alignment"]["version"] == 1
+    assert {key: value for key, value in from_phone.items() if key != "alignment"} == {
+        key: value for key, value in manga.spread_pages(book_id).items() if key != "alignment"
+    }
     with pytest.raises(MediaError):
         _call(phone, "GET", "manga/999/spreads")
 
