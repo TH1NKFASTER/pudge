@@ -40,6 +40,7 @@ POLICY_TESTS = {
     "test_fix_ios_reader_guards.py": "iPhone/iPad readers (Swift) run only in Xcode on the Mac",
     "test_fix_ios_reader_follow_line.py": "iPhone/iPad light-novel reader with the audiobook (Swift) runs only in Xcode on the Mac",
     "test_fix_release_notes_and_clean_tree.py": "the release workflow file is GitHub configuration; its notes step is run here",
+    "test_fix_ci_runner_images.py": "the workflow files are GitHub configuration; their runner labels are checked here",
     "test_fix_ios_watched_elsewhere_cleanup.py": "iPhone/iPad watched cleanup (Swift) runs only in Xcode / swift test on the Mac",
     "test_fix_ios_pending_books_in_series.py": "iPhone/iPad audiobook library (Swift) runs only in Xcode on the Mac",
     "test_fix_manga_two_page_view.py": "iPhone/iPad manga reader (Swift) runs only in Xcode on the Mac",

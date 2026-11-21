@@ -11,7 +11,7 @@ jobs:
     name: Tests ${{ matrix.batch }}/4
     # uv.lock resolves for macOS only (tool.uv.environments): the locked install needs a Mac.
     # Python 3.12 only: the Python the app's installer sets up (and the release checks use).
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -84,7 +84,7 @@ jobs:
 
   macos-smoke:
     name: macOS smoke
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

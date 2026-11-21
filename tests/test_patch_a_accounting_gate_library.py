@@ -80,11 +80,13 @@ def _insert_ln(
     anilist_id: int | None = None,
 ) -> int:
     now = time.time()
+    # Whole nanoseconds: a float time ending in 1-3 decimals (….284) reads as a volume number.
+    path = tmp_path / f"{title}-{volume}-{time.time_ns()}.epub"
     conn = service._connect()
     try:
         conn.execute(
             "INSERT INTO ln_books(title,file_path,file_type,volume,anilist_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (title, str(tmp_path / f"{title}-{volume}-{now}.epub"), "epub", volume, anilist_id, now, now),
+            (title, str(path), "epub", volume, anilist_id, now, now),
         )
         book_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
         for index, text in enumerate(chapters):
